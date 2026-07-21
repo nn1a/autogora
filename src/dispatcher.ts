@@ -38,6 +38,7 @@ export interface DispatcherOptions {
   heartbeatMaxStaleSeconds?: number | undefined;
   crashGraceSeconds?: number | undefined;
   rateLimitCooldownSeconds?: number | undefined;
+  failureLimit?: number | undefined;
   notificationLimit?: number | undefined;
   notificationTimeoutMs?: number | undefined;
   goalJudge?: ((input: {
@@ -461,7 +462,7 @@ async function runClaim(
     preparedClaim = workspaces.prepare(store, claim);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    store.failRun(scope, `Workspace preparation failed: ${message}`);
+    store.failRun(scope, `Workspace preparation failed: ${message}`, { failureLimit: options.failureLimit });
     options.onLog?.(`workspace failure ${claim.task.task.id}: ${message}`);
     return;
   }
@@ -527,12 +528,12 @@ async function runClaim(
     const detail = execution.spawnError?.message ??
       `Runner exited without a terminal Kanban call (code=${execution.code}, signal=${execution.signal ?? "none"})`;
     if (execution.timedOut || (maxRuntimeMs !== null && maxRuntimeMs <= 0)) {
-      store.failRun(scope, detail, { outcome: "timed_out" });
+      store.failRun(scope, detail, { outcome: "timed_out", failureLimit: options.failureLimit });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
       return;
     }
     if (execution.spawnError) {
-      store.failRun(scope, detail, { outcome: "spawn_failed" });
+      store.failRun(scope, detail, { outcome: "spawn_failed", failureLimit: options.failureLimit });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
       return;
     }
@@ -541,17 +542,18 @@ async function runClaim(
         outcome: "rate_limited",
         countFailure: false,
         cooldownSeconds: Math.max(0, options.rateLimitCooldownSeconds ?? 60),
+        failureLimit: options.failureLimit,
       });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
       return;
     }
     if (execution.code !== 0) {
-      store.failRun(scope, detail);
+      store.failRun(scope, detail, { failureLimit: options.failureLimit });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
       return;
     }
     if (!goalMode) {
-      store.failRun(scope, detail, { outcome: "protocol_violation" });
+      store.failRun(scope, detail, { outcome: "protocol_violation", failureLimit: options.failureLimit });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
       return;
     }
@@ -559,7 +561,10 @@ async function runClaim(
     store.pauseGoalRun(scope, turn);
     sessionId = sessionId ?? execution.sessionId;
     if (!sessionId) {
-      store.failRun(scope, "Goal-mode runner did not report a resumable session id", { outcome: "protocol_violation" });
+      store.failRun(scope, "Goal-mode runner did not report a resumable session id", {
+        outcome: "protocol_violation",
+        failureLimit: options.failureLimit,
+      });
       return;
     }
     let judgment: GoalJudgment;

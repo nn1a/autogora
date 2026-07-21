@@ -65,6 +65,11 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     assert.equal(reassigned.ok.length, 2);
     assert.equal(reassigned.errors.length, 0);
 
+    const blocked = successfulJson<any[]>([
+      "block", first.task.id, "batch review required", "--ids", second.task.id, "--db", dbPath,
+    ]);
+    assert.deepEqual(blocked.map((detail) => detail.task.status), ["blocked", "blocked"]);
+
     const mine = successfulJson<any[]>(["list", "--db", dbPath, "--mine"], {
       ...process.env,
       HERMES_PROFILE: "reviewer",
@@ -73,6 +78,17 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
 
     const triage = successfulJson<any>(["create", "Rough idea", "--db", dbPath, "--triage"]);
     assert.equal(triage.task.status, "triage");
+
+    const dispatchable = successfulJson<any>([
+      "create", "Dry run candidate", "--db", dbPath, "--assignee", "worker", "--runtime", "codex",
+    ]);
+    const dryRun = successfulJson<any>(["dispatch", "--db", dbPath, "--dry-run", "--max", "1"]);
+    assert.equal(dryRun.dryRun, true);
+    assert.deepEqual(dryRun.candidates.map((task: { id: string }) => task.id), [dispatchable.task.id]);
+
+    const daemon = cli(["daemon", "--db", dbPath]);
+    assert.equal(daemon.status, 1);
+    assert.match(daemon.stderr, /requires --force/);
 
     const invalidSort = cli(["list", "--db", dbPath, "--sort", "unsupported"]);
     assert.equal(invalidSort.status, 1);

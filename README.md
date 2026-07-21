@@ -212,6 +212,8 @@ terminal task; preserved directories and worktrees are left untouched.
 
 ```bash
 node dist/cli.js bulk <task-a> <task-b> --assignee reviewer --priority 10
+node dist/cli.js block <task-a> "needs review" --ids <task-b> --ids <task-c>
+node dist/cli.js dispatch --dry-run --max 3
 node dist/cli.js gc --event-retention-days 30 --log-retention-days 30
 ```
 

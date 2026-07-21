@@ -72,6 +72,7 @@ Commands:
   archive <id>...       Archive tasks
   delete <id>...        Permanently delete tasks
   dispatch              Run the Claude/Codex worker dispatcher
+  daemon --force        Run the deprecated standalone dispatcher alias
   dashboard             Run the authenticated local web dashboard
 
 Common options:
@@ -80,6 +81,9 @@ Common options:
 
 Dispatch options:
   --once                Run at most one ready task, then exit
+  --dry-run             Preview claimable tasks without mutating the board
+  --max <n>             Alias for --max-workers
+  --failure-limit <n>   Override the run failure circuit breaker
   --watch               Keep polling for work (default)
   --max-workers <n>     Parallel workers (default: 2)
   --max-in-progress <n> Board-wide running task cap
@@ -1034,14 +1038,18 @@ async function main(): Promise<void> {
     const parsed = parseArgs({
       args,
       allowPositionals: true,
-      options: { db: { type: "string" }, kind: { type: "string" } },
+      options: { db: { type: "string" }, kind: { type: "string" }, ids: { type: "string", multiple: true } },
     });
-    const [taskId, ...reasonParts] = parsed.positionals;
-    const reason = reasonParts.join(" ").trim();
+    const [taskId, reasonValue, ...positionalIds] = parsed.positionals;
+    const reason = reasonValue?.trim() ?? "";
     if (!taskId || !reason) throw new Error("block requires a task id and reason");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      process.stdout.write(`${JSON.stringify(store.blockTask(taskId, { reason, kind: requireBlockKind(parsed.values.kind) }), null, 2)}\n`);
+      const taskIds = [taskId, ...positionalIds, ...(parsed.values.ids ?? [])];
+      process.stdout.write(`${JSON.stringify(taskIds.map((id) => store.blockTask(id, {
+        reason,
+        kind: requireBlockKind(parsed.values.kind),
+      })), null, 2)}\n`);
     } finally {
       store.close();
     }
@@ -1083,7 +1091,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === "dispatch") {
+  if (command === "dispatch" || command === "daemon") {
     const parsed = parseArgs({
       args,
       options: {
@@ -1091,7 +1099,11 @@ async function main(): Promise<void> {
         board: { type: "string" },
         once: { type: "boolean" },
         watch: { type: "boolean" },
+        force: { type: "boolean" },
+        "dry-run": { type: "boolean" },
+        max: { type: "string" },
         "max-workers": { type: "string" },
+        "failure-limit": { type: "string" },
         "max-in-progress": { type: "string" },
         "max-per-assignee": { type: "string" },
         "claim-ttl-seconds": { type: "string" },
@@ -1110,6 +1122,33 @@ async function main(): Promise<void> {
         "planner-timeout-ms": { type: "string" },
       },
     });
+    if (command === "daemon" && !parsed.values.force) throw new Error("daemon is deprecated and requires --force; prefer dispatch --watch");
+    if (parsed.values["dry-run"]) {
+      const manager = managerFor(parsed.values.db);
+      const boards = globalBoard
+        ? [manager.resolve(globalBoard)]
+        : manager.list().filter((item) => !item.archived).map((item) => item.slug);
+      const limit = numberOption(parsed.values.max ?? parsed.values["max-workers"], 2);
+      const candidates: unknown[] = [];
+      for (const board of boards) {
+        const store = manager.openStore(board);
+        try {
+          const ready = store.listTasks({ status: "ready", sort: "priority-desc", limit: 500 });
+          for (const task of ready) {
+            if (!task.assignee || task.runtime === "manual") continue;
+            if (task.scheduledAt && Date.parse(task.scheduledAt) > Date.now()) continue;
+            if (store.getTask(task.id).parents.some((parent) => parent.status !== "done")) continue;
+            candidates.push(task);
+            if (candidates.length >= limit) break;
+          }
+        } finally {
+          store.close();
+        }
+        if (candidates.length >= limit) break;
+      }
+      process.stdout.write(`${JSON.stringify({ dryRun: true, candidates }, null, 2)}\n`);
+      return;
+    }
     const controller = new AbortController();
     process.once("SIGINT", () => controller.abort());
     process.once("SIGTERM", () => controller.abort());
@@ -1117,9 +1156,9 @@ async function main(): Promise<void> {
       dbPath: resolve(parsed.values.db ?? defaultDbPath()),
       cliEntry: resolve(process.argv[1] ?? "dist/cli.js"),
       board: globalBoard,
-      once: parsed.values.once ?? false,
+      once: command === "daemon" ? false : parsed.values.once ?? false,
       intervalMs: numberOption(parsed.values["interval-ms"], 2_000),
-      maxWorkers: numberOption(parsed.values["max-workers"], 2),
+      maxWorkers: numberOption(parsed.values.max ?? parsed.values["max-workers"], 2),
       maxInProgress: parsed.values["max-in-progress"] === undefined
         ? undefined
         : numberOption(parsed.values["max-in-progress"], 1),
@@ -1131,6 +1170,9 @@ async function main(): Promise<void> {
       heartbeatMaxStaleSeconds: numberOption(parsed.values["heartbeat-max-stale-seconds"], 60 * 60),
       crashGraceSeconds: numberOption(parsed.values["crash-grace-seconds"], 30),
       rateLimitCooldownSeconds: numberOption(parsed.values["rate-limit-cooldown-seconds"], 60),
+      failureLimit: parsed.values["failure-limit"] === undefined
+        ? undefined
+        : numberOption(parsed.values["failure-limit"], 2),
       autoDecompose: parsed.values["auto-decompose"],
       autoDecomposePerTick: numberOption(parsed.values["auto-decompose-per-tick"], 3),
       decompositionProfiles: (parsed.values.profile ?? []).map((profile) =>

@@ -172,6 +172,7 @@ export interface FailRunOptions {
   outcome?: Exclude<RunStatus, "running" | "completed" | "blocked" | "reclaimed"> | undefined;
   countFailure?: boolean | undefined;
   cooldownSeconds?: number | undefined;
+  failureLimit?: number | undefined;
 }
 
 export interface ActiveRun {
@@ -2319,10 +2320,12 @@ export class KanbanStore {
     outcome: Exclude<RunStatus, "running" | "completed" | "blocked">,
     countFailure: boolean,
     cooldownSeconds: number,
+    failureLimit?: number,
   ): void {
     const timestamp = now();
     const failures = task.failure_count + (countFailure ? 1 : 0);
-    const exhausted = countFailure && failures >= task.max_retries;
+    const effectiveLimit = Math.max(1, failureLimit ?? task.max_retries);
+    const exhausted = countFailure && failures >= effectiveLimit;
     const scheduledAt = !exhausted && cooldownSeconds > 0 ? futureIso(cooldownSeconds) : null;
     const nextStatus: TaskStatus = exhausted
       ? "blocked"
@@ -2343,7 +2346,7 @@ export class KanbanStore {
       `)
       .run(nextStatus, failures, scheduledAt, exhausted ? 1 : 0, exhausted ? error : null, timestamp, task.id);
 
-    const payload = { error, failures, outcome, countFailure, scheduledAt };
+    const payload = { error, failures, effectiveLimit, outcome, countFailure, scheduledAt };
     if (outcome === "failed") {
       this.appendEvent(task.id, exhausted ? "gave_up" : "requeued", payload, run.id);
     } else {
@@ -2364,6 +2367,7 @@ export class KanbanStore {
         options.outcome ?? "failed",
         options.countFailure ?? true,
         Math.max(0, options.cooldownSeconds ?? 0),
+        options.failureLimit,
       );
     });
     return this.getTask(taskId);

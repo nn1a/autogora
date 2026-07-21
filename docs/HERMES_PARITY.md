@@ -63,7 +63,7 @@ Authoritative references:
 - [x] Scoped worker isolation and portable worker/orchestrator Skills
 - [x] Attachment MCP tools and attachment-aware task detail
 - [x] Bounded, preformatted worker context with parent handoffs and prior attempts
-- [x] CLI verbs for boards, tasks, claim/heartbeat, runs, events, logs, stats, and diagnostics
+- [x] CLI verbs for boards, tasks, claim/heartbeat, runs, events, logs, stats, diagnostics, and dry-run dispatch
 - [x] Terminal event watch/tail and machine-readable output
 - [x] Notification subscriptions and leased terminal-event delivery adapters
 
