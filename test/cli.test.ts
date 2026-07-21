@@ -66,6 +66,12 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     const stale = cli(["heartbeat", created.task.id], { ...scopedWorkerEnv, KANBAN_CLAIM_TOKEN: "stale" });
     assert.equal(stale.status, 1);
     assert.match(stale.stderr, /Invalid claim token/);
+    const escapedDatabase = cli(["show", created.task.id, "--db", join(directory, "other.db")], scopedWorkerEnv);
+    assert.equal(escapedDatabase.status, 1);
+    assert.match(escapedDatabase.stderr, /scoped to database/);
+    const forbiddenAdmin = cli(["delete", created.task.id], scopedWorkerEnv);
+    assert.equal(forbiddenAdmin.status, 1);
+    assert.match(forbiddenAdmin.stderr, /context and lifecycle commands/);
     successfulJson<any[]>(["complete", created.task.id, "--summary", "CLI flow complete"], scopedWorkerEnv);
 
     const first = successfulJson<any>(["create", "First", "--db", dbPath]);

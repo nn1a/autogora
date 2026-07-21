@@ -105,7 +105,10 @@ function defaultDbPath(): string {
 }
 
 function managerFor(dbPath?: string): BoardManager {
-  return new BoardManager(resolve(dbPath ?? defaultDbPath()));
+  const resolved = resolve(dbPath ?? defaultDbPath());
+  const pinned = process.env.KANBAN_TASK_ID ? process.env.KANBAN_DB?.trim() : undefined;
+  if (pinned && resolved !== resolve(pinned)) throw new Error(`This worker is scoped to database ${resolve(pinned)}`);
+  return new BoardManager(resolved);
 }
 
 function openTaskStore(dbPath: string | undefined, board?: string) {
@@ -234,6 +237,12 @@ async function main(): Promise<void> {
   if (!command || command === "help" || command === "--help" || command === "-h") {
     process.stdout.write(HELP);
     return;
+  }
+  if (
+    process.env.KANBAN_TASK_ID &&
+    !["serve", "show", "context", "runs", "log", "heartbeat", "comment", "complete", "block"].includes(command)
+  ) {
+    throw new Error("Dispatcher-scoped workers may only use Kanban CLI context and lifecycle commands");
   }
 
   if (command === "boards") {
