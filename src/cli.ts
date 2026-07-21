@@ -696,7 +696,10 @@ async function main(): Promise<void> {
       throw new Error("An explicit specification cannot be reused with --all");
     }
     const plannerRuntime = requirePlannerRuntime(parsed.values["planner-runtime"]);
-    const store = openTaskStore(parsed.values.db, globalBoard);
+    const orchestrationManager = managerFor(parsed.values.db);
+    const orchestrationBoard = orchestrationManager.resolve(globalBoard);
+    const orchestrationSettings = orchestrationManager.read(orchestrationBoard).orchestration;
+    const store = orchestrationManager.openStore(orchestrationBoard);
     try {
       const taskIds = requestedId
         ? [requestedId]
@@ -742,6 +745,7 @@ async function main(): Promise<void> {
               orchestratorProfile: parsed.values["orchestrator-profile"]
                 ? parseProfileRoute(parsed.values["orchestrator-profile"], plannerRuntime)
                 : fallback,
+              autoPromoteChildren: orchestrationSettings.autoPromoteChildren,
               planner,
               plan: explicitPlan,
             });

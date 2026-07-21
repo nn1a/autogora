@@ -44,6 +44,7 @@
     </section>
 
     <section id="board" class="board" aria-label="Kanban board"></section>
+    <div id="trash-drop" class="trash-drop" aria-label="Delete task drop zone">Drop here to delete</div>
   </main>
 
   <aside id="drawer" class="drawer" aria-hidden="true">
@@ -97,6 +98,7 @@
       <label>Default project directory<input name="defaultWorkdir"></label>
       <hr>
       <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
+      <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
       <div class="form-grid">
         <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option></select></label>
         <label>Per tick<input name="autoDecomposePerTick" type="number" min="1" max="100" value="3"></label>

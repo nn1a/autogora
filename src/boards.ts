@@ -21,6 +21,7 @@ export interface BoardProfile {
 export interface BoardOrchestrationSettings {
   autoDecompose: boolean;
   autoDecomposePerTick: number;
+  autoPromoteChildren: boolean;
   plannerRuntime: Exclude<Runtime, "manual">;
   defaultProfile: string | null;
   orchestratorProfile: string | null;
@@ -100,6 +101,7 @@ function orchestrationSettings(raw: Partial<BoardOrchestrationSettings> | undefi
     autoDecomposePerTick: Number.isInteger(raw?.autoDecomposePerTick) && (raw?.autoDecomposePerTick ?? 0) > 0
       ? raw!.autoDecomposePerTick!
       : 3,
+    autoPromoteChildren: raw?.autoPromoteChildren !== false,
     plannerRuntime: raw?.plannerRuntime === "claude" ? "claude" : "codex",
     defaultProfile: typeof raw?.defaultProfile === "string" && raw.defaultProfile.trim()
       ? raw.defaultProfile.trim()

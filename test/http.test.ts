@@ -47,6 +47,7 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
         orchestration: {
           autoDecompose: true,
           autoDecomposePerTick: 2,
+          autoPromoteChildren: false,
           plannerRuntime: "codex",
           defaultProfile: "worker",
           profiles: [{ name: "worker", runtime: "codex", description: "general work" }],
@@ -55,6 +56,7 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     });
     assert.equal(orchestration.response.status, 200);
     assert.equal(orchestration.value.orchestration.autoDecompose, true);
+    assert.equal(orchestration.value.orchestration.autoPromoteChildren, false);
     assert.equal(new BoardManager(dbPath).read("default").orchestration.profiles[0]?.name, "worker");
 
     const invalidSort = await request("/api/tasks?board=default&sort=drop-table");
@@ -129,16 +131,22 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     const manager = new BoardManager(dbPath);
     const store = manager.openStore("default");
     const activeTask = store.createTask({ title: "active API run", assignee: "worker", runtime: "codex" });
-    const claim = store.claimTask({ taskId: activeTask.task.id });
-    assert.ok(claim);
     store.close();
-    const terminated = await request(`/api/runs/${claim.run.id}/terminate?board=default`, {
+    const claimed = await request(`/api/tasks/${activeTask.task.id}/claim?board=default`, {
+      method: "POST",
+      body: "{}",
+    });
+    assert.equal(claimed.response.status, 200);
+    assert.equal(claimed.value.task.task.status, "running");
+    assert.ok(claimed.value.task.task.workspace);
+    const runId = claimed.value.run.id as string;
+    const terminated = await request(`/api/runs/${runId}/terminate?board=default`, {
       method: "POST",
       body: JSON.stringify({ reason: "HTTP test termination" }),
     });
     assert.equal(terminated.response.status, 200);
     assert.equal(terminated.value.task.task.status, "ready");
-    const run = await request(`/api/runs/${claim.run.id}?board=default`);
+    const run = await request(`/api/runs/${runId}?board=default`);
     assert.equal(run.value.run.status, "reclaimed");
 
     const bulk = await request("/api/tasks/bulk?board=default", {
@@ -149,6 +157,8 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.equal(bulk.value.errors.length, 1);
     const board = await request("/api/board?board=default&includeArchived=true");
     assert.ok(board.value.tasks.some((task: { id: string; priority: number }) => task.id === taskId && task.priority === 7));
+    const taskCard = board.value.tasks.find((task: { id: string }) => task.id === taskId);
+    assert.equal(taskCard.commentsCount, 1);
   } finally {
     socket?.close();
     if (socket && socket.readyState !== WebSocket.CLOSED) {

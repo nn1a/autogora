@@ -358,6 +358,7 @@ async function decomposeBoardTriage(
             profiles,
             defaultProfile: fallback,
             orchestratorProfile: options.orchestratorProfile ?? configuredOrchestrator ?? fallback,
+            autoPromoteChildren: settings.autoPromoteChildren,
             planner,
           });
           options.onLog?.(`auto-${result.fanout ? "decomposed" : "specified"} ${task.id}: ${result.reason}`);

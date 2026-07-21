@@ -50,6 +50,9 @@ main { padding: 18px 22px 28px; }
 .bulk-bar select, .bulk-bar input { width: 160px; }
 
 .board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(275px, 1fr); gap: 12px; overflow-x: auto; min-height: calc(100vh - 170px); padding-bottom: 12px; scroll-snap-type: x proximity; }
+.trash-drop { position: fixed; left: 50%; bottom: 18px; z-index: 18; transform: translate(-50%, 120px); opacity: 0; pointer-events: none; color: #ffd8dc; background: #35171de8; border: 1px dashed #a84a58; border-radius: 999px; padding: 12px 22px; transition: .18s ease; box-shadow: var(--shadow); }
+body.drag-active .trash-drop { transform: translate(-50%, 0); opacity: 1; pointer-events: auto; }
+.trash-drop.drag-over { background: #702633; border-color: #ff8792; transform: translate(-50%, 0) scale(1.04); }
 .column { background: rgb(17 21 29 / 78%); border: 1px solid var(--line); border-radius: 12px; padding: 10px; scroll-snap-align: start; min-height: 300px; }
 .column.drag-over { border-color: var(--accent); background: #171d30; }
 .column-head { display: flex; align-items: center; gap: 8px; padding: 2px 3px 10px; position: sticky; top: 0; }

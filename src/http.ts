@@ -34,6 +34,7 @@ import {
   type Runtime,
   type TaskStatus,
 } from "./types.js";
+import { WorkspaceManager } from "./workspaces.js";
 
 export interface DashboardServerOptions {
   dbPath: string;
@@ -329,12 +330,20 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       const board = boardFrom(manager, url);
 
       if (segments[1] === "board" && method === "GET") {
-        const payload = await withStore(manager, board, (store) => ({
-          board: manager.read(board),
-          tasks: store.listTasks({ includeArchived: url.searchParams.get("includeArchived") === "true", limit: 500 }),
-          stats: store.getStats(board),
-          diagnostics: store.diagnose(board),
-        }));
+        const payload = await withStore(manager, board, (store) => {
+          const tasks = store.listTasks({ includeArchived: url.searchParams.get("includeArchived") === "true", limit: 500 })
+            .map((task) => {
+              const detail = store.getTask(task.id);
+              return {
+                ...task,
+                childrenDone: detail.children.filter((child) => child.status === "done").length,
+                childrenTotal: detail.children.length,
+                commentsCount: detail.comments.length,
+                linksCount: detail.parents.length + detail.children.length,
+              };
+            });
+          return { board: manager.read(board), tasks, stats: store.getStats(board), diagnostics: store.diagnose(board) };
+        });
         sendJson(response, 200, payload);
         return;
       }
@@ -441,6 +450,29 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           return;
         }
         const action = segments[3];
+        if (action === "claim" && method === "POST") {
+          const body = await readJson(request);
+          const value = await withStore(manager, board, (store) => {
+            const claim = store.claimTask({
+              taskId,
+              claimTtlSeconds: numberValue(body.ttlSeconds) ?? 900,
+              workerId: stringValue(body.workerId) ?? `dashboard-${process.pid}`,
+            });
+            if (!claim) throw new Error(`Task is not claimable: ${taskId}`);
+            try {
+              return new WorkspaceManager(manager).prepare(store, claim);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              store.failRun(
+                { runId: claim.run.id, claimToken: claim.claimToken },
+                `Workspace preparation failed: ${message}`,
+              );
+              throw error;
+            }
+          });
+          sendJson(response, 200, value);
+          return;
+        }
         if (action === "comments" && method === "POST") {
           const body = await readJson(request);
           sendJson(response, 201, await withStore(manager, board, (store) =>
@@ -525,6 +557,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
             profiles,
             defaultProfile,
             orchestratorProfile,
+            autoPromoteChildren: settings.autoPromoteChildren,
             plan: body.plan as DecompositionPlan | undefined,
             planner: createCliPlanner({ runtime: settings.plannerRuntime, cwd: process.cwd() }),
           }));

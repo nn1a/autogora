@@ -362,6 +362,7 @@ export async function decomposeTriageTask(
     profiles: ProfileRoute[];
     defaultProfile: ProfileRoute;
     orchestratorProfile?: ProfileRoute | undefined;
+    autoPromoteChildren?: boolean | undefined;
     planner?: StructuredPlanner | undefined;
     plan?: DecompositionPlan | undefined;
   },
@@ -397,6 +398,7 @@ export async function decomposeTriageTask(
     rootBody: plan.rootBody,
     orchestratorAssignee: orchestrator.name,
     orchestratorRuntime: orchestrator.runtime,
+    autoPromoteChildren: options.autoPromoteChildren,
     nodes,
     dependencies: plan.dependencies,
   });

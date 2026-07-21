@@ -53,7 +53,8 @@ The dashboard includes:
   and optional per-profile Running lanes;
 - create/edit drawers, safe Markdown rendering, dependencies, comments, run
   history and termination, attachments, and recent events;
-- drag/drop transitions and partial-failure bulk move, assign, archive, and
+- progress/comment/link badges, drag/drop transitions, atomic manual starts,
+  a guarded trash target, and partial-failure bulk move, assign, archive, and
   delete actions;
 - isolated board switching/creation/settings, persisted profile routing and
   automatic decomposition settings, manual specify/decompose, swarm creation,
@@ -265,6 +266,8 @@ For deterministic automation, `specify` accepts `--title` plus `--body`, and
 automatic triage processing by default, capped at three cards per dispatcher
 tick. Change it in the board's dashboard settings; command-line dispatcher
 overrides include `--auto-decompose` and `--auto-decompose-per-tick`.
+Boards can also disable automatic child promotion so every newly decomposed
+leaf remains in `todo` for a human routing review.
 
 The swarm helper creates a completed structured blackboard, parallel worker
 cards, a verifier gated on every worker, and a synthesizer gated on the

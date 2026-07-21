@@ -113,6 +113,7 @@ function cardHtml(task) {
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
       <span>${escapeHtml(task.assignee || "unassigned")}</span><span>·</span><span>${escapeHtml(task.runtime)}</span>
+      ${task.commentsCount ? `<span>💬 ${task.commentsCount}</span>` : ""}${task.linksCount ? `<span>↔ ${task.linksCount}</span>` : ""}
     </div>
   </article>`;
 }
@@ -136,7 +137,7 @@ function renderBoard() {
   $("#board").innerHTML = statuses.map((status) => {
     const cards = tasks.filter((task) => task.status === status);
     return `<section class="column" data-status="${status}" style="--status-color:${COLORS[status]}">
-      <header class="column-head"><span class="status-dot"></span><h2>${status}</h2><span class="count">${cards.length}</span><button data-create-status="${status}" aria-label="Create in ${status}">+</button></header>
+      <header class="column-head"><span class="status-dot"></span><h2>${status}</h2><span class="count">${cards.length}</span>${status === "running" ? "" : `<button data-create-status="${status}" aria-label="Create in ${status}">+</button>`}</header>
       ${renderCardList(cards, status === "running" && $("#lane-profile").checked)}
     </section>`;
   }).join("");
@@ -157,8 +158,9 @@ function bindCards() {
     card.addEventListener("dragstart", (event) => {
       event.dataTransfer.setData("text/plain", taskId);
       card.classList.add("dragging");
+      document.body.classList.add("drag-active");
     });
-    card.addEventListener("dragend", () => card.classList.remove("dragging"));
+    card.addEventListener("dragend", () => { card.classList.remove("dragging"); document.body.classList.remove("drag-active"); });
   });
   $$(".column").forEach((column) => {
     column.addEventListener("dragover", (event) => { event.preventDefault(); column.classList.add("drag-over"); });
@@ -170,14 +172,25 @@ function bindCards() {
     });
   });
   $$('[data-create-status]').forEach((button) => button.addEventListener("click", () => openTaskDialog(button.dataset.createStatus)));
+  const trash = $("#trash-drop");
+  trash.ondragover = (event) => { event.preventDefault(); trash.classList.add("drag-over"); };
+  trash.ondragleave = () => trash.classList.remove("drag-over");
+  trash.ondrop = async (event) => {
+    event.preventDefault(); trash.classList.remove("drag-over"); document.body.classList.remove("drag-active");
+    const taskId = event.dataTransfer.getData("text/plain");
+    if (!taskId || !confirm(`Permanently delete ${taskId}?`)) return;
+    try { await api(boardPath(`/api/tasks/${taskId}`), { method: "DELETE" }); await loadBoard(); }
+    catch (error) { toast(error.message, true); }
+  };
 }
 
 async function moveTask(taskId, status) {
-  if (status === "running") {
-    toast("Tasks enter Running only when claimed by the dispatcher", true);
-    return;
-  }
   try {
+    if (status === "running") {
+      await api(boardPath(`/api/tasks/${taskId}/claim`), { method: "POST", body: "{}" });
+      await loadBoard();
+      return;
+    }
     const body = { status };
     if (status === "done") body.summary = prompt("Completion summary:", "Completed from dashboard") || "Completed from dashboard";
     if (status === "blocked") body.reason = prompt("Block reason:");
@@ -266,6 +279,7 @@ function renderDrawer(detail) {
     <div class="action-row">
       ${task.status === "triage" ? '<button data-action="specify">Specify</button><button data-action="decompose">Decompose</button>' : ""}
       ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
+      ${task.status === "ready" ? '<button data-action="claim">Start manually</button>' : ""}
       ${["todo", "scheduled", "blocked", "triage", "review"].includes(task.status) ? '<button data-action="promote">Promote</button>' : ""}
       ${task.status !== "done" && task.status !== "archived" ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
       ${task.status !== "archived" ? '<button data-action="archive">Archive</button>' : ""}
@@ -343,6 +357,8 @@ async function drawerAction(taskId, action) {
     } else if (action === "specify" || action === "decompose") {
       if (!confirm(`${action} this triage card using the board planner?`)) return;
       await api(boardPath(`/api/tasks/${taskId}/${action}`), { method: "POST", body: "{}" });
+    } else if (action === "claim") {
+      await api(boardPath(`/api/tasks/${taskId}/claim`), { method: "POST", body: "{}" });
     } else if (action === "archive") {
       if (!confirm("Archive this task?")) return;
       await api(boardPath(`/api/tasks/${taskId}/archive`), { method: "POST", body: "{}" }); closeDrawer();
@@ -448,6 +464,7 @@ function openSettings() {
   form.elements.name.value = metadata.name; form.elements.description.value = metadata.description;
   form.elements.color.value = /^#[0-9a-f]{6}$/i.test(metadata.color) ? metadata.color : "#5b7cff";
   form.elements.defaultWorkdir.value = metadata.defaultWorkdir || ""; form.elements.autoDecompose.checked = settings.autoDecompose;
+  form.elements.autoPromoteChildren.checked = settings.autoPromoteChildren;
   form.elements.plannerRuntime.value = settings.plannerRuntime; form.elements.autoDecomposePerTick.value = settings.autoDecomposePerTick;
   form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.orchestratorProfile.value = settings.orchestratorProfile || "";
   form.elements.profiles.value = settings.profiles.map((profile) => `${profile.name}:${profile.runtime}:${profile.description || ""}`).join("\n");
@@ -461,7 +478,7 @@ async function submitSettings(event) {
     const profiles = String(data.get("profiles") || "").split("\n").map((line) => line.trim()).filter(Boolean).map(parseRoute);
     await api(`/api/boards/${encodeURIComponent(state.board)}`, { method: "PATCH", body: JSON.stringify({
       name: data.get("name"), description: data.get("description"), color: data.get("color"), defaultWorkdir: data.get("defaultWorkdir") || null,
-      orchestration: { autoDecompose: data.get("autoDecompose") === "on", plannerRuntime: data.get("plannerRuntime"),
+      orchestration: { autoDecompose: data.get("autoDecompose") === "on", autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
         autoDecomposePerTick: Number(data.get("autoDecomposePerTick")), defaultProfile: data.get("defaultProfile") || null,
         orchestratorProfile: data.get("orchestratorProfile") || null, profiles },
     }) });

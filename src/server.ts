@@ -41,6 +41,7 @@ const decompositionPlanSchema = z.object({
 const boardOrchestrationSchema = z.object({
   autoDecompose: z.boolean().optional(),
   autoDecomposePerTick: z.number().int().min(1).max(100).optional(),
+  autoPromoteChildren: z.boolean().optional(),
   plannerRuntime: workerRuntimeSchema.optional(),
   defaultProfile: z.string().nullable().optional(),
   orchestratorProfile: z.string().nullable().optional(),
@@ -614,6 +615,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         profiles: z.array(profileRouteSchema).default([]),
         default_profile: profileRouteSchema,
         orchestrator_profile: profileRouteSchema.optional(),
+        auto_promote_children: z.boolean().optional(),
         plan: decompositionPlanSchema.optional(),
         planner_runtime: workerRuntimeSchema.default("codex"),
         planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
@@ -626,6 +628,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
       profiles,
       default_profile,
       orchestrator_profile,
+      auto_promote_children,
       plan,
       planner_runtime,
       planner_timeout_ms,
@@ -638,6 +641,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
           profiles,
           defaultProfile: default_profile,
           orchestratorProfile: orchestrator_profile,
+          autoPromoteChildren: auto_promote_children ?? manager.read(resolvedBoard).orchestration.autoPromoteChildren,
           plan: plan as DecompositionPlan | undefined,
           planner: createCliPlanner({ runtime: planner_runtime, cwd: process.cwd(), timeoutMs: planner_timeout_ms }),
         });

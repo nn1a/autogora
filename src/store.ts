@@ -940,6 +940,7 @@ export class KanbanStore {
     rootBody?: string | undefined;
     orchestratorAssignee: string;
     orchestratorRuntime: Runtime;
+    autoPromoteChildren?: boolean | undefined;
     nodes: TaskGraphNode[];
     dependencies: Array<{ parent: string; child: string }>;
   }): TaskGraphResult {
@@ -984,6 +985,7 @@ export class KanbanStore {
           maxRuntimeSeconds: root.max_runtime_seconds,
           skills: node.skills,
           maxRetries: root.max_retries,
+          status: input.autoPromoteChildren === false ? "todo" : undefined,
         });
       }
       for (const dependency of input.dependencies) {
@@ -1015,6 +1017,7 @@ export class KanbanStore {
         childIds: Object.values(tasksByKey),
         leafIds,
         dependencies: input.dependencies,
+        autoPromoteChildren: input.autoPromoteChildren !== false,
       });
     });
     return {

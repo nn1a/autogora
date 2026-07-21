@@ -71,6 +71,7 @@ Authoritative references:
 
 - [x] Manual and bounded automatic triage specification
 - [x] Atomic task-graph decomposition with profile/runtime routing and fallback
+- [x] Configurable automatic promotion of unblocked decomposition children
 - [x] Kanban Swarm blackboard/worker/verifier/synthesizer topology helper
 - [x] Per-task skill guidance injected into Claude/Codex workers
 - [x] Goal-mode continuation and completion judgment
@@ -81,6 +82,7 @@ Authoritative references:
 - [x] Kanban columns, search/filter, archived toggle, and Running profile lanes
 - [x] Create/edit drawer, dependencies, comments, runs, attachments, and events
 - [x] Drag/drop and bulk status/assignee/archive/delete operations
+- [x] Atomic dashboard manual start, card progress badges, and guarded trash drop
 - [x] Board switcher/settings and specify/decompose/swarm controls
 - [x] WebSocket event stream with reconnect/cursor support
 

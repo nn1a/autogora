@@ -127,6 +127,33 @@ test("swarm topology creates a completed blackboard, parallel workers, verifier,
   }
 });
 
+test("decomposition can leave unblocked children in todo for manual review", async () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const root = store.createTask({ title: "review graph first", status: "triage" });
+    const result = await decomposeTriageTask(store, root.task.id, {
+      profiles: [{ name: "worker", runtime: "codex" }],
+      defaultProfile: { name: "worker", runtime: "codex" },
+      autoPromoteChildren: false,
+      plan: {
+        fanout: true,
+        rootTitle: "Review child graph",
+        rootBody: "Promote children only after a manual routing review.",
+        reason: "manual review requested",
+        tasks: [
+          { key: "one", title: "First child", body: "First deliverable", assignee: "worker", runtime: "codex", priority: 0, skills: [] },
+          { key: "two", title: "Second child", body: "Second deliverable", assignee: "worker", runtime: "codex", priority: 0, skills: [] },
+        ],
+        dependencies: [],
+      },
+    });
+    assert.ok(result.graph);
+    assert.deepEqual(result.graph.childIds.map((id) => store.getTask(id).task.status), ["todo", "todo"]);
+  } finally {
+    store.close();
+  }
+});
+
 test("Codex auxiliary planner uses a strict output schema and parsed last message", async () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-cli-planner-"));
   const fixture = resolve("test/fixtures/planner-agent.mjs");
