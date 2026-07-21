@@ -19,9 +19,10 @@ Authoritative references:
 - [x] Task, dependency, comment, run, and append-only event records
 - [x] Statuses: `triage`, `todo`, `ready`, `running`, `blocked`, `done`, `archived`
 - [x] Atomic claim tokens, heartbeat, structured completion handoff, retry budget
-- [ ] Statuses: `scheduled` and `review`
-- [ ] Tenant namespace and idempotency keys
-- [ ] Scheduled start, maximum runtime, task skills, goal-mode settings
+- [x] Statuses: `scheduled` and `review`
+- [x] Tenant namespace and idempotency keys
+- [x] Scheduled-start promotion and persisted runtime/skill/goal settings
+- [ ] Maximum-runtime enforcement and goal-mode continuation engine
 - [ ] Typed blockers and repeated unblock/re-block loop breaker
 - [ ] Synthetic runs for human completion/blocking and reclaimed-run invariant
 - [ ] Unlink, archive, delete, promote, bulk mutation, configurable sorting
@@ -65,7 +66,7 @@ Authoritative references:
 - [ ] Manual and automatic triage specification
 - [ ] Task-graph decomposition with profile/runtime routing
 - [ ] Kanban Swarm topology helper
-- [ ] Per-task skill injection into Claude/Codex workers
+- [x] Per-task skill guidance injected into Claude/Codex workers
 - [ ] Goal-mode continuation and completion judgment
 
 ### Dashboard

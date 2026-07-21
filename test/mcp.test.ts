@@ -33,9 +33,14 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
         name: "kanban_create",
         arguments: {
           title: "MCP smoke task",
+          tenant: "engineering",
+          idempotency_key: "mcp-smoke-once",
           assignee: "reviewer",
           runtime: "codex",
           workspace: process.cwd(),
+          skills: ["github-code-review"],
+          goal_mode: true,
+          goal_max_turns: 7,
         },
       }),
     ) as { task: { id: string; status: string } };
@@ -48,8 +53,12 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
 
     const shown = textPayload(
       await client.callTool({ name: "kanban_show", arguments: { task_id: created.task.id } }),
-    ) as { task: { title: string } };
+    ) as { task: { title: string; tenant: string; skills: string[]; goalMode: boolean; goalMaxTurns: number } };
     assert.equal(shown.task.title, "MCP smoke task");
+    assert.equal(shown.task.tenant, "engineering");
+    assert.deepEqual(shown.task.skills, ["github-code-review"]);
+    assert.equal(shown.task.goalMode, true);
+    assert.equal(shown.task.goalMaxTurns, 7);
 
     const claim = textPayload(
       await client.callTool({ name: "kanban_claim", arguments: { task_id: created.task.id } }),

@@ -26,13 +26,17 @@ export interface DispatcherOptions {
 
 function workerPrompt(claim: ClaimedTask): string {
   const { task } = claim.task;
-  return [
+  const instructions = [
     `You are the assigned Kanban worker for ${task.id}.`,
     "Call kanban_show first without a task_id. Work only on that task in the current workspace.",
     "Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
     "You must end exactly once by calling kanban_complete with verification evidence, or kanban_block with the concrete reason.",
     "Do not claim, create, reassign, unblock, or modify unrelated tasks.",
-  ].join(" ");
+  ];
+  if (task.skills.length > 0) {
+    instructions.push(`Load and follow these task-specific skills before working: ${task.skills.join(", ")}.`);
+  }
+  return instructions.join(" ");
 }
 
 function mcpServerArgs(cliEntry: string, dbPath: string): string[] {
@@ -100,8 +104,8 @@ export function buildRunnerCommand(
       "mcp__kanban__kanban_block",
     ];
     const builtInTools = options.allowWrites
-      ? ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
-      : ["Read", "Glob", "Grep", "WebSearch", "WebFetch"];
+      ? ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "Skill"]
+      : ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
     return {
       command: process.env.KANBAN_CLAUDE_BIN ?? "claude",
       cwd,
@@ -198,6 +202,7 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
   try {
     do {
       let launched = false;
+      store.promoteDueTasks(options.board ?? "default");
       while (!options.signal?.aborted && active.size < maxWorkers) {
         const claim = store.claimTask({
           board: options.board ?? "default",

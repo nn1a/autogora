@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { runDispatcher } from "./dispatcher.js";
 import { runStdioServer } from "./server.js";
 import { KanbanStore } from "./store.js";
-import { RUNTIMES, TASK_STATUSES, type Runtime, type TaskStatus } from "./types.js";
+import { RUNTIMES, TASK_STATUSES, type ListTaskFilter, type Runtime, type TaskStatus } from "./types.js";
 
 const HELP = `kanban-mcp <command> [options]
 
@@ -80,11 +80,20 @@ async function main(): Promise<void> {
         db: { type: "string" },
         body: { type: "string" },
         board: { type: "string" },
+        tenant: { type: "string" },
+        "idempotency-key": { type: "string" },
         assignee: { type: "string" },
         runtime: { type: "string" },
         priority: { type: "string" },
         workspace: { type: "string" },
+        "workspace-kind": { type: "string" },
+        branch: { type: "string" },
         status: { type: "string" },
+        "scheduled-at": { type: "string" },
+        "max-runtime-seconds": { type: "string" },
+        skill: { type: "string", multiple: true },
+        goal: { type: "boolean" },
+        "goal-max-turns": { type: "string" },
         parent: { type: "string", multiple: true },
         "max-retries": { type: "string" },
       },
@@ -97,11 +106,22 @@ async function main(): Promise<void> {
         title,
         body: parsed.values.body,
         board: parsed.values.board,
+        tenant: parsed.values.tenant,
+        idempotencyKey: parsed.values["idempotency-key"],
         assignee: parsed.values.assignee,
         runtime: requireRuntime(parsed.values.runtime),
         priority: numberOption(parsed.values.priority, 0),
         workspace: parsed.values.workspace,
+        workspaceKind: parsed.values["workspace-kind"] as "scratch" | "dir" | "worktree" | undefined,
+        branch: parsed.values.branch,
         status: requireStatus(parsed.values.status),
+        scheduledAt: parsed.values["scheduled-at"],
+        maxRuntimeSeconds: parsed.values["max-runtime-seconds"] === undefined
+          ? undefined
+          : numberOption(parsed.values["max-runtime-seconds"], 0),
+        skills: parsed.values.skill,
+        goalMode: parsed.values.goal,
+        goalMaxTurns: numberOption(parsed.values["goal-max-turns"], 20),
         parents: parsed.values.parent,
         maxRetries: numberOption(parsed.values["max-retries"], 2),
       });
@@ -119,9 +139,12 @@ async function main(): Promise<void> {
         db: { type: "string" },
         board: { type: "string" },
         status: { type: "string" },
+        tenant: { type: "string" },
         assignee: { type: "string" },
         runtime: { type: "string" },
         archived: { type: "boolean" },
+        search: { type: "string" },
+        sort: { type: "string" },
       },
     });
     const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
@@ -129,9 +152,12 @@ async function main(): Promise<void> {
       const tasks = store.listTasks({
         board: parsed.values.board,
         status: requireStatus(parsed.values.status),
+        tenant: parsed.values.tenant,
         assignee: parsed.values.assignee,
         runtime: parsed.values.runtime ? requireRuntime(parsed.values.runtime) : undefined,
         includeArchived: parsed.values.archived,
+        search: parsed.values.search,
+        sort: parsed.values.sort as ListTaskFilter["sort"],
       });
       process.stdout.write(`${JSON.stringify(tasks, null, 2)}\n`);
     } finally {

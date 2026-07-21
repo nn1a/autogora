@@ -1,9 +1,11 @@
 export const TASK_STATUSES = [
   "triage",
   "todo",
+  "scheduled",
   "ready",
   "running",
   "blocked",
+  "review",
   "done",
   "archived",
 ] as const;
@@ -14,9 +16,30 @@ export const RUNTIMES = ["claude", "codex", "manual"] as const;
 
 export type Runtime = (typeof RUNTIMES)[number];
 
+export const BLOCK_KINDS = ["dependency", "needs_input", "capability", "transient"] as const;
+
+export type BlockKind = (typeof BLOCK_KINDS)[number];
+
+export const RUN_STATUSES = [
+  "running",
+  "completed",
+  "blocked",
+  "failed",
+  "reclaimed",
+  "crashed",
+  "timed_out",
+  "rate_limited",
+  "spawn_failed",
+  "protocol_violation",
+] as const;
+
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
 export interface Task {
   id: string;
   board: string;
+  tenant: string | null;
+  idempotencyKey: string | null;
   title: string;
   body: string;
   assignee: string | null;
@@ -24,7 +47,20 @@ export interface Task {
   status: TaskStatus;
   priority: number;
   workspace: string | null;
+  workspaceKind: "scratch" | "dir" | "worktree";
+  branch: string | null;
   currentRunId: string | null;
+  result: string | null;
+  scheduledAt: string | null;
+  maxRuntimeSeconds: number | null;
+  skills: string[];
+  goalMode: boolean;
+  goalMaxTurns: number;
+  workflowTemplateId: string | null;
+  currentStepKey: string | null;
+  blockKind: BlockKind | null;
+  blockReason: string | null;
+  blockRecurrences: number;
   failureCount: number;
   maxRetries: number;
   createdAt: string;
@@ -36,10 +72,14 @@ export interface Run {
   taskId: string;
   workerId: string;
   runtime: Runtime;
-  status: "running" | "completed" | "blocked" | "failed";
+  status: RunStatus;
   claimedAt: string;
+  claimExpiresAt: string;
   heartbeatAt: string;
   endedAt: string | null;
+  pid: number | null;
+  logPath: string | null;
+  exitCode: number | null;
   summary: string | null;
   metadata: Record<string, unknown> | null;
   error: string | null;
@@ -75,11 +115,22 @@ export interface CreateTaskInput {
   title: string;
   body?: string | undefined;
   board?: string | undefined;
+  tenant?: string | null | undefined;
+  idempotencyKey?: string | null | undefined;
   assignee?: string | null | undefined;
   runtime?: Runtime | undefined;
   priority?: number | undefined;
   workspace?: string | null | undefined;
+  workspaceKind?: "scratch" | "dir" | "worktree" | undefined;
+  branch?: string | null | undefined;
   status?: TaskStatus | undefined;
+  scheduledAt?: string | null | undefined;
+  maxRuntimeSeconds?: number | null | undefined;
+  skills?: string[] | undefined;
+  goalMode?: boolean | undefined;
+  goalMaxTurns?: number | undefined;
+  workflowTemplateId?: string | null | undefined;
+  currentStepKey?: string | null | undefined;
   maxRetries?: number | undefined;
   parents?: string[] | undefined;
 }
@@ -93,8 +144,11 @@ export interface ClaimedTask {
 export interface ListTaskFilter {
   board?: string | undefined;
   status?: TaskStatus | undefined;
+  tenant?: string | undefined;
   assignee?: string | undefined;
   runtime?: Runtime | undefined;
   includeArchived?: boolean | undefined;
+  search?: string | undefined;
+  sort?: "created" | "created-desc" | "priority" | "priority-desc" | "status" | "assignee" | "title" | "updated" | undefined;
   limit?: number | undefined;
 }

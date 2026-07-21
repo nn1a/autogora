@@ -7,6 +7,7 @@ import {
   RUNTIMES,
   TASK_STATUSES,
   type ClaimedTask,
+  type BlockKind,
   type Comment,
   type CreateTaskInput,
   type ListTaskFilter,
@@ -21,6 +22,8 @@ import {
 type TaskRow = {
   id: string;
   board: string;
+  tenant: string | null;
+  idempotency_key: string | null;
   title: string;
   body: string;
   assignee: string | null;
@@ -28,7 +31,20 @@ type TaskRow = {
   status: TaskStatus;
   priority: number;
   workspace: string | null;
+  workspace_kind: "scratch" | "dir" | "worktree";
+  branch: string | null;
   current_run_id: string | null;
+  result: string | null;
+  scheduled_at: string | null;
+  max_runtime_seconds: number | null;
+  skills_json: string;
+  goal_mode: number;
+  goal_max_turns: number;
+  workflow_template_id: string | null;
+  current_step_key: string | null;
+  block_kind: BlockKind | null;
+  block_reason: string | null;
+  block_recurrences: number;
   failure_count: number;
   max_retries: number;
   created_at: string;
@@ -41,9 +57,14 @@ type RunRow = {
   worker_id: string;
   runtime: Runtime;
   status: Run["status"];
+  claim_token: string;
   claimed_at: string;
+  claim_expires_at: string;
   heartbeat_at: string;
   ended_at: string | null;
+  pid: number | null;
+  log_path: string | null;
+  exit_code: number | null;
   summary: string | null;
   metadata_json: string | null;
   error: string | null;
@@ -70,9 +91,19 @@ export interface UpdateTaskInput {
   title?: string | undefined;
   body?: string | undefined;
   assignee?: string | null | undefined;
+  tenant?: string | null | undefined;
   runtime?: Runtime | undefined;
   priority?: number | undefined;
   workspace?: string | null | undefined;
+  workspaceKind?: "scratch" | "dir" | "worktree" | undefined;
+  branch?: string | null | undefined;
+  scheduledAt?: string | null | undefined;
+  maxRuntimeSeconds?: number | null | undefined;
+  skills?: string[] | undefined;
+  goalMode?: boolean | undefined;
+  goalMaxTurns?: number | undefined;
+  workflowTemplateId?: string | null | undefined;
+  currentStepKey?: string | null | undefined;
   status?: TaskStatus | undefined;
 }
 
@@ -83,6 +114,28 @@ export interface RunScope {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function futureIso(seconds: number): string {
+  return new Date(Date.now() + seconds * 1_000).toISOString();
+}
+
+function normalizeIso(value: string | null | undefined, field: string): string | null {
+  if (value === null || value === undefined || value.trim() === "") return null;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error(`${field} must be a valid ISO-8601 date`);
+  return new Date(timestamp).toISOString();
+}
+
+function normalizeSkills(skills: string[] | undefined): string[] {
+  return [...new Set((skills ?? []).map((skill) => skill.trim()).filter(Boolean))];
+}
+
+function workspaceKind(workspace: string | null | undefined, explicit?: "scratch" | "dir" | "worktree") {
+  if (explicit) return explicit;
+  if (!workspace || workspace === "scratch") return "scratch" as const;
+  if (workspace === "worktree" || workspace.startsWith("worktree:")) return "worktree" as const;
+  return "dir" as const;
 }
 
 function newId(prefix: string): string {
@@ -98,6 +151,8 @@ function taskFromRow(row: TaskRow): Task {
   return {
     id: row.id,
     board: row.board,
+    tenant: row.tenant,
+    idempotencyKey: row.idempotency_key,
     title: row.title,
     body: row.body,
     assignee: row.assignee,
@@ -105,7 +160,20 @@ function taskFromRow(row: TaskRow): Task {
     status: row.status,
     priority: row.priority,
     workspace: row.workspace,
+    workspaceKind: row.workspace_kind,
+    branch: row.branch,
     currentRunId: row.current_run_id,
+    result: row.result,
+    scheduledAt: row.scheduled_at,
+    maxRuntimeSeconds: row.max_runtime_seconds,
+    skills: JSON.parse(row.skills_json) as string[],
+    goalMode: row.goal_mode === 1,
+    goalMaxTurns: row.goal_max_turns,
+    workflowTemplateId: row.workflow_template_id,
+    currentStepKey: row.current_step_key,
+    blockKind: row.block_kind,
+    blockReason: row.block_reason,
+    blockRecurrences: row.block_recurrences,
     failureCount: row.failure_count,
     maxRetries: row.max_retries,
     createdAt: row.created_at,
@@ -121,8 +189,12 @@ function runFromRow(row: RunRow): Run {
     runtime: row.runtime,
     status: row.status,
     claimedAt: row.claimed_at,
+    claimExpiresAt: row.claim_expires_at,
     heartbeatAt: row.heartbeat_at,
     endedAt: row.ended_at,
+    pid: row.pid,
+    logPath: row.log_path,
+    exitCode: row.exit_code,
     summary: row.summary,
     metadata: parseJson(row.metadata_json),
     error: row.error,
@@ -169,18 +241,45 @@ export class KanbanStore {
   }
 
   private initialize(): void {
+    const existing = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
+      .get() as { sql: string } | undefined;
+    if (existing && (!existing.sql.includes("'scheduled'") || !existing.sql.includes("idempotency_key"))) {
+      this.migrateLegacySchema();
+    } else {
+      this.createLatestSchema();
+    }
+    this.db.exec("PRAGMA user_version = 2");
+  }
+
+  private createLatestSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         board TEXT NOT NULL DEFAULT 'default',
+        tenant TEXT,
+        idempotency_key TEXT,
         title TEXT NOT NULL,
         body TEXT NOT NULL DEFAULT '',
         assignee TEXT,
         runtime TEXT NOT NULL DEFAULT 'manual' CHECK (runtime IN ('claude', 'codex', 'manual')),
-        status TEXT NOT NULL CHECK (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'done', 'archived')),
+        status TEXT NOT NULL CHECK (status IN ('triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done', 'archived')),
         priority INTEGER NOT NULL DEFAULT 0,
         workspace TEXT,
+        workspace_kind TEXT NOT NULL DEFAULT 'scratch' CHECK (workspace_kind IN ('scratch', 'dir', 'worktree')),
+        branch TEXT,
         current_run_id TEXT,
+        result TEXT,
+        scheduled_at TEXT,
+        max_runtime_seconds INTEGER CHECK (max_runtime_seconds IS NULL OR max_runtime_seconds >= 1),
+        skills_json TEXT NOT NULL DEFAULT '[]',
+        goal_mode INTEGER NOT NULL DEFAULT 0 CHECK (goal_mode IN (0, 1)),
+        goal_max_turns INTEGER NOT NULL DEFAULT 20 CHECK (goal_max_turns >= 1),
+        workflow_template_id TEXT,
+        current_step_key TEXT,
+        block_kind TEXT CHECK (block_kind IS NULL OR block_kind IN ('dependency', 'needs_input', 'capability', 'transient')),
+        block_reason TEXT,
+        block_recurrences INTEGER NOT NULL DEFAULT 0,
         failure_count INTEGER NOT NULL DEFAULT 0,
         max_retries INTEGER NOT NULL DEFAULT 2 CHECK (max_retries >= 1),
         created_at TEXT NOT NULL,
@@ -207,11 +306,15 @@ export class KanbanStore {
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         worker_id TEXT NOT NULL,
         runtime TEXT NOT NULL CHECK (runtime IN ('claude', 'codex', 'manual')),
-        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'blocked', 'failed')),
+        status TEXT NOT NULL,
         claim_token TEXT NOT NULL,
         claimed_at TEXT NOT NULL,
+        claim_expires_at TEXT NOT NULL,
         heartbeat_at TEXT NOT NULL,
         ended_at TEXT,
+        pid INTEGER,
+        log_path TEXT,
+        exit_code INTEGER,
         summary TEXT,
         metadata_json TEXT,
         error TEXT
@@ -227,10 +330,72 @@ export class KanbanStore {
       );
 
       CREATE INDEX IF NOT EXISTS idx_tasks_queue
-        ON tasks(board, status, runtime, priority DESC, created_at);
+        ON tasks(board, status, scheduled_at, runtime, priority DESC, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
+        ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
       CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
       CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
     `);
+  }
+
+  private migrateLegacySchema(): void {
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE task_events RENAME TO task_events_legacy;
+        ALTER TABLE task_runs RENAME TO task_runs_legacy;
+        ALTER TABLE task_comments RENAME TO task_comments_legacy;
+        ALTER TABLE task_links RENAME TO task_links_legacy;
+        ALTER TABLE tasks RENAME TO tasks_legacy;
+        DROP INDEX IF EXISTS idx_tasks_queue;
+        DROP INDEX IF EXISTS idx_runs_task;
+        DROP INDEX IF EXISTS idx_events_task;
+      `);
+      this.createLatestSchema();
+      this.db.exec(`
+        INSERT INTO tasks(
+          id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
+          priority, workspace, workspace_kind, branch, current_run_id, result,
+          scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
+          workflow_template_id, current_step_key, block_kind, block_reason,
+          block_recurrences, failure_count, max_retries, created_at, updated_at
+        )
+        SELECT
+          id, board, NULL, NULL, title, body, assignee, runtime, status,
+          priority, workspace,
+          CASE WHEN workspace IS NULL OR workspace = 'scratch' THEN 'scratch' ELSE 'dir' END,
+          NULL, current_run_id, NULL, NULL, NULL, '[]', 0, 20,
+          NULL, NULL, NULL, NULL, 0, failure_count, max_retries, created_at, updated_at
+        FROM tasks_legacy;
+
+        INSERT INTO task_links SELECT * FROM task_links_legacy;
+        INSERT INTO task_comments SELECT * FROM task_comments_legacy;
+        INSERT INTO task_runs(
+          id, task_id, worker_id, runtime, status, claim_token, claimed_at,
+          claim_expires_at, heartbeat_at, ended_at, pid, log_path, exit_code,
+          summary, metadata_json, error
+        )
+        SELECT
+          id, task_id, worker_id, runtime, status, claim_token, claimed_at,
+          strftime('%Y-%m-%dT%H:%M:%fZ', claimed_at, '+15 minutes'),
+          heartbeat_at, ended_at, NULL, NULL, NULL, summary, metadata_json, error
+        FROM task_runs_legacy;
+        INSERT INTO task_events SELECT * FROM task_events_legacy;
+
+        DROP TABLE task_events_legacy;
+        DROP TABLE task_runs_legacy;
+        DROP TABLE task_comments_legacy;
+        DROP TABLE task_links_legacy;
+        DROP TABLE tasks_legacy;
+        COMMIT;
+      `);
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON");
+    }
   }
 
   private write<T>(fn: () => T): T {
@@ -276,9 +441,17 @@ export class KanbanStore {
     return row.count > 0;
   }
 
-  private recomputeReady(taskId: string): void {
+  private recomputeReady(taskId: string, at = now()): void {
     const task = this.requireTaskRow(taskId);
-    if (["triage", "running", "blocked", "done", "archived"].includes(task.status)) return;
+    if (["triage", "running", "blocked", "review", "done", "archived"].includes(task.status)) return;
+    if (task.status === "scheduled" && task.scheduled_at === null) return;
+    if (task.scheduled_at && Date.parse(task.scheduled_at) > Date.parse(at)) {
+      if (task.status !== "scheduled") {
+        this.db.prepare("UPDATE tasks SET status = 'scheduled', updated_at = ? WHERE id = ?").run(now(), taskId);
+        this.appendEvent(taskId, "scheduled", { scheduledAt: task.scheduled_at });
+      }
+      return;
+    }
     const status: TaskStatus =
       this.hasOpenParents(taskId) || task.assignee === null || task.runtime === "manual" ? "todo" : "ready";
     if (status !== task.status) {
@@ -322,21 +495,50 @@ export class KanbanStore {
       throw new Error(`Invalid status: ${requestedStatus}`);
     }
 
-    const taskId = newId("t");
+    const tenant = input.tenant?.trim() || null;
+    const idempotencyKey = input.idempotencyKey?.trim() || null;
+    const scheduledAt = normalizeIso(input.scheduledAt, "scheduledAt");
+    const maxRuntimeSeconds = input.maxRuntimeSeconds ?? null;
+    if (maxRuntimeSeconds !== null && (!Number.isInteger(maxRuntimeSeconds) || maxRuntimeSeconds < 1)) {
+      throw new Error("maxRuntimeSeconds must be a positive integer");
+    }
+    const maxRetries = input.maxRetries ?? 2;
+    if (!Number.isInteger(maxRetries) || maxRetries < 1) throw new Error("maxRetries must be a positive integer");
+    const goalMaxTurns = input.goalMaxTurns ?? 20;
+    if (!Number.isInteger(goalMaxTurns) || goalMaxTurns < 1) throw new Error("goalMaxTurns must be a positive integer");
+    const skills = normalizeSkills(input.skills);
+    let taskId = newId("t");
     this.write(() => {
+      if (idempotencyKey) {
+        const existing = this.db
+          .prepare("SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'")
+          .get(input.board ?? "default", idempotencyKey) as { id: string } | undefined;
+        if (existing) {
+          taskId = existing.id;
+          return;
+        }
+      }
       const timestamp = now();
-      const automaticStatus: TaskStatus =
-        input.assignee && runtime !== "manual" && (input.parents?.length ?? 0) === 0 ? "ready" : "todo";
+      const automaticStatus: TaskStatus = scheduledAt && Date.parse(scheduledAt) > Date.now()
+        ? "scheduled"
+        : input.assignee && runtime !== "manual" && (input.parents?.length ?? 0) === 0
+          ? "ready"
+          : "todo";
       this.db
         .prepare(`
           INSERT INTO tasks(
-            id, board, title, body, assignee, runtime, status, priority, workspace,
-            current_run_id, failure_count, max_retries, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
+            id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
+            priority, workspace, workspace_kind, branch, current_run_id, result,
+            scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
+            workflow_template_id, current_step_key, block_kind, block_reason,
+            block_recurrences, failure_count, max_retries, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?, ?)
         `)
         .run(
           taskId,
           input.board ?? "default",
+          tenant,
+          idempotencyKey,
           title,
           input.body ?? "",
           input.assignee ?? null,
@@ -344,11 +546,26 @@ export class KanbanStore {
           requestedStatus ?? automaticStatus,
           input.priority ?? 0,
           input.workspace ?? null,
-          input.maxRetries ?? 2,
+          workspaceKind(input.workspace, input.workspaceKind),
+          input.branch ?? null,
+          scheduledAt,
+          maxRuntimeSeconds,
+          JSON.stringify(skills),
+          input.goalMode ? 1 : 0,
+          goalMaxTurns,
+          input.workflowTemplateId ?? null,
+          input.currentStepKey ?? null,
+          maxRetries,
           timestamp,
           timestamp,
         );
-      this.appendEvent(taskId, "created", { runtime, assignee: input.assignee ?? null });
+      this.appendEvent(taskId, "created", {
+        runtime,
+        assignee: input.assignee ?? null,
+        tenant,
+        status: requestedStatus ?? automaticStatus,
+        parents: input.parents ?? [],
+      });
       for (const parentId of input.parents ?? []) this.linkNoTransaction(parentId, taskId);
       if (requestedStatus === "ready" && this.hasOpenParents(taskId)) {
         this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), taskId);
@@ -375,16 +592,39 @@ export class KanbanStore {
       }
       if (input.body !== undefined) add("body", input.body);
       if (input.assignee !== undefined) add("assignee", input.assignee);
+      if (input.tenant !== undefined) add("tenant", input.tenant?.trim() || null);
       if (input.runtime !== undefined) add("runtime", input.runtime);
       if (input.priority !== undefined) add("priority", input.priority);
-      if (input.workspace !== undefined) add("workspace", input.workspace);
+      if (input.workspace !== undefined) {
+        add("workspace", input.workspace);
+        if (input.workspaceKind === undefined) add("workspace_kind", workspaceKind(input.workspace));
+      }
+      if (input.workspaceKind !== undefined) add("workspace_kind", input.workspaceKind);
+      if (input.branch !== undefined) add("branch", input.branch);
+      if (input.scheduledAt !== undefined) add("scheduled_at", normalizeIso(input.scheduledAt, "scheduledAt"));
+      if (input.maxRuntimeSeconds !== undefined) {
+        if (input.maxRuntimeSeconds !== null && (!Number.isInteger(input.maxRuntimeSeconds) || input.maxRuntimeSeconds < 1)) {
+          throw new Error("maxRuntimeSeconds must be a positive integer");
+        }
+        add("max_runtime_seconds", input.maxRuntimeSeconds);
+      }
+      if (input.skills !== undefined) add("skills_json", JSON.stringify(normalizeSkills(input.skills)));
+      if (input.goalMode !== undefined) add("goal_mode", input.goalMode ? 1 : 0);
+      if (input.goalMaxTurns !== undefined) {
+        if (!Number.isInteger(input.goalMaxTurns) || input.goalMaxTurns < 1) {
+          throw new Error("goalMaxTurns must be a positive integer");
+        }
+        add("goal_max_turns", input.goalMaxTurns);
+      }
+      if (input.workflowTemplateId !== undefined) add("workflow_template_id", input.workflowTemplateId);
+      if (input.currentStepKey !== undefined) add("current_step_key", input.currentStepKey);
       if (input.status !== undefined) add("status", input.status);
       if (updates.length === 0) return;
       updates.push("updated_at = ?");
       values.push(now(), taskId);
       this.db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...values);
       this.appendEvent(taskId, "updated", input as Record<string, unknown>);
-      if (input.status === undefined || input.status === "ready" || input.status === "todo") {
+      if (input.status === undefined || ["ready", "todo", "scheduled"].includes(input.status)) {
         this.recomputeReady(taskId);
       }
     });
@@ -400,6 +640,10 @@ export class KanbanStore {
     } else if (!filter.includeArchived) {
       clauses.push("status <> 'archived'");
     }
+    if (filter.tenant) {
+      clauses.push("tenant = ?");
+      values.push(filter.tenant);
+    }
     if (filter.assignee) {
       clauses.push("assignee = ?");
       values.push(filter.assignee);
@@ -408,10 +652,25 @@ export class KanbanStore {
       clauses.push("runtime = ?");
       values.push(filter.runtime);
     }
+    if (filter.search?.trim()) {
+      clauses.push("(title LIKE ? OR body LIKE ?)");
+      const pattern = `%${filter.search.trim()}%`;
+      values.push(pattern, pattern);
+    }
+    const orderBy: Record<NonNullable<ListTaskFilter["sort"]>, string> = {
+      created: "created_at ASC",
+      "created-desc": "created_at DESC",
+      priority: "priority ASC, created_at ASC",
+      "priority-desc": "priority DESC, created_at ASC",
+      status: "status ASC, priority DESC, created_at ASC",
+      assignee: "assignee ASC, priority DESC, created_at ASC",
+      title: "title COLLATE NOCASE ASC",
+      updated: "updated_at DESC",
+    };
     const limit = Math.max(1, Math.min(filter.limit ?? 100, 500));
     values.push(limit);
     const rows = this.db
-      .prepare(`SELECT * FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY priority DESC, created_at ASC LIMIT ?`)
+      .prepare(`SELECT * FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY ${orderBy[filter.sort ?? "priority-desc"]} LIMIT ?`)
       .all(...values) as unknown as TaskRow[];
     return rows.map(taskFromRow);
   }
@@ -463,6 +722,20 @@ export class KanbanStore {
     return commentFromRow(row);
   }
 
+  promoteDueTasks(board = "default", at = now()): number {
+    return this.write(() => {
+      const rows = this.db
+        .prepare("SELECT id FROM tasks WHERE board = ? AND status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
+        .all(board, at) as unknown as { id: string }[];
+      for (const row of rows) {
+        this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), row.id);
+        this.appendEvent(row.id, "schedule_due", { scheduledAt: at });
+        this.recomputeReady(row.id, at);
+      }
+      return rows.length;
+    });
+  }
+
   claimTask(
     input: {
       taskId?: string | undefined;
@@ -470,14 +743,15 @@ export class KanbanStore {
       runtime?: Runtime | undefined;
       workerId?: string | undefined;
       excludeManual?: boolean | undefined;
+      claimTtlSeconds?: number | undefined;
     } = {},
   ): ClaimedTask | null {
     let runId = "";
     let claimToken = "";
     let taskId = "";
     const claimed = this.write(() => {
-      const clauses = ["board = ?", "status = 'ready'", "current_run_id IS NULL"];
-      const values: SQLInputValue[] = [input.board ?? "default"];
+      const clauses = ["board = ?", "status = 'ready'", "current_run_id IS NULL", "(scheduled_at IS NULL OR scheduled_at <= ?)"];
+      const values: SQLInputValue[] = [input.board ?? "default", now()];
       if (input.taskId) {
         clauses.push("id = ?");
         values.push(input.taskId);
@@ -499,6 +773,8 @@ export class KanbanStore {
       claimToken = randomBytes(24).toString("base64url");
       taskId = row.id;
       const timestamp = now();
+      const claimTtlSeconds = Math.max(1, input.claimTtlSeconds ?? 15 * 60);
+      const claimExpiresAt = futureIso(claimTtlSeconds);
       const changed = this.db
         .prepare("UPDATE tasks SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ? AND status = 'ready' AND current_run_id IS NULL")
         .run(runId, timestamp, row.id);
@@ -506,11 +782,26 @@ export class KanbanStore {
       this.db
         .prepare(`
           INSERT INTO task_runs(
-            id, task_id, worker_id, runtime, status, claim_token, claimed_at, heartbeat_at
-          ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+            id, task_id, worker_id, runtime, status, claim_token, claimed_at,
+            claim_expires_at, heartbeat_at
+          ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
         `)
-        .run(runId, row.id, input.workerId ?? `${row.runtime}-worker`, row.runtime, claimToken, timestamp, timestamp);
-      this.appendEvent(row.id, "claimed", { workerId: input.workerId ?? `${row.runtime}-worker` }, runId);
+        .run(
+          runId,
+          row.id,
+          input.workerId ?? `${row.runtime}-worker`,
+          row.runtime,
+          claimToken,
+          timestamp,
+          claimExpiresAt,
+          timestamp,
+        );
+      this.appendEvent(
+        row.id,
+        "claimed",
+        { workerId: input.workerId ?? `${row.runtime}-worker`, expires: claimExpiresAt },
+        runId,
+      );
       return true;
     });
     if (!claimed) return null;
@@ -535,7 +826,11 @@ export class KanbanStore {
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
       const timestamp = now();
-      this.db.prepare("UPDATE task_runs SET heartbeat_at = ? WHERE id = ?").run(timestamp, run.id);
+      const originalTtl = Math.max(1_000, Date.parse(run.claim_expires_at) - Date.parse(run.claimed_at));
+      const claimExpiresAt = new Date(Date.now() + originalTtl).toISOString();
+      this.db
+        .prepare("UPDATE task_runs SET heartbeat_at = ?, claim_expires_at = ? WHERE id = ?")
+        .run(timestamp, claimExpiresAt, run.id);
       this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(timestamp, task.id);
       this.appendEvent(task.id, "heartbeat", note ? { note } : null, run.id);
     });

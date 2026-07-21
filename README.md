@@ -63,6 +63,22 @@ node dist/cli.js dispatch --watch --max-workers 2 --allow-writes
 
 Worker output is stored next to the database under `data/logs/`.
 
+Automation-friendly task fields are available through both the CLI and MCP:
+
+```bash
+node dist/cli.js create "Nightly security audit" \
+  --tenant acme \
+  --idempotency-key "audit-2026-07-22" \
+  --scheduled-at "2026-07-22T23:00:00+09:00" \
+  --max-runtime-seconds 1800 \
+  --skill security-audit \
+  --goal --goal-max-turns 12 \
+  --assignee reviewer --runtime codex
+```
+
+Scheduled cards are promoted when they become due. Repeating the same non-empty
+idempotency key on a board returns the existing non-archived task.
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`
