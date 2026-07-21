@@ -57,8 +57,9 @@ The dashboard includes:
   a guarded trash target, and partial-failure bulk move, assign, archive, and
   delete actions;
 - isolated board switching/creation/settings, persisted profile routing and
-  automatic decomposition settings, manual specify/decompose, swarm creation,
-  and dispatcher nudging;
+  opt-in auxiliary profile descriptions, automatic decomposition settings,
+  manual specify/decompose, swarm creation, and dispatcher nudging;
+- multi-file attachment upload and persisted archived/profile-lane preferences;
 - a cursor-based WebSocket stream with reconnect and debounced board/drawer
   refresh.
 
@@ -291,7 +292,7 @@ node dist/cli.js swarm "Design a multi-region failover plan" \
 - Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
 - Administration: `kanban_bulk`, `kanban_gc`
 - Notifications: `kanban_notify_subscribe`, `kanban_notify_list`, `kanban_notify_unsubscribe`, `kanban_notify_deliver`
-- Orchestration: `kanban_specify`, `kanban_decompose`, `kanban_swarm`
+- Orchestration: `kanban_specify`, `kanban_decompose`, `kanban_profile_describe_auto`, `kanban_swarm`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope

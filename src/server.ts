@@ -8,6 +8,7 @@ import { deliverNotifications } from "./notifications.js";
 import {
   createCliPlanner,
   decomposeTriageTask,
+  describeProfileRoute,
   specifyTriageTask,
   type DecompositionPlan,
 } from "./orchestration.js";
@@ -646,6 +647,48 @@ export function createKanbanServer(manager: BoardManager): McpServer {
           planner: createCliPlanner({ runtime: planner_runtime, cwd: process.cwd(), timeoutMs: planner_timeout_ms }),
         });
         return result(value);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  server.registerTool(
+    "kanban_profile_describe_auto",
+    {
+      title: "Describe a Kanban routing profile",
+      description: "Generate and persist a concise board routing description from the profile name and its prior task evidence.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        name: z.string().min(1),
+        runtime: workerRuntimeSchema,
+        planner_runtime: workerRuntimeSchema.optional(),
+        planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ board, name, runtime, planner_runtime, planner_timeout_ms }) => {
+      requireAdminSurface();
+      const resolvedBoard = selectedBoard(manager, board);
+      const metadata = manager.read(resolvedBoard);
+      const store = manager.openStore(resolvedBoard);
+      try {
+        const existing = metadata.orchestration.profiles.find((profile) => profile.name === name);
+        const evidence = store.listTasks({ assignee: name, includeArchived: true, limit: 50 })
+          .map((task) => ({ title: task.title, body: task.body, skills: task.skills }));
+        const described = await describeProfileRoute(
+          { name, runtime, description: existing?.description },
+          evidence,
+          createCliPlanner({
+            runtime: planner_runtime ?? metadata.orchestration.plannerRuntime,
+            cwd: process.cwd(),
+            timeoutMs: planner_timeout_ms,
+          }),
+        );
+        const profiles = metadata.orchestration.profiles.filter((profile) => profile.name !== name);
+        profiles.push({ name, runtime, description: described.description ?? "" });
+        manager.update(resolvedBoard, { orchestration: { profiles } });
+        return result(described);
       } finally {
         store.close();
       }

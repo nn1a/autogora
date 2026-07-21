@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-import { createCliPlanner, decomposeTriageTask, specifyTriageTask } from "../src/orchestration.js";
+import { createCliPlanner, decomposeTriageTask, describeProfileRoute, specifyTriageTask } from "../src/orchestration.js";
 import { KanbanStore } from "../src/store.js";
 
 test("triage specification and decomposition use durable atomic task graphs", async () => {
@@ -175,4 +175,19 @@ test("Codex auxiliary planner uses a strict output schema and parsed last messag
     else process.env.KANBAN_CODEX_BIN = previous;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("profile descriptions are generated through a constrained structured planner", async () => {
+  let prompt = "";
+  const described = await describeProfileRoute(
+    { name: "security-reviewer", runtime: "codex" },
+    [{ title: "Audit auth flow", body: "Review token validation and threat boundaries.", skills: ["security-audit"] }],
+    async (request) => {
+      prompt = request.prompt;
+      assert.equal(request.kind, "profile_describe");
+      return { description: "Reviews authentication code, threat boundaries, and security verification evidence." };
+    },
+  );
+  assert.match(prompt, /Audit auth flow/);
+  assert.match(described.description ?? "", /authentication code/);
 });

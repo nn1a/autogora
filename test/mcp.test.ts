@@ -46,6 +46,7 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_deliver"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_specify"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_decompose"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_profile_describe_auto"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_swarm"));
     const boards = textPayload(
       await client.callTool({ name: "kanban_boards_list", arguments: {} }),

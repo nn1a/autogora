@@ -22,6 +22,7 @@ import { deliverNotifications } from "./notifications.js";
 import {
   createCliPlanner,
   decomposeTriageTask,
+  describeProfileRoute,
   specifyTriageTask,
   type DecompositionPlan,
   type ProfileRoute,
@@ -688,6 +689,26 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           .filter((task) => task.assignee && task.runtime !== "manual")
           .map((task) => ({ name: task.assignee!, runtime: task.runtime })));
         sendJson(response, 200, [...new Map([...discovered, ...metadata.orchestration.profiles].map((item) => [item.name, item])).values()]);
+        return;
+      }
+      if (segments[1] === "profiles" && segments[2] && segments[3] === "describe-auto" && method === "POST") {
+        const body = await readJson(request);
+        const metadata = manager.read(board);
+        const existing = metadata.orchestration.profiles.find((profile) => profile.name === segments[2]);
+        const runtime = existing?.runtime ?? runtimeValue(body.runtime);
+        if (!runtime || runtime === "manual") throw new Error("Profile auto-description requires a Claude/Codex runtime");
+        const evidence = await withStore(manager, board, (store) => store.listTasks({
+          assignee: segments[2], includeArchived: true, limit: 50,
+        }).map((task) => ({ title: task.title, body: task.body, skills: task.skills })));
+        const described = await describeProfileRoute(
+          { name: segments[2], runtime, description: existing?.description },
+          evidence,
+          createCliPlanner({ runtime: metadata.orchestration.plannerRuntime, cwd: process.cwd() }),
+        );
+        const profiles = metadata.orchestration.profiles.filter((profile) => profile.name !== described.name);
+        profiles.push({ name: described.name, runtime: described.runtime, description: described.description ?? "" });
+        manager.update(board, { orchestration: { profiles } });
+        sendJson(response, 200, described);
         return;
       }
 

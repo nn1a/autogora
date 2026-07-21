@@ -44,7 +44,7 @@ export interface GoalJudgment {
 }
 
 export interface StructuredPlannerRequest {
-  kind: "specify" | "decompose" | "goal_judge";
+  kind: "specify" | "decompose" | "goal_judge" | "profile_describe";
   prompt: string;
   schema: Record<string, unknown>;
 }
@@ -112,6 +112,15 @@ const GOAL_JUDGE_SCHEMA: Record<string, unknown> = {
     nextPrompt: { type: "string" },
   },
   required: ["complete", "reason", "nextPrompt"],
+};
+
+const PROFILE_DESCRIPTION_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    description: { type: "string", minLength: 1, maxLength: 500 },
+  },
+  required: ["description"],
 };
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -430,4 +439,32 @@ export async function judgeGoalProgress(
     `Latest worker output:\n${output || "(empty)"}`,
   ].join("\n");
   return parseGoalJudgment(await planner({ kind: "goal_judge", prompt, schema: GOAL_JUDGE_SCHEMA }));
+}
+
+export async function describeProfileRoute(
+  profile: ProfileRoute,
+  evidence: Array<{ title: string; body: string; skills: string[] }>,
+  planner: StructuredPlanner,
+): Promise<ProfileRoute> {
+  const examples = evidence.slice(0, 20).map((task) =>
+    `- ${task.title}: ${task.body.slice(0, 300) || "(no body)"}; skills=${task.skills.join(", ") || "none"}`,
+  ).join("\n");
+  const prompt = [
+    "You describe a Claude/Codex Kanban worker profile for a task-routing planner.",
+    "Write one concise capability description grounded only in the supplied evidence.",
+    "State the work this profile should receive and any evident specialization. Do not use marketing language.",
+    "Return only the requested structured object.",
+    "",
+    `Profile: ${profile.name}`,
+    `Runtime: ${profile.runtime}`,
+    `Existing description: ${profile.description?.trim() || "(none)"}`,
+    "Observed tasks:",
+    examples || "(none; describe it conservatively from its name and runtime)",
+  ].join("\n");
+  const value = record(await planner({
+    kind: "profile_describe",
+    prompt,
+    schema: PROFILE_DESCRIPTION_SCHEMA,
+  }), "Profile description");
+  return { ...profile, description: requiredString(value.description, "Profile description").slice(0, 500) };
 }

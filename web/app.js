@@ -32,6 +32,14 @@ function markdown(value = "") {
   return safe;
 }
 
+function relativeTime(value) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(value)) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60); if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 function boardPath(path) {
   const separator = path.includes("?") ? "&" : "?";
   return `${path}${separator}board=${encodeURIComponent(state.board)}`;
@@ -114,6 +122,7 @@ function cardHtml(task) {
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
       <span>${escapeHtml(task.assignee || "unassigned")}</span><span>·</span><span>${escapeHtml(task.runtime)}</span>
       ${task.commentsCount ? `<span>💬 ${task.commentsCount}</span>` : ""}${task.linksCount ? `<span>↔ ${task.linksCount}</span>` : ""}
+      <span>${relativeTime(task.createdAt)}</span>
     </div>
   </article>`;
 }
@@ -294,7 +303,7 @@ function renderDrawer(detail) {
     <h3>Comments</h3><div class="detail-list">${comments || '<small>No comments</small>'}</div>
     <form id="comment-form" class="comment-form"><input required placeholder="Add durable context…"><button>Comment</button></form>
     <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
-    <form id="attachment-form" class="attachment-form"><input type="file" required><button>Upload</button></form>
+    <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
     <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
     <h3>Recent events</h3><div class="detail-list">${events}</div>`;
   bindDrawer(detail);
@@ -329,10 +338,12 @@ function bindDrawer(detail) {
     await openDrawer(taskId);
   });
   $("#attachment-form").addEventListener("submit", async (event) => {
-    event.preventDefault(); const file = $("input", event.currentTarget).files[0]; if (!file) return;
-    await api(boardPath(`/api/tasks/${taskId}/attachments?name=${encodeURIComponent(file.name)}`), {
-      method: "POST", body: file, headers: { "content-type": file.type || "application/octet-stream" },
-    });
+    event.preventDefault(); const files = [...$("input", event.currentTarget).files]; if (!files.length) return;
+    for (const file of files) {
+      await api(boardPath(`/api/tasks/${taskId}/attachments?name=${encodeURIComponent(file.name)}`), {
+        method: "POST", body: file, headers: { "content-type": file.type || "application/octet-stream" },
+      });
+    }
     await openDrawer(taskId);
   });
   const link = (formId, parent) => $(formId).addEventListener("submit", async (event) => {
@@ -406,6 +417,8 @@ function initializeSelects() {
   const options = mutableStatuses.map((status) => `<option value="${status}">${status}</option>`).join("");
   $("#task-form [name=status]").innerHTML = options;
   $("#bulk-status").innerHTML = `<option value="">Move to…</option>${options}`;
+  $("#show-archived").checked = localStorage.getItem("kanban.showArchived") === "true";
+  $("#lane-profile").checked = localStorage.getItem("kanban.laneByProfile") === "true";
 }
 
 function bindGlobalActions() {
@@ -414,8 +427,9 @@ function bindGlobalActions() {
     state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("kanban.board", state.board);
     await loadBoard(); connectEvents();
   });
-  ["#search", "#tenant-filter", "#assignee-filter", "#lane-profile"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
-  $("#show-archived").addEventListener("change", loadBoard);
+  ["#search", "#tenant-filter", "#assignee-filter"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
+  $("#lane-profile").addEventListener("change", () => { localStorage.setItem("kanban.laneByProfile", $("#lane-profile").checked); renderBoard(); });
+  $("#show-archived").addEventListener("change", () => { localStorage.setItem("kanban.showArchived", $("#show-archived").checked); loadBoard(); });
   $("#drawer-close").addEventListener("click", closeDrawer); $("#scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.drawerTask) closeDrawer(); });
   $("#bulk-clear").addEventListener("click", () => { state.selected.clear(); renderBoard(); });
@@ -430,6 +444,7 @@ function bindGlobalActions() {
   $("#task-form").addEventListener("submit", submitTask);
   $("#board-form").addEventListener("submit", submitBoard);
   $("#settings-form").addEventListener("submit", submitSettings);
+  $("#auto-describe-profiles").addEventListener("click", autoDescribeProfiles);
   $("#swarm-form").addEventListener("submit", submitSwarm);
   $("#archive-board").addEventListener("click", archiveBoard);
 }
@@ -451,7 +466,7 @@ async function submitBoard(event) {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
     const board = await api("/api/boards", { method: "POST", body: JSON.stringify({
-      slug: data.get("slug"), name: data.get("name"), description: data.get("description"),
+      slug: data.get("slug"), name: data.get("name"), description: data.get("description"), icon: data.get("icon"),
       defaultWorkdir: data.get("defaultWorkdir") || null, switch: true,
     }) });
     state.board = board.slug; state.cursor = 0; localStorage.setItem("kanban.board", state.board);
@@ -484,6 +499,28 @@ async function submitSettings(event) {
     }) });
     $("#settings-dialog").close(); await loadBoards(); await loadBoard();
   } catch (error) { toast(error.message, true); }
+}
+
+async function autoDescribeProfiles() {
+  const button = $("#auto-describe-profiles");
+  try {
+    const textarea = $("#settings-form [name=profiles]");
+    const profiles = String(textarea.value || "").split("\n").map((line) => line.trim()).filter(Boolean).map(parseRoute);
+    const blank = profiles.filter((profile) => !profile.description?.trim());
+    if (!blank.length) { toast("Every configured profile already has a description"); return; }
+    button.disabled = true; button.textContent = `Describing 0/${blank.length}…`;
+    for (let index = 0; index < blank.length; index += 1) {
+      const profile = blank[index];
+      button.textContent = `Describing ${index + 1}/${blank.length}…`;
+      const described = await api(boardPath(`/api/profiles/${encodeURIComponent(profile.name)}/describe-auto`), {
+        method: "POST", body: JSON.stringify({ runtime: profile.runtime }),
+      });
+      profile.description = described.description;
+    }
+    textarea.value = profiles.map((profile) => `${profile.name}:${profile.runtime}:${profile.description || ""}`).join("\n");
+    await loadBoard(); toast(`${blank.length} profile description${blank.length === 1 ? "" : "s"} generated`);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; button.textContent = "Auto-describe blank profiles"; }
 }
 
 async function submitSwarm(event) {

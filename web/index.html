@@ -82,6 +82,7 @@
       <label>Slug<input name="slug" required pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}"></label>
       <label>Name<input name="name"></label>
       <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Icon<input name="icon" placeholder="emoji or short label"></label>
       <label>Project directory<input name="defaultWorkdir" placeholder="absolute path"></label>
       <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button class="primary">Create board</button></footer>
     </form>
@@ -106,6 +107,7 @@
         <label>Orchestrator profile<input name="orchestratorProfile"></label>
       </div>
       <label>Profiles <small>one per line: name:runtime:description</small><textarea name="profiles" rows="6"></textarea></label>
+      <button id="auto-describe-profiles" type="button">Auto-describe blank profiles</button>
       <footer>
         <button id="archive-board" value="cancel" class="danger">Archive board</button>
         <span class="spacer"></span>
