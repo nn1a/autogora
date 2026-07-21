@@ -65,7 +65,7 @@ Authoritative references:
 - [x] Bounded, preformatted worker context with parent handoffs and prior attempts
 - [x] CLI verbs for boards, tasks, runs, events, logs, stats, and diagnostics
 - [x] Terminal event watch/tail and machine-readable output
-- [ ] Notification subscriptions and terminal-event delivery adapters
+- [x] Notification subscriptions and leased terminal-event delivery adapters
 
 ### Orchestration
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -44,12 +45,31 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
   chmodSync(fakeAgent, 0o755);
   const manager = new BoardManager(dbPath);
   manager.create("project");
+  let notificationCount = 0;
+  const notificationServer = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      notificationCount += 1;
+      response.writeHead(204).end();
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    notificationServer.once("error", rejectListen);
+    notificationServer.listen(0, "127.0.0.1", resolveListen);
+  });
+  const notificationAddress = notificationServer.address();
+  assert.ok(notificationAddress && typeof notificationAddress !== "string");
   const store = manager.openStore("project");
   const task = store.createTask({
     title: "dispatcher e2e",
     assignee: "fake",
     runtime: "codex",
     workspace: process.cwd(),
+  });
+  store.subscribeTask({
+    taskId: task.task.id,
+    platform: "webhook",
+    chatId: `http://127.0.0.1:${notificationAddress.port}/kanban`,
   });
   store.close();
 
@@ -71,12 +91,17 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
       assert.equal(completed.runs[0]?.metadata?.verification?.[0], "dispatcher-e2e");
       assert.ok(completed.runs[0]?.pid);
       assert.ok(completed.runs[0]?.logPath);
+      assert.equal(notificationCount, 1);
+      assert.equal(check.listNotificationSubscriptions(task.task.id).length, 0);
     } finally {
       check.close();
     }
   } finally {
     if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
     else process.env.KANBAN_CODEX_BIN = previous;
+    await new Promise<void>((resolveClose, rejectClose) =>
+      notificationServer.close((error) => error ? rejectClose(error) : resolveClose()),
+    );
     rmSync(directory, { recursive: true, force: true });
   }
 });

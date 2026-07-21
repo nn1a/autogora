@@ -40,6 +40,10 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_events"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_bulk"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_gc"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_subscribe"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_list"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_unsubscribe"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_deliver"));
     const boards = textPayload(
       await client.callTool({ name: "kanban_boards_list", arguments: {} }),
     ) as { slug: string }[];
@@ -155,6 +159,25 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     const parked = textPayload(
       await client.callTool({ name: "kanban_create", arguments: { title: "parked admin task" } }),
     ) as { task: { id: string } };
+    const subscribed = textPayload(
+      await client.callTool({
+        name: "kanban_notify_subscribe",
+        arguments: { task_id: parked.task.id, platform: "test", chat_id: "chat-1", secret: "not-returned" },
+      }),
+    ) as { id: string; hasSecret: boolean; secret?: string };
+    assert.equal(subscribed.hasSecret, true);
+    assert.equal(subscribed.secret, undefined);
+    const subscriptions = textPayload(
+      await client.callTool({ name: "kanban_notify_list", arguments: { task_id: parked.task.id } }),
+    ) as { id: string }[];
+    assert.equal(subscriptions[0]?.id, subscribed.id);
+    const unsubscribed = textPayload(
+      await client.callTool({
+        name: "kanban_notify_unsubscribe",
+        arguments: { task_id: parked.task.id, platform: "test", chat_id: "chat-1" },
+      }),
+    ) as { unsubscribed: boolean };
+    assert.equal(unsubscribed.unsubscribed, true);
     const scheduled = textPayload(
       await client.callTool({
         name: "kanban_schedule",

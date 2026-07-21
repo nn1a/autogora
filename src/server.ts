@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import { BoardManager } from "./boards.js";
 import { garbageCollect } from "./maintenance.js";
+import { deliverNotifications } from "./notifications.js";
 import { KanbanStore, type RunScope } from "./store.js";
 import { BLOCK_KINDS, RUNTIMES, TASK_STATUSES, type BlockKind, type Runtime, type TaskStatus } from "./types.js";
 
@@ -418,6 +419,101 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         logRetentionDays: log_retention_days,
         workspaceRetentionDays: workspace_retention_days,
       }));
+    },
+  );
+
+  server.registerTool(
+    "kanban_notify_subscribe",
+    {
+      title: "Subscribe to Kanban task notifications",
+      description: "Subscribe a platform destination to future terminal events for one task. Use platform=webhook and an HTTP(S) URL as chat_id for the bundled adapter.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string(),
+        platform: z.string().min(1),
+        chat_id: z.string().min(1),
+        thread_id: z.string().nullable().optional(),
+        user_id: z.string().nullable().optional(),
+        event_kinds: z.array(z.string().min(1)).min(1).optional(),
+        secret: z.string().nullable().optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board, task_id, platform, chat_id, thread_id, user_id, event_kinds, secret }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => store.subscribeTask({
+        taskId: task_id,
+        platform,
+        chatId: chat_id,
+        threadId: thread_id,
+        userId: user_id,
+        eventKinds: event_kinds,
+        secret,
+      })));
+    },
+  );
+
+  server.registerTool(
+    "kanban_notify_list",
+    {
+      title: "List Kanban notification subscriptions",
+      description: "List board notification subscriptions, optionally for one task. Stored secrets are never returned.",
+      inputSchema: z.object({ board: z.string().optional(), task_id: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board, task_id }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => store.listNotificationSubscriptions(task_id)));
+    },
+  );
+
+  server.registerTool(
+    "kanban_notify_unsubscribe",
+    {
+      title: "Unsubscribe from Kanban task notifications",
+      description: "Remove a task notification destination and its pending deliveries.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string(),
+        platform: z.string().min(1),
+        chat_id: z.string().min(1),
+        thread_id: z.string().nullable().optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board, task_id, platform, chat_id, thread_id }) => {
+      requireAdminSurface();
+      const unsubscribed = usingStore(manager, board, (store) => store.unsubscribeTask({
+        taskId: task_id,
+        platform,
+        chatId: chat_id,
+        threadId: thread_id,
+      }));
+      return result({ taskId: task_id, unsubscribed });
+    },
+  );
+
+  server.registerTool(
+    "kanban_notify_deliver",
+    {
+      title: "Deliver pending Kanban notifications",
+      description: "Claim and deliver pending terminal events. The bundled webhook adapter performs external HTTP requests.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        limit: z.number().int().min(1).max(500).default(25),
+        timeout_ms: z.number().int().min(100).max(120_000).default(10_000),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ board, limit, timeout_ms }) => {
+      requireAdminSurface();
+      const resolvedBoard = selectedBoard(manager, board);
+      const store = manager.openStore(resolvedBoard);
+      try {
+        return result(await deliverNotifications(store, { limit, timeoutMs: timeout_ms }));
+      } finally {
+        store.close();
+      }
     },
   );
 

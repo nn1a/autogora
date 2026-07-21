@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { BoardManager } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
 import { garbageCollect } from "./maintenance.js";
+import { deliverNotifications } from "./notifications.js";
 import { runStdioServer } from "./server.js";
 import {
   BLOCK_KINDS,
@@ -35,6 +36,10 @@ Commands:
   watch                 Read or follow the board event stream
   bulk <id>...          Apply a mutation with per-task results
   gc                     Collect old events, logs, and terminal scratch dirs
+  notify-subscribe <id> Subscribe a destination to task terminal events
+  notify-list [id]      List board or task notification subscriptions
+  notify-unsubscribe <id> Remove a task notification destination
+  notify-deliver        Deliver pending notifications once
   edit <task-id>        Edit task metadata
   assign <id> <worker>  Assign or unassign a task
   link <parent> <child> Add a dependency
@@ -498,6 +503,88 @@ async function main(): Promise<void> {
       workspaceRetentionDays: numberOption(parsed.values["workspace-retention-days"], 7),
     });
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    return;
+  }
+
+  if (["notify-subscribe", "notify-unsubscribe"].includes(command)) {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        platform: { type: "string" },
+        "chat-id": { type: "string" },
+        "thread-id": { type: "string" },
+        "user-id": { type: "string" },
+        kinds: { type: "string" },
+        secret: { type: "string" },
+        "clear-secret": { type: "boolean" },
+      },
+    });
+    const taskId = parsed.positionals[0];
+    const platform = parsed.values.platform;
+    const chatId = parsed.values["chat-id"];
+    if (!taskId || !platform || !chatId) {
+      throw new Error(`${command} requires a task id, --platform, and --chat-id`);
+    }
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      if (command === "notify-subscribe") {
+        const output = store.subscribeTask({
+          taskId,
+          platform,
+          chatId,
+          threadId: parsed.values["thread-id"],
+          userId: parsed.values["user-id"],
+          eventKinds: parsed.values.kinds?.split(",").map((kind) => kind.trim()).filter(Boolean),
+          secret: parsed.values["clear-secret"] ? null : parsed.values.secret,
+        });
+        process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+      } else {
+        const unsubscribed = store.unsubscribeTask({
+          taskId,
+          platform,
+          chatId,
+          threadId: parsed.values["thread-id"],
+        });
+        process.stdout.write(`${JSON.stringify({ taskId, unsubscribed }, null, 2)}\n`);
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "notify-list") {
+    const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      process.stdout.write(`${JSON.stringify(store.listNotificationSubscriptions(parsed.positionals[0]), null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "notify-deliver") {
+    const parsed = parseArgs({
+      args,
+      options: {
+        db: { type: "string" },
+        limit: { type: "string" },
+        "timeout-ms": { type: "string" },
+      },
+    });
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const output = await deliverNotifications(store, {
+        limit: numberOption(parsed.values.limit, 25),
+        timeoutMs: numberOption(parsed.values["timeout-ms"], 10_000),
+      });
+      process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
     return;
   }
 

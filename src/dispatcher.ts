@@ -3,6 +3,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
+import { deliverNotifications } from "./notifications.js";
 import { KanbanStore } from "./store.js";
 import type { ClaimedTask, Runtime } from "./types.js";
 import { WorkspaceManager } from "./workspaces.js";
@@ -28,6 +29,8 @@ export interface DispatcherOptions {
   heartbeatMaxStaleSeconds?: number | undefined;
   crashGraceSeconds?: number | undefined;
   rateLimitCooldownSeconds?: number | undefined;
+  notificationLimit?: number | undefined;
+  notificationTimeoutMs?: number | undefined;
   allowWrites?: boolean | undefined;
   workspaceRoot?: string | undefined;
   attachmentsRoot?: string | undefined;
@@ -220,6 +223,30 @@ function recoverAbandonedRuns(store: KanbanStore, board: string, options: Dispat
   }
 }
 
+async function deliverBoardNotifications(
+  manager: BoardManager,
+  boards: string[],
+  options: DispatcherOptions,
+): Promise<void> {
+  await Promise.all(boards.map(async (board) => {
+    const store = manager.openStore(board);
+    try {
+      const results = await deliverNotifications(store, {
+        limit: options.notificationLimit ?? 25,
+        timeoutMs: options.notificationTimeoutMs ?? 5_000,
+      });
+      for (const delivery of results) {
+        if (delivery.delivered) options.onLog?.(`notified ${delivery.taskId}: ${delivery.eventKind}`);
+        else options.onLog?.(`notification failed ${delivery.taskId}: ${delivery.error ?? "unknown error"}`);
+      }
+    } catch (error) {
+      options.onLog?.(`notification sweep failed for ${board}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      store.close();
+    }
+  }));
+}
+
 async function runClaim(
   store: KanbanStore,
   claim: ClaimedTask,
@@ -332,6 +359,7 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
       const boards = options.board
         ? [manager.resolve(options.board)]
         : manager.list().filter((board) => !board.archived).map((board) => board.slug);
+      await deliverBoardNotifications(manager, boards, options);
       let foundInPass = true;
       while (!options.signal?.aborted && active.size < maxWorkers && foundInPass) {
         foundInPass = false;
@@ -376,6 +404,7 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
 
       if (options.once) {
         await Promise.all(active);
+        await deliverBoardNotifications(manager, boards, options);
         break;
       }
       if (options.signal?.aborted) break;

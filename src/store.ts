@@ -90,6 +90,34 @@ type EventRow = {
   created_at: string;
 };
 
+type NotificationSubscriptionRow = {
+  id: string;
+  task_id: string;
+  platform: string;
+  chat_id: string;
+  thread_id: string;
+  user_id: string | null;
+  event_kinds_json: string;
+  secret: string | null;
+  last_event_id: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type NotificationDeliveryRow = {
+  id: string;
+  subscription_id: string;
+  event_id: number;
+  status: "pending" | "delivering" | "delivered";
+  attempts: number;
+  lease_token: string | null;
+  lease_expires_at: string | null;
+  next_attempt_at: string;
+  last_error: string | null;
+  delivered_at: string | null;
+  created_at: string;
+};
+
 type AttachmentRow = {
   id: string;
   task_id: string;
@@ -179,6 +207,32 @@ export interface BulkMutation {
 export interface BulkResult {
   ok: Array<{ id: string; value: unknown }>;
   errors: Array<{ id: string; error: string }>;
+}
+
+export const TERMINAL_NOTIFICATION_KINDS = ["completed", "blocked", "gave_up", "crashed", "timed_out"] as const;
+
+export interface NotificationSubscription {
+  id: string;
+  taskId: string;
+  platform: string;
+  chatId: string;
+  threadId: string | null;
+  userId: string | null;
+  eventKinds: string[];
+  hasSecret: boolean;
+  lastEventId: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClaimedNotificationDelivery {
+  id: string;
+  leaseToken: string;
+  subscription: NotificationSubscription;
+  secret: string | null;
+  event: TaskEvent;
+  task: Task;
+  attempts: number;
 }
 
 const BLOCK_RECURRENCE_LIMIT = 2;
@@ -340,6 +394,22 @@ function attachmentFromRow(row: AttachmentRow): Attachment {
   };
 }
 
+function notificationSubscriptionFromRow(row: NotificationSubscriptionRow): NotificationSubscription {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    platform: row.platform,
+    chatId: row.chat_id,
+    threadId: row.thread_id || null,
+    userId: row.user_id,
+    eventKinds: JSON.parse(row.event_kinds_json) as string[],
+    hasSecret: row.secret !== null,
+    lastEventId: row.last_event_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export class KanbanStore {
   readonly dbPath: string;
   readonly board: string;
@@ -371,7 +441,7 @@ export class KanbanStore {
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 3");
+    this.db.exec("PRAGMA user_version = 4");
   }
 
   private createLatestSchema(): void {
@@ -466,6 +536,36 @@ export class KanbanStore {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS notification_subscriptions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        platform TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT,
+        event_kinds_json TEXT NOT NULL,
+        secret TEXT,
+        last_event_id INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(task_id, platform, chat_id, thread_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS notification_deliveries (
+        id TEXT PRIMARY KEY,
+        subscription_id TEXT NOT NULL REFERENCES notification_subscriptions(id) ON DELETE CASCADE,
+        event_id INTEGER NOT NULL REFERENCES task_events(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'delivering', 'delivered')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        delivered_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(subscription_id, event_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_queue
         ON tasks(board, status, scheduled_at, runtime, priority DESC, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
@@ -473,6 +573,10 @@ export class KanbanStore {
       CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
       CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_notification_subscriptions_task
+        ON notification_subscriptions(task_id, platform, chat_id);
+      CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due
+        ON notification_deliveries(status, next_attempt_at, lease_expires_at);
     `);
   }
 
@@ -844,6 +948,9 @@ export class KanbanStore {
       values.push(now(), taskId);
       this.db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...values);
       this.appendEvent(taskId, "updated", input as Record<string, unknown>);
+      if (input.status === "archived") {
+        this.db.prepare("DELETE FROM notification_subscriptions WHERE task_id = ?").run(taskId);
+      }
       if (reclaimedRunId && input.status && !["done", "blocked"].includes(input.status)) {
         this.appendEvent(taskId, "reclaimed", { status: input.status }, reclaimedRunId);
       }
@@ -1004,6 +1111,268 @@ export class KanbanStore {
     return rows.map(eventFromRow);
   }
 
+  subscribeTask(input: {
+    taskId: string;
+    platform: string;
+    chatId: string;
+    threadId?: string | null | undefined;
+    userId?: string | null | undefined;
+    eventKinds?: string[] | undefined;
+    secret?: string | null | undefined;
+  }): NotificationSubscription {
+    const platform = input.platform.trim().toLowerCase();
+    const chatId = input.chatId.trim();
+    const threadId = input.threadId?.trim() || "";
+    const userId = input.userId?.trim() || null;
+    const eventKinds = [...new Set(input.eventKinds ?? [...TERMINAL_NOTIFICATION_KINDS])]
+      .map((kind) => kind.trim())
+      .filter(Boolean);
+    if (!platform) throw new Error("Notification platform cannot be empty");
+    if (!chatId) throw new Error("Notification chat id cannot be empty");
+    if (eventKinds.length === 0) throw new Error("At least one notification event kind is required");
+    let subscriptionId = "";
+    this.write(() => {
+      const task = this.requireTaskRow(input.taskId);
+      if (["done", "archived"].includes(task.status)) {
+        throw new Error(`Cannot subscribe to a ${task.status} task`);
+      }
+      const existing = this.db
+        .prepare(`
+          SELECT * FROM notification_subscriptions
+          WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+        `)
+        .get(input.taskId, platform, chatId, threadId) as NotificationSubscriptionRow | undefined;
+      const timestamp = now();
+      if (existing) {
+        subscriptionId = existing.id;
+        this.db
+          .prepare(`
+            UPDATE notification_subscriptions
+            SET user_id = ?, event_kinds_json = ?, secret = ?, updated_at = ?
+            WHERE id = ?
+          `)
+          .run(
+            userId,
+            JSON.stringify(eventKinds),
+            input.secret === undefined ? existing.secret : input.secret,
+            timestamp,
+            existing.id,
+          );
+        return;
+      }
+      subscriptionId = newId("nsub");
+      const latest = this.db
+        .prepare("SELECT COALESCE(MAX(id), 0) AS id FROM task_events WHERE task_id = ?")
+        .get(input.taskId) as { id: number };
+      this.db
+        .prepare(`
+          INSERT INTO notification_subscriptions(
+            id, task_id, platform, chat_id, thread_id, user_id, event_kinds_json,
+            secret, last_event_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          subscriptionId,
+          input.taskId,
+          platform,
+          chatId,
+          threadId,
+          userId,
+          JSON.stringify(eventKinds),
+          input.secret ?? null,
+          latest.id,
+          timestamp,
+          timestamp,
+        );
+    });
+    const row = this.db
+      .prepare("SELECT * FROM notification_subscriptions WHERE id = ?")
+      .get(subscriptionId) as NotificationSubscriptionRow;
+    return notificationSubscriptionFromRow(row);
+  }
+
+  listNotificationSubscriptions(taskId?: string): NotificationSubscription[] {
+    if (taskId) this.requireTaskRow(taskId);
+    const rows = (taskId
+      ? this.db.prepare("SELECT * FROM notification_subscriptions WHERE task_id = ? ORDER BY created_at").all(taskId)
+      : this.db.prepare(`
+          SELECT s.* FROM notification_subscriptions s
+          JOIN tasks t ON t.id = s.task_id
+          WHERE t.board = ? ORDER BY s.created_at
+        `).all(this.board)) as unknown as NotificationSubscriptionRow[];
+    return rows.map(notificationSubscriptionFromRow);
+  }
+
+  unsubscribeTask(input: {
+    taskId: string;
+    platform: string;
+    chatId: string;
+    threadId?: string | null | undefined;
+  }): boolean {
+    return this.write(() => {
+      this.requireTaskRow(input.taskId);
+      const deleted = this.db
+        .prepare(`
+          DELETE FROM notification_subscriptions
+          WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+        `)
+        .run(
+          input.taskId,
+          input.platform.trim().toLowerCase(),
+          input.chatId.trim(),
+          input.threadId?.trim() || "",
+        );
+      return deleted.changes > 0;
+    });
+  }
+
+  claimNotificationDeliveries(limit = 25, leaseSeconds = 30): ClaimedNotificationDelivery[] {
+    const claimed: ClaimedNotificationDelivery[] = [];
+    this.write(() => {
+      this.db.prepare(`
+        DELETE FROM notification_subscriptions
+        WHERE task_id IN (SELECT id FROM tasks WHERE board = ? AND status = 'archived')
+      `).run(this.board);
+      const subscriptions = this.db
+        .prepare(`
+          SELECT s.* FROM notification_subscriptions s
+          JOIN tasks t ON t.id = s.task_id
+          WHERE t.board = ? ORDER BY s.created_at
+        `)
+        .all(this.board) as unknown as NotificationSubscriptionRow[];
+      for (const subscription of subscriptions) {
+        const kinds = JSON.parse(subscription.event_kinds_json) as string[];
+        if (kinds.length === 0) continue;
+        const event = this.db
+          .prepare(`
+            SELECT e.* FROM task_events e
+            WHERE e.task_id = ? AND e.id > ? AND e.kind IN (${kinds.map(() => "?").join(", ")})
+              AND NOT EXISTS (
+                SELECT 1 FROM notification_deliveries d
+                WHERE d.subscription_id = ? AND d.event_id = e.id
+              )
+            ORDER BY e.id ASC LIMIT 1
+          `)
+          .get(subscription.task_id, subscription.last_event_id, ...kinds, subscription.id) as EventRow | undefined;
+        if (event) {
+          const timestamp = now();
+          this.db
+            .prepare(`
+              INSERT OR IGNORE INTO notification_deliveries(
+                id, subscription_id, event_id, status, attempts, next_attempt_at, created_at
+              ) VALUES (?, ?, ?, 'pending', 0, ?, ?)
+            `)
+            .run(newId("ndel"), subscription.id, event.id, timestamp, timestamp);
+        }
+      }
+
+      this.db.prepare(`
+        DELETE FROM notification_subscriptions
+        WHERE task_id IN (SELECT id FROM tasks WHERE board = ? AND status = 'done')
+          AND NOT EXISTS (
+            SELECT 1 FROM notification_deliveries d
+            WHERE d.subscription_id = notification_subscriptions.id AND d.status <> 'delivered'
+          )
+      `).run(this.board);
+
+      const timestamp = now();
+      const due = this.db
+        .prepare(`
+          SELECT d.* FROM notification_deliveries d
+          JOIN notification_subscriptions s ON s.id = d.subscription_id
+          JOIN tasks t ON t.id = s.task_id
+          WHERE t.board = ? AND (
+            (d.status = 'pending' AND d.next_attempt_at <= ?) OR
+            (d.status = 'delivering' AND d.lease_expires_at <= ?)
+          )
+          ORDER BY d.created_at, d.event_id
+        `)
+        .all(this.board, timestamp, timestamp) as unknown as NotificationDeliveryRow[];
+      const seenSubscriptions = new Set<string>();
+      for (const delivery of due) {
+        if (claimed.length >= Math.max(1, Math.min(limit, 500))) break;
+        if (seenSubscriptions.has(delivery.subscription_id)) continue;
+        const leaseToken = randomBytes(24).toString("base64url");
+        const leaseExpiresAt = futureIso(Math.max(1, leaseSeconds));
+        const changed = this.db
+          .prepare(`
+            UPDATE notification_deliveries
+            SET status = 'delivering', attempts = attempts + 1, lease_token = ?, lease_expires_at = ?
+            WHERE id = ? AND (
+              (status = 'pending' AND next_attempt_at <= ?) OR
+              (status = 'delivering' AND lease_expires_at <= ?)
+            )
+          `)
+          .run(leaseToken, leaseExpiresAt, delivery.id, timestamp, timestamp);
+        if (changed.changes !== 1) continue;
+        const subscription = this.db
+          .prepare("SELECT * FROM notification_subscriptions WHERE id = ?")
+          .get(delivery.subscription_id) as NotificationSubscriptionRow;
+        const event = this.db.prepare("SELECT * FROM task_events WHERE id = ?").get(delivery.event_id) as EventRow;
+        const task = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(subscription.task_id) as TaskRow;
+        claimed.push({
+          id: delivery.id,
+          leaseToken,
+          subscription: notificationSubscriptionFromRow(subscription),
+          secret: subscription.secret,
+          event: eventFromRow(event),
+          task: taskFromRow(task),
+          attempts: delivery.attempts + 1,
+        });
+        seenSubscriptions.add(delivery.subscription_id);
+      }
+    });
+    return claimed;
+  }
+
+  resolveNotificationDelivery(
+    deliveryId: string,
+    leaseToken: string,
+    result: { error?: string | undefined },
+  ): void {
+    this.write(() => {
+      const delivery = this.db
+        .prepare("SELECT * FROM notification_deliveries WHERE id = ?")
+        .get(deliveryId) as NotificationDeliveryRow | undefined;
+      if (!delivery) return;
+      if (delivery.status !== "delivering" || delivery.lease_token !== leaseToken) {
+        throw new Error(`Notification delivery lease is no longer active: ${deliveryId}`);
+      }
+      const timestamp = now();
+      if (result.error === undefined) {
+        const event = this.db.prepare("SELECT * FROM task_events WHERE id = ?").get(delivery.event_id) as EventRow;
+        this.db
+          .prepare(`
+            UPDATE notification_deliveries
+            SET status = 'delivered', delivered_at = ?, lease_token = NULL,
+                lease_expires_at = NULL, last_error = NULL
+            WHERE id = ?
+          `)
+          .run(timestamp, deliveryId);
+        this.db
+          .prepare(`
+            UPDATE notification_subscriptions
+            SET last_event_id = MAX(last_event_id, ?), updated_at = ?
+            WHERE id = ?
+          `)
+          .run(delivery.event_id, timestamp, delivery.subscription_id);
+        if (["completed", "archived"].includes(event.kind)) {
+          this.db.prepare("DELETE FROM notification_subscriptions WHERE id = ?").run(delivery.subscription_id);
+        }
+        return;
+      }
+      const delaySeconds = Math.min(300, 2 ** Math.min(delivery.attempts, 8));
+      this.db
+        .prepare(`
+          UPDATE notification_deliveries
+          SET status = 'pending', lease_token = NULL, lease_expires_at = NULL,
+              next_attempt_at = ?, last_error = ?
+          WHERE id = ?
+        `)
+        .run(futureIso(delaySeconds), result.error.slice(0, 2_000), deliveryId);
+    });
+  }
+
   buildWorkerContext(taskId: string): string {
     const detail = this.getTask(taskId);
     const lines = [
@@ -1144,6 +1513,7 @@ export class KanbanStore {
         .prepare("UPDATE tasks SET status = 'archived', current_run_id = NULL, updated_at = ? WHERE id = ?")
         .run(now(), taskId);
       this.appendEvent(taskId, "archived", null, runId);
+      this.db.prepare("DELETE FROM notification_subscriptions WHERE task_id = ?").run(taskId);
     });
     return this.getTask(taskId);
   }

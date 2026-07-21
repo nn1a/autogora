@@ -157,6 +157,34 @@ node dist/cli.js bulk <task-a> <task-b> --assignee reviewer --priority 10
 node dist/cli.js gc --event-retention-days 30 --log-retention-days 30
 ```
 
+## Notifications
+
+Task-scoped subscriptions follow the Hermes platform/chat/thread model and
+default to `completed`, `blocked`, `gave_up`, `crashed`, and `timed_out`
+events. The dispatcher polls and delivers them in the background; a one-shot
+delivery pass is also available for cron and diagnostics.
+
+The standalone bundled adapter uses `platform=webhook` with the endpoint URL in
+`--chat-id`. An optional secret signs the exact JSON body with HMAC-SHA256 in
+`X-Kanban-Signature`. Delivery leases prevent concurrent dispatchers from
+claiming the same event, failures use bounded backoff, and a completion or
+archive removes the subscription automatically.
+
+```bash
+node dist/cli.js notify-subscribe <task-id> \
+  --platform webhook --chat-id https://example.com/hooks/kanban \
+  --thread-id release --secret "$KANBAN_WEBHOOK_SECRET"
+node dist/cli.js notify-list <task-id>
+node dist/cli.js notify-deliver
+node dist/cli.js notify-unsubscribe <task-id> \
+  --platform webhook --chat-id https://example.com/hooks/kanban \
+  --thread-id release
+```
+
+Additional messaging platforms can register the exported notification adapter
+interface without changing the board kernel. Stored secrets are never returned
+by CLI or MCP reads.
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
@@ -166,6 +194,7 @@ node dist/cli.js gc --event-retention-days 30 --log-retention-days 30
 - Attachments: `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_attachment_remove`
 - Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
 - Administration: `kanban_bulk`, `kanban_gc`
+- Notifications: `kanban_notify_subscribe`, `kanban_notify_list`, `kanban_notify_unsubscribe`, `kanban_notify_deliver`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope
@@ -195,4 +224,4 @@ Restart the client if it does not detect the new skills.
 - `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
 - The server is local stdio only; there is no remote authentication or multi-user isolation.
 - SQLite and PID recovery assume one host; cross-host dispatch is intentionally unsupported.
-- The dashboard, notification delivery, triage decomposition, goal continuation, and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.
+- The dashboard, triage decomposition, goal continuation, and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.
