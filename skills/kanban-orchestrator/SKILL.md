@@ -14,7 +14,7 @@ Use Kanban MCP to turn a goal into a small dependency graph that workers can exe
 3. Create each card with:
    - an outcome-oriented title;
    - a body containing scope, constraints, acceptance criteria, and expected evidence;
-   - an explicit `assignee`, `runtime` (`claude` or `codex`), and `workspace`;
+   - an explicit `assignee`, `runtime` (`claude` or `codex`), and workspace policy (`scratch`, `dir:<absolute-path>`, or `worktree`);
    - `parents` when the task consumes another card's result.
 4. Use `kanban_link` only for dependencies discovered after creation. Cycles are invalid.
 5. Call `kanban_show` on the created cards and check that roots are `ready` and gated children are `todo`.
@@ -24,6 +24,7 @@ Do not claim or implement cards while acting as orchestrator. The dispatcher own
 ## Routing guidelines
 
 - Route code modification and repository automation to a worker with a writable workspace.
+- Keep every graph on one board; workers are pinned to that board and cross-board links are invalid.
 - Keep research and review cards read-only when possible.
 - A child must be able to continue from parent completion summaries and metadata; never rely on the orchestrator's private conversation.
 - Use priority to order otherwise-ready work, not to bypass dependencies.

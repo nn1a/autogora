@@ -97,6 +97,19 @@ node dist/cli.js boards rm project-api       # recoverable archive
 Use `boards rm <slug> --delete` only when permanent removal is intended. The
 `default` board cannot be removed.
 
+## Workspaces
+
+- `scratch` (default): isolated under the board workspace root and removed only
+  after successful completion and artifact capture.
+- `dir:/absolute/path`: uses and preserves an existing trusted directory.
+- `worktree`: creates and preserves a Git worktree under the board workspace
+  root. Set a board `default-workdir` to the source repository and optionally
+  pass `--branch` on task creation.
+- `worktree:/absolute/target`: pins the worktree destination explicitly.
+
+Relative `dir:` and explicit worktree paths are rejected. Dispatcher runs record
+their resolved workspace, worker PID, and log path in attempt history.
+
 ## Attachments and artifacts
 
 Files are copied into the active board's durable attachment root and limited to

@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { BoardManager } from "./boards.js";
 import { KanbanStore } from "./store.js";
 import type { ClaimedTask, Runtime } from "./types.js";
+import { WorkspaceManager } from "./workspaces.js";
 
 export interface RunnerCommand {
   command: string;
@@ -21,6 +22,9 @@ export interface DispatcherOptions {
   intervalMs?: number | undefined;
   maxWorkers?: number | undefined;
   allowWrites?: boolean | undefined;
+  workspaceRoot?: string | undefined;
+  attachmentsRoot?: string | undefined;
+  logsRoot?: string | undefined;
   signal?: AbortSignal | undefined;
   onLog?: ((message: string) => void) | undefined;
 }
@@ -50,7 +54,10 @@ function codexConfigString(value: string): string {
 
 export function buildRunnerCommand(
   claim: ClaimedTask,
-  options: Pick<DispatcherOptions, "dbPath" | "cliEntry" | "allowWrites">,
+  options: Pick<
+    DispatcherOptions,
+    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot"
+  >,
 ): RunnerCommand {
   const task = claim.task.task;
   const cwd = task.workspace ? (isAbsolute(task.workspace) ? task.workspace : resolve(task.workspace)) : process.cwd();
@@ -64,6 +71,10 @@ export function buildRunnerCommand(
     KANBAN_CLAIM_TOKEN: claim.claimToken,
     KANBAN_WORKER_ID: claim.run.workerId,
     KANBAN_TENANT: task.tenant ?? "",
+    KANBAN_WORKSPACE: cwd,
+    KANBAN_WORKSPACES_ROOT: options.workspaceRoot,
+    KANBAN_ATTACHMENTS_ROOT: options.attachmentsRoot,
+    KANBAN_LOGS_ROOT: options.logsRoot,
   };
   const prompt = workerPrompt(claim);
 
@@ -154,12 +165,30 @@ async function runClaim(
   options: DispatcherOptions,
   children: Set<ChildProcess>,
   logsDir: string,
+  workspaces: WorkspaceManager,
+  workspaceRoot: string,
+  attachmentsRoot: string,
 ): Promise<void> {
-  const command = buildRunnerCommand(claim, options);
+  const scope = { runId: claim.run.id, claimToken: claim.claimToken };
+  let preparedClaim: ClaimedTask;
+  try {
+    preparedClaim = workspaces.prepare(store, claim);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    store.failRun(scope, `Workspace preparation failed: ${message}`);
+    options.onLog?.(`workspace failure ${claim.task.task.id}: ${message}`);
+    return;
+  }
+  const command = buildRunnerCommand(preparedClaim, {
+    ...options,
+    workspaceRoot,
+    attachmentsRoot,
+    logsRoot: logsDir,
+  });
   mkdirSync(logsDir, { recursive: true });
-  const logPath = join(logsDir, `${claim.task.task.id}-${claim.run.id}.log`);
+  const logPath = join(logsDir, `${preparedClaim.task.task.id}-${preparedClaim.run.id}.log`);
   const logStream = createWriteStream(logPath, { flags: "a" });
-  options.onLog?.(`launch ${claim.task.task.id} via ${claim.task.task.runtime}; log=${logPath}`);
+  options.onLog?.(`launch ${preparedClaim.task.task.id} via ${preparedClaim.task.task.runtime}; log=${logPath}`);
 
   await new Promise<void>((resolveRun) => {
     const child = spawn(command.command, command.args, {
@@ -168,6 +197,7 @@ async function runClaim(
       stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
+    if (child.pid !== undefined) store.recordSpawn(scope, child.pid, logPath);
     child.stdout?.pipe(logStream, { end: false });
     child.stderr?.pipe(logStream, { end: false });
     let spawnError: Error | null = null;
@@ -177,13 +207,20 @@ async function runClaim(
     child.once("close", (code, signal) => {
       children.delete(child);
       logStream.end();
-      const current = store.getTask(claim.task.task.id).task;
-      if (current.status === "running" && current.currentRunId === claim.run.id) {
+      const current = store.getTask(preparedClaim.task.task.id).task;
+      if (current.status === "running" && current.currentRunId === preparedClaim.run.id) {
         const detail = spawnError?.message ?? `Runner exited without a terminal Kanban call (code=${code}, signal=${signal ?? "none"})`;
-        store.failRun({ runId: claim.run.id, claimToken: claim.claimToken }, detail);
+        store.failRun(scope, detail);
         options.onLog?.(`requeue/fail ${current.id}: ${detail}`);
       } else {
         options.onLog?.(`finish ${current.id}: ${current.status}`);
+        if (current.status === "done") {
+          try {
+            workspaces.cleanup(current);
+          } catch (error) {
+            options.onLog?.(`workspace cleanup failed ${current.id}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
       }
       resolveRun();
     });
@@ -192,6 +229,7 @@ async function runClaim(
 
 export async function runDispatcher(options: DispatcherOptions): Promise<void> {
   const manager = new BoardManager(options.dbPath);
+  const workspaces = new WorkspaceManager(manager);
   const active = new Set<Promise<void>>();
   const children = new Set<ChildProcess>();
   const maxWorkers = Math.max(1, options.maxWorkers ?? 2);
@@ -227,7 +265,16 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
           foundInPass = true;
           launched = true;
           let running: Promise<void>;
-          running = runClaim(store, claim, options, children, manager.logsRoot(board)).finally(() => {
+          running = runClaim(
+            store,
+            claim,
+            options,
+            children,
+            manager.logsRoot(board),
+            workspaces,
+            manager.workspaceRoot(board),
+            manager.attachmentsRoot(board),
+          ).finally(() => {
             store.close();
             active.delete(running);
           });

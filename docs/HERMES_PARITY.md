@@ -38,10 +38,11 @@ Authoritative references:
 
 ### Workspaces and artifacts
 
-- [ ] `scratch`, `dir:<path>`, `worktree`, and `worktree:<path>` workspaces
-- [ ] Optional git branch and preserved worktree lifecycle
+- [x] `scratch`, `dir:<path>`, `worktree`, and `worktree:<path>` workspaces
+- [x] Optional git branch and preserved worktree lifecycle
 - [x] Durable file and URL attachments with a 25 MB upload limit
 - [x] Completion artifact validation and durable capture
+- [x] Successful scratch cleanup with preserved dir/worktree workspaces
 - [ ] Garbage collection for scratch workspaces, old events, and logs
 
 ### Dispatcher resilience

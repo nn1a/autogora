@@ -1186,6 +1186,34 @@ export class KanbanStore {
     return runFromRow(row);
   }
 
+  bindRunWorkspace(
+    scope: RunScope,
+    workspace: string,
+    kind: "scratch" | "dir" | "worktree",
+  ): TaskDetail {
+    let taskId = "";
+    this.write(() => {
+      const { task, run } = this.requireActiveRun(scope);
+      taskId = task.id;
+      const path = resolve(workspace);
+      this.db
+        .prepare("UPDATE tasks SET workspace = ?, workspace_kind = ?, updated_at = ? WHERE id = ?")
+        .run(path, kind, now(), task.id);
+      this.appendEvent(task.id, "workspace_prepared", { path, kind }, run.id);
+    });
+    return this.getTask(taskId);
+  }
+
+  recordSpawn(scope: RunScope, pid: number, logPath: string): Run {
+    this.write(() => {
+      const { task, run } = this.requireActiveRun(scope);
+      this.db.prepare("UPDATE task_runs SET pid = ?, log_path = ? WHERE id = ?").run(pid, resolve(logPath), run.id);
+      this.appendEvent(task.id, "spawned", { pid, logPath: resolve(logPath) }, run.id);
+    });
+    const row = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(scope.runId) as RunRow;
+    return runFromRow(row);
+  }
+
   completeRun(
     scope: RunScope,
     summaryOrInput: string | CompletionInput,

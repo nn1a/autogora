@@ -69,6 +69,8 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
       assert.equal(completed.task.status, "done");
       assert.equal(completed.runs[0]?.summary, "fake worker completed");
       assert.equal(completed.runs[0]?.metadata?.verification?.[0], "dispatcher-e2e");
+      assert.ok(completed.runs[0]?.pid);
+      assert.ok(completed.runs[0]?.logPath);
     } finally {
       check.close();
     }

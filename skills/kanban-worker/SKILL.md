@@ -10,12 +10,12 @@ Treat Kanban MCP as the canonical task state. Finish the assigned work and leave
 ## Workflow
 
 1. Call `kanban_show` without `task_id`. Read the body, parent results, comments, prior runs, and workspace constraints.
-2. Work only on that task in the current workspace. Do not claim, create, reassign, link, unblock, or update unrelated cards.
+2. Work only on that task under `$KANBAN_WORKSPACE`. Read task attachments from the absolute paths returned by `kanban_show`. Do not claim, create, reassign, link, unblock, or update unrelated cards.
 3. For long work, call `kanban_heartbeat` after meaningful checkpoints. Use `kanban_comment` for intermediate findings another run must retain.
 4. Verify the acceptance criteria. For code, run focused tests and inspect the final diff.
 5. Terminate exactly once:
-   - Call `kanban_complete` only when the result is usable and verified.
-   - Call `kanban_block` when human input, a missing capability, or an unresolved external dependency prevents completion.
+   - Call `kanban_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$KANBAN_WORKSPACE` and must exist.
+   - Call `kanban_block` with `kind=dependency`, `needs_input`, `capability`, or `transient` when work cannot continue.
 
 Do not finish with prose alone. A dispatcher treats exit without `kanban_complete` or `kanban_block` as a failed run.
 
