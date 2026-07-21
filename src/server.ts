@@ -450,6 +450,68 @@ export function createKanbanServer(manager: BoardManager): McpServer {
   );
 
   server.registerTool(
+    "kanban_attach",
+    {
+      title: "Attach file to Kanban task",
+      description: "Copy a local file up to 25 MB into durable board-scoped attachment storage.",
+      inputSchema: z.object({
+        task_id: z.string().optional(),
+        board: z.string().optional(),
+        path: z.string().min(1),
+        name: z.string().min(1).optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ task_id, board, path, name }) =>
+      result(usingStore(manager, board, (store) => store.attachFile(scopedTaskId(task_id), path, name))),
+  );
+
+  server.registerTool(
+    "kanban_attach_url",
+    {
+      title: "Attach URL to Kanban task",
+      description: "Add an http(s) reference to the durable task attachment list.",
+      inputSchema: z.object({
+        task_id: z.string().optional(),
+        board: z.string().optional(),
+        url: z.string().url(),
+        name: z.string().min(1).optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ task_id, board, url, name }) =>
+      result(usingStore(manager, board, (store) => store.attachUrl(scopedTaskId(task_id), url, name))),
+  );
+
+  server.registerTool(
+    "kanban_attachments",
+    {
+      title: "List Kanban attachments",
+      description: "List durable file paths and URL references attached to a task.",
+      inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, board }) =>
+      result(usingStore(manager, board, (store) => store.listAttachments(scopedTaskId(task_id)))),
+  );
+
+  server.registerTool(
+    "kanban_attachment_remove",
+    {
+      title: "Remove Kanban attachment",
+      description: "Remove attachment metadata and its stored file, when applicable.",
+      inputSchema: z.object({
+        task_id: z.string().optional(),
+        board: z.string().optional(),
+        attachment_id: z.string(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ task_id, board, attachment_id }) =>
+      result(usingStore(manager, board, (store) => store.removeAttachment(scopedTaskId(task_id), attachment_id))),
+  );
+
+  server.registerTool(
     "kanban_heartbeat",
     {
       title: "Heartbeat Kanban run",
@@ -478,12 +540,13 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         summary: z.string().min(1).optional(),
         result: z.string().min(1).optional(),
         metadata: z.record(z.string(), z.unknown()).optional(),
+        artifacts: z.array(z.string().min(1)).default([]),
       }).refine((input) => Boolean(input.summary || input.result), "summary or result is required"),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ run_id, claim_token, board, summary, result: taskResult, metadata }) =>
+    async ({ run_id, claim_token, board, summary, result: taskResult, metadata, artifacts }) =>
       result(usingStore(manager, board, (store) =>
-        store.completeRun(scopedRun(run_id, claim_token), { summary, result: taskResult, metadata })
+        store.completeRun(scopedRun(run_id, claim_token), { summary, result: taskResult, metadata, artifacts })
       )),
   );
 

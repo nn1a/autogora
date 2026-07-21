@@ -30,6 +30,10 @@ Commands:
   link <parent> <child> Add a dependency
   unlink <parent> <child> Remove a dependency
   comment <id> <text>   Append a durable comment
+  attach <id> <path>    Copy a file into durable attachment storage
+  attach-url <id> <url> Attach an HTTP(S) reference
+  attachments <id>      List task attachments
+  attach-rm <id> <aid>  Remove an attachment
   complete <id>...      Complete one or more tasks
   block <id> <reason>   Block a task with an optional typed reason
   unblock <id>...       Return blocked tasks to the work queue
@@ -432,6 +436,29 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (["attach", "attach-url", "attachments", "attach-rm"].includes(command)) {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { db: { type: "string" }, name: { type: "string" } },
+    });
+    const [taskId, value] = parsed.positionals;
+    if (!taskId) throw new Error(`${command} requires a task id`);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      let output: unknown;
+      if (command === "attachments") output = store.listAttachments(taskId);
+      else if (!value) throw new Error(`${command} requires a path, URL, or attachment id`);
+      else if (command === "attach") output = store.attachFile(taskId, value, parsed.values.name);
+      else if (command === "attach-url") output = store.attachUrl(taskId, value, parsed.values.name);
+      else output = store.removeAttachment(taskId, value);
+      process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
   if (command === "complete") {
     const parsed = parseArgs({
       args,
@@ -441,10 +468,14 @@ async function main(): Promise<void> {
         summary: { type: "string" },
         result: { type: "string" },
         metadata: { type: "string" },
+        artifact: { type: "string", multiple: true },
       },
     });
     if (parsed.positionals.length === 0) throw new Error("complete requires at least one task id");
-    if (parsed.positionals.length > 1 && (parsed.values.summary || parsed.values.result || parsed.values.metadata)) {
+    if (
+      parsed.positionals.length > 1 &&
+      (parsed.values.summary || parsed.values.result || parsed.values.metadata || parsed.values.artifact)
+    ) {
       throw new Error("Structured completion handoff is only allowed for one task at a time");
     }
     const store = openTaskStore(parsed.values.db, globalBoard);
@@ -454,6 +485,7 @@ async function main(): Promise<void> {
           summary: parsed.values.summary,
           result: parsed.values.result,
           metadata: parseMetadata(parsed.values.metadata),
+          artifacts: parsed.values.artifact,
         })
       );
       process.stdout.write(`${JSON.stringify(completed, null, 2)}\n`);

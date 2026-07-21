@@ -97,12 +97,29 @@ node dist/cli.js boards rm project-api       # recoverable archive
 Use `boards rm <slug> --delete` only when permanent removal is intended. The
 `default` board cannot be removed.
 
+## Attachments and artifacts
+
+Files are copied into the active board's durable attachment root and limited to
+25 MB each. HTTP(S) references are stored without downloading them.
+
+```bash
+node dist/cli.js attach <task-id> ./requirements.pdf
+node dist/cli.js attach-url <task-id> https://example.com/design --name "Design"
+node dist/cli.js attachments <task-id>
+```
+
+Workers can declare relative deliverables in `kanban_complete` through its
+`artifacts` array. Every path must exist before the task can become `done`; the
+server copies valid artifacts into durable storage and records them in run
+metadata.
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
 - Boards: `kanban_boards_list`, `kanban_boards_create`, `kanban_boards_update`, `kanban_boards_switch`, `kanban_boards_remove`
 - Dispatch: `kanban_claim`
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
+- Attachments: `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_attachment_remove`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope

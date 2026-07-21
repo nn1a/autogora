@@ -1,6 +1,6 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import {
@@ -8,6 +8,7 @@ import {
   RUNTIMES,
   TASK_STATUSES,
   type ClaimedTask,
+  type Attachment,
   type BlockKind,
   type Comment,
   type CreateTaskInput,
@@ -88,6 +89,19 @@ type EventRow = {
   created_at: string;
 };
 
+type AttachmentRow = {
+  id: string;
+  task_id: string;
+  kind: "file" | "url";
+  name: string;
+  media_type: string | null;
+  size: number | null;
+  sha256: string | null;
+  path: string | null;
+  url: string | null;
+  created_at: string;
+};
+
 export interface UpdateTaskInput {
   title?: string | undefined;
   body?: string | undefined;
@@ -117,6 +131,7 @@ export interface CompletionInput {
   summary?: string | undefined;
   result?: string | undefined;
   metadata?: Record<string, unknown> | undefined;
+  artifacts?: string[] | undefined;
 }
 
 export interface BlockInput {
@@ -125,6 +140,7 @@ export interface BlockInput {
 }
 
 const BLOCK_RECURRENCE_LIMIT = 2;
+export const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
 function now(): string {
   return new Date().toISOString();
@@ -150,6 +166,32 @@ function workspaceKind(workspace: string | null | undefined, explicit?: "scratch
   if (!workspace || workspace === "scratch") return "scratch" as const;
   if (workspace === "worktree" || workspace.startsWith("worktree:")) return "worktree" as const;
   return "dir" as const;
+}
+
+function mediaTypeFor(name: string): string | null {
+  const extension = name.toLowerCase().split(".").pop();
+  const known: Record<string, string> = {
+    txt: "text/plain",
+    md: "text/markdown",
+    json: "application/json",
+    pdf: "application/pdf",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    csv: "text/csv",
+    html: "text/html",
+    xml: "application/xml",
+    zip: "application/zip",
+  };
+  return extension ? known[extension] ?? null : null;
+}
+
+function cleanAttachmentName(value: string): string {
+  const name = basename(value).replaceAll("\0", "").trim();
+  if (!name || name === "." || name === "..") throw new Error("Attachment name cannot be empty");
+  return name.slice(0, 255);
 }
 
 function newId(prefix: string): string {
@@ -236,14 +278,31 @@ function eventFromRow(row: EventRow): TaskEvent {
   };
 }
 
+function attachmentFromRow(row: AttachmentRow): Attachment {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    kind: row.kind,
+    name: row.name,
+    mediaType: row.media_type,
+    size: row.size,
+    sha256: row.sha256,
+    path: row.path,
+    url: row.url,
+    createdAt: row.created_at,
+  };
+}
+
 export class KanbanStore {
   readonly dbPath: string;
   readonly board: string;
+  readonly attachmentsRoot: string;
   private readonly db: DatabaseSync;
 
-  constructor(dbPath: string, board = "default") {
+  constructor(dbPath: string, board = "default", attachmentsRoot?: string) {
     this.dbPath = dbPath === ":memory:" ? dbPath : resolve(dbPath);
     this.board = board.trim() || "default";
+    this.attachmentsRoot = resolve(attachmentsRoot ?? join(dirname(this.dbPath), "attachments"));
     if (this.dbPath !== ":memory:") mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec("PRAGMA foreign_keys = ON");
@@ -265,7 +324,7 @@ export class KanbanStore {
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 2");
+    this.db.exec("PRAGMA user_version = 3");
   }
 
   private createLatestSchema(): void {
@@ -336,6 +395,21 @@ export class KanbanStore {
         error TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS task_attachments (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('file', 'url')),
+        name TEXT NOT NULL,
+        media_type TEXT,
+        size INTEGER,
+        sha256 TEXT,
+        path TEXT,
+        url TEXT,
+        created_at TEXT NOT NULL,
+        CHECK ((kind = 'file' AND path IS NOT NULL AND url IS NULL) OR
+               (kind = 'url' AND url IS NOT NULL AND path IS NULL))
+      );
+
       CREATE TABLE IF NOT EXISTS task_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -350,6 +424,7 @@ export class KanbanStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
         ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
       CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
     `);
   }
@@ -796,6 +871,9 @@ export class KanbanStore {
     const comments = this.db
       .prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY id")
       .all(taskId) as unknown as CommentRow[];
+    const attachments = this.db
+      .prepare("SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at, id")
+      .all(taskId) as unknown as AttachmentRow[];
     const runs = this.db
       .prepare("SELECT * FROM task_runs WHERE task_id = ? ORDER BY claimed_at")
       .all(taskId) as unknown as RunRow[];
@@ -807,6 +885,7 @@ export class KanbanStore {
       parents: parents.map(taskFromRow),
       children: children.map(taskFromRow),
       comments: comments.map(commentFromRow),
+      attachments: attachments.map(attachmentFromRow),
       runs: runs.map(runFromRow),
       events: events.map(eventFromRow).reverse(),
     };
@@ -844,11 +923,14 @@ export class KanbanStore {
   }
 
   deleteTask(taskId: string): { id: string; deleted: true } {
-    return this.write(() => {
+    const result = this.write(() => {
       this.requireTaskRow(taskId);
       this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
       return { id: taskId, deleted: true as const };
     });
+    const directory = join(this.attachmentsRoot, taskId);
+    if (existsSync(directory)) rmSync(directory, { recursive: true, force: true });
+    return result;
   }
 
   promoteTask(taskId: string): TaskDetail {
@@ -893,6 +975,99 @@ export class KanbanStore {
     });
     const row = this.db.prepare("SELECT * FROM task_comments WHERE id = ?").get(id) as CommentRow;
     return commentFromRow(row);
+  }
+
+  listAttachments(taskId: string): Attachment[] {
+    this.requireTaskRow(taskId);
+    const rows = this.db
+      .prepare("SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at, id")
+      .all(taskId) as unknown as AttachmentRow[];
+    return rows.map(attachmentFromRow);
+  }
+
+  attachFile(taskId: string, sourcePath: string, displayName?: string): Attachment {
+    this.requireTaskRow(taskId);
+    const source = resolve(sourcePath);
+    if (!existsSync(source)) throw new Error(`Attachment file not found: ${source}`);
+    const stat = statSync(source);
+    if (!stat.isFile()) throw new Error(`Attachment source is not a file: ${source}`);
+    if (stat.size > ATTACHMENT_MAX_BYTES) {
+      throw new Error(`Attachment exceeds the ${ATTACHMENT_MAX_BYTES} byte limit`);
+    }
+    const id = newId("a");
+    const name = cleanAttachmentName(displayName ?? source);
+    const directory = join(this.attachmentsRoot, taskId);
+    mkdirSync(directory, { recursive: true });
+    const target = join(directory, `${id}-${name}`);
+    copyFileSync(source, target);
+    const sha256 = createHash("sha256").update(readFileSync(target)).digest("hex");
+    try {
+      this.write(() => {
+        this.requireTaskRow(taskId);
+        this.db
+          .prepare(`
+            INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
+            VALUES (?, ?, 'file', ?, ?, ?, ?, ?, NULL, ?)
+          `)
+          .run(id, taskId, name, mediaTypeFor(name), stat.size, sha256, target, now());
+        this.appendEvent(taskId, "attached", { attachmentId: id, kind: "file", name, size: stat.size });
+      });
+    } catch (error) {
+      if (existsSync(target)) unlinkSync(target);
+      throw error;
+    }
+    return attachmentFromRow(
+      this.db.prepare("SELECT * FROM task_attachments WHERE id = ?").get(id) as AttachmentRow,
+    );
+  }
+
+  attachUrl(taskId: string, rawUrl: string, displayName?: string): Attachment {
+    this.requireTaskRow(taskId);
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      throw new Error("Attachment URL must be valid");
+    }
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Attachment URL must use http or https");
+    const id = newId("a");
+    const fallbackName = basename(url.pathname) || url.hostname;
+    const name = cleanAttachmentName(displayName ?? fallbackName);
+    this.write(() => {
+      this.requireTaskRow(taskId);
+      this.db
+        .prepare(`
+          INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
+          VALUES (?, ?, 'url', ?, NULL, NULL, NULL, NULL, ?, ?)
+        `)
+        .run(id, taskId, name, url.toString(), now());
+      this.appendEvent(taskId, "attached", { attachmentId: id, kind: "url", name, url: url.toString() });
+    });
+    return attachmentFromRow(
+      this.db.prepare("SELECT * FROM task_attachments WHERE id = ?").get(id) as AttachmentRow,
+    );
+  }
+
+  removeAttachment(taskId: string, attachmentId: string): { id: string; removed: true } {
+    const row = this.db
+      .prepare("SELECT * FROM task_attachments WHERE id = ? AND task_id = ?")
+      .get(attachmentId, taskId) as AttachmentRow | undefined;
+    if (!row) throw new Error(`Attachment not found: ${attachmentId}`);
+    this.write(() => {
+      this.db.prepare("DELETE FROM task_attachments WHERE id = ? AND task_id = ?").run(attachmentId, taskId);
+      this.appendEvent(taskId, "attachment_removed", { attachmentId, name: row.name });
+    });
+    if (row.path && existsSync(row.path)) unlinkSync(row.path);
+    return { id: attachmentId, removed: true };
+  }
+
+  private captureArtifacts(task: TaskRow, artifacts: string[] | undefined): Attachment[] {
+    if (!artifacts || artifacts.length === 0) return [];
+    const workspace = task.workspace?.replace(/^(?:dir|worktree):/, "") || process.cwd();
+    return normalizeSkills(artifacts).map((artifact) => {
+      const path = isAbsolute(artifact) ? artifact : resolve(workspace, artifact);
+      return this.attachFile(task.id, path);
+    });
   }
 
   promoteDueTasks(board = this.board, at = now()): number {
@@ -1022,6 +1197,11 @@ export class KanbanStore {
     const cleanSummary = completion.summary?.trim() || completion.result?.trim() || "";
     const cleanResult = completion.result?.trim() || null;
     if (!cleanSummary) throw new Error("Completion requires a summary or result");
+    const preflight = this.requireActiveRun(scope);
+    const captured = this.captureArtifacts(preflight.task, completion.artifacts);
+    const metadata = captured.length > 0
+      ? { ...(completion.metadata ?? {}), artifacts: captured.map((attachment) => ({ id: attachment.id, name: attachment.name, path: attachment.path })) }
+      : completion.metadata;
     let taskId = "";
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
@@ -1029,7 +1209,7 @@ export class KanbanStore {
       const timestamp = now();
       this.db
         .prepare("UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?, summary = ?, metadata_json = ? WHERE id = ?")
-        .run(timestamp, timestamp, cleanSummary, completion.metadata ? JSON.stringify(completion.metadata) : null, run.id);
+        .run(timestamp, timestamp, cleanSummary, metadata ? JSON.stringify(metadata) : null, run.id);
       this.db
         .prepare(`
           UPDATE tasks
@@ -1055,6 +1235,11 @@ export class KanbanStore {
   completeTask(taskId: string, completion: CompletionInput = {}): TaskDetail {
     const cleanSummary = completion.summary?.trim() || completion.result?.trim() || "";
     const cleanResult = completion.result?.trim() || null;
+    const preflight = this.requireTaskRow(taskId);
+    const captured = preflight.status === "done" ? [] : this.captureArtifacts(preflight, completion.artifacts);
+    const metadata = captured.length > 0
+      ? { ...(completion.metadata ?? {}), artifacts: captured.map((attachment) => ({ id: attachment.id, name: attachment.name, path: attachment.path })) }
+      : completion.metadata;
     this.write(() => {
       const task = this.requireTaskRow(taskId);
       if (task.status === "archived") throw new Error("Cannot complete an archived task");
@@ -1062,12 +1247,12 @@ export class KanbanStore {
       const runId = task.current_run_id
         ? this.closeRunNoTransaction(task, "completed", {
             summary: cleanSummary || null,
-            metadata: completion.metadata ?? null,
+            metadata: metadata ?? null,
           })
-        : cleanSummary || completion.metadata
+        : cleanSummary || metadata
           ? this.syntheticRunNoTransaction(task, "completed", {
               summary: cleanSummary || null,
-              metadata: completion.metadata ?? null,
+              metadata: metadata ?? null,
             })
           : null;
       this.db

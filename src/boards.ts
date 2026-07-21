@@ -273,7 +273,7 @@ export class BoardManager {
   openStore(board?: string): KanbanStore {
     const slug = board ? normalizeBoardSlug(board) : this.getCurrent();
     if (slug !== "default" && !this.exists(slug)) throw new Error(`Board not found: ${slug}`);
-    return new KanbanStore(this.dbPath(slug), slug);
+    return new KanbanStore(this.dbPath(slug), slug, this.attachmentsRoot(slug));
   }
 }
 

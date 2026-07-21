@@ -93,6 +93,19 @@ export interface Comment {
   createdAt: string;
 }
 
+export interface Attachment {
+  id: string;
+  taskId: string;
+  kind: "file" | "url";
+  name: string;
+  mediaType: string | null;
+  size: number | null;
+  sha256: string | null;
+  path: string | null;
+  url: string | null;
+  createdAt: string;
+}
+
 export interface TaskEvent {
   id: number;
   taskId: string;
@@ -107,6 +120,7 @@ export interface TaskDetail {
   parents: Task[];
   children: Task[];
   comments: Comment[];
+  attachments: Attachment[];
   runs: Run[];
   events: TaskEvent[];
 }

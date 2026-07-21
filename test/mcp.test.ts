@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -66,6 +66,16 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
       }),
     ) as { task: { id: string; status: string } };
     assert.equal(created.task.status, "ready");
+    const briefPath = join(directory, "brief.txt");
+    writeFileSync(briefPath, "MCP attachment", "utf8");
+    const attached = textPayload(
+      await client.callTool({
+        name: "kanban_attach",
+        arguments: { board: "project", task_id: created.task.id, path: briefPath },
+      }),
+    ) as { kind: string; name: string };
+    assert.equal(attached.kind, "file");
+    assert.equal(attached.name, "brief.txt");
 
     const listed = textPayload(
       await client.callTool({ name: "kanban_list", arguments: { board: "project", status: "ready" } }),
@@ -74,12 +84,16 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
 
     const shown = textPayload(
       await client.callTool({ name: "kanban_show", arguments: { board: "project", task_id: created.task.id } }),
-    ) as { task: { title: string; tenant: string; skills: string[]; goalMode: boolean; goalMaxTurns: number } };
+    ) as {
+      task: { title: string; tenant: string; skills: string[]; goalMode: boolean; goalMaxTurns: number };
+      attachments: { name: string }[];
+    };
     assert.equal(shown.task.title, "MCP smoke task");
     assert.equal(shown.task.tenant, "engineering");
     assert.deepEqual(shown.task.skills, ["github-code-review"]);
     assert.equal(shown.task.goalMode, true);
     assert.equal(shown.task.goalMaxTurns, 7);
+    assert.equal(shown.attachments[0]?.name, "brief.txt");
 
     const claim = textPayload(
       await client.callTool({ name: "kanban_claim", arguments: { board: "project", task_id: created.task.id } }),

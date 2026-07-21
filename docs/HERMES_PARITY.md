@@ -40,8 +40,8 @@ Authoritative references:
 
 - [ ] `scratch`, `dir:<path>`, `worktree`, and `worktree:<path>` workspaces
 - [ ] Optional git branch and preserved worktree lifecycle
-- [ ] Durable file and URL attachments with a 25 MB upload limit
-- [ ] Completion artifact capture before scratch cleanup
+- [x] Durable file and URL attachments with a 25 MB upload limit
+- [x] Completion artifact validation and durable capture
 - [ ] Garbage collection for scratch workspaces, old events, and logs
 
 ### Dispatcher resilience
@@ -58,7 +58,8 @@ Authoritative references:
 
 - [x] Core MCP planning and worker lifecycle tools
 - [x] Scoped worker isolation and portable worker/orchestrator Skills
-- [ ] Attachment MCP tools and bounded, preformatted worker context
+- [x] Attachment MCP tools and attachment-aware task detail
+- [ ] Bounded, preformatted worker context with parent handoffs and prior attempts
 - [ ] Full CLI verbs for boards, tasks, runs, events, logs, stats, and diagnostics
 - [ ] Terminal event watch/tail and machine-readable output
 - [ ] Notification subscriptions and terminal-event delivery adapters
