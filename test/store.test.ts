@@ -213,3 +213,82 @@ test("legacy MVP databases migrate without losing tasks, runs, links, comments, 
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("typed dependency blocks wait in todo and repeated human blockers escalate to triage", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const parent = store.createTask({ title: "dependency", assignee: "parent", runtime: "codex" });
+    const task = store.createTask({ title: "blocked work", assignee: "worker", runtime: "claude" });
+    const dependencyRun = store.claimTask({ taskId: task.task.id });
+    assert.ok(dependencyRun);
+    const waiting = store.blockRun(
+      { runId: dependencyRun.run.id, claimToken: dependencyRun.claimToken },
+      "waiting for parent output",
+      "dependency",
+    );
+    assert.equal(waiting.task.status, "todo");
+    assert.equal(waiting.task.blockKind, "dependency");
+
+    store.linkTasks(parent.task.id, task.task.id);
+    const parentRun = store.claimTask({ taskId: parent.task.id });
+    assert.ok(parentRun);
+    store.completeRun({ runId: parentRun.run.id, claimToken: parentRun.claimToken }, "dependency complete");
+    assert.equal(store.getTask(task.task.id).task.status, "ready");
+
+    const first = store.claimTask({ taskId: task.task.id });
+    assert.ok(first);
+    const firstBlock = store.blockRun(
+      { runId: first.run.id, claimToken: first.claimToken },
+      "choose a data retention policy",
+      "needs_input",
+    );
+    assert.equal(firstBlock.task.status, "blocked");
+    assert.equal(firstBlock.task.blockRecurrences, 1);
+    store.unblockTask(task.task.id);
+
+    const second = store.claimTask({ taskId: task.task.id });
+    assert.ok(second);
+    const escalated = store.blockRun(
+      { runId: second.run.id, claimToken: second.claimToken },
+      "choose a data retention policy",
+      "needs_input",
+    );
+    assert.equal(escalated.task.status, "triage");
+    assert.equal(escalated.task.blockRecurrences, 2);
+    assert.ok(escalated.events.some((event) => event.kind === "block_loop_detected"));
+  } finally {
+    store.close();
+  }
+});
+
+test("human lifecycle actions synthesize handoff runs and administrative moves reclaim active runs", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const manual = store.createTask({ title: "human task" });
+    const completed = store.completeTask(manual.task.id, {
+      summary: "verified manually",
+      result: "approved",
+      metadata: { verification: ["human review"] },
+    });
+    assert.equal(completed.task.status, "done");
+    assert.equal(completed.task.result, "approved");
+    assert.equal(completed.runs[0]?.status, "completed");
+    assert.equal(completed.runs[0]?.workerId, "human");
+
+    const running = store.createTask({ title: "running", assignee: "worker", runtime: "codex" });
+    const claim = store.claimTask({ taskId: running.task.id });
+    assert.ok(claim);
+    const archived = store.archiveTask(running.task.id);
+    assert.equal(archived.task.status, "archived");
+    assert.equal(archived.task.currentRunId, null);
+    assert.equal(archived.runs[0]?.status, "reclaimed");
+
+    const parent = store.createTask({ title: "unlink parent" });
+    const child = store.createTask({ title: "unlink child", parents: [parent.task.id] });
+    assert.equal(store.unlinkTasks(parent.task.id, child.task.id).parents.length, 0);
+    assert.deepEqual(store.deleteTask(child.task.id), { id: child.task.id, deleted: true });
+    assert.throws(() => store.getTask(child.task.id), /Task not found/);
+  } finally {
+    store.close();
+  }
+});

@@ -81,10 +81,10 @@ idempotency key on a board returns the existing non-archived task.
 
 ## MCP tools
 
-- Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`
+- Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
 - Dispatch: `kanban_claim`
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
-- Human recovery: `kanban_unblock`
+- Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive task, run, and claim-token scope through environment variables. Their lifecycle tools can omit those identifiers, and the server rejects attempts to operate on another scoped task or run.
 

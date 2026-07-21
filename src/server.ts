@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { KanbanStore, type RunScope } from "./store.js";
-import { RUNTIMES, TASK_STATUSES, type Runtime, type TaskStatus } from "./types.js";
+import { BLOCK_KINDS, RUNTIMES, TASK_STATUSES, type BlockKind, type Runtime, type TaskStatus } from "./types.js";
 
 const runtimeSchema = z.enum(RUNTIMES);
 const statusSchema = z.enum(TASK_STATUSES);
@@ -228,6 +228,80 @@ export function createKanbanServer(store: KanbanStore): McpServer {
   );
 
   server.registerTool(
+    "kanban_unlink",
+    {
+      title: "Unlink Kanban dependency",
+      description: "Remove a parent-to-child dependency and recompute whether the child is ready.",
+      inputSchema: z.object({ parent_id: z.string(), child_id: z.string() }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ parent_id, child_id }) => {
+      requireAdminSurface();
+      return result(store.unlinkTasks(parent_id, child_id));
+    },
+  );
+
+  server.registerTool(
+    "kanban_promote",
+    {
+      title: "Promote Kanban task",
+      description: "Move a parked task into the executable todo/ready pipeline, respecting dependencies.",
+      inputSchema: z.object({ task_id: z.string() }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ task_id }) => {
+      requireAdminSurface();
+      return result(store.promoteTask(task_id));
+    },
+  );
+
+  server.registerTool(
+    "kanban_schedule",
+    {
+      title: "Schedule Kanban task",
+      description: "Park a task until an optional ISO-8601 start time or a manual promotion.",
+      inputSchema: z.object({
+        task_id: z.string(),
+        scheduled_at: z.string().datetime({ offset: true }).nullable().default(null),
+        reason: z.string().optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, scheduled_at, reason }) => {
+      requireAdminSurface();
+      return result(store.scheduleTask(task_id, scheduled_at, reason));
+    },
+  );
+
+  server.registerTool(
+    "kanban_archive",
+    {
+      title: "Archive Kanban task",
+      description: "Archive a task and reclaim any active run.",
+      inputSchema: z.object({ task_id: z.string() }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id }) => {
+      requireAdminSurface();
+      return result(store.archiveTask(task_id));
+    },
+  );
+
+  server.registerTool(
+    "kanban_delete",
+    {
+      title: "Delete Kanban task",
+      description: "Permanently delete a task and its links, comments, runs, and events.",
+      inputSchema: z.object({ task_id: z.string() }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ task_id }) => {
+      requireAdminSurface();
+      return result(store.deleteTask(task_id));
+    },
+  );
+
+  server.registerTool(
     "kanban_claim",
     {
       title: "Claim Kanban task",
@@ -278,13 +352,14 @@ export function createKanbanServer(store: KanbanStore): McpServer {
       inputSchema: z.object({
         run_id: z.string().optional(),
         claim_token: z.string().optional(),
-        summary: z.string().min(1),
+        summary: z.string().min(1).optional(),
+        result: z.string().min(1).optional(),
         metadata: z.record(z.string(), z.unknown()).optional(),
-      }),
+      }).refine((input) => Boolean(input.summary || input.result), "summary or result is required"),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ run_id, claim_token, summary, metadata }) =>
-      result(store.completeRun(scopedRun(run_id, claim_token), summary, metadata)),
+    async ({ run_id, claim_token, summary, result: taskResult, metadata }) =>
+      result(store.completeRun(scopedRun(run_id, claim_token), { summary, result: taskResult, metadata })),
   );
 
   server.registerTool(
@@ -296,11 +371,12 @@ export function createKanbanServer(store: KanbanStore): McpServer {
         run_id: z.string().optional(),
         claim_token: z.string().optional(),
         reason: z.string().min(1),
+        kind: z.enum(BLOCK_KINDS).optional(),
       }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ run_id, claim_token, reason }) =>
-      result(store.blockRun(scopedRun(run_id, claim_token), reason)),
+    async ({ run_id, claim_token, reason, kind }) =>
+      result(store.blockRun(scopedRun(run_id, claim_token), reason, kind as BlockKind | undefined)),
   );
 
   server.registerTool(

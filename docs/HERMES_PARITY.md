@@ -23,9 +23,10 @@ Authoritative references:
 - [x] Tenant namespace and idempotency keys
 - [x] Scheduled-start promotion and persisted runtime/skill/goal settings
 - [ ] Maximum-runtime enforcement and goal-mode continuation engine
-- [ ] Typed blockers and repeated unblock/re-block loop breaker
-- [ ] Synthetic runs for human completion/blocking and reclaimed-run invariant
-- [ ] Unlink, archive, delete, promote, bulk mutation, configurable sorting
+- [x] Typed blockers and repeated unblock/re-block loop breaker
+- [x] Synthetic human handoff runs and reclaimed-run invariant on administrative moves
+- [x] Unlink, archive, delete, promote, scheduling, and configurable sorting
+- [ ] Bulk mutation with per-task failure reporting
 
 ### Multi-board isolation
 

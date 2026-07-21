@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import {
+  BLOCK_KINDS,
   RUNTIMES,
   TASK_STATUSES,
   type ClaimedTask,
@@ -111,6 +112,19 @@ export interface RunScope {
   runId: string;
   claimToken: string;
 }
+
+export interface CompletionInput {
+  summary?: string | undefined;
+  result?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+export interface BlockInput {
+  reason: string;
+  kind?: BlockKind | undefined;
+}
+
+const BLOCK_RECURRENCE_LIMIT = 2;
 
 function now(): string {
   return new Date().toISOString();
@@ -429,6 +443,64 @@ export class KanbanStore {
       .run(taskId, runId, kind, payload === null ? null : JSON.stringify(payload), now());
   }
 
+  private closeRunNoTransaction(
+    task: TaskRow,
+    status: Run["status"],
+    input: { summary?: string | null; metadata?: Record<string, unknown> | null; error?: string | null; exitCode?: number | null } = {},
+  ): string | null {
+    if (!task.current_run_id) return null;
+    const timestamp = now();
+    this.db
+      .prepare(`
+        UPDATE task_runs
+        SET status = ?, ended_at = ?, heartbeat_at = ?, summary = COALESCE(?, summary),
+            metadata_json = COALESCE(?, metadata_json), error = COALESCE(?, error),
+            exit_code = COALESCE(?, exit_code)
+        WHERE id = ? AND status = 'running'
+      `)
+      .run(
+        status,
+        timestamp,
+        timestamp,
+        input.summary ?? null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        input.error ?? null,
+        input.exitCode ?? null,
+        task.current_run_id,
+      );
+    return task.current_run_id;
+  }
+
+  private syntheticRunNoTransaction(
+    task: TaskRow,
+    status: Run["status"],
+    input: { summary?: string | null; metadata?: Record<string, unknown> | null; error?: string | null } = {},
+  ): string {
+    const runId = newId("r");
+    const timestamp = now();
+    this.db
+      .prepare(`
+        INSERT INTO task_runs(
+          id, task_id, worker_id, runtime, status, claim_token, claimed_at,
+          claim_expires_at, heartbeat_at, ended_at, summary, metadata_json, error
+        ) VALUES (?, ?, 'human', ?, ?, 'synthetic', ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        runId,
+        task.id,
+        task.runtime,
+        status,
+        timestamp,
+        timestamp,
+        timestamp,
+        timestamp,
+        input.summary ?? null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        input.error ?? null,
+      );
+    return runId;
+  }
+
   private hasOpenParents(taskId: string): boolean {
     const row = this.db
       .prepare(`
@@ -577,8 +649,14 @@ export class KanbanStore {
   updateTask(taskId: string, input: UpdateTaskInput): TaskDetail {
     this.write(() => {
       const task = this.requireTaskRow(taskId);
-      if (task.current_run_id && input.status && input.status !== "running") {
-        throw new Error("Use complete, block, or fail to terminate a running task");
+      if (input.status === "running" && task.status !== "running") {
+        throw new Error("Tasks enter running only through an atomic claim");
+      }
+      if (
+        task.current_run_id &&
+        (input.assignee !== undefined || input.runtime !== undefined || input.workspace !== undefined || input.workspaceKind !== undefined)
+      ) {
+        throw new Error("Cannot change task ownership or workspace while a run is active");
       }
       const updates: string[] = [];
       const values: SQLInputValue[] = [];
@@ -619,11 +697,32 @@ export class KanbanStore {
       if (input.workflowTemplateId !== undefined) add("workflow_template_id", input.workflowTemplateId);
       if (input.currentStepKey !== undefined) add("current_step_key", input.currentStepKey);
       if (input.status !== undefined) add("status", input.status);
+      let reclaimedRunId: string | null = null;
+      if (task.current_run_id && input.status && input.status !== "running") {
+        const runStatus: Run["status"] = input.status === "done"
+          ? "completed"
+          : input.status === "blocked"
+            ? "blocked"
+            : "reclaimed";
+        reclaimedRunId = this.closeRunNoTransaction(task, runStatus, {
+          error: runStatus === "reclaimed" ? `Administrative status transition to ${input.status}` : null,
+        });
+        add("current_run_id", null);
+      }
+      if (input.status === "done") {
+        add("failure_count", 0);
+        add("block_kind", null);
+        add("block_reason", null);
+        add("block_recurrences", 0);
+      }
       if (updates.length === 0) return;
       updates.push("updated_at = ?");
       values.push(now(), taskId);
       this.db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...values);
       this.appendEvent(taskId, "updated", input as Record<string, unknown>);
+      if (reclaimedRunId && input.status && !["done", "blocked"].includes(input.status)) {
+        this.appendEvent(taskId, "reclaimed", { status: input.status }, reclaimedRunId);
+      }
       if (input.status === undefined || ["ready", "todo", "scheduled"].includes(input.status)) {
         this.recomputeReady(taskId);
       }
@@ -705,6 +804,69 @@ export class KanbanStore {
   linkTasks(parentId: string, childId: string): TaskDetail {
     this.write(() => this.linkNoTransaction(parentId, childId));
     return this.getTask(childId);
+  }
+
+  unlinkTasks(parentId: string, childId: string): TaskDetail {
+    this.write(() => {
+      this.requireTaskRow(parentId);
+      this.requireTaskRow(childId);
+      const deleted = this.db
+        .prepare("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?")
+        .run(parentId, childId);
+      if (deleted.changes > 0) this.appendEvent(childId, "unlinked", { parentId });
+      this.recomputeReady(childId);
+    });
+    return this.getTask(childId);
+  }
+
+  archiveTask(taskId: string): TaskDetail {
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (task.status === "archived") return;
+      const runId = this.closeRunNoTransaction(task, "reclaimed", { error: "Task archived while running" });
+      this.db
+        .prepare("UPDATE tasks SET status = 'archived', current_run_id = NULL, updated_at = ? WHERE id = ?")
+        .run(now(), taskId);
+      this.appendEvent(taskId, "archived", null, runId);
+    });
+    return this.getTask(taskId);
+  }
+
+  deleteTask(taskId: string): { id: string; deleted: true } {
+    return this.write(() => {
+      this.requireTaskRow(taskId);
+      this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
+      return { id: taskId, deleted: true as const };
+    });
+  }
+
+  promoteTask(taskId: string): TaskDetail {
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (!["todo", "scheduled", "blocked", "triage", "review"].includes(task.status)) {
+        throw new Error(`Task cannot be promoted from ${task.status}`);
+      }
+      if (task.current_run_id) throw new Error("Cannot promote a running task");
+      this.db
+        .prepare("UPDATE tasks SET status = 'todo', scheduled_at = NULL, failure_count = 0, updated_at = ? WHERE id = ?")
+        .run(now(), taskId);
+      this.appendEvent(taskId, "promote_requested");
+      this.recomputeReady(taskId);
+    });
+    return this.getTask(taskId);
+  }
+
+  scheduleTask(taskId: string, scheduledAt: string | null, reason?: string): TaskDetail {
+    const normalized = normalizeIso(scheduledAt, "scheduledAt");
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (task.current_run_id) throw new Error("Cannot schedule a running task");
+      this.db
+        .prepare("UPDATE tasks SET status = 'scheduled', scheduled_at = ?, updated_at = ? WHERE id = ?")
+        .run(normalized, now(), taskId);
+      this.appendEvent(taskId, "scheduled", { scheduledAt: normalized, reason: reason?.trim() || null });
+    });
+    return this.getTask(taskId);
   }
 
   addComment(taskId: string, author: string, body: string): Comment {
@@ -838,9 +1000,17 @@ export class KanbanStore {
     return runFromRow(row);
   }
 
-  completeRun(scope: RunScope, summary: string, metadata?: Record<string, unknown>): TaskDetail {
-    const cleanSummary = summary.trim();
-    if (!cleanSummary) throw new Error("Completion summary cannot be empty");
+  completeRun(
+    scope: RunScope,
+    summaryOrInput: string | CompletionInput,
+    legacyMetadata?: Record<string, unknown>,
+  ): TaskDetail {
+    const completion: CompletionInput = typeof summaryOrInput === "string"
+      ? { summary: summaryOrInput, metadata: legacyMetadata }
+      : summaryOrInput;
+    const cleanSummary = completion.summary?.trim() || completion.result?.trim() || "";
+    const cleanResult = completion.result?.trim() || null;
+    if (!cleanSummary) throw new Error("Completion requires a summary or result");
     let taskId = "";
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
@@ -848,11 +1018,21 @@ export class KanbanStore {
       const timestamp = now();
       this.db
         .prepare("UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?, summary = ?, metadata_json = ? WHERE id = ?")
-        .run(timestamp, timestamp, cleanSummary, metadata ? JSON.stringify(metadata) : null, run.id);
+        .run(timestamp, timestamp, cleanSummary, completion.metadata ? JSON.stringify(completion.metadata) : null, run.id);
       this.db
-        .prepare("UPDATE tasks SET status = 'done', current_run_id = NULL, failure_count = 0, updated_at = ? WHERE id = ?")
-        .run(timestamp, task.id);
-      this.appendEvent(task.id, "completed", { summary: cleanSummary, metadata: metadata ?? null }, run.id);
+        .prepare(`
+          UPDATE tasks
+          SET status = 'done', current_run_id = NULL, result = ?, failure_count = 0,
+              block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(cleanResult, timestamp, task.id);
+      this.appendEvent(
+        task.id,
+        "completed",
+        { summary: cleanSummary.slice(0, 400), resultLength: cleanResult?.length ?? 0 },
+        run.id,
+      );
       const children = this.db.prepare("SELECT child_id FROM task_links WHERE parent_id = ?").all(task.id) as unknown as {
         child_id: string;
       }[];
@@ -861,9 +1041,81 @@ export class KanbanStore {
     return this.getTask(taskId);
   }
 
-  blockRun(scope: RunScope, reason: string): TaskDetail {
-    const cleanReason = reason.trim();
+  completeTask(taskId: string, completion: CompletionInput = {}): TaskDetail {
+    const cleanSummary = completion.summary?.trim() || completion.result?.trim() || "";
+    const cleanResult = completion.result?.trim() || null;
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (task.status === "archived") throw new Error("Cannot complete an archived task");
+      if (task.status === "done") return;
+      const runId = task.current_run_id
+        ? this.closeRunNoTransaction(task, "completed", {
+            summary: cleanSummary || null,
+            metadata: completion.metadata ?? null,
+          })
+        : cleanSummary || completion.metadata
+          ? this.syntheticRunNoTransaction(task, "completed", {
+              summary: cleanSummary || null,
+              metadata: completion.metadata ?? null,
+            })
+          : null;
+      this.db
+        .prepare(`
+          UPDATE tasks
+          SET status = 'done', current_run_id = NULL, result = ?, failure_count = 0,
+              block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(cleanResult, now(), taskId);
+      this.appendEvent(taskId, "completed", { summary: cleanSummary.slice(0, 400), resultLength: cleanResult?.length ?? 0 }, runId);
+      const children = this.db.prepare("SELECT child_id FROM task_links WHERE parent_id = ?").all(taskId) as unknown as {
+        child_id: string;
+      }[];
+      for (const child of children) this.recomputeReady(child.child_id);
+    });
+    return this.getTask(taskId);
+  }
+
+  private blockNoTransaction(task: TaskRow, input: BlockInput, runId: string | null): void {
+    const cleanReason = input.reason.trim();
     if (!cleanReason) throw new Error("Block reason cannot be empty");
+    if (input.kind && !BLOCK_KINDS.includes(input.kind)) throw new Error(`Invalid block kind: ${input.kind}`);
+    const timestamp = now();
+    if (input.kind === "dependency") {
+      this.db
+        .prepare(`
+          UPDATE tasks
+          SET status = 'todo', current_run_id = NULL, block_kind = ?, block_reason = ?, updated_at = ?
+          WHERE id = ?
+      `)
+        .run(input.kind, cleanReason, timestamp, task.id);
+      this.appendEvent(task.id, "dependency_wait", { reason: cleanReason, kind: input.kind }, runId);
+      return;
+    }
+
+    const sameBlock = task.block_kind === (input.kind ?? null) && task.block_reason === cleanReason;
+    const recurrences = sameBlock ? task.block_recurrences + 1 : 1;
+    const loopDetected = recurrences >= BLOCK_RECURRENCE_LIMIT && task.block_recurrences > 0;
+    const status: TaskStatus = loopDetected ? "triage" : "blocked";
+    this.db
+      .prepare(`
+        UPDATE tasks
+        SET status = ?, current_run_id = NULL, block_kind = ?, block_reason = ?,
+            block_recurrences = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(status, input.kind ?? null, cleanReason, recurrences, timestamp, task.id);
+    this.appendEvent(
+      task.id,
+      loopDetected ? "block_loop_detected" : "blocked",
+      loopDetected
+        ? { reason: cleanReason, kind: input.kind ?? null, recurrences, limit: BLOCK_RECURRENCE_LIMIT }
+        : { reason: cleanReason, kind: input.kind ?? null, recurrences },
+      runId,
+    );
+  }
+
+  blockRun(scope: RunScope, reason: string, kind?: BlockKind): TaskDetail {
     let taskId = "";
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
@@ -871,11 +1123,21 @@ export class KanbanStore {
       const timestamp = now();
       this.db
         .prepare("UPDATE task_runs SET status = 'blocked', ended_at = ?, heartbeat_at = ?, error = ? WHERE id = ?")
-        .run(timestamp, timestamp, cleanReason, run.id);
-      this.db
-        .prepare("UPDATE tasks SET status = 'blocked', current_run_id = NULL, updated_at = ? WHERE id = ?")
-        .run(timestamp, task.id);
-      this.appendEvent(task.id, "blocked", { reason: cleanReason }, run.id);
+        .run(timestamp, timestamp, reason.trim(), run.id);
+      this.blockNoTransaction(task, { reason, kind }, run.id);
+    });
+    return this.getTask(taskId);
+  }
+
+  blockTask(taskId: string, input: BlockInput): TaskDetail {
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (["done", "archived"].includes(task.status)) throw new Error(`Cannot block a ${task.status} task`);
+      if (task.status === "blocked") throw new Error("Task is already blocked; unblock it before blocking again");
+      const runId = task.current_run_id
+        ? this.closeRunNoTransaction(task, "blocked", { error: input.reason.trim() })
+        : this.syntheticRunNoTransaction(task, "blocked", { error: input.reason.trim() });
+      this.blockNoTransaction(task, input, runId);
     });
     return this.getTask(taskId);
   }
@@ -908,7 +1170,9 @@ export class KanbanStore {
     this.write(() => {
       const task = this.requireTaskRow(taskId);
       if (task.status !== "blocked") throw new Error(`Task is not blocked: ${task.status}`);
-      this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), taskId);
+      this.db
+        .prepare("UPDATE tasks SET status = 'todo', failure_count = 0, updated_at = ? WHERE id = ?")
+        .run(now(), taskId);
       this.appendEvent(taskId, "unblocked");
       this.recomputeReady(taskId);
     });

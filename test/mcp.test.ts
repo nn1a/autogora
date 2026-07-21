@@ -27,6 +27,10 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     const tools = await client.listTools();
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_create"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_complete"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_unlink"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_schedule"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_archive"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_delete"));
 
     const created = textPayload(
       await client.callTool({
@@ -94,6 +98,26 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     ) as { task: { status: string }; runs: { status: string }[] };
     assert.equal(completed.task.status, "done");
     assert.equal(completed.runs[0]?.status, "completed");
+
+    const parked = textPayload(
+      await client.callTool({ name: "kanban_create", arguments: { title: "parked admin task" } }),
+    ) as { task: { id: string } };
+    const scheduled = textPayload(
+      await client.callTool({
+        name: "kanban_schedule",
+        arguments: { task_id: parked.task.id, reason: "wait for maintenance window" },
+      }),
+    ) as { task: { status: string } };
+    assert.equal(scheduled.task.status, "scheduled");
+    const promoted = textPayload(
+      await client.callTool({ name: "kanban_promote", arguments: { task_id: parked.task.id } }),
+    ) as { task: { status: string } };
+    assert.equal(promoted.task.status, "todo");
+    await client.callTool({ name: "kanban_archive", arguments: { task_id: parked.task.id } });
+    const deleted = textPayload(
+      await client.callTool({ name: "kanban_delete", arguments: { task_id: parked.task.id } }),
+    ) as { id: string; deleted: boolean };
+    assert.deepEqual(deleted, { id: parked.task.id, deleted: true });
   } finally {
     await worker?.close();
     await client.close();
