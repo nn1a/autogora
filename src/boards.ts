@@ -96,7 +96,7 @@ function orchestrationSettings(raw: Partial<BoardOrchestrationSettings> | undefi
       })).filter((profile) => profile.name)
     : [];
   return {
-    autoDecompose: raw?.autoDecompose === true,
+    autoDecompose: raw?.autoDecompose !== false,
     autoDecomposePerTick: Number.isInteger(raw?.autoDecomposePerTick) && (raw?.autoDecomposePerTick ?? 0) > 0
       ? raw!.autoDecomposePerTick!
       : 3,

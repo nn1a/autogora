@@ -16,6 +16,7 @@ import {
   type ProfileRoute,
 } from "./orchestration.js";
 import { runStdioServer } from "./server.js";
+import { WorkspaceManager } from "./workspaces.js";
 import {
   BLOCK_KINDS,
   RUNTIMES,
@@ -53,8 +54,11 @@ Commands:
   swarm <goal>          Create a blackboard/worker/verifier/synthesizer graph
   edit <task-id>        Edit task metadata
   assign <id> <worker>  Assign or unassign a task
+  reassign <id>... <worker> Bulk assign or unassign tasks
   link <parent> <child> Add a dependency
   unlink <parent> <child> Remove a dependency
+  claim <task-id>       Atomically claim and prepare a ready task
+  heartbeat <task-id>   Refresh the active run lease
   comment <id> <text>   Append a durable comment
   attach <id> <path>    Copy a file into durable attachment storage
   attach-url <id> <url> Attach an HTTP(S) reference
@@ -127,6 +131,17 @@ function numberOption(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function durationSeconds(value: string): number {
+  const match = /^(\d+)(s|m|h|d)?$/i.exec(value.trim());
+  if (!match) throw new Error(`Invalid duration: ${value}`);
+  const amount = Number.parseInt(match[1]!, 10);
+  const multiplier = { s: 1, m: 60, h: 60 * 60, d: 24 * 60 * 60 }[(match[2] ?? "s").toLowerCase() as "s" | "m" | "h" | "d"];
+  if (!Number.isSafeInteger(amount) || amount < 1) throw new Error(`Invalid duration: ${value}`);
+  const seconds = amount * multiplier;
+  if (!Number.isSafeInteger(seconds)) throw new Error(`Duration is too large: ${value}`);
+  return seconds;
+}
+
 function requireRuntime(value: string | undefined): Runtime {
   const runtime = value ?? "manual";
   if (!RUNTIMES.includes(runtime as Runtime)) throw new Error(`Invalid runtime: ${runtime}`);
@@ -154,6 +169,15 @@ function requireStatus(value: string | undefined): TaskStatus | undefined {
   if (value === undefined) return undefined;
   if (!TASK_STATUSES.includes(value as TaskStatus)) throw new Error(`Invalid status: ${value}`);
   return value as TaskStatus;
+}
+
+function requireSort(value: string | undefined): ListTaskFilter["sort"] {
+  if (value === undefined) return undefined;
+  const sorts: NonNullable<ListTaskFilter["sort"]>[] = [
+    "created", "created-desc", "priority", "priority-desc", "status", "assignee", "title", "updated",
+  ];
+  if (!sorts.includes(value as NonNullable<ListTaskFilter["sort"]>)) throw new Error(`Invalid sort: ${value}`);
+  return value as ListTaskFilter["sort"];
 }
 
 function requireBlockKind(value: string | undefined): BlockKind | undefined {
@@ -296,17 +320,24 @@ async function main(): Promise<void> {
         "workspace-kind": { type: "string" },
         branch: { type: "string" },
         status: { type: "string" },
+        triage: { type: "boolean" },
         "scheduled-at": { type: "string" },
+        "max-runtime": { type: "string" },
         "max-runtime-seconds": { type: "string" },
         skill: { type: "string", multiple: true },
         goal: { type: "boolean" },
         "goal-max-turns": { type: "string" },
+        "workflow-template-id": { type: "string" },
+        "current-step-key": { type: "string" },
         parent: { type: "string", multiple: true },
         "max-retries": { type: "string" },
       },
     });
     const title = parsed.positionals.join(" ").trim();
     if (!title) throw new Error("create requires a title");
+    if (parsed.values.triage && parsed.values.status && parsed.values.status !== "triage") {
+      throw new Error("--triage cannot be combined with a different --status");
+    }
     const manager = managerFor(parsed.values.db);
     const board = manager.resolve(globalBoard);
     const store = manager.openStore(board);
@@ -323,14 +354,18 @@ async function main(): Promise<void> {
         workspace: parsed.values.workspace,
         workspaceKind: parsed.values["workspace-kind"] as "scratch" | "dir" | "worktree" | undefined,
         branch: parsed.values.branch,
-        status: requireStatus(parsed.values.status),
+        status: parsed.values.triage ? "triage" : requireStatus(parsed.values.status),
         scheduledAt: parsed.values["scheduled-at"],
-        maxRuntimeSeconds: parsed.values["max-runtime-seconds"] === undefined
-          ? undefined
-          : numberOption(parsed.values["max-runtime-seconds"], 0),
+        maxRuntimeSeconds: parsed.values["max-runtime"] !== undefined
+          ? durationSeconds(parsed.values["max-runtime"])
+          : parsed.values["max-runtime-seconds"] === undefined
+            ? undefined
+            : durationSeconds(parsed.values["max-runtime-seconds"]),
         skills: parsed.values.skill,
         goalMode: parsed.values.goal,
         goalMaxTurns: numberOption(parsed.values["goal-max-turns"], 20),
+        workflowTemplateId: parsed.values["workflow-template-id"],
+        currentStepKey: parsed.values["current-step-key"],
         parents: parsed.values.parent,
         maxRetries: numberOption(parsed.values["max-retries"], 2),
       });
@@ -350,25 +385,37 @@ async function main(): Promise<void> {
         status: { type: "string" },
         tenant: { type: "string" },
         assignee: { type: "string" },
+        mine: { type: "boolean" },
         runtime: { type: "string" },
+        "workflow-template-id": { type: "string" },
+        "current-step-key": { type: "string" },
         archived: { type: "boolean" },
         search: { type: "string" },
         sort: { type: "string" },
+        limit: { type: "string" },
       },
     });
     const manager = managerFor(parsed.values.db);
     const board = manager.resolve(globalBoard);
     const store = manager.openStore(board);
     try {
+      if (parsed.values.mine && parsed.values.assignee) throw new Error("--mine and --assignee cannot be combined");
+      const mine = parsed.values.mine
+        ? process.env.KANBAN_PROFILE ?? process.env.HERMES_PROFILE ?? process.env.KANBAN_WORKER_ID
+        : undefined;
+      if (parsed.values.mine && !mine) throw new Error("--mine requires KANBAN_PROFILE, HERMES_PROFILE, or KANBAN_WORKER_ID");
       const tasks = store.listTasks({
         board,
         status: requireStatus(parsed.values.status),
         tenant: parsed.values.tenant,
-        assignee: parsed.values.assignee,
+        assignee: mine ?? parsed.values.assignee,
         runtime: parsed.values.runtime ? requireRuntime(parsed.values.runtime) : undefined,
+        workflowTemplateId: parsed.values["workflow-template-id"],
+        currentStepKey: parsed.values["current-step-key"],
         includeArchived: parsed.values.archived,
         search: parsed.values.search,
-        sort: parsed.values.sort as ListTaskFilter["sort"],
+        sort: requireSort(parsed.values.sort),
+        limit: numberOption(parsed.values.limit, 100),
       });
       process.stdout.write(`${JSON.stringify(tasks, null, 2)}\n`);
     } finally {
@@ -820,6 +867,22 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "reassign") {
+    const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
+    if (parsed.positionals.length < 2) throw new Error("reassign requires at least one task id and an assignee");
+    const assignee = parsed.positionals.at(-1)!;
+    const taskIds = parsed.positionals.slice(0, -1);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      process.stdout.write(`${JSON.stringify(store.bulkMutate(taskIds, {
+        assignee: assignee === "none" ? null : assignee,
+      }), null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
   if (command === "link" || command === "unlink") {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const [parentId, childId] = parsed.positionals;
@@ -828,6 +891,58 @@ async function main(): Promise<void> {
     try {
       const detail = command === "link" ? store.linkTasks(parentId, childId) : store.unlinkTasks(parentId, childId);
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "claim") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { db: { type: "string" }, ttl: { type: "string" }, worker: { type: "string" } },
+    });
+    const taskId = parsed.positionals[0];
+    if (!taskId) throw new Error("claim requires a task id");
+    const manager = managerFor(parsed.values.db);
+    const board = manager.resolve(globalBoard);
+    const store = manager.openStore(board);
+    try {
+      const claim = store.claimTask({
+        taskId,
+        claimTtlSeconds: numberOption(parsed.values.ttl, 900),
+        workerId: parsed.values.worker ?? `cli-${process.pid}`,
+      });
+      if (!claim) throw new Error(`Task is not claimable: ${taskId}`);
+      try {
+        const prepared = new WorkspaceManager(manager).prepare(store, claim);
+        process.stdout.write(`${JSON.stringify(prepared, null, 2)}\n`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        store.failRun(
+          { runId: claim.run.id, claimToken: claim.claimToken },
+          `Workspace preparation failed: ${message}`,
+        );
+        throw error;
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "heartbeat") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { db: { type: "string" }, note: { type: "string" } },
+    });
+    const taskId = parsed.positionals[0];
+    if (!taskId) throw new Error("heartbeat requires a task id");
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      process.stdout.write(`${JSON.stringify(store.heartbeatTask(taskId, parsed.values.note), null, 2)}\n`);
     } finally {
       store.close();
     }

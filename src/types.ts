@@ -161,6 +161,8 @@ export interface ListTaskFilter {
   tenant?: string | undefined;
   assignee?: string | undefined;
   runtime?: Runtime | undefined;
+  workflowTemplateId?: string | undefined;
+  currentStepKey?: string | undefined;
   includeArchived?: boolean | undefined;
   search?: string | undefined;
   sort?: "created" | "created-desc" | "priority" | "priority-desc" | "status" | "assignee" | "title" | "updated" | undefined;

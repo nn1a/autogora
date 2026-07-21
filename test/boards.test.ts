@@ -15,6 +15,7 @@ test("boards isolate databases and manage metadata, current selection, archive, 
     const initial = manager.list();
     assert.equal(initial.length, 1);
     assert.equal(initial[0]?.slug, "default");
+    assert.equal(initial[0]?.orchestration.autoDecompose, true);
 
     const project = manager.create("Project_API", {
       name: "Project API",

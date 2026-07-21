@@ -191,6 +191,19 @@ node dist/cli.js watch --since 0
 node dist/cli.js tail <task-id> --follow
 ```
 
+Scripts can also claim a ready task and keep its lease alive through the same
+atomic run kernel used by the dispatcher:
+
+```bash
+node dist/cli.js claim <task-id> --ttl 900
+node dist/cli.js heartbeat <task-id> --note "verification in progress"
+node dist/cli.js complete <task-id> --summary "verified and delivered"
+```
+
+`claim` prepares and prints the resolved workspace plus the scoped claim token.
+Use `reassign <id>... <profile>` for partial-failure bulk routing, and
+`list --mine` with `HERMES_PROFILE` or `KANBAN_PROFILE` for profile-local views.
+
 Bulk mutations always report success or failure for each task instead of
 aborting the whole batch. Garbage collection is board-scoped and only removes
 expired events, log files, and old scratch directories that still map to a
@@ -248,9 +261,10 @@ node dist/cli.js decompose <triage-id> \
 ```
 
 For deterministic automation, `specify` accepts `--title` plus `--body`, and
-`decompose` accepts a validated `--plan-json`. A persistent dispatcher can opt
-into bounded automatic triage processing with `--auto-decompose` and
-`--auto-decompose-per-tick`.
+`decompose` accepts a validated `--plan-json`. New boards enable bounded
+automatic triage processing by default, capped at three cards per dispatcher
+tick. Change it in the board's dashboard settings; command-line dispatcher
+overrides include `--auto-decompose` and `--auto-decompose-per-tick`.
 
 The swarm helper creates a completed structured blackboard, parallel worker
 cards, a verifier gated on every worker, and a synthesizer gated on the

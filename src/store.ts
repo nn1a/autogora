@@ -1219,6 +1219,14 @@ export class KanbanStore {
       clauses.push("runtime = ?");
       values.push(filter.runtime);
     }
+    if (filter.workflowTemplateId) {
+      clauses.push("workflow_template_id = ?");
+      values.push(filter.workflowTemplateId);
+    }
+    if (filter.currentStepKey) {
+      clauses.push("current_step_key = ?");
+      values.push(filter.currentStepKey);
+    }
     if (filter.search?.trim()) {
       clauses.push("(title LIKE ? OR body LIKE ?)");
       const pattern = `%${filter.search.trim()}%`;
@@ -2073,6 +2081,16 @@ export class KanbanStore {
     });
     const row = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(scope.runId) as RunRow;
     return runFromRow(row);
+  }
+
+  heartbeatTask(taskId: string, note?: string): Run {
+    const task = this.requireTaskRow(taskId);
+    if (!task.current_run_id || task.status !== "running") throw new Error(`Task has no active run: ${taskId}`);
+    const run = this.db
+      .prepare("SELECT id, claim_token FROM task_runs WHERE id = ?")
+      .get(task.current_run_id) as { id: string; claim_token: string } | undefined;
+    if (!run) throw new Error(`Active run not found: ${task.current_run_id}`);
+    return this.heartbeat({ runId: run.id, claimToken: run.claim_token }, note);
   }
 
   recordGoalJudgment(
