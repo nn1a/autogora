@@ -1,0 +1,10 @@
+interface:
+  display_name: "Kanban Worker"
+  short_description: "Execute and report a claimed Kanban task"
+  default_prompt: "Use $kanban-worker to execute the assigned task and report its lifecycle through Kanban MCP."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "kanban"
+      description: "Durable Kanban task and run lifecycle tools"
+      transport: "stdio"

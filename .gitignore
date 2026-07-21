@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.kanban/
+*.log
+*.db
+*.db-shm
+*.db-wal

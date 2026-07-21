@@ -1,0 +1,12 @@
+# Replace /absolute/path/to/kanban with this repository's absolute path.
+[mcp_servers.kanban]
+command = "node"
+args = [
+  "/absolute/path/to/kanban/dist/cli.js",
+  "serve",
+  "--db",
+  "/absolute/path/to/kanban/data/kanban.db",
+]
+required = true
+startup_timeout_sec = 10
+tool_timeout_sec = 30

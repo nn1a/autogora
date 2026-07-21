@@ -1,0 +1,10 @@
+interface:
+  display_name: "Kanban Orchestrator"
+  short_description: "Plan and route work through Kanban MCP"
+  default_prompt: "Use $kanban-orchestrator to decompose this goal into assigned Kanban tasks and dependencies."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "kanban"
+      description: "Durable Kanban planning and routing tools"
+      transport: "stdio"

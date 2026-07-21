@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kanban": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PROJECT_DIR}/dist/cli.js",
+        "serve",
+        "--db",
+        "${CLAUDE_PROJECT_DIR}/data/kanban.db"
+      ]
+    }
+  }
+}
