@@ -44,6 +44,9 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_list"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_unsubscribe"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_notify_deliver"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_specify"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_decompose"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_swarm"));
     const boards = textPayload(
       await client.callTool({ name: "kanban_boards_list", arguments: {} }),
     ) as { slug: string }[];
@@ -178,6 +181,33 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
       }),
     ) as { unsubscribed: boolean };
     assert.equal(unsubscribed.unsubscribed, true);
+    const triage = textPayload(
+      await client.callTool({ name: "kanban_create", arguments: { title: "rough MCP idea", status: "triage" } }),
+    ) as { task: { id: string } };
+    const specified = textPayload(
+      await client.callTool({
+        name: "kanban_specify",
+        arguments: {
+          task_id: triage.task.id,
+          title: "Specified MCP task",
+          body: "Deliver the MCP task. Acceptance: the deterministic tool call succeeds.",
+        },
+      }),
+    ) as { task: { status: string } };
+    assert.equal(specified.task.status, "todo");
+    const swarm = textPayload(
+      await client.callTool({
+        name: "kanban_swarm",
+        arguments: {
+          goal: "Exercise MCP swarm topology",
+          workers: [{ name: "researcher", runtime: "codex" }],
+          verifier: { name: "reviewer", runtime: "claude" },
+          synthesizer: { name: "writer", runtime: "claude" },
+        },
+      }),
+    ) as { root: { task: { status: string } }; workerIds: string[] };
+    assert.equal(swarm.root.task.status, "done");
+    assert.equal(swarm.workerIds.length, 1);
     const scheduled = textPayload(
       await client.callTool({
         name: "kanban_schedule",

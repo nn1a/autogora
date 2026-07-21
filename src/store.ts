@@ -235,6 +235,30 @@ export interface ClaimedNotificationDelivery {
   attempts: number;
 }
 
+export interface TaskGraphNode {
+  key: string;
+  title: string;
+  body: string;
+  assignee: string;
+  runtime: Runtime;
+  priority?: number | undefined;
+  skills?: string[] | undefined;
+}
+
+export interface TaskGraphResult {
+  root: TaskDetail;
+  childIds: string[];
+  tasksByKey: Record<string, string>;
+  leafIds: string[];
+}
+
+export interface SwarmResult {
+  root: TaskDetail;
+  workerIds: string[];
+  verifierId: string;
+  synthesizerId: string;
+}
+
 const BLOCK_RECURRENCE_LIMIT = 2;
 export const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
@@ -785,7 +809,7 @@ export class KanbanStore {
     this.recomputeReady(childId);
   }
 
-  createTask(input: CreateTaskInput): TaskDetail {
+  private createTaskNoTransaction(input: CreateTaskInput): string {
     const title = input.title.trim();
     if (!title) throw new Error("Task title cannot be empty");
     const runtime = input.runtime ?? "manual";
@@ -807,71 +831,278 @@ export class KanbanStore {
     const goalMaxTurns = input.goalMaxTurns ?? 20;
     if (!Number.isInteger(goalMaxTurns) || goalMaxTurns < 1) throw new Error("goalMaxTurns must be a positive integer");
     const skills = normalizeSkills(input.skills);
-    let taskId = newId("t");
-    this.write(() => {
-      if (idempotencyKey) {
-        const existing = this.db
-          .prepare("SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'")
-          .get(input.board ?? this.board, idempotencyKey) as { id: string } | undefined;
-        if (existing) {
-          taskId = existing.id;
-          return;
-        }
+    const taskId = newId("t");
+    if (idempotencyKey) {
+      const existing = this.db
+        .prepare("SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'")
+        .get(input.board ?? this.board, idempotencyKey) as { id: string } | undefined;
+      if (existing) {
+        return existing.id;
       }
-      const timestamp = now();
-      const automaticStatus: TaskStatus = scheduledAt && Date.parse(scheduledAt) > Date.now()
-        ? "scheduled"
-        : input.assignee && runtime !== "manual" && (input.parents?.length ?? 0) === 0
-          ? "ready"
-          : "todo";
-      this.db
-        .prepare(`
-          INSERT INTO tasks(
-            id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
-            priority, workspace, workspace_kind, branch, current_run_id, result,
-            scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
-            workflow_template_id, current_step_key, block_kind, block_reason,
-            block_recurrences, failure_count, max_retries, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?, ?)
-        `)
-        .run(
-          taskId,
-          input.board ?? this.board,
-          tenant,
-          idempotencyKey,
-          title,
-          input.body ?? "",
-          input.assignee ?? null,
-          runtime,
-          requestedStatus ?? automaticStatus,
-          input.priority ?? 0,
-          input.workspace ?? null,
-          workspaceKind(input.workspace, input.workspaceKind),
-          input.branch ?? null,
-          scheduledAt,
-          maxRuntimeSeconds,
-          JSON.stringify(skills),
-          input.goalMode ? 1 : 0,
-          goalMaxTurns,
-          input.workflowTemplateId ?? null,
-          input.currentStepKey ?? null,
-          maxRetries,
-          timestamp,
-          timestamp,
-        );
-      this.appendEvent(taskId, "created", {
-        runtime,
-        assignee: input.assignee ?? null,
+    }
+    const timestamp = now();
+    const automaticStatus: TaskStatus = scheduledAt && Date.parse(scheduledAt) > Date.now()
+      ? "scheduled"
+      : input.assignee && runtime !== "manual" && (input.parents?.length ?? 0) === 0
+        ? "ready"
+        : "todo";
+    this.db
+      .prepare(`
+        INSERT INTO tasks(
+          id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
+          priority, workspace, workspace_kind, branch, current_run_id, result,
+          scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
+          workflow_template_id, current_step_key, block_kind, block_reason,
+          block_recurrences, failure_count, max_retries, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?, ?)
+      `)
+      .run(
+        taskId,
+        input.board ?? this.board,
         tenant,
-        status: requestedStatus ?? automaticStatus,
-        parents: input.parents ?? [],
-      });
-      for (const parentId of input.parents ?? []) this.linkNoTransaction(parentId, taskId);
-      if (requestedStatus === "ready" && this.hasOpenParents(taskId)) {
-        this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), taskId);
-      }
+        idempotencyKey,
+        title,
+        input.body ?? "",
+        input.assignee ?? null,
+        runtime,
+        requestedStatus ?? automaticStatus,
+        input.priority ?? 0,
+        input.workspace ?? null,
+        workspaceKind(input.workspace, input.workspaceKind),
+        input.branch ?? null,
+        scheduledAt,
+        maxRuntimeSeconds,
+        JSON.stringify(skills),
+        input.goalMode ? 1 : 0,
+        goalMaxTurns,
+        input.workflowTemplateId ?? null,
+        input.currentStepKey ?? null,
+        maxRetries,
+        timestamp,
+        timestamp,
+      );
+    this.appendEvent(taskId, "created", {
+      runtime,
+      assignee: input.assignee ?? null,
+      tenant,
+      status: requestedStatus ?? automaticStatus,
+      parents: input.parents ?? [],
+    });
+    for (const parentId of input.parents ?? []) this.linkNoTransaction(parentId, taskId);
+    if (requestedStatus === "ready" && this.hasOpenParents(taskId)) {
+      this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), taskId);
+    }
+    return taskId;
+  }
+
+  createTask(input: CreateTaskInput): TaskDetail {
+    let taskId = "";
+    this.write(() => {
+      taskId = this.createTaskNoTransaction(input);
     });
     return this.getTask(taskId);
+  }
+
+  specifyTask(
+    taskId: string,
+    specification: { title: string; body: string; author?: string | undefined },
+  ): TaskDetail {
+    const title = specification.title.trim();
+    const body = specification.body.trim();
+    if (!title) throw new Error("Specified task title cannot be empty");
+    if (!body) throw new Error("Specified task body cannot be empty");
+    this.write(() => {
+      const task = this.requireTaskRow(taskId);
+      if (task.status !== "triage") throw new Error(`Task is not in triage: ${taskId}`);
+      const timestamp = now();
+      this.db
+        .prepare(`
+          UPDATE tasks
+          SET title = ?, body = ?, status = 'todo', block_kind = NULL,
+              block_reason = NULL, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(title, body, timestamp, taskId);
+      this.appendEvent(taskId, "specified", { author: specification.author?.trim() || "specifier", title });
+    });
+    return this.getTask(taskId);
+  }
+
+  applyTaskGraph(input: {
+    rootTaskId: string;
+    rootTitle?: string | undefined;
+    rootBody?: string | undefined;
+    orchestratorAssignee: string;
+    orchestratorRuntime: Runtime;
+    nodes: TaskGraphNode[];
+    dependencies: Array<{ parent: string; child: string }>;
+  }): TaskGraphResult {
+    if (input.nodes.length === 0) throw new Error("A task graph requires at least one child");
+    if (input.nodes.length > 100) throw new Error("A task graph cannot exceed 100 children");
+    const keys = new Set<string>();
+    for (const node of input.nodes) {
+      const key = node.key.trim();
+      if (!key || keys.has(key)) throw new Error(`Task graph keys must be non-empty and unique: ${node.key}`);
+      keys.add(key);
+      if (!RUNTIMES.includes(node.runtime)) throw new Error(`Invalid task graph runtime: ${node.runtime}`);
+      if (!node.assignee.trim()) throw new Error(`Task graph node ${key} has no assignee`);
+    }
+    if (!RUNTIMES.includes(input.orchestratorRuntime)) {
+      throw new Error(`Invalid orchestrator runtime: ${input.orchestratorRuntime}`);
+    }
+    if (!input.orchestratorAssignee.trim()) throw new Error("Orchestrator assignee cannot be empty");
+    for (const dependency of input.dependencies) {
+      if (!keys.has(dependency.parent) || !keys.has(dependency.child)) {
+        throw new Error(`Unknown task graph dependency: ${dependency.parent} -> ${dependency.child}`);
+      }
+      if (dependency.parent === dependency.child) throw new Error("A task graph node cannot depend on itself");
+    }
+
+    const tasksByKey: Record<string, string> = {};
+    let leafIds: string[] = [];
+    this.write(() => {
+      const root = this.requireTaskRow(input.rootTaskId);
+      if (root.status !== "triage") throw new Error(`Task is not in triage: ${input.rootTaskId}`);
+      for (const node of input.nodes) {
+        const workspace = root.workspace_kind === "dir" ? root.workspace : null;
+        tasksByKey[node.key] = this.createTaskNoTransaction({
+          title: node.title,
+          body: node.body,
+          board: root.board,
+          tenant: root.tenant,
+          assignee: node.assignee.trim(),
+          runtime: node.runtime,
+          priority: node.priority ?? root.priority,
+          workspace,
+          workspaceKind: root.workspace_kind,
+          maxRuntimeSeconds: root.max_runtime_seconds,
+          skills: node.skills,
+          maxRetries: root.max_retries,
+        });
+      }
+      for (const dependency of input.dependencies) {
+        this.linkNoTransaction(tasksByKey[dependency.parent]!, tasksByKey[dependency.child]!);
+      }
+      const nonLeaves = new Set(input.dependencies.map((dependency) => dependency.parent));
+      const leafKeys = input.nodes.map((node) => node.key).filter((key) => !nonLeaves.has(key));
+      leafIds = leafKeys.map((key) => tasksByKey[key]!);
+
+      const title = input.rootTitle?.trim() || root.title;
+      const body = input.rootBody?.trim() || root.body;
+      this.db
+        .prepare(`
+          UPDATE tasks
+          SET title = ?, body = ?, assignee = ?, runtime = ?, status = 'todo',
+              block_kind = NULL, block_reason = NULL, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(
+          title,
+          body,
+          input.orchestratorAssignee.trim(),
+          input.orchestratorRuntime,
+          now(),
+          root.id,
+        );
+      for (const leafId of leafIds) this.linkNoTransaction(leafId, root.id);
+      this.appendEvent(root.id, "decomposed", {
+        childIds: Object.values(tasksByKey),
+        leafIds,
+        dependencies: input.dependencies,
+      });
+    });
+    return {
+      root: this.getTask(input.rootTaskId),
+      childIds: input.nodes.map((node) => tasksByKey[node.key]!),
+      tasksByKey,
+      leafIds,
+    };
+  }
+
+  createSwarm(input: {
+    goal: string;
+    workers: Array<{ assignee: string; runtime: Runtime }>;
+    verifier: { assignee: string; runtime: Runtime };
+    synthesizer: { assignee: string; runtime: Runtime };
+    tenant?: string | null | undefined;
+    workspace?: string | null | undefined;
+    workspaceKind?: "scratch" | "dir" | "worktree" | undefined;
+    blackboard?: Record<string, unknown> | undefined;
+  }): SwarmResult {
+    const goal = input.goal.trim();
+    if (!goal) throw new Error("Swarm goal cannot be empty");
+    if (input.workers.length === 0) throw new Error("A swarm requires at least one worker");
+    if (input.workers.length > 50) throw new Error("A swarm cannot exceed 50 workers");
+    const routes = [...input.workers, input.verifier, input.synthesizer];
+    for (const route of routes) {
+      if (!route.assignee.trim()) throw new Error("Swarm assignees cannot be empty");
+      if (!RUNTIMES.includes(route.runtime) || route.runtime === "manual") {
+        throw new Error(`Invalid swarm runtime: ${route.runtime}`);
+      }
+    }
+    const taskWorkspace = input.workspaceKind === "worktree" ? null : input.workspace;
+    let rootId = "";
+    const workerIds: string[] = [];
+    let verifierId = "";
+    let synthesizerId = "";
+    this.write(() => {
+      rootId = this.createTaskNoTransaction({
+        title: `Swarm blackboard: ${goal}`,
+        body: goal,
+        tenant: input.tenant,
+        status: "todo",
+        runtime: "manual",
+        workspace: taskWorkspace,
+        workspaceKind: input.workspaceKind,
+      });
+      const root = this.requireTaskRow(rootId);
+      const runId = this.syntheticRunNoTransaction(root, "completed", {
+        summary: "Swarm blackboard initialized",
+        metadata: { goal, ...(input.blackboard ?? {}) },
+      });
+      this.db
+        .prepare("UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?")
+        .run("Swarm blackboard initialized", now(), rootId);
+      this.db
+        .prepare("INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, 'swarm', ?, ?)")
+        .run(rootId, JSON.stringify({ type: "kanban_swarm_blackboard", goal, ...(input.blackboard ?? {}) }), now());
+      this.appendEvent(rootId, "completed", { summary: "Swarm blackboard initialized" }, runId);
+
+      for (const [index, worker] of input.workers.entries()) {
+        workerIds.push(this.createTaskNoTransaction({
+          title: `Swarm worker ${index + 1} (${worker.assignee}): ${goal}`,
+          body: `Work independently on this swarm goal. Read the blackboard parent and leave a structured handoff.\n\n${goal}`,
+          tenant: input.tenant,
+          assignee: worker.assignee,
+          runtime: worker.runtime,
+          workspace: taskWorkspace,
+          workspaceKind: input.workspaceKind,
+          parents: [rootId],
+        }));
+      }
+      verifierId = this.createTaskNoTransaction({
+        title: `Verify swarm results: ${goal}`,
+        body: "Review every worker handoff against the shared goal. Identify gaps and provide a clear verification decision.",
+        tenant: input.tenant,
+        assignee: input.verifier.assignee,
+        runtime: input.verifier.runtime,
+        workspace: taskWorkspace,
+        workspaceKind: input.workspaceKind,
+        parents: workerIds,
+      });
+      synthesizerId = this.createTaskNoTransaction({
+        title: `Synthesize swarm result: ${goal}`,
+        body: "Produce the final deliverable using the verified swarm handoffs and verification decision.",
+        tenant: input.tenant,
+        assignee: input.synthesizer.assignee,
+        runtime: input.synthesizer.runtime,
+        workspace: taskWorkspace,
+        workspaceKind: input.workspaceKind,
+        parents: [verifierId],
+      });
+      this.appendEvent(rootId, "swarm_created", { workerIds, verifierId, synthesizerId });
+    });
+    return { root: this.getTask(rootId), workerIds, verifierId, synthesizerId };
   }
 
   updateTask(taskId: string, input: UpdateTaskInput): TaskDetail {
@@ -1826,7 +2057,7 @@ export class KanbanStore {
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
       const timestamp = now();
-      const originalTtl = Math.max(1_000, Date.parse(run.claim_expires_at) - Date.parse(run.claimed_at));
+      const originalTtl = Math.max(1_000, Date.parse(run.claim_expires_at) - Date.parse(run.heartbeat_at));
       const claimExpiresAt = new Date(Date.now() + originalTtl).toISOString();
       this.db
         .prepare("UPDATE task_runs SET heartbeat_at = ?, claim_expires_at = ? WHERE id = ?")
@@ -1836,6 +2067,42 @@ export class KanbanStore {
     });
     const row = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(scope.runId) as RunRow;
     return runFromRow(row);
+  }
+
+  recordGoalJudgment(
+    scope: RunScope,
+    input: { turn: number; complete: boolean; reason: string; nextPrompt?: string | undefined },
+  ): Run {
+    this.write(() => {
+      const { task, run } = this.requireActiveRun(scope);
+      const timestamp = now();
+      const originalTtl = Math.max(1_000, Date.parse(run.claim_expires_at) - Date.parse(run.heartbeat_at));
+      this.db
+        .prepare("UPDATE task_runs SET heartbeat_at = ?, claim_expires_at = ? WHERE id = ?")
+        .run(timestamp, new Date(Date.now() + originalTtl).toISOString(), run.id);
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(timestamp, task.id);
+      this.appendEvent(task.id, "goal_judged", {
+        turn: input.turn,
+        complete: input.complete,
+        reason: input.reason.slice(0, 2_000),
+        nextPrompt: input.nextPrompt?.slice(0, 2_000) || null,
+      }, run.id);
+    });
+    return runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(scope.runId) as RunRow);
+  }
+
+  pauseGoalRun(scope: RunScope, turn: number): Run {
+    this.write(() => {
+      const { task, run } = this.requireActiveRun(scope);
+      const timestamp = now();
+      const originalTtl = Math.max(1_000, Date.parse(run.claim_expires_at) - Date.parse(run.heartbeat_at));
+      this.db
+        .prepare("UPDATE task_runs SET pid = NULL, heartbeat_at = ?, claim_expires_at = ? WHERE id = ?")
+        .run(timestamp, new Date(Date.now() + originalTtl).toISOString(), run.id);
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(timestamp, task.id);
+      this.appendEvent(task.id, "goal_turn_finished", { turn }, run.id);
+    });
+    return runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(scope.runId) as RunRow);
   }
 
   bindRunWorkspace(

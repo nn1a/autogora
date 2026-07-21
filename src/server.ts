@@ -5,11 +5,39 @@ import { z } from "zod";
 import { BoardManager } from "./boards.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
+import {
+  createCliPlanner,
+  decomposeTriageTask,
+  specifyTriageTask,
+  type DecompositionPlan,
+} from "./orchestration.js";
 import { KanbanStore, type RunScope } from "./store.js";
 import { BLOCK_KINDS, RUNTIMES, TASK_STATUSES, type BlockKind, type Runtime, type TaskStatus } from "./types.js";
 
 const runtimeSchema = z.enum(RUNTIMES);
 const statusSchema = z.enum(TASK_STATUSES);
+const workerRuntimeSchema = z.enum(["claude", "codex"]);
+const profileRouteSchema = z.object({
+  name: z.string().min(1),
+  runtime: workerRuntimeSchema,
+  description: z.string().optional(),
+});
+const decompositionPlanSchema = z.object({
+  fanout: z.boolean(),
+  rootTitle: z.string().min(1),
+  rootBody: z.string().min(1),
+  reason: z.string(),
+  tasks: z.array(z.object({
+    key: z.string().min(1),
+    title: z.string().min(1),
+    body: z.string().min(1),
+    assignee: z.string().min(1),
+    runtime: workerRuntimeSchema,
+    priority: z.number().int(),
+    skills: z.array(z.string()),
+  })).max(100),
+  dependencies: z.array(z.object({ parent: z.string().min(1), child: z.string().min(1) })),
+});
 
 function result(value: unknown) {
   return {
@@ -514,6 +542,119 @@ export function createKanbanServer(manager: BoardManager): McpServer {
       } finally {
         store.close();
       }
+    },
+  );
+
+  server.registerTool(
+    "kanban_specify",
+    {
+      title: "Specify a Kanban triage task",
+      description: "Rewrite a rough triage card into an executable specification and move it to todo. Provide title/body directly or use a Claude/Codex auxiliary planner.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string(),
+        title: z.string().min(1).optional(),
+        body: z.string().min(1).optional(),
+        author: z.string().optional(),
+        planner_runtime: workerRuntimeSchema.default("codex"),
+        planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
+      }).refine(({ title, body }) => (title === undefined) === (body === undefined), {
+        message: "title and body must be provided together",
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ board, task_id, title, body, author, planner_runtime, planner_timeout_ms }) => {
+      requireAdminSurface();
+      const resolvedBoard = selectedBoard(manager, board);
+      const store = manager.openStore(resolvedBoard);
+      try {
+        const value = await specifyTriageTask(store, task_id, {
+          specification: title && body ? { title, body } : undefined,
+          planner: createCliPlanner({ runtime: planner_runtime, cwd: process.cwd(), timeoutMs: planner_timeout_ms }),
+          author,
+        });
+        return result(value);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  server.registerTool(
+    "kanban_decompose",
+    {
+      title: "Decompose a Kanban triage task",
+      description: "Use an explicit or Claude/Codex-generated plan to atomically create and route a child task graph. Unknown assignees fall back to default_profile.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string(),
+        profiles: z.array(profileRouteSchema).default([]),
+        default_profile: profileRouteSchema,
+        orchestrator_profile: profileRouteSchema.optional(),
+        plan: decompositionPlanSchema.optional(),
+        planner_runtime: workerRuntimeSchema.default("codex"),
+        planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({
+      board,
+      task_id,
+      profiles,
+      default_profile,
+      orchestrator_profile,
+      plan,
+      planner_runtime,
+      planner_timeout_ms,
+    }) => {
+      requireAdminSurface();
+      const resolvedBoard = selectedBoard(manager, board);
+      const store = manager.openStore(resolvedBoard);
+      try {
+        const value = await decomposeTriageTask(store, task_id, {
+          profiles,
+          defaultProfile: default_profile,
+          orchestratorProfile: orchestrator_profile,
+          plan: plan as DecompositionPlan | undefined,
+          planner: createCliPlanner({ runtime: planner_runtime, cwd: process.cwd(), timeoutMs: planner_timeout_ms }),
+        });
+        return result(value);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  server.registerTool(
+    "kanban_swarm",
+    {
+      title: "Create a Kanban swarm",
+      description: "Atomically create a completed blackboard, parallel workers, a gated verifier, and a gated synthesizer.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        goal: z.string().min(1),
+        workers: z.array(profileRouteSchema).min(1).max(50),
+        verifier: profileRouteSchema,
+        synthesizer: profileRouteSchema,
+        tenant: z.string().nullable().optional(),
+        workspace: z.string().nullable().optional(),
+        workspace_kind: z.enum(["scratch", "dir", "worktree"]).optional(),
+        blackboard: z.record(z.string(), z.unknown()).optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ board, goal, workers, verifier, synthesizer, tenant, workspace, workspace_kind, blackboard }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => store.createSwarm({
+        goal,
+        workers: workers.map((profile) => ({ assignee: profile.name, runtime: profile.runtime })),
+        verifier: { assignee: verifier.name, runtime: verifier.runtime },
+        synthesizer: { assignee: synthesizer.name, runtime: synthesizer.runtime },
+        tenant,
+        workspace,
+        workspaceKind: workspace_kind,
+        blackboard,
+      })));
     },
   );
 

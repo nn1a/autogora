@@ -145,6 +145,138 @@ test("dispatcher treats exit 75 as a retry-neutral rate limit", async () => {
   }
 });
 
+test("dispatcher can automatically specify triage cards through the decomposition planner", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-auto-decompose-"));
+  const dbPath = join(directory, "kanban.db");
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({ title: "rough operational idea", status: "triage" });
+  store.close();
+  const plannerKinds: string[] = [];
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      autoDecompose: true,
+      decompositionPlanner: async ({ kind }) => {
+        plannerKinds.push(kind);
+        return {
+          fanout: false,
+          rootTitle: "Audit the production backup process",
+          rootBody: "Verify restoration from the latest backup. Acceptance: record timestamps and checksum evidence.",
+          reason: "One specialist can execute this safely.",
+          tasks: [],
+          dependencies: [],
+        };
+      },
+    });
+    const check = manager.openStore("default");
+    try {
+      const specified = check.getTask(task.task.id);
+      assert.equal(specified.task.status, "todo");
+      assert.match(specified.task.body, /Acceptance/);
+      assert.deepEqual(plannerKinds, ["decompose"]);
+    } finally {
+      check.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("goal mode resumes one worker session until completion", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-goal-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/goal-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "finish a multi-turn goal",
+    body: "Acceptance: the second turn records a verified completion.",
+    assignee: "worker",
+    runtime: "codex",
+    workspace: directory,
+    goalMode: true,
+    goalMaxTurns: 3,
+  });
+  store.close();
+  const previous = process.env.KANBAN_CODEX_BIN;
+  process.env.KANBAN_CODEX_BIN = fixture;
+  const judgedTurns: number[] = [];
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      goalJudge: async ({ turn }) => {
+        judgedTurns.push(turn);
+        return { complete: false, reason: "one acceptance gap remains", nextPrompt: "Finish and verify the remaining gap." };
+      },
+    });
+    const check = manager.openStore("default");
+    try {
+      const completed = check.getTask(task.task.id);
+      assert.equal(completed.task.status, "done");
+      assert.equal(completed.runs[0]?.status, "completed");
+      assert.equal(completed.runs[0]?.metadata?.turns, 2);
+      assert.deepEqual(judgedTurns, [1]);
+      assert.equal(completed.events.filter((event) => event.kind === "goal_judged").length, 1);
+      assert.equal(completed.events.filter((event) => event.kind === "spawned").length, 2);
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
+    else process.env.KANBAN_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("goal mode blocks for review when its turn budget is exhausted", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-goal-budget-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/goal-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "bounded goal",
+    body: "Acceptance: evidence is required.",
+    assignee: "worker",
+    runtime: "codex",
+    workspace: directory,
+    goalMode: true,
+    goalMaxTurns: 1,
+  });
+  store.close();
+  const previous = process.env.KANBAN_CODEX_BIN;
+  process.env.KANBAN_CODEX_BIN = fixture;
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      goalJudge: async () => ({ complete: false, reason: "verification is missing", nextPrompt: "verify" }),
+    });
+    const check = manager.openStore("default");
+    try {
+      const blocked = check.getTask(task.task.id);
+      assert.equal(blocked.task.status, "blocked");
+      assert.equal(blocked.task.blockKind, "needs_input");
+      assert.match(blocked.task.blockReason ?? "", /budget exhausted/i);
+      assert.equal(blocked.runs[0]?.status, "blocked");
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
+    else process.env.KANBAN_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("dispatcher terminates workers that exceed the task runtime limit", async () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-timeout-"));
   const dbPath = join(directory, "kanban.db");

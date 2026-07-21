@@ -13,11 +13,12 @@ Treat Kanban MCP as the canonical task state. Finish the assigned work and leave
 2. Work only on that task under `$KANBAN_WORKSPACE`. Read task attachments from the absolute paths returned by `kanban_show`. Do not claim, create, reassign, link, unblock, or update unrelated cards.
 3. For long work, call `kanban_heartbeat` after meaningful checkpoints. Use `kanban_comment` for intermediate findings another run must retain.
 4. Verify the acceptance criteria. For code, run focused tests and inspect the final diff.
-5. Terminate exactly once:
+5. For an ordinary card, terminate exactly once:
    - Call `kanban_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$KANBAN_WORKSPACE` and must exist.
    - Call `kanban_block` with `kind=dependency`, `needs_input`, `capability`, or `transient` when work cannot continue.
+   For a goal-mode card whose acceptance criteria are not yet met, leave the run active and end the turn with a concise progress handoff. The dispatcher records an independent judgment and resumes the same session until acceptance or the turn budget is exhausted.
 
-Do not finish with prose alone. A dispatcher treats exit without `kanban_complete` or `kanban_block` as a failed run.
+Do not finish an ordinary card with prose alone. A dispatcher treats that as a failed run.
 
 ## Completion evidence
 

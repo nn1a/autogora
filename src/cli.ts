@@ -7,6 +7,13 @@ import { BoardManager } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
+import {
+  createCliPlanner,
+  decomposeTriageTask,
+  specifyTriageTask,
+  type DecompositionPlan,
+  type ProfileRoute,
+} from "./orchestration.js";
 import { runStdioServer } from "./server.js";
 import {
   BLOCK_KINDS,
@@ -40,6 +47,9 @@ Commands:
   notify-list [id]      List board or task notification subscriptions
   notify-unsubscribe <id> Remove a task notification destination
   notify-deliver        Deliver pending notifications once
+  specify <id>          Expand a triage idea into an executable specification
+  decompose <id>        Expand a triage idea into an atomic task graph
+  swarm <goal>          Create a blackboard/worker/verifier/synthesizer graph
   edit <task-id>        Edit task metadata
   assign <id> <worker>  Assign or unassign a task
   link <parent> <child> Add a dependency
@@ -71,6 +81,9 @@ Dispatch options:
   --claim-ttl-seconds <n> Claim lease duration (default: 900)
   --interval-ms <n>     Idle poll interval (default: 2000)
   --allow-writes        Allow workspace edits and shell commands
+  --auto-decompose      Use the auxiliary planner for triage cards
+  --auto-decompose-per-tick <n> Limit planner calls per dispatcher tick
+  --profile <route>     Repeat name:runtime:description routes for decomposition
 `;
 
 function defaultDbPath(): string {
@@ -116,6 +129,23 @@ function requireRuntime(value: string | undefined): Runtime {
   const runtime = value ?? "manual";
   if (!RUNTIMES.includes(runtime as Runtime)) throw new Error(`Invalid runtime: ${runtime}`);
   return runtime as Runtime;
+}
+
+function requirePlannerRuntime(value: string | undefined): Exclude<Runtime, "manual"> {
+  const runtime = value ?? "codex";
+  if (runtime !== "codex" && runtime !== "claude") throw new Error(`Invalid planner runtime: ${runtime}`);
+  return runtime;
+}
+
+function parseProfileRoute(value: string, fallbackRuntime: Exclude<Runtime, "manual"> = "codex"): ProfileRoute {
+  const [rawName, rawRuntime, ...descriptionParts] = value.split(":");
+  const name = rawName?.trim();
+  if (!name) throw new Error(`Invalid profile route: ${value}`);
+  const runtime = rawRuntime?.trim() || fallbackRuntime;
+  if (!RUNTIMES.includes(runtime as Runtime) || runtime === "manual") {
+    throw new Error(`Invalid profile runtime in ${value}`);
+  }
+  return { name, runtime: runtime as Exclude<Runtime, "manual">, description: descriptionParts.join(":").trim() || undefined };
 }
 
 function requireStatus(value: string | undefined): TaskStatus | undefined {
@@ -588,6 +618,138 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "specify" || command === "decompose") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        all: { type: "boolean" },
+        tenant: { type: "string" },
+        title: { type: "string" },
+        body: { type: "string" },
+        author: { type: "string" },
+        "planner-runtime": { type: "string" },
+        "planner-timeout-ms": { type: "string" },
+        "plan-json": { type: "string" },
+        profile: { type: "string", multiple: true },
+        "default-profile": { type: "string" },
+        "orchestrator-profile": { type: "string" },
+      },
+    });
+    const requestedId = parsed.positionals[0];
+    if (!requestedId && !parsed.values.all) throw new Error(`${command} requires a task id or --all`);
+    if (requestedId && parsed.values.all) throw new Error(`${command} accepts a task id or --all, not both`);
+    if ((parsed.values.title === undefined) !== (parsed.values.body === undefined)) {
+      throw new Error("--title and --body must be provided together");
+    }
+    if (parsed.values.all && parsed.values.title !== undefined) {
+      throw new Error("An explicit specification cannot be reused with --all");
+    }
+    const plannerRuntime = requirePlannerRuntime(parsed.values["planner-runtime"]);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const taskIds = requestedId
+        ? [requestedId]
+        : store.listTasks({ status: "triage", tenant: parsed.values.tenant, limit: 500 }).map((task) => task.id);
+      const planner = createCliPlanner({
+        runtime: plannerRuntime,
+        cwd: process.cwd(),
+        timeoutMs: numberOption(parsed.values["planner-timeout-ms"], 120_000),
+      });
+      const explicitProfiles = (parsed.values.profile ?? []).map((profile) => parseProfileRoute(profile, plannerRuntime));
+      const discoveredProfiles = store.listTasks({ includeArchived: true, limit: 500 })
+        .filter((task) => task.assignee && task.runtime !== "manual")
+        .map((task) => ({
+          name: task.assignee!,
+          runtime: task.runtime as Exclude<Runtime, "manual">,
+        } satisfies ProfileRoute));
+      const profiles = [...new Map([...discoveredProfiles, ...explicitProfiles].map((profile) => [profile.name, profile])).values()];
+      const explicitPlan = parsed.values["plan-json"]
+        ? JSON.parse(parsed.values["plan-json"]) as DecompositionPlan
+        : undefined;
+      const results: Array<{ taskId: string; ok: boolean; value?: unknown; error?: string }> = [];
+      for (const taskId of taskIds) {
+        try {
+          if (command === "specify") {
+            const value = await specifyTriageTask(store, taskId, {
+              planner,
+              specification: parsed.values.title && parsed.values.body
+                ? { title: parsed.values.title, body: parsed.values.body }
+                : undefined,
+              author: parsed.values.author,
+            });
+            results.push({ taskId, ok: true, value });
+          } else {
+            const root = store.getTask(taskId).task;
+            const fallback = parsed.values["default-profile"]
+              ? parseProfileRoute(parsed.values["default-profile"], plannerRuntime)
+              : root.assignee && root.runtime !== "manual"
+                ? { name: root.assignee, runtime: root.runtime as Exclude<Runtime, "manual"> }
+                : profiles[0] ?? { name: `${plannerRuntime}-worker`, runtime: plannerRuntime };
+            const value = await decomposeTriageTask(store, taskId, {
+              profiles,
+              defaultProfile: fallback,
+              orchestratorProfile: parsed.values["orchestrator-profile"]
+                ? parseProfileRoute(parsed.values["orchestrator-profile"], plannerRuntime)
+                : fallback,
+              planner,
+              plan: explicitPlan,
+            });
+            results.push({ taskId, ok: true, value });
+          }
+        } catch (error) {
+          results.push({ taskId, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "swarm") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        workers: { type: "string" },
+        verifier: { type: "string" },
+        synthesizer: { type: "string" },
+        tenant: { type: "string" },
+        workspace: { type: "string" },
+        "workspace-kind": { type: "string" },
+        blackboard: { type: "string" },
+      },
+    });
+    const goal = parsed.positionals.join(" ").trim();
+    if (!goal || !parsed.values.workers || !parsed.values.verifier || !parsed.values.synthesizer) {
+      throw new Error("swarm requires a goal, --workers, --verifier, and --synthesizer");
+    }
+    const workers = parsed.values.workers.split(",").map((worker) => parseProfileRoute(worker.trim()));
+    const verifier = parseProfileRoute(parsed.values.verifier);
+    const synthesizer = parseProfileRoute(parsed.values.synthesizer);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const output = store.createSwarm({
+        goal,
+        workers: workers.map((profile) => ({ assignee: profile.name, runtime: profile.runtime })),
+        verifier: { assignee: verifier.name, runtime: verifier.runtime },
+        synthesizer: { assignee: synthesizer.name, runtime: synthesizer.runtime },
+        tenant: parsed.values.tenant,
+        workspace: parsed.values.workspace,
+        workspaceKind: parsed.values["workspace-kind"] as "scratch" | "dir" | "worktree" | undefined,
+        blackboard: parsed.values.blackboard ? parseMetadata(parsed.values.blackboard) : undefined,
+      });
+      process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
   if (command === "edit") {
     const parsed = parseArgs({
       args,
@@ -818,6 +980,13 @@ async function main(): Promise<void> {
         "rate-limit-cooldown-seconds": { type: "string" },
         "interval-ms": { type: "string" },
         "allow-writes": { type: "boolean" },
+        "auto-decompose": { type: "boolean" },
+        "auto-decompose-per-tick": { type: "string" },
+        profile: { type: "string", multiple: true },
+        "default-profile": { type: "string" },
+        "orchestrator-profile": { type: "string" },
+        "planner-runtime": { type: "string" },
+        "planner-timeout-ms": { type: "string" },
       },
     });
     const controller = new AbortController();
@@ -841,6 +1010,19 @@ async function main(): Promise<void> {
       heartbeatMaxStaleSeconds: numberOption(parsed.values["heartbeat-max-stale-seconds"], 60 * 60),
       crashGraceSeconds: numberOption(parsed.values["crash-grace-seconds"], 30),
       rateLimitCooldownSeconds: numberOption(parsed.values["rate-limit-cooldown-seconds"], 60),
+      autoDecompose: parsed.values["auto-decompose"] ?? false,
+      autoDecomposePerTick: numberOption(parsed.values["auto-decompose-per-tick"], 3),
+      decompositionProfiles: (parsed.values.profile ?? []).map((profile) =>
+        parseProfileRoute(profile, requirePlannerRuntime(parsed.values["planner-runtime"])),
+      ),
+      defaultDecompositionProfile: parsed.values["default-profile"]
+        ? parseProfileRoute(parsed.values["default-profile"], requirePlannerRuntime(parsed.values["planner-runtime"]))
+        : undefined,
+      orchestratorProfile: parsed.values["orchestrator-profile"]
+        ? parseProfileRoute(parsed.values["orchestrator-profile"], requirePlannerRuntime(parsed.values["planner-runtime"]))
+        : undefined,
+      plannerRuntime: requirePlannerRuntime(parsed.values["planner-runtime"]),
+      plannerTimeoutMs: numberOption(parsed.values["planner-timeout-ms"], 120_000),
       allowWrites: parsed.values["allow-writes"] ?? false,
       signal: controller.signal,
       onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),

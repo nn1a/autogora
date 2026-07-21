@@ -1,9 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
 import { deliverNotifications } from "./notifications.js";
+import {
+  createCliPlanner,
+  decomposeTriageTask,
+  judgeGoalProgress,
+  type GoalJudgment,
+  type ProfileRoute,
+  type StructuredPlanner,
+} from "./orchestration.js";
 import { KanbanStore } from "./store.js";
 import type { ClaimedTask, Runtime } from "./types.js";
 import { WorkspaceManager } from "./workspaces.js";
@@ -31,6 +40,19 @@ export interface DispatcherOptions {
   rateLimitCooldownSeconds?: number | undefined;
   notificationLimit?: number | undefined;
   notificationTimeoutMs?: number | undefined;
+  goalJudge?: ((input: {
+    task: ClaimedTask["task"];
+    turn: number;
+    workerOutput: string;
+  }) => Promise<GoalJudgment>) | undefined;
+  autoDecompose?: boolean | undefined;
+  autoDecomposePerTick?: number | undefined;
+  decompositionProfiles?: ProfileRoute[] | undefined;
+  defaultDecompositionProfile?: ProfileRoute | undefined;
+  orchestratorProfile?: ProfileRoute | undefined;
+  plannerRuntime?: Exclude<Runtime, "manual"> | undefined;
+  plannerTimeoutMs?: number | undefined;
+  decompositionPlanner?: StructuredPlanner | undefined;
   allowWrites?: boolean | undefined;
   workspaceRoot?: string | undefined;
   attachmentsRoot?: string | undefined;
@@ -45,9 +67,16 @@ function workerPrompt(claim: ClaimedTask): string {
     `You are the assigned Kanban worker for ${task.id}.`,
     "Call kanban_show first without a task_id. Work only on that task in the current workspace.",
     "Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
-    "You must end exactly once by calling kanban_complete with verification evidence, or kanban_block with the concrete reason.",
     "Do not claim, create, reassign, unblock, or modify unrelated tasks.",
   ];
+  if (task.goalMode) {
+    instructions.push(
+      "This card is in goal mode. Call kanban_complete only when every acceptance criterion is demonstrably satisfied, or kanban_block for a real blocker.",
+      "If meaningful work remains after this turn, leave the task running and end your response with a concise progress handoff; an independent judge will continue this same session.",
+    );
+  } else {
+    instructions.push("You must end exactly once by calling kanban_complete with verification evidence, or kanban_block with the concrete reason.");
+  }
   if (task.skills.length > 0) {
     instructions.push(`Load and follow these task-specific skills before working: ${task.skills.join(", ")}.`);
   }
@@ -68,6 +97,7 @@ export function buildRunnerCommand(
     DispatcherOptions,
     "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot"
   >,
+  sessionId?: string,
 ): RunnerCommand {
   const task = claim.task.task;
   const cwd = task.workspace ? (isAbsolute(task.workspace) ? task.workspace : resolve(task.workspace)) : process.cwd();
@@ -147,11 +177,46 @@ export function buildRunnerCommand(
         options.allowWrites ? "acceptEdits" : "dontAsk",
         "--allowedTools",
         [...builtInTools, ...lifecycleTools].join(","),
+        ...(sessionId ? ["--session-id", sessionId] : []),
       ],
     };
   }
 
   throw new Error(`Dispatcher cannot launch runtime: ${task.runtime satisfies Runtime}`);
+}
+
+function buildGoalContinuationCommand(
+  claim: ClaimedTask,
+  options: Pick<
+    DispatcherOptions,
+    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot"
+  >,
+  sessionId: string,
+  prompt: string,
+): RunnerCommand {
+  const task = claim.task.task;
+  const initial = buildRunnerCommand(claim, options);
+  if (task.runtime === "codex") {
+    return {
+      ...initial,
+      args: [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        sessionId,
+        prompt,
+      ],
+    };
+  }
+  if (task.runtime === "claude") {
+    const promptIndex = initial.args.indexOf(workerPrompt(claim));
+    const args = [...initial.args];
+    if (promptIndex >= 0) args[promptIndex] = prompt;
+    args.push("--resume", sessionId);
+    return { ...initial, args };
+  }
+  throw new Error(`Goal continuation cannot launch runtime: ${task.runtime}`);
 }
 
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -247,6 +312,128 @@ async function deliverBoardNotifications(
   }));
 }
 
+async function decomposeBoardTriage(
+  manager: BoardManager,
+  boards: string[],
+  options: DispatcherOptions,
+): Promise<void> {
+  if (!options.autoDecompose) return;
+  let remaining = Math.max(1, options.autoDecomposePerTick ?? 3);
+  const plannerRuntime = options.plannerRuntime ?? "codex";
+  const planner = options.decompositionPlanner ?? createCliPlanner({
+    runtime: plannerRuntime,
+    cwd: process.cwd(),
+    timeoutMs: options.plannerTimeoutMs ?? 120_000,
+  });
+  for (const board of boards) {
+    if (remaining <= 0) break;
+    const store = manager.openStore(board);
+    try {
+      const triage = store.listTasks({ status: "triage", limit: remaining });
+      const discovered = store.listTasks({ includeArchived: true, limit: 500 })
+        .filter((task) => task.assignee && task.runtime !== "manual")
+        .map((task) => ({
+          name: task.assignee!,
+          runtime: task.runtime as Exclude<Runtime, "manual">,
+        } satisfies ProfileRoute));
+      const profiles = [...new Map(
+        [...discovered, ...(options.decompositionProfiles ?? [])].map((profile) => [profile.name, profile]),
+      ).values()];
+      for (const task of triage) {
+        const fallback = options.defaultDecompositionProfile ??
+          (task.assignee && task.runtime !== "manual"
+            ? { name: task.assignee, runtime: task.runtime as Exclude<Runtime, "manual"> }
+            : profiles[0] ?? { name: `${plannerRuntime}-worker`, runtime: plannerRuntime });
+        try {
+          const result = await decomposeTriageTask(store, task.id, {
+            profiles,
+            defaultProfile: fallback,
+            orchestratorProfile: options.orchestratorProfile ?? fallback,
+            planner,
+          });
+          options.onLog?.(`auto-${result.fanout ? "decomposed" : "specified"} ${task.id}: ${result.reason}`);
+        } catch (error) {
+          options.onLog?.(`auto-decompose failed ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        remaining -= 1;
+        if (remaining <= 0) break;
+      }
+    } finally {
+      store.close();
+    }
+  }
+}
+
+interface TurnExecution {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  spawnError: Error | null;
+  timedOut: boolean;
+  output: string;
+  sessionId: string | null;
+}
+
+function sessionIdFromOutput(output: string): string | null {
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      const sessionId = event.thread_id ?? event.session_id;
+      if (typeof sessionId === "string" && sessionId) return sessionId;
+    } catch {
+      // Non-JSON lines are still useful to the goal judge.
+    }
+  }
+  return null;
+}
+
+async function executeTurn(
+  command: RunnerCommand,
+  store: KanbanStore,
+  scope: { runId: string; claimToken: string },
+  children: Set<ChildProcess>,
+  logPath: string,
+  runtimeLimitMs: number | null,
+): Promise<TurnExecution> {
+  return new Promise((resolveTurn) => {
+    const logStream = createWriteStream(logPath, { flags: "a" });
+    const child = spawn(command.command, command.args, {
+      cwd: command.cwd,
+      env: command.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.add(child);
+    if (child.pid !== undefined) store.recordSpawn(scope, child.pid, logPath);
+    let output = "";
+    const capture = (chunk: Buffer): void => {
+      logStream.write(chunk);
+      output = `${output}${chunk.toString("utf8")}`.slice(-128 * 1_024);
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    let spawnError: Error | null = null;
+    let timedOut = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const runtimeTimer = runtimeLimitMs === null
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+          forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        }, Math.max(1, runtimeLimitMs));
+    child.once("error", (error) => {
+      spawnError = error;
+    });
+    child.once("close", (code, signal) => {
+      if (runtimeTimer) clearTimeout(runtimeTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      children.delete(child);
+      logStream.end();
+      resolveTurn({ code, signal, spawnError, timedOut, output, sessionId: sessionIdFromOutput(output) });
+    });
+  });
+}
+
 async function runClaim(
   store: KanbanStore,
   claim: ClaimedTask,
@@ -267,77 +454,135 @@ async function runClaim(
     options.onLog?.(`workspace failure ${claim.task.task.id}: ${message}`);
     return;
   }
-  const command = buildRunnerCommand(preparedClaim, {
+
+  mkdirSync(logsDir, { recursive: true });
+  const taskId = preparedClaim.task.task.id;
+  const logPath = join(logsDir, `${taskId}-${preparedClaim.run.id}.log`);
+  const runnerOptions = {
     ...options,
     workspaceRoot,
     attachmentsRoot,
     logsRoot: logsDir,
-  });
-  mkdirSync(logsDir, { recursive: true });
-  const logPath = join(logsDir, `${preparedClaim.task.task.id}-${preparedClaim.run.id}.log`);
-  const logStream = createWriteStream(logPath, { flags: "a" });
-  options.onLog?.(`launch ${preparedClaim.task.task.id} via ${preparedClaim.task.task.runtime}; log=${logPath}`);
+  };
+  const goalMode = preparedClaim.task.task.goalMode;
+  let sessionId: string | null = goalMode && preparedClaim.task.task.runtime === "claude" ? randomUUID() : null;
+  let continuationPrompt: string | null = null;
+  let turn = 1;
+  const runStartedAt = Date.parse(preparedClaim.run.claimedAt);
+  const defaultGoalPlanner = goalMode && !options.goalJudge
+      ? createCliPlanner({
+        runtime: preparedClaim.task.task.runtime as Exclude<Runtime, "manual">,
+        cwd: preparedClaim.task.task.workspace ?? process.cwd(),
+        timeoutMs: options.plannerTimeoutMs ?? 120_000,
+      })
+    : null;
 
-  await new Promise<void>((resolveRun) => {
-    const child = spawn(command.command, command.args, {
-      cwd: command.cwd,
-      env: command.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    children.add(child);
-    if (child.pid !== undefined) store.recordSpawn(scope, child.pid, logPath);
-    child.stdout?.pipe(logStream, { end: false });
-    child.stderr?.pipe(logStream, { end: false });
-    let spawnError: Error | null = null;
-    let timedOut = false;
-    let forceKillTimer: NodeJS.Timeout | undefined;
-    const runtimeTimer = preparedClaim.task.task.maxRuntimeSeconds === null
-      ? undefined
-      : setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-        }, preparedClaim.task.task.maxRuntimeSeconds * 1_000);
-    child.once("error", (error) => {
-      spawnError = error;
-    });
-    child.once("close", (code, signal) => {
-      if (runtimeTimer) clearTimeout(runtimeTimer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      children.delete(child);
-      logStream.end();
-      const current = store.getTask(preparedClaim.task.task.id).task;
-      if (current.status === "running" && current.currentRunId === preparedClaim.run.id) {
-        const detail = spawnError?.message ?? `Runner exited without a terminal Kanban call (code=${code}, signal=${signal ?? "none"})`;
-        if (timedOut) {
-          store.failRun(scope, detail, { outcome: "timed_out" });
-        } else if (spawnError) {
-          store.failRun(scope, detail, { outcome: "spawn_failed" });
-        } else if (code === 75) {
-          store.failRun(scope, detail, {
-            outcome: "rate_limited",
-            countFailure: false,
-            cooldownSeconds: Math.max(0, options.rateLimitCooldownSeconds ?? 60),
-          });
-        } else if (code === 0) {
-          store.failRun(scope, detail, { outcome: "protocol_violation" });
-        } else {
-          store.failRun(scope, detail);
-        }
-        options.onLog?.(`requeue/fail ${current.id}: ${detail}`);
-      } else {
-        options.onLog?.(`finish ${current.id}: ${current.status}`);
-        if (current.status === "done") {
-          try {
-            workspaces.cleanup(current);
-          } catch (error) {
-            options.onLog?.(`workspace cleanup failed ${current.id}: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-      }
-      resolveRun();
-    });
-  });
+  const cleanupIfDone = (): void => {
+    const current = store.getTask(taskId).task;
+    options.onLog?.(`finish ${current.id}: ${current.status}`);
+    if (current.status !== "done") return;
+    try {
+      workspaces.cleanup(current);
+    } catch (error) {
+      options.onLog?.(`workspace cleanup failed ${current.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  while (true) {
+    const command = continuationPrompt && sessionId
+      ? buildGoalContinuationCommand(preparedClaim, runnerOptions, sessionId, continuationPrompt)
+      : buildRunnerCommand(preparedClaim, runnerOptions, sessionId ?? undefined);
+    const maxRuntimeMs = preparedClaim.task.task.maxRuntimeSeconds === null
+      ? null
+      : preparedClaim.task.task.maxRuntimeSeconds * 1_000 - (Date.now() - runStartedAt);
+    options.onLog?.(
+      `launch ${taskId} via ${preparedClaim.task.task.runtime}${goalMode ? ` goal turn ${turn}` : ""}; log=${logPath}`,
+    );
+    const execution = await executeTurn(command, store, scope, children, logPath, maxRuntimeMs);
+    const currentDetail = store.getTask(taskId);
+    const current = currentDetail.task;
+    if (current.status !== "running" || current.currentRunId !== preparedClaim.run.id) {
+      cleanupIfDone();
+      return;
+    }
+
+    const latestEvent = currentDetail.events.at(-1);
+    if (latestEvent?.kind === "reclaim_deferred" && latestEvent.runId === preparedClaim.run.id) {
+      store.recoverAbandonedRun(preparedClaim.run.id, "reclaimed", "Claim reclaimed after worker termination", false);
+      options.onLog?.(`reclaimed ${taskId} after deferred termination`);
+      return;
+    }
+
+    const detail = execution.spawnError?.message ??
+      `Runner exited without a terminal Kanban call (code=${execution.code}, signal=${execution.signal ?? "none"})`;
+    if (execution.timedOut || (maxRuntimeMs !== null && maxRuntimeMs <= 0)) {
+      store.failRun(scope, detail, { outcome: "timed_out" });
+      options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
+      return;
+    }
+    if (execution.spawnError) {
+      store.failRun(scope, detail, { outcome: "spawn_failed" });
+      options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
+      return;
+    }
+    if (execution.code === 75) {
+      store.failRun(scope, detail, {
+        outcome: "rate_limited",
+        countFailure: false,
+        cooldownSeconds: Math.max(0, options.rateLimitCooldownSeconds ?? 60),
+      });
+      options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
+      return;
+    }
+    if (execution.code !== 0) {
+      store.failRun(scope, detail);
+      options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
+      return;
+    }
+    if (!goalMode) {
+      store.failRun(scope, detail, { outcome: "protocol_violation" });
+      options.onLog?.(`requeue/fail ${taskId}: ${detail}`);
+      return;
+    }
+
+    store.pauseGoalRun(scope, turn);
+    sessionId = sessionId ?? execution.sessionId;
+    if (!sessionId) {
+      store.failRun(scope, "Goal-mode runner did not report a resumable session id", { outcome: "protocol_violation" });
+      return;
+    }
+    let judgment: GoalJudgment;
+    try {
+      judgment = options.goalJudge
+        ? await options.goalJudge({ task: currentDetail, turn, workerOutput: execution.output })
+        : await judgeGoalProgress(currentDetail, turn, execution.output, defaultGoalPlanner!);
+    } catch (error) {
+      const reason = `Goal judge failed: ${error instanceof Error ? error.message : String(error)}`;
+      store.blockRun(scope, reason, "transient");
+      options.onLog?.(`blocked ${taskId}: ${reason}`);
+      return;
+    }
+    store.recordGoalJudgment(scope, { turn, ...judgment });
+    if (judgment.complete) {
+      store.completeRun(scope, {
+        summary: `Goal accepted after ${turn} turn${turn === 1 ? "" : "s"}: ${judgment.reason}`,
+        metadata: { goalMode: true, turns: turn, judgeReason: judgment.reason },
+      });
+      cleanupIfDone();
+      return;
+    }
+    if (turn >= preparedClaim.task.task.goalMaxTurns) {
+      store.blockRun(
+        scope,
+        `Goal turn budget exhausted after ${turn} turns: ${judgment.reason}`,
+        "needs_input",
+      );
+      options.onLog?.(`goal budget exhausted ${taskId}`);
+      return;
+    }
+    turn += 1;
+    continuationPrompt = judgment.nextPrompt || `Continue toward the task acceptance criteria. Address this gap: ${judgment.reason}`;
+  }
 }
 
 export async function runDispatcher(options: DispatcherOptions): Promise<void> {
@@ -360,6 +605,7 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
         ? [manager.resolve(options.board)]
         : manager.list().filter((board) => !board.archived).map((board) => board.slug);
       await deliverBoardNotifications(manager, boards, options);
+      await decomposeBoardTriage(manager, boards, options);
       let foundInPass = true;
       while (!options.signal?.aborted && active.size < maxWorkers && foundInPass) {
         foundInPass = false;

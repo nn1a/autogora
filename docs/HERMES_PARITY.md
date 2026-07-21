@@ -23,7 +23,7 @@ Authoritative references:
 - [x] Tenant namespace and idempotency keys
 - [x] Scheduled-start promotion and persisted runtime/skill/goal settings
 - [x] Maximum-runtime enforcement
-- [ ] Goal-mode continuation engine
+- [x] Goal-mode same-session continuation, independent judgment, and turn budget
 - [x] Typed blockers and repeated unblock/re-block loop breaker
 - [x] Synthetic human handoff runs and reclaimed-run invariant on administrative moves
 - [x] Unlink, archive, delete, promote, scheduling, and configurable sorting
@@ -69,11 +69,11 @@ Authoritative references:
 
 ### Orchestration
 
-- [ ] Manual and automatic triage specification
-- [ ] Task-graph decomposition with profile/runtime routing
-- [ ] Kanban Swarm topology helper
+- [x] Manual and bounded automatic triage specification
+- [x] Atomic task-graph decomposition with profile/runtime routing and fallback
+- [x] Kanban Swarm blackboard/worker/verifier/synthesizer topology helper
 - [x] Per-task skill guidance injected into Claude/Codex workers
-- [ ] Goal-mode continuation and completion judgment
+- [x] Goal-mode continuation and completion judgment
 
 ### Dashboard
 

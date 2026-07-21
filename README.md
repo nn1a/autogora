@@ -85,6 +85,12 @@ node dist/cli.js create "Nightly security audit" \
 Scheduled cards are promoted when they become due. Repeating the same non-empty
 idempotency key on a board returns the existing non-archived task.
 
+Goal-mode cards run differently from ordinary one-shot work. After a worker
+turn exits without a terminal MCP call, an independent structured-output judge
+checks the card's title/body acceptance criteria. An incomplete card resumes
+the same Claude/Codex session with the judge's next instruction. Acceptance
+completes the task; exhausting `goal_max_turns` blocks it for human review.
+
 ## Multiple boards
 
 Named boards isolate their database, workspaces, attachments, and logs. The
@@ -185,6 +191,39 @@ Additional messaging platforms can register the exported notification adapter
 interface without changing the board kernel. Stored secrets are never returned
 by CLI or MCP reads.
 
+## Triage and orchestration
+
+`specify` turns a rough `triage` card into a scoped task with deliverables,
+acceptance criteria, constraints, and verification. `decompose` asks Claude or
+Codex for a structured acyclic graph, validates every route, substitutes a
+configured fallback for unknown assignees, and applies all children, links, and
+root changes in one SQLite transaction. If fan-out adds no value, decomposition
+falls back to specification.
+
+```bash
+node dist/cli.js specify <triage-id> --planner-runtime codex
+node dist/cli.js decompose <triage-id> \
+  --profile "researcher:codex:finds primary sources" \
+  --profile "writer:claude:synthesizes verified reports" \
+  --default-profile researcher:codex \
+  --orchestrator-profile writer:claude
+```
+
+For deterministic automation, `specify` accepts `--title` plus `--body`, and
+`decompose` accepts a validated `--plan-json`. A persistent dispatcher can opt
+into bounded automatic triage processing with `--auto-decompose` and
+`--auto-decompose-per-tick`.
+
+The swarm helper creates a completed structured blackboard, parallel worker
+cards, a verifier gated on every worker, and a synthesizer gated on the
+verifier:
+
+```bash
+node dist/cli.js swarm "Design a multi-region failover plan" \
+  --workers researcher:codex,architect:claude,sre:codex \
+  --verifier reviewer:claude --synthesizer writer:claude
+```
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
@@ -195,6 +234,7 @@ by CLI or MCP reads.
 - Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
 - Administration: `kanban_bulk`, `kanban_gc`
 - Notifications: `kanban_notify_subscribe`, `kanban_notify_list`, `kanban_notify_unsubscribe`, `kanban_notify_deliver`
+- Orchestration: `kanban_specify`, `kanban_decompose`, `kanban_swarm`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope
@@ -224,4 +264,4 @@ Restart the client if it does not detect the new skills.
 - `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
 - The server is local stdio only; there is no remote authentication or multi-user isolation.
 - SQLite and PID recovery assume one host; cross-host dispatch is intentionally unsupported.
-- The dashboard, triage decomposition, goal continuation, and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.
+- The dashboard and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.
