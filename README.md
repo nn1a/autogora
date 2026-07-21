@@ -317,7 +317,7 @@ cp -R skills/kanban-worker skills/kanban-orchestrator ~/.claude/skills/
 
 Restart the client if it does not detect the new skills.
 
-## Safety and MVP limits
+## Safety and scope
 
 - `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
 - The MCP server is local stdio only; there is no multi-user isolation.
@@ -325,5 +325,6 @@ Restart the client if it does not detect the new skills.
   single-tenant surface; its bearer token is not a substitute for TLS on an
   untrusted network.
 - SQLite and PID recovery assume one host; cross-host dispatch is intentionally unsupported.
-- Automated review routing remains part of the final parity audit. See
-  `docs/HERMES_PARITY.md` for the audited checklist.
+- Messaging-platform slash commands remain adapter concerns; every board action
+  they need is available through the shared MCP, CLI, or authenticated HTTP
+  kernel. See `docs/HERMES_PARITY.md` for the audited checklist.
