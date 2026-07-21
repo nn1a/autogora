@@ -79,6 +79,24 @@ node dist/cli.js create "Nightly security audit" \
 Scheduled cards are promoted when they become due. Repeating the same non-empty
 idempotency key on a board returns the existing non-archived task.
 
+## Multiple boards
+
+Named boards isolate their database, workspaces, attachments, and logs. The
+`default` board retains `data/kanban.db`; named boards live under
+`data/boards/<slug>/`.
+
+```bash
+node dist/cli.js boards create project-api \
+  --name "Project API" --default-workdir "$PWD" --switch
+node dist/cli.js boards list
+node dist/cli.js boards show
+node dist/cli.js boards rename project-api "Project API v2"
+node dist/cli.js boards rm project-api       # recoverable archive
+```
+
+Use `boards rm <slug> --delete` only when permanent removal is intended. The
+`default` board cannot be removed.
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`

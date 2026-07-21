@@ -3,9 +3,9 @@
 import { parseArgs } from "node:util";
 import { join, resolve } from "node:path";
 
+import { BoardManager } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
 import { runStdioServer } from "./server.js";
-import { KanbanStore } from "./store.js";
 import {
   BLOCK_KINDS,
   RUNTIMES,
@@ -21,6 +21,7 @@ const HELP = `kanban-mcp <command> [options]
 Commands:
   serve                 Run the stdio MCP server
   init                  Initialize the SQLite database
+  boards <action>       List, create, switch, edit, archive, or delete boards
   create <title>        Create a task from the shell
   list                  List tasks
   show <task-id>        Show task details
@@ -51,6 +52,10 @@ Dispatch options:
 
 function defaultDbPath(): string {
   return resolve(process.env.KANBAN_DB ?? join(process.cwd(), "data", "kanban.db"));
+}
+
+function managerFor(dbPath?: string): BoardManager {
+  return new BoardManager(resolve(dbPath ?? defaultDbPath()));
 }
 
 function numberOption(value: string | undefined, fallback: number): number {
@@ -94,6 +99,87 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "boards") {
+    const [action, ...boardArgs] = args;
+    if (!action) throw new Error("boards requires list, create, switch, show, rename, or rm");
+    if (action === "list" || action === "ls") {
+      const parsed = parseArgs({
+        args: boardArgs,
+        options: { db: { type: "string" }, all: { type: "boolean" } },
+      });
+      process.stdout.write(`${JSON.stringify(managerFor(parsed.values.db).list(parsed.values.all), null, 2)}\n`);
+      return;
+    }
+    if (action === "create") {
+      const parsed = parseArgs({
+        args: boardArgs,
+        allowPositionals: true,
+        options: {
+          db: { type: "string" },
+          name: { type: "string" },
+          description: { type: "string" },
+          icon: { type: "string" },
+          color: { type: "string" },
+          "default-workdir": { type: "string" },
+          switch: { type: "boolean" },
+        },
+      });
+      const slug = parsed.positionals[0];
+      if (!slug) throw new Error("boards create requires a slug");
+      const manager = managerFor(parsed.values.db);
+      const metadata = manager.create(slug, {
+        name: parsed.values.name,
+        description: parsed.values.description,
+        icon: parsed.values.icon,
+        color: parsed.values.color,
+        defaultWorkdir: parsed.values["default-workdir"],
+      });
+      if (parsed.values.switch) manager.switch(metadata.slug);
+      process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
+      return;
+    }
+    if (["switch", "use"].includes(action)) {
+      const parsed = parseArgs({ args: boardArgs, allowPositionals: true, options: { db: { type: "string" } } });
+      const slug = parsed.positionals[0];
+      if (!slug) throw new Error("boards switch requires a slug");
+      process.stdout.write(`${JSON.stringify(managerFor(parsed.values.db).switch(slug), null, 2)}\n`);
+      return;
+    }
+    if (action === "show" || action === "current") {
+      const parsed = parseArgs({ args: boardArgs, allowPositionals: true, options: { db: { type: "string" } } });
+      const manager = managerFor(parsed.values.db);
+      const slug = parsed.positionals[0] ?? manager.getCurrent();
+      const metadata = manager.read(manager.resolve(slug));
+      const store = manager.openStore(metadata.slug);
+      try {
+        process.stdout.write(`${JSON.stringify({ ...metadata, counts: store.countTasksByStatus() }, null, 2)}\n`);
+      } finally {
+        store.close();
+      }
+      return;
+    }
+    if (action === "rename") {
+      const parsed = parseArgs({ args: boardArgs, allowPositionals: true, options: { db: { type: "string" } } });
+      const [slug, ...nameParts] = parsed.positionals;
+      const name = nameParts.join(" ").trim();
+      if (!slug || !name) throw new Error("boards rename requires a slug and display name");
+      process.stdout.write(`${JSON.stringify(managerFor(parsed.values.db).update(slug, { name }), null, 2)}\n`);
+      return;
+    }
+    if (action === "rm" || action === "remove") {
+      const parsed = parseArgs({
+        args: boardArgs,
+        allowPositionals: true,
+        options: { db: { type: "string" }, delete: { type: "boolean" } },
+      });
+      const slug = parsed.positionals[0];
+      if (!slug) throw new Error("boards rm requires a slug");
+      process.stdout.write(`${JSON.stringify(managerFor(parsed.values.db).remove(slug, parsed.values.delete), null, 2)}\n`);
+      return;
+    }
+    throw new Error(`Unknown boards action: ${action}`);
+  }
+
   if (command === "serve" || command === "init") {
     const parsed = parseArgs({ args, options: { db: { type: "string" } } });
     const dbPath = resolve(parsed.values.db ?? defaultDbPath());
@@ -101,7 +187,9 @@ async function main(): Promise<void> {
       await runStdioServer(dbPath);
       return;
     }
-    const store = new KanbanStore(dbPath);
+    const manager = new BoardManager(dbPath);
+    manager.create("default");
+    const store = manager.openStore("default");
     store.close();
     process.stdout.write(`${dbPath}\n`);
     return;
@@ -135,12 +223,14 @@ async function main(): Promise<void> {
     });
     const title = parsed.positionals.join(" ").trim();
     if (!title) throw new Error("create requires a title");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const manager = managerFor(parsed.values.db);
+    const board = manager.resolve(parsed.values.board);
+    const store = manager.openStore(board);
     try {
       const task = store.createTask({
         title,
         body: parsed.values.body,
-        board: parsed.values.board,
+        board,
         tenant: parsed.values.tenant,
         idempotencyKey: parsed.values["idempotency-key"],
         assignee: parsed.values.assignee,
@@ -182,10 +272,12 @@ async function main(): Promise<void> {
         sort: { type: "string" },
       },
     });
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const manager = managerFor(parsed.values.db);
+    const board = manager.resolve(parsed.values.board);
+    const store = manager.openStore(board);
     try {
       const tasks = store.listTasks({
-        board: parsed.values.board,
+        board,
         status: requireStatus(parsed.values.status),
         tenant: parsed.values.tenant,
         assignee: parsed.values.assignee,
@@ -205,7 +297,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("show requires a task id");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       process.stdout.write(`${JSON.stringify(store.getTask(taskId), null, 2)}\n`);
     } finally {
@@ -239,7 +331,7 @@ async function main(): Promise<void> {
     });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("edit requires a task id");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       const detail = store.updateTask(taskId, {
         title: parsed.values.title,
@@ -273,7 +365,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const [taskId, assignee] = parsed.positionals;
     if (!taskId || !assignee) throw new Error("assign requires a task id and assignee (or 'none')");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       process.stdout.write(`${JSON.stringify(store.updateTask(taskId, { assignee: assignee === "none" ? null : assignee }), null, 2)}\n`);
     } finally {
@@ -286,7 +378,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const [parentId, childId] = parsed.positionals;
     if (!parentId || !childId) throw new Error(`${command} requires parent and child task ids`);
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       const detail = command === "link" ? store.linkTasks(parentId, childId) : store.unlinkTasks(parentId, childId);
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
@@ -305,7 +397,7 @@ async function main(): Promise<void> {
     const [taskId, ...bodyParts] = parsed.positionals;
     const body = bodyParts.join(" ").trim();
     if (!taskId || !body) throw new Error("comment requires a task id and text");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       process.stdout.write(`${JSON.stringify(store.addComment(taskId, parsed.values.author ?? "human", body), null, 2)}\n`);
     } finally {
@@ -329,7 +421,7 @@ async function main(): Promise<void> {
     if (parsed.positionals.length > 1 && (parsed.values.summary || parsed.values.result || parsed.values.metadata)) {
       throw new Error("Structured completion handoff is only allowed for one task at a time");
     }
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       const completed = parsed.positionals.map((taskId) =>
         store.completeTask(taskId, {
@@ -354,7 +446,7 @@ async function main(): Promise<void> {
     const [taskId, ...reasonParts] = parsed.positionals;
     const reason = reasonParts.join(" ").trim();
     if (!taskId || !reason) throw new Error("block requires a task id and reason");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       process.stdout.write(`${JSON.stringify(store.blockTask(taskId, { reason, kind: requireBlockKind(parsed.values.kind) }), null, 2)}\n`);
     } finally {
@@ -366,7 +458,7 @@ async function main(): Promise<void> {
   if (["unblock", "promote", "archive", "delete"].includes(command)) {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     if (parsed.positionals.length === 0) throw new Error(`${command} requires at least one task id`);
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       const results = parsed.positionals.map((taskId) => {
         if (command === "unblock") return store.unblockTask(taskId);
@@ -389,7 +481,7 @@ async function main(): Promise<void> {
     });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("schedule requires a task id");
-    const store = new KanbanStore(resolve(parsed.values.db ?? defaultDbPath()));
+    const store = managerFor(parsed.values.db).openStore();
     try {
       process.stdout.write(`${JSON.stringify(store.scheduleTask(taskId, parsed.values.at ?? null, parsed.values.reason), null, 2)}\n`);
     } finally {

@@ -238,10 +238,12 @@ function eventFromRow(row: EventRow): TaskEvent {
 
 export class KanbanStore {
   readonly dbPath: string;
+  readonly board: string;
   private readonly db: DatabaseSync;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, board = "default") {
     this.dbPath = dbPath === ":memory:" ? dbPath : resolve(dbPath);
+    this.board = board.trim() || "default";
     if (this.dbPath !== ":memory:") mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec("PRAGMA foreign_keys = ON");
@@ -584,7 +586,7 @@ export class KanbanStore {
       if (idempotencyKey) {
         const existing = this.db
           .prepare("SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'")
-          .get(input.board ?? "default", idempotencyKey) as { id: string } | undefined;
+          .get(input.board ?? this.board, idempotencyKey) as { id: string } | undefined;
         if (existing) {
           taskId = existing.id;
           return;
@@ -608,7 +610,7 @@ export class KanbanStore {
         `)
         .run(
           taskId,
-          input.board ?? "default",
+          input.board ?? this.board,
           tenant,
           idempotencyKey,
           title,
@@ -732,7 +734,7 @@ export class KanbanStore {
 
   listTasks(filter: ListTaskFilter = {}): Task[] {
     const clauses = ["board = ?"];
-    const values: SQLInputValue[] = [filter.board ?? "default"];
+    const values: SQLInputValue[] = [filter.board ?? this.board];
     if (filter.status) {
       clauses.push("status = ?");
       values.push(filter.status);
@@ -772,6 +774,15 @@ export class KanbanStore {
       .prepare(`SELECT * FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY ${orderBy[filter.sort ?? "priority-desc"]} LIMIT ?`)
       .all(...values) as unknown as TaskRow[];
     return rows.map(taskFromRow);
+  }
+
+  countTasksByStatus(board = this.board): Record<TaskStatus, number> {
+    const counts = Object.fromEntries(TASK_STATUSES.map((status) => [status, 0])) as Record<TaskStatus, number>;
+    const rows = this.db
+      .prepare("SELECT status, COUNT(*) AS count FROM tasks WHERE board = ? GROUP BY status")
+      .all(board) as unknown as { status: TaskStatus; count: number }[];
+    for (const row of rows) counts[row.status] = row.count;
+    return counts;
   }
 
   getTask(taskId: string): TaskDetail {
@@ -884,7 +895,7 @@ export class KanbanStore {
     return commentFromRow(row);
   }
 
-  promoteDueTasks(board = "default", at = now()): number {
+  promoteDueTasks(board = this.board, at = now()): number {
     return this.write(() => {
       const rows = this.db
         .prepare("SELECT id FROM tasks WHERE board = ? AND status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
@@ -913,7 +924,7 @@ export class KanbanStore {
     let taskId = "";
     const claimed = this.write(() => {
       const clauses = ["board = ?", "status = 'ready'", "current_run_id IS NULL", "(scheduled_at IS NULL OR scheduled_at <= ?)"];
-      const values: SQLInputValue[] = [input.board ?? "default", now()];
+      const values: SQLInputValue[] = [input.board ?? this.board, now()];
       if (input.taskId) {
         clauses.push("id = ?");
         values.push(input.taskId);

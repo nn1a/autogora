@@ -30,10 +30,11 @@ Authoritative references:
 
 ### Multi-board isolation
 
-- [ ] Board metadata: slug, display name, description, icon, color, default workdir
-- [ ] Separate database, workspace, attachment, and log roots per board
-- [ ] Current-board resolution and worker board pinning
-- [ ] Create, list, switch, rename, archive, and delete board operations
+- [x] Board metadata: slug, display name, description, icon, color, default workdir
+- [x] Separate database, workspace, attachment, and log roots per board
+- [x] Current-board resolution with validated, traversal-safe slugs
+- [ ] MCP/dispatcher worker board pinning
+- [x] Create, list, switch, rename, archive, and delete board operations
 
 ### Workspaces and artifacts
 
