@@ -33,7 +33,7 @@ Authoritative references:
 - [x] Board metadata: slug, display name, description, icon, color, default workdir
 - [x] Separate database, workspace, attachment, and log roots per board
 - [x] Current-board resolution with validated, traversal-safe slugs
-- [ ] MCP/dispatcher worker board pinning
+- [x] MCP/dispatcher worker board pinning and all-board dispatcher sweep
 - [x] Create, list, switch, rename, archive, and delete board operations
 
 ### Workspaces and artifacts

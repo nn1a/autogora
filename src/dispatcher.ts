@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
+import { BoardManager } from "./boards.js";
 import { KanbanStore } from "./store.js";
 import type { ClaimedTask, Runtime } from "./types.js";
 
@@ -57,10 +58,12 @@ export function buildRunnerCommand(
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     KANBAN_DB: resolve(options.dbPath),
+    KANBAN_BOARD: task.board,
     KANBAN_TASK_ID: task.id,
     KANBAN_RUN_ID: claim.run.id,
     KANBAN_CLAIM_TOKEN: claim.claimToken,
     KANBAN_WORKER_ID: claim.run.workerId,
+    KANBAN_TENANT: task.tenant ?? "",
   };
   const prompt = workerPrompt(claim);
 
@@ -150,9 +153,9 @@ async function runClaim(
   claim: ClaimedTask,
   options: DispatcherOptions,
   children: Set<ChildProcess>,
+  logsDir: string,
 ): Promise<void> {
   const command = buildRunnerCommand(claim, options);
-  const logsDir = join(dirname(resolve(options.dbPath)), "logs");
   mkdirSync(logsDir, { recursive: true });
   const logPath = join(logsDir, `${claim.task.task.id}-${claim.run.id}.log`);
   const logStream = createWriteStream(logPath, { flags: "a" });
@@ -188,7 +191,7 @@ async function runClaim(
 }
 
 export async function runDispatcher(options: DispatcherOptions): Promise<void> {
-  const store = new KanbanStore(options.dbPath);
+  const manager = new BoardManager(options.dbPath);
   const active = new Set<Promise<void>>();
   const children = new Set<ChildProcess>();
   const maxWorkers = Math.max(1, options.maxWorkers ?? 2);
@@ -202,18 +205,36 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
   try {
     do {
       let launched = false;
-      store.promoteDueTasks(options.board ?? "default");
-      while (!options.signal?.aborted && active.size < maxWorkers) {
-        const claim = store.claimTask({
-          board: options.board ?? "default",
-          workerId: `dispatcher-${process.pid}`,
-          excludeManual: true,
-        });
-        if (!claim) break;
-        launched = true;
-        const running = runClaim(store, claim, options, children).finally(() => active.delete(running));
-        active.add(running);
-        if (options.once) break;
+      const boards = options.board
+        ? [manager.resolve(options.board)]
+        : manager.list().filter((board) => !board.archived).map((board) => board.slug);
+      let foundInPass = true;
+      while (!options.signal?.aborted && active.size < maxWorkers && foundInPass) {
+        foundInPass = false;
+        for (const board of boards) {
+          if (options.signal?.aborted || active.size >= maxWorkers) break;
+          const store = manager.openStore(board);
+          store.promoteDueTasks(board);
+          const claim = store.claimTask({
+            board,
+            workerId: `dispatcher-${process.pid}`,
+            excludeManual: true,
+          });
+          if (!claim) {
+            store.close();
+            continue;
+          }
+          foundInPass = true;
+          launched = true;
+          let running: Promise<void>;
+          running = runClaim(store, claim, options, children, manager.logsRoot(board)).finally(() => {
+            store.close();
+            active.delete(running);
+          });
+          active.add(running);
+          if (options.once) break;
+        }
+        if (options.once && launched) break;
       }
 
       if (options.once) {
@@ -230,6 +251,5 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
     await Promise.all(active);
   } finally {
     options.signal?.removeEventListener("abort", stopChildren);
-    store.close();
   }
 }

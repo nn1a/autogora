@@ -100,11 +100,16 @@ Use `boards rm <slug> --delete` only when permanent removal is intended. The
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
+- Boards: `kanban_boards_list`, `kanban_boards_create`, `kanban_boards_update`, `kanban_boards_switch`, `kanban_boards_remove`
 - Dispatch: `kanban_claim`
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
-Dispatcher-launched workers receive task, run, and claim-token scope through environment variables. Their lifecycle tools can omit those identifiers, and the server rejects attempts to operate on another scoped task or run.
+Dispatcher-launched workers receive board, task, run, and claim-token scope
+through environment variables. Their lifecycle tools can omit those identifiers,
+and the server rejects attempts to operate on another scoped board, task, or
+run. Without `--board`, the dispatcher sweeps all active boards while preserving
+the global worker limit.
 
 ## Skills
 

@@ -12,6 +12,7 @@ const transport = new StdioClientTransport({
   env: {
     ...getDefaultEnvironment(),
     KANBAN_TASK_ID: process.env.KANBAN_TASK_ID,
+    KANBAN_BOARD: process.env.KANBAN_BOARD,
     KANBAN_RUN_ID: process.env.KANBAN_RUN_ID,
     KANBAN_CLAIM_TOKEN: process.env.KANBAN_CLAIM_TOKEN,
   },

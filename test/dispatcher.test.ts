@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import { BoardManager } from "../src/boards.js";
 import { buildRunnerCommand, runDispatcher } from "../src/dispatcher.js";
 import { KanbanStore } from "../src/store.js";
 
@@ -25,6 +26,7 @@ for (const runtime of ["claude", "codex"] as const) {
         allowWrites: false,
       });
       assert.equal(command.env.KANBAN_TASK_ID, detail.task.id);
+      assert.equal(command.env.KANBAN_BOARD, "default");
       assert.equal(command.env.KANBAN_RUN_ID, claim.run.id);
       assert.equal(command.env.KANBAN_CLAIM_TOKEN, claim.claimToken);
       assert.equal(command.args.includes(claim.claimToken), false);
@@ -40,7 +42,9 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
   const dbPath = join(directory, "kanban.db");
   const fakeAgent = resolve("test/fixtures/fake-agent.mjs");
   chmodSync(fakeAgent, 0o755);
-  const store = new KanbanStore(dbPath);
+  const manager = new BoardManager(dbPath);
+  manager.create("project");
+  const store = manager.openStore("project");
   const task = store.createTask({
     title: "dispatcher e2e",
     assignee: "fake",
@@ -59,7 +63,7 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
       maxWorkers: 1,
       allowWrites: false,
     });
-    const check = new KanbanStore(dbPath);
+    const check = manager.openStore("project");
     try {
       const completed = check.getTask(task.task.id);
       assert.equal(completed.task.status, "done");

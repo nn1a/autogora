@@ -41,6 +41,7 @@ Commands:
 
 Common options:
   --db <path>           SQLite path (default: ./data/kanban.db)
+  --board <slug>        Override the current board for this command
 
 Dispatch options:
   --once                Run at most one ready task, then exit
@@ -56,6 +57,30 @@ function defaultDbPath(): string {
 
 function managerFor(dbPath?: string): BoardManager {
   return new BoardManager(resolve(dbPath ?? defaultDbPath()));
+}
+
+function openTaskStore(dbPath: string | undefined, board?: string) {
+  const manager = managerFor(dbPath);
+  return manager.openStore(manager.resolve(board));
+}
+
+function extractBoardOption(values: string[]): { args: string[]; board: string | undefined } {
+  const args: string[] = [];
+  let board: string | undefined;
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value === "--board") {
+      const next = values[index + 1];
+      if (!next) throw new Error("--board requires a slug");
+      board = next;
+      index += 1;
+    } else if (value?.startsWith("--board=")) {
+      board = value.slice("--board=".length);
+    } else if (value !== undefined) {
+      args.push(value);
+    }
+  }
+  return { args, board };
 }
 
 function numberOption(value: string | undefined, fallback: number): number {
@@ -93,7 +118,8 @@ function parseMetadata(value: string | undefined): Record<string, unknown> | und
 }
 
 async function main(): Promise<void> {
-  const [command, ...args] = process.argv.slice(2);
+  const [command, ...rawArgs] = process.argv.slice(2);
+  const { args, board: globalBoard } = extractBoardOption(rawArgs);
   if (!command || command === "help" || command === "--help" || command === "-h") {
     process.stdout.write(HELP);
     return;
@@ -224,7 +250,7 @@ async function main(): Promise<void> {
     const title = parsed.positionals.join(" ").trim();
     if (!title) throw new Error("create requires a title");
     const manager = managerFor(parsed.values.db);
-    const board = manager.resolve(parsed.values.board);
+    const board = manager.resolve(globalBoard);
     const store = manager.openStore(board);
     try {
       const task = store.createTask({
@@ -273,7 +299,7 @@ async function main(): Promise<void> {
       },
     });
     const manager = managerFor(parsed.values.db);
-    const board = manager.resolve(parsed.values.board);
+    const board = manager.resolve(globalBoard);
     const store = manager.openStore(board);
     try {
       const tasks = store.listTasks({
@@ -297,7 +323,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("show requires a task id");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.getTask(taskId), null, 2)}\n`);
     } finally {
@@ -331,7 +357,7 @@ async function main(): Promise<void> {
     });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("edit requires a task id");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       const detail = store.updateTask(taskId, {
         title: parsed.values.title,
@@ -365,7 +391,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const [taskId, assignee] = parsed.positionals;
     if (!taskId || !assignee) throw new Error("assign requires a task id and assignee (or 'none')");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.updateTask(taskId, { assignee: assignee === "none" ? null : assignee }), null, 2)}\n`);
     } finally {
@@ -378,7 +404,7 @@ async function main(): Promise<void> {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     const [parentId, childId] = parsed.positionals;
     if (!parentId || !childId) throw new Error(`${command} requires parent and child task ids`);
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       const detail = command === "link" ? store.linkTasks(parentId, childId) : store.unlinkTasks(parentId, childId);
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
@@ -397,7 +423,7 @@ async function main(): Promise<void> {
     const [taskId, ...bodyParts] = parsed.positionals;
     const body = bodyParts.join(" ").trim();
     if (!taskId || !body) throw new Error("comment requires a task id and text");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.addComment(taskId, parsed.values.author ?? "human", body), null, 2)}\n`);
     } finally {
@@ -421,7 +447,7 @@ async function main(): Promise<void> {
     if (parsed.positionals.length > 1 && (parsed.values.summary || parsed.values.result || parsed.values.metadata)) {
       throw new Error("Structured completion handoff is only allowed for one task at a time");
     }
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       const completed = parsed.positionals.map((taskId) =>
         store.completeTask(taskId, {
@@ -446,7 +472,7 @@ async function main(): Promise<void> {
     const [taskId, ...reasonParts] = parsed.positionals;
     const reason = reasonParts.join(" ").trim();
     if (!taskId || !reason) throw new Error("block requires a task id and reason");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.blockTask(taskId, { reason, kind: requireBlockKind(parsed.values.kind) }), null, 2)}\n`);
     } finally {
@@ -458,7 +484,7 @@ async function main(): Promise<void> {
   if (["unblock", "promote", "archive", "delete"].includes(command)) {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
     if (parsed.positionals.length === 0) throw new Error(`${command} requires at least one task id`);
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       const results = parsed.positionals.map((taskId) => {
         if (command === "unblock") return store.unblockTask(taskId);
@@ -481,7 +507,7 @@ async function main(): Promise<void> {
     });
     const taskId = parsed.positionals[0];
     if (!taskId) throw new Error("schedule requires a task id");
-    const store = managerFor(parsed.values.db).openStore();
+    const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.scheduleTask(taskId, parsed.values.at ?? null, parsed.values.reason), null, 2)}\n`);
     } finally {
@@ -509,7 +535,7 @@ async function main(): Promise<void> {
     await runDispatcher({
       dbPath: resolve(parsed.values.db ?? defaultDbPath()),
       cliEntry: resolve(process.argv[1] ?? "dist/cli.js"),
-      board: parsed.values.board,
+      board: globalBoard,
       once: parsed.values.once ?? false,
       intervalMs: numberOption(parsed.values["interval-ms"], 2_000),
       maxWorkers: numberOption(parsed.values["max-workers"], 2),
