@@ -51,6 +51,9 @@ Dispatch options:
   --once                Run at most one ready task, then exit
   --watch               Keep polling for work (default)
   --max-workers <n>     Parallel workers (default: 2)
+  --max-in-progress <n> Board-wide running task cap
+  --max-per-assignee <n> Running task cap per assignee
+  --claim-ttl-seconds <n> Claim lease duration (default: 900)
   --interval-ms <n>     Idle poll interval (default: 2000)
   --allow-writes        Allow workspace edits and shell commands
 `;
@@ -557,6 +560,13 @@ async function main(): Promise<void> {
         once: { type: "boolean" },
         watch: { type: "boolean" },
         "max-workers": { type: "string" },
+        "max-in-progress": { type: "string" },
+        "max-per-assignee": { type: "string" },
+        "claim-ttl-seconds": { type: "string" },
+        "stale-timeout-seconds": { type: "string" },
+        "heartbeat-max-stale-seconds": { type: "string" },
+        "crash-grace-seconds": { type: "string" },
+        "rate-limit-cooldown-seconds": { type: "string" },
         "interval-ms": { type: "string" },
         "allow-writes": { type: "boolean" },
       },
@@ -571,6 +581,17 @@ async function main(): Promise<void> {
       once: parsed.values.once ?? false,
       intervalMs: numberOption(parsed.values["interval-ms"], 2_000),
       maxWorkers: numberOption(parsed.values["max-workers"], 2),
+      maxInProgress: parsed.values["max-in-progress"] === undefined
+        ? undefined
+        : numberOption(parsed.values["max-in-progress"], 1),
+      maxInProgressPerAssignee: parsed.values["max-per-assignee"] === undefined
+        ? undefined
+        : numberOption(parsed.values["max-per-assignee"], 1),
+      claimTtlSeconds: numberOption(parsed.values["claim-ttl-seconds"], 900),
+      staleTimeoutSeconds: numberOption(parsed.values["stale-timeout-seconds"], 4 * 60 * 60),
+      heartbeatMaxStaleSeconds: numberOption(parsed.values["heartbeat-max-stale-seconds"], 60 * 60),
+      crashGraceSeconds: numberOption(parsed.values["crash-grace-seconds"], 30),
+      rateLimitCooldownSeconds: numberOption(parsed.values["rate-limit-cooldown-seconds"], 60),
       allowWrites: parsed.values["allow-writes"] ?? false,
       signal: controller.signal,
       onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),

@@ -21,6 +21,13 @@ export interface DispatcherOptions {
   once?: boolean | undefined;
   intervalMs?: number | undefined;
   maxWorkers?: number | undefined;
+  maxInProgress?: number | undefined;
+  maxInProgressPerAssignee?: number | undefined;
+  claimTtlSeconds?: number | undefined;
+  staleTimeoutSeconds?: number | undefined;
+  heartbeatMaxStaleSeconds?: number | undefined;
+  crashGraceSeconds?: number | undefined;
+  rateLimitCooldownSeconds?: number | undefined;
   allowWrites?: boolean | undefined;
   workspaceRoot?: string | undefined;
   attachmentsRoot?: string | undefined;
@@ -159,6 +166,60 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function terminatePid(pid: number): boolean {
+  if (pid === process.pid || !pidAlive(pid)) return false;
+  try {
+    process.kill(pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoverAbandonedRuns(store: KanbanStore, board: string, options: DispatcherOptions): void {
+  const timestamp = Date.now();
+  const staleTimeoutMs = Math.max(60, options.staleTimeoutSeconds ?? 4 * 60 * 60) * 1_000;
+  const heartbeatMaxStaleMs = Math.max(60, options.heartbeatMaxStaleSeconds ?? 60 * 60) * 1_000;
+  const crashGraceMs = Math.max(0, options.crashGraceSeconds ?? 30) * 1_000;
+  for (const active of store.listActiveRuns(board)) {
+    const elapsed = timestamp - Date.parse(active.run.claimedAt);
+    const heartbeatAge = timestamp - Date.parse(active.run.heartbeatAt);
+    const expired = timestamp >= Date.parse(active.run.claimExpiresAt);
+    const stale = elapsed >= staleTimeoutMs && heartbeatAge >= heartbeatMaxStaleMs;
+    const timedOut = active.task.maxRuntimeSeconds !== null && elapsed >= active.task.maxRuntimeSeconds * 1_000;
+    const alive = active.run.pid !== null && pidAlive(active.run.pid);
+    const crashed = active.run.pid !== null && elapsed >= crashGraceMs && !alive;
+
+    if (timedOut) {
+      if (active.run.pid !== null) terminatePid(active.run.pid);
+      store.recoverAbandonedRun(active.run.id, "timed_out", `Maximum runtime exceeded after ${Math.floor(elapsed / 1_000)} seconds`);
+      options.onLog?.(`timed out ${active.task.id}`);
+    } else if (crashed) {
+      store.recoverAbandonedRun(active.run.id, "crashed", `Worker PID ${active.run.pid} is no longer alive`);
+      options.onLog?.(`reclaimed crashed worker ${active.task.id}`);
+    } else if (expired || stale) {
+      if (alive && active.run.pid !== null && terminatePid(active.run.pid)) {
+        store.deferReclaim(active.run.id, 120);
+        options.onLog?.(`deferred reclaim while terminating PID ${active.run.pid} for ${active.task.id}`);
+      } else {
+        const reason = stale ? "Heartbeat became stale" : "Claim TTL expired";
+        store.recoverAbandonedRun(active.run.id, "reclaimed", reason, false);
+        options.onLog?.(`reclaimed ${active.task.id}: ${reason}`);
+      }
+    }
+  }
+}
+
 async function runClaim(
   store: KanbanStore,
   claim: ClaimedTask,
@@ -201,16 +262,41 @@ async function runClaim(
     child.stdout?.pipe(logStream, { end: false });
     child.stderr?.pipe(logStream, { end: false });
     let spawnError: Error | null = null;
+    let timedOut = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const runtimeTimer = preparedClaim.task.task.maxRuntimeSeconds === null
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+          forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        }, preparedClaim.task.task.maxRuntimeSeconds * 1_000);
     child.once("error", (error) => {
       spawnError = error;
     });
     child.once("close", (code, signal) => {
+      if (runtimeTimer) clearTimeout(runtimeTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       children.delete(child);
       logStream.end();
       const current = store.getTask(preparedClaim.task.task.id).task;
       if (current.status === "running" && current.currentRunId === preparedClaim.run.id) {
         const detail = spawnError?.message ?? `Runner exited without a terminal Kanban call (code=${code}, signal=${signal ?? "none"})`;
-        store.failRun(scope, detail);
+        if (timedOut) {
+          store.failRun(scope, detail, { outcome: "timed_out" });
+        } else if (spawnError) {
+          store.failRun(scope, detail, { outcome: "spawn_failed" });
+        } else if (code === 75) {
+          store.failRun(scope, detail, {
+            outcome: "rate_limited",
+            countFailure: false,
+            cooldownSeconds: Math.max(0, options.rateLimitCooldownSeconds ?? 60),
+          });
+        } else if (code === 0) {
+          store.failRun(scope, detail, { outcome: "protocol_violation" });
+        } else {
+          store.failRun(scope, detail);
+        }
         options.onLog?.(`requeue/fail ${current.id}: ${detail}`);
       } else {
         options.onLog?.(`finish ${current.id}: ${current.status}`);
@@ -253,10 +339,14 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
           if (options.signal?.aborted || active.size >= maxWorkers) break;
           const store = manager.openStore(board);
           store.promoteDueTasks(board);
+          recoverAbandonedRuns(store, board, options);
           const claim = store.claimTask({
             board,
             workerId: `dispatcher-${process.pid}`,
             excludeManual: true,
+            claimTtlSeconds: options.claimTtlSeconds,
+            maxInProgress: options.maxInProgress,
+            maxInProgressPerAssignee: options.maxInProgressPerAssignee,
           });
           if (!claim) {
             store.close();

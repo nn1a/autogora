@@ -15,6 +15,7 @@ import {
   type ListTaskFilter,
   type Run,
   type Runtime,
+  type RunStatus,
   type Task,
   type TaskDetail,
   type TaskEvent,
@@ -137,6 +138,17 @@ export interface CompletionInput {
 export interface BlockInput {
   reason: string;
   kind?: BlockKind | undefined;
+}
+
+export interface FailRunOptions {
+  outcome?: Exclude<RunStatus, "running" | "completed" | "blocked" | "reclaimed"> | undefined;
+  countFailure?: boolean | undefined;
+  cooldownSeconds?: number | undefined;
+}
+
+export interface ActiveRun {
+  task: Task;
+  run: Run;
 }
 
 const BLOCK_RECURRENCE_LIMIT = 2;
@@ -1084,6 +1096,37 @@ export class KanbanStore {
     });
   }
 
+  private respawnGuardReason(taskId: string): "blocker_auth" | "recent_success" | "active_pr" | null {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+    const recent = this.db
+      .prepare("SELECT status, error FROM task_runs WHERE task_id = ? AND ended_at >= ? ORDER BY ended_at DESC LIMIT 1")
+      .get(taskId, oneHourAgo) as { status: RunStatus; error: string | null } | undefined;
+    if (recent?.status === "completed") return "recent_success";
+    if (recent?.error && /(?:429|rate.?limit|quota|unauthorized|authentication|invalid api key)/i.test(recent.error)) {
+      return "blocker_auth";
+    }
+    const pullRequest = this.db
+      .prepare(`
+        SELECT 1 AS found FROM task_comments
+        WHERE task_id = ? AND body LIKE '%github.com/%/pull/%'
+        ORDER BY id DESC LIMIT 1
+      `)
+      .get(taskId) as { found: number } | undefined;
+    return pullRequest ? "active_pr" : null;
+  }
+
+  private appendRespawnGuard(taskId: string, reason: string): void {
+    const recent = this.db
+      .prepare(`
+        SELECT payload_json FROM task_events
+        WHERE task_id = ? AND kind = 'respawn_guarded' AND created_at >= ?
+        ORDER BY id DESC LIMIT 1
+      `)
+      .get(taskId, new Date(Date.now() - 60_000).toISOString()) as { payload_json: string | null } | undefined;
+    if (recent && parseJson(recent.payload_json)?.reason === reason) return;
+    this.appendEvent(taskId, "respawn_guarded", { reason });
+  }
+
   claimTask(
     input: {
       taskId?: string | undefined;
@@ -1092,14 +1135,23 @@ export class KanbanStore {
       workerId?: string | undefined;
       excludeManual?: boolean | undefined;
       claimTtlSeconds?: number | undefined;
+      maxInProgress?: number | undefined;
+      maxInProgressPerAssignee?: number | undefined;
     } = {},
   ): ClaimedTask | null {
     let runId = "";
     let claimToken = "";
     let taskId = "";
     const claimed = this.write(() => {
+      const board = input.board ?? this.board;
+      if (input.maxInProgress !== undefined) {
+        const running = this.db
+          .prepare("SELECT COUNT(*) AS count FROM tasks WHERE board = ? AND status = 'running'")
+          .get(board) as { count: number };
+        if (running.count >= Math.max(1, input.maxInProgress)) return false;
+      }
       const clauses = ["board = ?", "status = 'ready'", "current_run_id IS NULL", "(scheduled_at IS NULL OR scheduled_at <= ?)"];
-      const values: SQLInputValue[] = [input.board ?? this.board, now()];
+      const values: SQLInputValue[] = [board, now()];
       if (input.taskId) {
         clauses.push("id = ?");
         values.push(input.taskId);
@@ -1109,14 +1161,30 @@ export class KanbanStore {
         values.push(input.runtime);
       }
       if (input.excludeManual) clauses.push("runtime <> 'manual'");
-      const row = this.db
-        .prepare(`SELECT * FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY priority DESC, created_at ASC LIMIT 1`)
-        .get(...values) as TaskRow | undefined;
-      if (!row) return false;
-      if (this.hasOpenParents(row.id)) {
-        this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), row.id);
-        return false;
+      const candidates = this.db
+        .prepare(`SELECT * FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY priority DESC, created_at ASC LIMIT 50`)
+        .all(...values) as unknown as TaskRow[];
+      let row: TaskRow | undefined;
+      for (const candidate of candidates) {
+        if (this.hasOpenParents(candidate.id)) {
+          this.db.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").run(now(), candidate.id);
+          continue;
+        }
+        if (input.maxInProgressPerAssignee !== undefined && candidate.assignee) {
+          const running = this.db
+            .prepare("SELECT COUNT(*) AS count FROM tasks WHERE board = ? AND status = 'running' AND assignee = ?")
+            .get(board, candidate.assignee) as { count: number };
+          if (running.count >= Math.max(1, input.maxInProgressPerAssignee)) continue;
+        }
+        const guard = this.respawnGuardReason(candidate.id);
+        if (guard) {
+          this.appendRespawnGuard(candidate.id, guard);
+          continue;
+        }
+        row = candidate;
+        break;
       }
+      if (!row) return false;
       runId = newId("r");
       claimToken = randomBytes(24).toString("base64url");
       taskId = row.id;
@@ -1366,28 +1434,106 @@ export class KanbanStore {
     return this.getTask(taskId);
   }
 
-  failRun(scope: RunScope, error: string): TaskDetail {
+  private finishUnsuccessfulNoTransaction(
+    task: TaskRow,
+    run: RunRow,
+    error: string,
+    outcome: Exclude<RunStatus, "running" | "completed" | "blocked">,
+    countFailure: boolean,
+    cooldownSeconds: number,
+  ): void {
+    const timestamp = now();
+    const failures = task.failure_count + (countFailure ? 1 : 0);
+    const exhausted = countFailure && failures >= task.max_retries;
+    const scheduledAt = !exhausted && cooldownSeconds > 0 ? futureIso(cooldownSeconds) : null;
+    const nextStatus: TaskStatus = exhausted
+      ? "blocked"
+      : scheduledAt
+        ? "scheduled"
+        : this.hasOpenParents(task.id) || task.assignee === null || task.runtime === "manual"
+          ? "todo"
+          : "ready";
+    this.db
+      .prepare("UPDATE task_runs SET status = ?, ended_at = ?, heartbeat_at = ?, error = ? WHERE id = ?")
+      .run(outcome, timestamp, timestamp, error, run.id);
+    this.db
+      .prepare(`
+        UPDATE tasks
+        SET status = ?, current_run_id = NULL, failure_count = ?, scheduled_at = ?,
+            block_reason = CASE WHEN ? THEN ? ELSE block_reason END, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(nextStatus, failures, scheduledAt, exhausted ? 1 : 0, exhausted ? error : null, timestamp, task.id);
+
+    const payload = { error, failures, outcome, countFailure, scheduledAt };
+    if (outcome === "failed") {
+      this.appendEvent(task.id, exhausted ? "gave_up" : "requeued", payload, run.id);
+    } else {
+      this.appendEvent(task.id, outcome, payload, run.id);
+      if (exhausted) this.appendEvent(task.id, "gave_up", payload, run.id);
+    }
+  }
+
+  failRun(scope: RunScope, error: string, options: FailRunOptions = {}): TaskDetail {
     let taskId = "";
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
       taskId = task.id;
-      const timestamp = now();
-      const failures = task.failure_count + 1;
-      const exhausted = failures >= task.max_retries;
-      const nextStatus: TaskStatus = exhausted
-        ? "blocked"
-        : this.hasOpenParents(task.id) || task.assignee === null || task.runtime === "manual"
-          ? "todo"
-          : "ready";
-      this.db
-        .prepare("UPDATE task_runs SET status = 'failed', ended_at = ?, heartbeat_at = ?, error = ? WHERE id = ?")
-        .run(timestamp, timestamp, error, run.id);
-      this.db
-        .prepare("UPDATE tasks SET status = ?, current_run_id = NULL, failure_count = ?, updated_at = ? WHERE id = ?")
-        .run(nextStatus, failures, timestamp, task.id);
-      this.appendEvent(task.id, exhausted ? "gave_up" : "requeued", { error, failures }, run.id);
+      this.finishUnsuccessfulNoTransaction(
+        task,
+        run,
+        error,
+        options.outcome ?? "failed",
+        options.countFailure ?? true,
+        Math.max(0, options.cooldownSeconds ?? 0),
+      );
     });
     return this.getTask(taskId);
+  }
+
+  listActiveRuns(board = this.board): ActiveRun[] {
+    const rows = this.db
+      .prepare(`
+        SELECT r.id AS run_id, r.task_id
+        FROM task_runs r JOIN tasks t ON t.id = r.task_id
+        WHERE t.board = ? AND t.status = 'running' AND t.current_run_id = r.id AND r.status = 'running'
+        ORDER BY r.claimed_at
+      `)
+      .all(board) as unknown as { run_id: string; task_id: string }[];
+    return rows.map((row) => {
+      const task = taskFromRow(this.requireTaskRow(row.task_id));
+      const run = runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(row.run_id) as RunRow);
+      return { task, run };
+    });
+  }
+
+  recoverAbandonedRun(
+    runId: string,
+    outcome: "reclaimed" | "crashed" | "timed_out",
+    error: string,
+    countFailure = outcome !== "reclaimed",
+  ): TaskDetail {
+    let taskId = "";
+    this.write(() => {
+      const run = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
+      if (!run) throw new Error(`Run not found: ${runId}`);
+      const task = this.requireTaskRow(run.task_id);
+      taskId = task.id;
+      if (run.status !== "running" || task.current_run_id !== run.id || task.status !== "running") return;
+      this.finishUnsuccessfulNoTransaction(task, run, error, outcome, countFailure, 0);
+    });
+    return this.getTask(taskId);
+  }
+
+  deferReclaim(runId: string, seconds = 120): Run {
+    this.write(() => {
+      const run = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
+      if (!run || run.status !== "running") throw new Error(`Active run not found: ${runId}`);
+      const expires = futureIso(Math.max(1, seconds));
+      this.db.prepare("UPDATE task_runs SET claim_expires_at = ? WHERE id = ?").run(expires, runId);
+      this.appendEvent(run.task_id, "reclaim_deferred", { pid: run.pid, expires }, run.id);
+    });
+    return runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow);
   }
 
   unblockTask(taskId: string): TaskDetail {

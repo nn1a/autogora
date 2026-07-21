@@ -48,11 +48,11 @@ Authoritative references:
 ### Dispatcher resilience
 
 - [x] Claude/Codex process launch, bounded parallelism, logs, terminal-call guard
-- [ ] Claim TTL and safe stale-claim reclaim
-- [ ] Worker PID tracking, crash detection, heartbeat-stale detection
-- [ ] Maximum-runtime termination and rate-limit-neutral requeue
-- [ ] Board-wide and per-runtime/profile concurrency limits
-- [ ] Spawn/protocol failure classification and respawn guards
+- [x] Claim TTL and safe stale-claim reclaim with live-PID termination deferral
+- [x] Worker PID tracking, crash detection, and heartbeat-stale detection
+- [x] Maximum-runtime termination and rate-limit-neutral cooldown/requeue
+- [x] Board-wide and per-assignee concurrency limits
+- [x] Spawn/protocol failure classification and respawn guards
 - [ ] Active-worker, run-control, backlog, and diagnostics snapshots
 
 ### Agent and human surfaces

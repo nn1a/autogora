@@ -61,6 +61,12 @@ Run a persistent local dispatcher with up to two workers:
 node dist/cli.js dispatch --watch --max-workers 2 --allow-writes
 ```
 
+Long-running dispatchers persist claim TTLs, heartbeats, worker PIDs, and task
+runtime limits. They recover dead or stale workers, terminate tasks that exceed
+`max_runtime_seconds`, and treat exit code 75 as a retry-neutral provider rate
+limit. Optional `--max-in-progress` and `--max-per-assignee` caps coordinate
+multiple dispatcher processes through the database.
+
 Worker output is stored next to the database under `data/logs/`.
 
 Automation-friendly task fields are available through both the CLI and MCP:
@@ -161,5 +167,5 @@ Restart the client if it does not detect the new skills.
 
 - `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
 - The server is local stdio only; there is no remote authentication or multi-user isolation.
-- SQLite assumes one host. Atomic claims allow multiple local dispatcher processes, but this MVP does not yet reclaim a run after the dispatcher host itself crashes.
-- There is no dashboard, attachment storage, scheduler, notification gateway, automatic decomposition, or PR review gate yet.
+- SQLite and PID recovery assume one host; cross-host dispatch is intentionally unsupported.
+- The dashboard, notification delivery, triage decomposition, goal continuation, and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.

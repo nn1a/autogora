@@ -80,3 +80,77 @@ test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", 
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("dispatcher treats exit 75 as a retry-neutral rate limit", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-rate-limit-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/exit-75.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "rate limited worker",
+    assignee: "worker",
+    runtime: "codex",
+    workspace: process.cwd(),
+  });
+  store.close();
+  const previous = process.env.KANBAN_CODEX_BIN;
+  process.env.KANBAN_CODEX_BIN = fixture;
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      rateLimitCooldownSeconds: 0,
+    });
+    const check = manager.openStore("default");
+    try {
+      const detail = check.getTask(task.task.id);
+      assert.equal(detail.task.status, "ready");
+      assert.equal(detail.task.failureCount, 0);
+      assert.equal(detail.runs[0]?.status, "rate_limited");
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
+    else process.env.KANBAN_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher terminates workers that exceed the task runtime limit", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-timeout-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/hanging-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "timed worker",
+    assignee: "worker",
+    runtime: "codex",
+    workspace: process.cwd(),
+    maxRuntimeSeconds: 1,
+  });
+  store.close();
+  const previous = process.env.KANBAN_CODEX_BIN;
+  process.env.KANBAN_CODEX_BIN = fixture;
+  try {
+    await runDispatcher({ dbPath, cliEntry: resolve("dist/cli.js"), once: true });
+    const check = manager.openStore("default");
+    try {
+      const detail = check.getTask(task.task.id);
+      assert.equal(detail.task.status, "ready");
+      assert.equal(detail.task.failureCount, 1);
+      assert.equal(detail.runs[0]?.status, "timed_out");
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
+    else process.env.KANBAN_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
