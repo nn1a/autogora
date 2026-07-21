@@ -22,11 +22,12 @@ Authoritative references:
 - [x] Statuses: `scheduled` and `review`
 - [x] Tenant namespace and idempotency keys
 - [x] Scheduled-start promotion and persisted runtime/skill/goal settings
-- [ ] Maximum-runtime enforcement and goal-mode continuation engine
+- [x] Maximum-runtime enforcement
+- [ ] Goal-mode continuation engine
 - [x] Typed blockers and repeated unblock/re-block loop breaker
 - [x] Synthetic human handoff runs and reclaimed-run invariant on administrative moves
 - [x] Unlink, archive, delete, promote, scheduling, and configurable sorting
-- [ ] Bulk mutation with per-task failure reporting
+- [x] Bulk mutation with per-task failure reporting
 
 ### Multi-board isolation
 
@@ -43,7 +44,7 @@ Authoritative references:
 - [x] Durable file and URL attachments with a 25 MB upload limit
 - [x] Completion artifact validation and durable capture
 - [x] Successful scratch cleanup with preserved dir/worktree workspaces
-- [ ] Garbage collection for scratch workspaces, old events, and logs
+- [x] Garbage collection for scratch workspaces, old events, and logs
 
 ### Dispatcher resilience
 
@@ -53,16 +54,17 @@ Authoritative references:
 - [x] Maximum-runtime termination and rate-limit-neutral cooldown/requeue
 - [x] Board-wide and per-assignee concurrency limits
 - [x] Spawn/protocol failure classification and respawn guards
-- [ ] Active-worker, run-control, backlog, and diagnostics snapshots
+- [x] Active-worker, backlog, and diagnostics snapshots
+- [ ] Explicit active-run termination control
 
 ### Agent and human surfaces
 
 - [x] Core MCP planning and worker lifecycle tools
 - [x] Scoped worker isolation and portable worker/orchestrator Skills
 - [x] Attachment MCP tools and attachment-aware task detail
-- [ ] Bounded, preformatted worker context with parent handoffs and prior attempts
-- [ ] Full CLI verbs for boards, tasks, runs, events, logs, stats, and diagnostics
-- [ ] Terminal event watch/tail and machine-readable output
+- [x] Bounded, preformatted worker context with parent handoffs and prior attempts
+- [x] CLI verbs for boards, tasks, runs, events, logs, stats, and diagnostics
+- [x] Terminal event watch/tail and machine-readable output
 - [ ] Notification subscriptions and terminal-event delivery adapters
 
 ### Orchestration

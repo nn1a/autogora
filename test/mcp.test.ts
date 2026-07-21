@@ -35,6 +35,11 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_schedule"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_archive"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_delete"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_context"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_diagnostics"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_events"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_bulk"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_gc"));
     const boards = textPayload(
       await client.callTool({ name: "kanban_boards_list", arguments: {} }),
     ) as { slug: string }[];
@@ -94,6 +99,22 @@ test("Claude/Codex-compatible stdio MCP transport exposes the Kanban workflow", 
     assert.equal(shown.task.goalMode, true);
     assert.equal(shown.task.goalMaxTurns, 7);
     assert.equal(shown.attachments[0]?.name, "brief.txt");
+
+    const context = textPayload(
+      await client.callTool({ name: "kanban_context", arguments: { board: "project", task_id: created.task.id } }),
+    );
+    assert.equal(typeof context, "string");
+    assert.match(context as string, /MCP smoke task/);
+    const stats = textPayload(
+      await client.callTool({ name: "kanban_stats", arguments: { board: "project" } }),
+    ) as { total: number; byRuntime: Record<string, number> };
+    assert.equal(stats.total, 1);
+    assert.equal(stats.byRuntime.manual, 0);
+    const events = textPayload(
+      await client.callTool({ name: "kanban_events", arguments: { board: "project", task_id: created.task.id } }),
+    ) as { taskId: string }[];
+    assert.ok(events.length > 0);
+    assert.ok(events.every((event) => event.taskId === created.task.id));
 
     const claim = textPayload(
       await client.callTool({ name: "kanban_claim", arguments: { board: "project", task_id: created.task.id } }),

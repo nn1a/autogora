@@ -151,6 +151,36 @@ export interface ActiveRun {
   run: Run;
 }
 
+export interface BoardStats {
+  board: string;
+  total: number;
+  byStatus: Record<TaskStatus, number>;
+  byAssignee: Record<string, number>;
+  byRuntime: Record<Runtime, number>;
+  byTenant: Record<string, number>;
+}
+
+export interface BoardDiagnostics {
+  board: string;
+  healthy: boolean;
+  stats: BoardStats;
+  issues: Array<{ kind: string; taskId: string; detail: string }>;
+  activeRuns: ActiveRun[];
+}
+
+export interface BulkMutation {
+  status?: TaskStatus | undefined;
+  assignee?: string | null | undefined;
+  priority?: number | undefined;
+  archive?: boolean | undefined;
+  delete?: boolean | undefined;
+}
+
+export interface BulkResult {
+  ok: Array<{ id: string; value: unknown }>;
+  errors: Array<{ id: string; error: string }>;
+}
+
 const BLOCK_RECURRENCE_LIMIT = 2;
 export const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
@@ -204,6 +234,11 @@ function cleanAttachmentName(value: string): string {
   const name = basename(value).replaceAll("\0", "").trim();
   if (!name || name === "." || name === "..") throw new Error("Attachment name cannot be empty");
   return name.slice(0, 255);
+}
+
+function truncate(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  return `${value.slice(0, Math.max(0, limit - 24))}\n… (${value.length - limit} chars omitted)`;
 }
 
 function newId(prefix: string): string {
@@ -872,6 +907,185 @@ export class KanbanStore {
     return counts;
   }
 
+  getStats(board = this.board): BoardStats {
+    const byStatus = this.countTasksByStatus(board);
+    const grouped = (column: "assignee" | "runtime" | "tenant"): Record<string, number> => {
+      const rows = this.db
+        .prepare(`SELECT COALESCE(${column}, '(unassigned)') AS key, COUNT(*) AS count FROM tasks WHERE board = ? GROUP BY ${column}`)
+        .all(board) as unknown as { key: string; count: number }[];
+      return Object.fromEntries(rows.map((row) => [row.key, row.count]));
+    };
+    const runtimeCounts = grouped("runtime");
+    return {
+      board,
+      total: Object.values(byStatus).reduce((sum, count) => sum + count, 0),
+      byStatus,
+      byAssignee: grouped("assignee"),
+      byRuntime: Object.fromEntries(
+        RUNTIMES.map((runtime) => [runtime, runtimeCounts[runtime] ?? 0]),
+      ) as Record<Runtime, number>,
+      byTenant: grouped("tenant"),
+    };
+  }
+
+  diagnose(board = this.board): BoardDiagnostics {
+    const issues: BoardDiagnostics["issues"] = [];
+    const inconsistent = this.db
+      .prepare(`
+        SELECT id, status, current_run_id FROM tasks
+        WHERE board = ? AND ((status = 'running' AND current_run_id IS NULL) OR
+          (status <> 'running' AND current_run_id IS NOT NULL))
+      `)
+      .all(board) as unknown as { id: string; status: TaskStatus; current_run_id: string | null }[];
+    for (const task of inconsistent) {
+      issues.push({
+        kind: "run_invariant",
+        taskId: task.id,
+        detail: `status=${task.status}, currentRunId=${task.current_run_id ?? "null"}`,
+      });
+    }
+    const stranded = this.db
+      .prepare(`
+        SELECT id, assignee, runtime FROM tasks
+        WHERE board = ? AND status = 'ready' AND (assignee IS NULL OR runtime = 'manual')
+      `)
+      .all(board) as unknown as { id: string; assignee: string | null; runtime: Runtime }[];
+    for (const task of stranded) {
+      issues.push({
+        kind: "stranded_in_ready",
+        taskId: task.id,
+        detail: task.assignee === null ? "ready task has no assignee" : "manual runtime cannot be dispatched",
+      });
+    }
+    const promotable = this.db
+      .prepare(`
+        SELECT t.id FROM tasks t
+        WHERE t.board = ? AND t.status = 'todo' AND t.assignee IS NOT NULL AND t.runtime <> 'manual'
+          AND NOT EXISTS (
+            SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id
+            WHERE l.child_id = t.id AND p.status <> 'done'
+          )
+      `)
+      .all(board) as unknown as { id: string }[];
+    for (const task of promotable) {
+      issues.push({ kind: "promotion_lag", taskId: task.id, detail: "todo task has no open dependency" });
+    }
+    const activeRuns = this.listActiveRuns(board);
+    return { board, healthy: issues.length === 0, stats: this.getStats(board), issues, activeRuns };
+  }
+
+  listEvents(input: {
+    taskId?: string | undefined;
+    sinceId?: number | undefined;
+    kinds?: string[] | undefined;
+    limit?: number | undefined;
+  } = {}): TaskEvent[] {
+    const clauses = ["t.board = ?"];
+    const values: SQLInputValue[] = [this.board];
+    if (input.taskId) {
+      clauses.push("e.task_id = ?");
+      values.push(input.taskId);
+    }
+    if (input.sinceId !== undefined) {
+      clauses.push("e.id > ?");
+      values.push(input.sinceId);
+    }
+    if (input.kinds && input.kinds.length > 0) {
+      clauses.push(`e.kind IN (${input.kinds.map(() => "?").join(", ")})`);
+      values.push(...input.kinds);
+    }
+    values.push(Math.max(1, Math.min(input.limit ?? 500, 2_000)));
+    const rows = this.db
+      .prepare(`
+        SELECT e.* FROM task_events e JOIN tasks t ON t.id = e.task_id
+        WHERE ${clauses.join(" AND ")} ORDER BY e.id ASC LIMIT ?
+      `)
+      .all(...values) as unknown as EventRow[];
+    return rows.map(eventFromRow);
+  }
+
+  buildWorkerContext(taskId: string): string {
+    const detail = this.getTask(taskId);
+    const lines = [
+      `# Kanban task ${detail.task.id}`,
+      "",
+      `Title: ${detail.task.title}`,
+      `Board: ${detail.task.board}`,
+      `Tenant: ${detail.task.tenant ?? "(none)"}`,
+      `Assignee/runtime: ${detail.task.assignee ?? "(unassigned)"} / ${detail.task.runtime}`,
+      `Status: ${detail.task.status}`,
+      `Workspace: ${detail.task.workspace ?? "(not prepared)"} (${detail.task.workspaceKind})`,
+      "",
+      "## Task body",
+      truncate(detail.task.body || "(empty)", 8 * 1_024),
+    ];
+
+    if (detail.parents.length > 0) {
+      lines.push("", "## Parent handoffs");
+      for (const parent of detail.parents) {
+        const parentDetail = this.getTask(parent.id);
+        const completed = [...parentDetail.runs].reverse().find((run) => run.status === "completed");
+        lines.push(`- ${parent.id} [${parent.status}] ${parent.title}`);
+        if (completed?.summary) lines.push(`  Summary: ${truncate(completed.summary, 4 * 1_024)}`);
+        if (completed?.metadata) lines.push(`  Metadata: ${truncate(JSON.stringify(completed.metadata), 4 * 1_024)}`);
+      }
+    }
+
+    if (detail.attachments.length > 0) {
+      lines.push("", "## Attachments");
+      for (const attachment of detail.attachments) {
+        lines.push(`- ${attachment.name}: ${attachment.path ?? attachment.url ?? "(unavailable)"}`);
+      }
+    }
+
+    const priorRuns = detail.runs.filter((run) => run.status !== "running").slice(-10);
+    if (priorRuns.length > 0) {
+      lines.push("", "## Prior attempts");
+      for (const run of priorRuns) {
+        lines.push(`- ${run.id}: ${run.status}${run.summary ? ` — ${truncate(run.summary, 4 * 1_024)}` : ""}`);
+        if (run.error) lines.push(`  Error: ${truncate(run.error, 4 * 1_024)}`);
+      }
+    }
+
+    const comments = detail.comments.slice(-30);
+    if (comments.length > 0) {
+      lines.push("", "## Comments");
+      for (const comment of comments) {
+        lines.push(`- ${comment.author} (${comment.createdAt}): ${truncate(comment.body, 2 * 1_024)}`);
+      }
+    }
+    return truncate(lines.join("\n"), 96 * 1_024);
+  }
+
+  bulkMutate(taskIds: string[], mutation: BulkMutation): BulkResult {
+    const result: BulkResult = { ok: [], errors: [] };
+    for (const id of [...new Set(taskIds)]) {
+      try {
+        let value: unknown;
+        if (mutation.delete) value = this.deleteTask(id);
+        else if (mutation.archive) value = this.archiveTask(id);
+        else if (mutation.status === "done") value = this.completeTask(id);
+        else value = this.updateTask(id, {
+          status: mutation.status,
+          assignee: mutation.assignee,
+          priority: mutation.priority,
+        });
+        result.ok.push({ id, value });
+      } catch (error) {
+        result.errors.push({ id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return result;
+  }
+
+  garbageCollectEvents(retentionDays = 30): number {
+    const cutoff = new Date(Date.now() - Math.max(0, retentionDays) * 86_400_000).toISOString();
+    return this.write(() => {
+      const deleted = this.db.prepare("DELETE FROM task_events WHERE created_at < ?").run(cutoff);
+      return Number(deleted.changes);
+    });
+  }
+
   getTask(taskId: string): TaskDetail {
     const task = taskFromRow(this.requireTaskRow(taskId));
     const parents = this.db
@@ -1505,6 +1719,30 @@ export class KanbanStore {
       const run = runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(row.run_id) as RunRow);
       return { task, run };
     });
+  }
+
+  readRunLog(taskId: string, tailBytes = 64 * 1_024, runId?: string): {
+    runId: string;
+    path: string;
+    text: string;
+    truncated: boolean;
+  } {
+    this.requireTaskRow(taskId);
+    const row = runId
+      ? this.db.prepare("SELECT id, log_path FROM task_runs WHERE id = ? AND task_id = ?").get(runId, taskId)
+      : this.db.prepare("SELECT id, log_path FROM task_runs WHERE task_id = ? AND log_path IS NOT NULL ORDER BY claimed_at DESC LIMIT 1").get(taskId);
+    const run = row as { id: string; log_path: string | null } | undefined;
+    if (!run?.log_path) throw new Error(`No worker log found for task: ${taskId}`);
+    if (!existsSync(run.log_path)) throw new Error(`Worker log file is missing: ${run.log_path}`);
+    const content = readFileSync(run.log_path);
+    const limit = Math.max(1, Math.min(tailBytes, 1024 * 1024));
+    const truncated = content.length > limit;
+    return {
+      runId: run.id,
+      path: run.log_path,
+      text: (truncated ? content.subarray(content.length - limit) : content).toString("utf8"),
+      truncated,
+    };
   }
 
   recoverAbandonedRun(

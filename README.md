@@ -132,6 +132,31 @@ Workers can declare relative deliverables in `kanban_complete` through its
 server copies valid artifacts into durable storage and records them in run
 metadata.
 
+## Observe and maintain a board
+
+The CLI and MCP expose the same bounded worker context, attempt history, event
+cursor, counts, and health diagnostics used by the dispatcher:
+
+```bash
+node dist/cli.js context <task-id>
+node dist/cli.js runs <task-id>
+node dist/cli.js log <task-id> --tail-bytes 65536
+node dist/cli.js stats
+node dist/cli.js diagnostics
+node dist/cli.js watch --since 0
+node dist/cli.js tail <task-id> --follow
+```
+
+Bulk mutations always report success or failure for each task instead of
+aborting the whole batch. Garbage collection is board-scoped and only removes
+expired events, log files, and old scratch directories that still map to a
+terminal task; preserved directories and worktrees are left untouched.
+
+```bash
+node dist/cli.js bulk <task-a> <task-b> --assignee reviewer --priority 10
+node dist/cli.js gc --event-retention-days 30 --log-retention-days 30
+```
+
 ## MCP tools
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
@@ -139,6 +164,8 @@ metadata.
 - Dispatch: `kanban_claim`
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
 - Attachments: `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_attachment_remove`
+- Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
+- Administration: `kanban_bulk`, `kanban_gc`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope

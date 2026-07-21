@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { BoardManager } from "./boards.js";
+import { garbageCollect } from "./maintenance.js";
 import { KanbanStore, type RunScope } from "./store.js";
 import { BLOCK_KINDS, RUNTIMES, TASK_STATUSES, type BlockKind, type Runtime, type TaskStatus } from "./types.js";
 
@@ -269,7 +270,155 @@ export function createKanbanServer(manager: BoardManager): McpServer {
       inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ task_id, board }) => result(usingStore(manager, board, (store) => store.getTask(scopedTaskId(task_id)))),
+    async ({ task_id, board }) => result(usingStore(manager, board, (store) => {
+      const resolvedTaskId = scopedTaskId(task_id);
+      return { ...store.getTask(resolvedTaskId), workerContext: store.buildWorkerContext(resolvedTaskId) };
+    })),
+  );
+
+  server.registerTool(
+    "kanban_context",
+    {
+      title: "Build Kanban worker context",
+      description: "Return the bounded task body, parent handoffs, attachments, prior attempts, and comments seen by a worker.",
+      inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, board }) =>
+      result(usingStore(manager, board, (store) => store.buildWorkerContext(scopedTaskId(task_id)))),
+  );
+
+  server.registerTool(
+    "kanban_stats",
+    {
+      title: "Get Kanban statistics",
+      description: "Count board tasks by status, assignee, runtime, and tenant.",
+      inputSchema: z.object({ board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store, resolvedBoard) => store.getStats(resolvedBoard)));
+    },
+  );
+
+  server.registerTool(
+    "kanban_diagnostics",
+    {
+      title: "Diagnose Kanban board",
+      description: "Inspect task/run invariants, stranded ready tasks, promotion lag, and active workers.",
+      inputSchema: z.object({ board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store, resolvedBoard) => store.diagnose(resolvedBoard)));
+    },
+  );
+
+  server.registerTool(
+    "kanban_events",
+    {
+      title: "Read Kanban events",
+      description: "Read the append-only board event stream by cursor, task, and event kind.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string().optional(),
+        since_id: z.number().int().min(0).optional(),
+        kinds: z.array(z.string()).default([]),
+        limit: z.number().int().min(1).max(2_000).default(500),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board, task_id, since_id, kinds, limit }) => result(usingStore(manager, board, (store) => {
+      const resolvedTaskId = process.env.KANBAN_TASK_ID ? scopedTaskId(task_id) : task_id;
+      return store.listEvents({ taskId: resolvedTaskId, sinceId: since_id, kinds, limit });
+    })),
+  );
+
+  server.registerTool(
+    "kanban_runs",
+    {
+      title: "List Kanban runs",
+      description: "Read full attempt history for one task.",
+      inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, board }) =>
+      result(usingStore(manager, board, (store) => store.getTask(scopedTaskId(task_id)).runs)),
+  );
+
+  server.registerTool(
+    "kanban_log",
+    {
+      title: "Read Kanban worker log",
+      description: "Read up to 1 MB from the tail of a task run log.",
+      inputSchema: z.object({
+        task_id: z.string().optional(),
+        board: z.string().optional(),
+        run_id: z.string().optional(),
+        tail_bytes: z.number().int().min(1).max(1024 * 1024).default(64 * 1024),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, board, run_id, tail_bytes }) =>
+      result(usingStore(manager, board, (store) => store.readRunLog(scopedTaskId(task_id), tail_bytes, run_id))),
+  );
+
+  server.registerTool(
+    "kanban_bulk",
+    {
+      title: "Bulk mutate Kanban tasks",
+      description: "Apply one status, assignee, priority, archive, or delete mutation with per-task error reporting.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_ids: z.array(z.string()).min(1).max(500),
+        status: statusSchema.optional(),
+        assignee: z.string().nullable().optional(),
+        priority: z.number().int().optional(),
+        archive: z.boolean().optional(),
+        delete: z.boolean().optional(),
+      }).refine(
+        ({ status, assignee, priority, archive, delete: hardDelete }) =>
+          status !== undefined || assignee !== undefined || priority !== undefined || archive === true || hardDelete === true,
+        { message: "At least one mutation is required" },
+      ),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ board, task_ids, status, assignee, priority, archive, delete: hardDelete }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => store.bulkMutate(task_ids, {
+        status: status as TaskStatus | undefined,
+        assignee,
+        priority,
+        archive,
+        delete: hardDelete,
+      })));
+    },
+  );
+
+  server.registerTool(
+    "kanban_gc",
+    {
+      title: "Garbage collect Kanban data",
+      description: "Delete expired events, worker logs, and terminal scratch workspaces from one board.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        event_retention_days: z.number().int().min(0).default(30),
+        log_retention_days: z.number().int().min(0).default(30),
+        workspace_retention_days: z.number().int().min(0).default(7),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ board, event_retention_days, log_retention_days, workspace_retention_days }) => {
+      requireAdminSurface();
+      const resolvedBoard = selectedBoard(manager, board);
+      return result(garbageCollect(manager, resolvedBoard, {
+        eventRetentionDays: event_retention_days,
+        logRetentionDays: log_retention_days,
+        workspaceRetentionDays: workspace_retention_days,
+      }));
+    },
   );
 
   server.registerTool(

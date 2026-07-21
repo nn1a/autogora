@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
+import { garbageCollect } from "./maintenance.js";
 import { runStdioServer } from "./server.js";
 import {
   BLOCK_KINDS,
@@ -25,6 +26,15 @@ Commands:
   create <title>        Create a task from the shell
   list                  List tasks
   show <task-id>        Show task details
+  context <task-id>     Print the bounded worker context
+  runs <task-id>        Show attempt history
+  log <task-id>         Read the latest worker log tail
+  stats                 Show board counts
+  diagnostics           Inspect board health and active workers
+  tail <task-id>        Read or follow one task's events
+  watch                 Read or follow the board event stream
+  bulk <id>...          Apply a mutation with per-task results
+  gc                     Collect old events, logs, and terminal scratch dirs
   edit <task-id>        Edit task metadata
   assign <id> <worker>  Assign or unassign a task
   link <parent> <child> Add a dependency
@@ -122,6 +132,10 @@ function parseMetadata(value: string | undefined): Record<string, unknown> | und
     throw new Error("metadata must be a JSON object");
   }
   return parsed as Record<string, unknown>;
+}
+
+function pause(milliseconds: number): Promise<void> {
+  return new Promise((resolvePause) => setTimeout(resolvePause, milliseconds));
 }
 
 async function main(): Promise<void> {
@@ -336,6 +350,154 @@ async function main(): Promise<void> {
     } finally {
       store.close();
     }
+    return;
+  }
+
+  if (["context", "runs", "log"].includes(command)) {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        run: { type: "string" },
+        "tail-bytes": { type: "string" },
+      },
+    });
+    const taskId = parsed.positionals[0];
+    if (!taskId) throw new Error(`${command} requires a task id`);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      if (command === "context") process.stdout.write(`${store.buildWorkerContext(taskId)}\n`);
+      else if (command === "runs") process.stdout.write(`${JSON.stringify(store.getTask(taskId).runs, null, 2)}\n`);
+      else {
+        const log = store.readRunLog(taskId, numberOption(parsed.values["tail-bytes"], 64 * 1_024), parsed.values.run);
+        process.stdout.write(log.text.endsWith("\n") ? log.text : `${log.text}\n`);
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (["stats", "diagnostics", "diag", "assignees"].includes(command)) {
+    const parsed = parseArgs({ args, options: { db: { type: "string" } } });
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const output = command === "stats"
+        ? store.getStats()
+        : command === "assignees"
+          ? store.getStats().byAssignee
+          : store.diagnose();
+      process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "tail" || command === "watch") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        since: { type: "string" },
+        kinds: { type: "string" },
+        limit: { type: "string" },
+        follow: { type: "boolean" },
+        "interval-ms": { type: "string" },
+      },
+    });
+    const taskId = command === "tail" ? parsed.positionals[0] : undefined;
+    if (command === "tail" && !taskId) throw new Error("tail requires a task id");
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    let stopped = false;
+    const stop = (): void => {
+      stopped = true;
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    try {
+      let cursor = numberOption(parsed.values.since, 0);
+      const kinds = parsed.values.kinds?.split(",").map((kind) => kind.trim()).filter(Boolean);
+      do {
+        const events = store.listEvents({
+          taskId,
+          sinceId: cursor,
+          kinds,
+          limit: numberOption(parsed.values.limit, 500),
+        });
+        for (const event of events) {
+          process.stdout.write(`${JSON.stringify(event)}\n`);
+          cursor = Math.max(cursor, event.id);
+        }
+        if (!parsed.values.follow || stopped) break;
+        await pause(Math.max(100, numberOption(parsed.values["interval-ms"], 1_000)));
+      } while (!stopped);
+    } finally {
+      process.removeListener("SIGINT", stop);
+      process.removeListener("SIGTERM", stop);
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "bulk") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        db: { type: "string" },
+        status: { type: "string" },
+        assignee: { type: "string" },
+        priority: { type: "string" },
+        archive: { type: "boolean" },
+        delete: { type: "boolean" },
+      },
+    });
+    if (parsed.positionals.length === 0) throw new Error("bulk requires at least one task id");
+    if (
+      parsed.values.status === undefined && parsed.values.assignee === undefined &&
+      parsed.values.priority === undefined && !parsed.values.archive && !parsed.values.delete
+    ) {
+      throw new Error("bulk requires --status, --assignee, --priority, --archive, or --delete");
+    }
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const output = store.bulkMutate(parsed.positionals, {
+        status: requireStatus(parsed.values.status),
+        assignee: parsed.values.assignee === undefined
+          ? undefined
+          : parsed.values.assignee === "none" ? null : parsed.values.assignee,
+        priority: parsed.values.priority === undefined ? undefined : numberOption(parsed.values.priority, 0),
+        archive: parsed.values.archive,
+        delete: parsed.values.delete,
+      });
+      process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "gc") {
+    const parsed = parseArgs({
+      args,
+      options: {
+        db: { type: "string" },
+        "event-retention-days": { type: "string" },
+        "log-retention-days": { type: "string" },
+        "workspace-retention-days": { type: "string" },
+      },
+    });
+    const manager = managerFor(parsed.values.db);
+    const board = manager.resolve(globalBoard);
+    const output = garbageCollect(manager, board, {
+      eventRetentionDays: numberOption(parsed.values["event-retention-days"], 30),
+      logRetentionDays: numberOption(parsed.values["log-retention-days"], 30),
+      workspaceRetentionDays: numberOption(parsed.values["workspace-retention-days"], 7),
+    });
+    process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     return;
   }
 
