@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
+import { startDashboardServer } from "./http.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
 import {
@@ -67,6 +68,7 @@ Commands:
   archive <id>...       Archive tasks
   delete <id>...        Permanently delete tasks
   dispatch              Run the Claude/Codex worker dispatcher
+  dashboard             Run the authenticated local web dashboard
 
 Common options:
   --db <path>           SQLite path (default: ./data/kanban.db)
@@ -1010,7 +1012,7 @@ async function main(): Promise<void> {
       heartbeatMaxStaleSeconds: numberOption(parsed.values["heartbeat-max-stale-seconds"], 60 * 60),
       crashGraceSeconds: numberOption(parsed.values["crash-grace-seconds"], 30),
       rateLimitCooldownSeconds: numberOption(parsed.values["rate-limit-cooldown-seconds"], 60),
-      autoDecompose: parsed.values["auto-decompose"] ?? false,
+      autoDecompose: parsed.values["auto-decompose"],
       autoDecomposePerTick: numberOption(parsed.values["auto-decompose-per-tick"], 3),
       decompositionProfiles: (parsed.values.profile ?? []).map((profile) =>
         parseProfileRoute(profile, requirePlannerRuntime(parsed.values["planner-runtime"])),
@@ -1027,6 +1029,33 @@ async function main(): Promise<void> {
       signal: controller.signal,
       onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),
     });
+    return;
+  }
+
+  if (command === "dashboard") {
+    const parsed = parseArgs({
+      args,
+      options: {
+        db: { type: "string" },
+        host: { type: "string" },
+        port: { type: "string" },
+        token: { type: "string" },
+      },
+    });
+    const dashboard = await startDashboardServer({
+      dbPath: resolve(parsed.values.db ?? defaultDbPath()),
+      cliEntry: resolve(process.argv[1] ?? "dist/cli.js"),
+      host: parsed.values.host ?? "127.0.0.1",
+      port: numberOption(parsed.values.port, 8420),
+      token: parsed.values.token,
+      onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),
+    });
+    process.stdout.write(`${dashboard.url}/?token=${encodeURIComponent(dashboard.token)}\n`);
+    const controller = new AbortController();
+    process.once("SIGINT", () => controller.abort());
+    process.once("SIGTERM", () => controller.abort());
+    await new Promise<void>((resolveStop) => controller.signal.addEventListener("abort", () => resolveStop(), { once: true }));
+    await dashboard.close();
     return;
   }
 

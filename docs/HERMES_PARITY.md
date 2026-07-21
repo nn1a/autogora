@@ -55,7 +55,7 @@ Authoritative references:
 - [x] Board-wide and per-assignee concurrency limits
 - [x] Spawn/protocol failure classification and respawn guards
 - [x] Active-worker, backlog, and diagnostics snapshots
-- [ ] Explicit active-run termination control
+- [x] Explicit active-run inspection and termination control
 
 ### Agent and human surfaces
 
@@ -77,12 +77,12 @@ Authoritative references:
 
 ### Dashboard
 
-- [ ] Local authenticated HTTP API for every kernel operation
-- [ ] Kanban columns, search/filter, archived toggle, profile/runtime lanes
-- [ ] Create/edit drawer, dependencies, comments, runs, attachments, events
-- [ ] Drag/drop and bulk status/assignee/archive/delete operations
-- [ ] Board switcher/settings and orchestration controls
-- [ ] Live event stream with reconnect/cursor support
+- [x] Local token-authenticated HTTP API over the shared board kernel
+- [x] Kanban columns, search/filter, archived toggle, and Running profile lanes
+- [x] Create/edit drawer, dependencies, comments, runs, attachments, and events
+- [x] Drag/drop and bulk status/assignee/archive/delete operations
+- [x] Board switcher/settings and specify/decompose/swarm controls
+- [x] WebSocket event stream with reconnect/cursor support
 
 ## Explicit upstream boundary
 

@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { BoardManager } from "./boards.js";
+import { BoardManager, type BoardUpdate } from "./boards.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
 import {
@@ -37,6 +37,14 @@ const decompositionPlanSchema = z.object({
     skills: z.array(z.string()),
   })).max(100),
   dependencies: z.array(z.object({ parent: z.string().min(1), child: z.string().min(1) })),
+});
+const boardOrchestrationSchema = z.object({
+  autoDecompose: z.boolean().optional(),
+  autoDecomposePerTick: z.number().int().min(1).max(100).optional(),
+  plannerRuntime: workerRuntimeSchema.optional(),
+  defaultProfile: z.string().nullable().optional(),
+  orchestratorProfile: z.string().nullable().optional(),
+  profiles: z.array(profileRouteSchema.extend({ description: z.string().default("") })).max(200).optional(),
 });
 
 function result(value: unknown) {
@@ -102,7 +110,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     {
       capabilities: { logging: {} },
       instructions:
-        "Use this server as the canonical Kanban state. Workers must read their task first, heartbeat during long work, and terminate exactly once with kanban_complete or kanban_block. Orchestrators create and link tasks but do not implement them.",
+        "Use this server as the canonical Kanban state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with kanban_complete or kanban_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it.",
     },
   );
 
@@ -132,6 +140,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         icon: z.string().optional(),
         color: z.string().optional(),
         default_workdir: z.string().nullable().optional(),
+        orchestration: boardOrchestrationSchema.optional(),
         switch: z.boolean().default(false),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -144,6 +153,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         icon: input.icon,
         color: input.color,
         defaultWorkdir: input.default_workdir,
+        orchestration: input.orchestration as BoardUpdate["orchestration"],
       });
       if (input.switch) manager.switch(metadata.slug);
       return result(metadata);
@@ -162,12 +172,17 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         icon: z.string().optional(),
         color: z.string().optional(),
         default_workdir: z.string().nullable().optional(),
+        orchestration: boardOrchestrationSchema.optional(),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, default_workdir, ...update }) => {
       requireAdminSurface();
-      return result(manager.update(slug, { ...update, defaultWorkdir: default_workdir }));
+      return result(manager.update(slug, {
+        ...update,
+        orchestration: update.orchestration as BoardUpdate["orchestration"],
+        defaultWorkdir: default_workdir,
+      }));
     },
   );
 

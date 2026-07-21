@@ -31,6 +31,44 @@ codex mcp add kanban -- \
 
 The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json) and [examples/codex.config.toml](examples/codex.config.toml).
 
+## Web dashboard and HTTP API
+
+Start the local dashboard after building:
+
+```bash
+node dist/cli.js dashboard
+```
+
+The command binds to `127.0.0.1:8420` and prints a bootstrap URL containing a
+random 256-bit token. Opening it once exchanges the query token for a strict,
+HTTP-only session cookie and redirects to a clean URL. Every static asset, REST
+request, attachment download, and WebSocket upgrade requires that cookie or an
+`Authorization: Bearer <token>` header. Use `--host`, `--port`, or `--token` to
+override the defaults; do not expose a non-loopback bind without an external
+TLS/reverse-proxy boundary.
+
+The dashboard includes:
+
+- all lifecycle columns, search, tenant/assignee filters, archived visibility,
+  and optional per-profile Running lanes;
+- create/edit drawers, safe Markdown rendering, dependencies, comments, run
+  history and termination, attachments, and recent events;
+- drag/drop transitions and partial-failure bulk move, assign, archive, and
+  delete actions;
+- isolated board switching/creation/settings, persisted profile routing and
+  automatic decomposition settings, manual specify/decompose, swarm creation,
+  and dispatcher nudging;
+- a cursor-based WebSocket stream with reconnect and debounced board/drawer
+  refresh.
+
+The JSON API lives under `/api/` and mirrors the same board kernel used by MCP
+and the CLI. For example:
+
+```bash
+curl -H "Authorization: Bearer $KANBAN_DASHBOARD_TOKEN" \
+  "http://127.0.0.1:8420/api/board?board=default"
+```
+
 ## Try a task
 
 Create one from the shell:
@@ -262,6 +300,10 @@ Restart the client if it does not detect the new skills.
 ## Safety and MVP limits
 
 - `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
-- The server is local stdio only; there is no remote authentication or multi-user isolation.
+- The MCP server is local stdio only; there is no multi-user isolation.
+- The optional dashboard is authenticated but remains a trusted-local-user,
+  single-tenant surface; its bearer token is not a substitute for TLS on an
+  untrusted network.
 - SQLite and PID recovery assume one host; cross-host dispatch is intentionally unsupported.
-- The dashboard and review automation are still in progress. See `docs/HERMES_PARITY.md` for the audited checklist.
+- Automated review routing remains part of the final parity audit. See
+  `docs/HERMES_PARITY.md` for the audited checklist.

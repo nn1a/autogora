@@ -292,3 +292,19 @@ test("human lifecycle actions synthesize handoff runs and administrative moves r
     store.close();
   }
 });
+
+test("running status can only be entered through an atomic claim", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    assert.throws(
+      () => store.createTask({ title: "invalid running task", status: "running" }),
+      /atomic claim/,
+    );
+    const task = store.createTask({ title: "claimable task", assignee: "worker", runtime: "codex" });
+    assert.throws(() => store.updateTask(task.task.id, { status: "running" }), /atomic claim/);
+    assert.ok(store.claimTask({ taskId: task.task.id }));
+    assert.equal(store.getTask(task.task.id).task.status, "running");
+  } finally {
+    store.close();
+  }
+});

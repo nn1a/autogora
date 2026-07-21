@@ -179,6 +179,11 @@ export interface ActiveRun {
   run: Run;
 }
 
+export interface RunInspection {
+  task: Task;
+  run: Run;
+}
+
 export interface BoardStats {
   board: string;
   total: number;
@@ -818,6 +823,7 @@ export class KanbanStore {
     if (requestedStatus && !TASK_STATUSES.includes(requestedStatus)) {
       throw new Error(`Invalid status: ${requestedStatus}`);
     }
+    if (requestedStatus === "running") throw new Error("Tasks enter running only through an atomic claim");
 
     const tenant = input.tenant?.trim() || null;
     const idempotencyKey = input.idempotencyKey?.trim() || null;
@@ -2356,6 +2362,17 @@ export class KanbanStore {
       const run = runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(row.run_id) as RunRow);
       return { task, run };
     });
+  }
+
+  getRun(runId: string): RunInspection {
+    const row = this.db
+      .prepare(`
+        SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id
+        WHERE r.id = ? AND t.board = ?
+      `)
+      .get(runId, this.board) as RunRow | undefined;
+    if (!row) throw new Error(`Run not found: ${runId}`);
+    return { task: taskFromRow(this.requireTaskRow(row.task_id)), run: runFromRow(row) };
   }
 
   readRunLog(taskId: string, tailBytes = 64 * 1_024, runId?: string): {

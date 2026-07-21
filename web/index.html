@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kanban Control Plane</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">K</span>
+      <div><strong>Kanban</strong><small>Claude + Codex control plane</small></div>
+    </div>
+    <div class="board-actions">
+      <label class="sr-only" for="board-select">Board</label>
+      <select id="board-select"></select>
+      <button id="new-board" class="ghost">New board</button>
+      <button id="board-settings" class="ghost">Settings</button>
+      <button id="new-swarm" class="ghost">Swarm</button>
+      <button id="nudge" class="primary">Nudge dispatcher</button>
+      <span id="connection" class="connection" title="Live event connection">offline</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar" aria-label="Board filters">
+      <input id="search" type="search" placeholder="Search title or description…">
+      <select id="tenant-filter"><option value="">All tenants</option></select>
+      <select id="assignee-filter"><option value="">All assignees</option></select>
+      <label><input id="show-archived" type="checkbox"> Archived</label>
+      <label><input id="lane-profile" type="checkbox"> Running lanes</label>
+      <div id="stats" class="stats"></div>
+    </section>
+
+    <section id="bulk-bar" class="bulk-bar hidden" aria-live="polite">
+      <strong><span id="bulk-count">0</span> selected</strong>
+      <select id="bulk-status"><option value="">Move to…</option></select>
+      <input id="bulk-assignee" placeholder="Assign to…">
+      <button id="bulk-assign">Assign</button>
+      <button id="bulk-archive">Archive</button>
+      <button id="bulk-delete" class="danger">Delete</button>
+      <button id="bulk-clear" class="ghost">Clear</button>
+    </section>
+
+    <section id="board" class="board" aria-label="Kanban board"></section>
+  </main>
+
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <div><span id="drawer-id" class="mono"></span><span id="drawer-status" class="status-chip"></span></div>
+      <button id="drawer-close" class="icon-button" aria-label="Close">×</button>
+    </div>
+    <div id="drawer-content" class="drawer-content"></div>
+  </aside>
+  <div id="scrim" class="scrim hidden"></div>
+
+  <dialog id="task-dialog">
+    <form id="task-form" method="dialog" class="dialog-form">
+      <header><h2>Create task</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <label>Title<input name="title" required maxlength="300"></label>
+      <label>Description<textarea name="body" rows="7"></textarea></label>
+      <div class="form-grid">
+        <label>Status<select name="status"></select></label>
+        <label>Assignee<input name="assignee" placeholder="profile name"></label>
+        <label>Runtime<select name="runtime"><option>manual</option><option>codex</option><option>claude</option></select></label>
+        <label>Priority<input name="priority" type="number" value="0"></label>
+        <label>Tenant<input name="tenant"></label>
+        <label>Workspace kind<select name="workspaceKind"><option>scratch</option><option>dir</option><option>worktree</option></select></label>
+      </div>
+      <label>Workspace path<input name="workspace" placeholder="absolute path (optional)"></label>
+      <label>Skills<input name="skills" placeholder="comma-separated"></label>
+      <label class="inline"><input name="goalMode" type="checkbox"> Goal mode</label>
+      <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button id="task-submit" class="primary">Create</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="board-dialog">
+    <form id="board-form" method="dialog" class="dialog-form">
+      <header><h2>New board</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <label>Slug<input name="slug" required pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}"></label>
+      <label>Name<input name="name"></label>
+      <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Project directory<input name="defaultWorkdir" placeholder="absolute path"></label>
+      <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button class="primary">Create board</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog">
+    <form id="settings-form" method="dialog" class="dialog-form wide">
+      <header><h2>Board & orchestration</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <div class="form-grid">
+        <label>Name<input name="name"></label>
+        <label>Color<input name="color" type="color" value="#5b7cff"></label>
+      </div>
+      <label>Description<textarea name="description" rows="3"></textarea></label>
+      <label>Default project directory<input name="defaultWorkdir"></label>
+      <hr>
+      <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
+      <div class="form-grid">
+        <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option></select></label>
+        <label>Per tick<input name="autoDecomposePerTick" type="number" min="1" max="100" value="3"></label>
+        <label>Default profile<input name="defaultProfile"></label>
+        <label>Orchestrator profile<input name="orchestratorProfile"></label>
+      </div>
+      <label>Profiles <small>one per line: name:runtime:description</small><textarea name="profiles" rows="6"></textarea></label>
+      <footer>
+        <button id="archive-board" value="cancel" class="danger">Archive board</button>
+        <span class="spacer"></span>
+        <button type="button" data-close-dialog class="ghost">Cancel</button><button class="primary">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="swarm-dialog">
+    <form id="swarm-form" method="dialog" class="dialog-form wide">
+      <header><h2>Create Kanban swarm</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <label>Goal<textarea name="goal" rows="4" required></textarea></label>
+      <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude"></label>
+      <div class="form-grid">
+        <label>Verifier<input name="verifier" required placeholder="reviewer:claude"></label>
+        <label>Synthesizer<input name="synthesizer" required placeholder="writer:claude"></label>
+      </div>
+      <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button class="primary">Create swarm</button></footer>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

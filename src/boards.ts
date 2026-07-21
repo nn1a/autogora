@@ -10,7 +10,22 @@ import {
 import { dirname, join, resolve } from "node:path";
 
 import { KanbanStore } from "./store.js";
-import { TASK_STATUSES, type TaskStatus } from "./types.js";
+import { TASK_STATUSES, type Runtime, type TaskStatus } from "./types.js";
+
+export interface BoardProfile {
+  name: string;
+  runtime: Exclude<Runtime, "manual">;
+  description: string;
+}
+
+export interface BoardOrchestrationSettings {
+  autoDecompose: boolean;
+  autoDecomposePerTick: number;
+  plannerRuntime: Exclude<Runtime, "manual">;
+  defaultProfile: string | null;
+  orchestratorProfile: string | null;
+  profiles: BoardProfile[];
+}
 
 export interface BoardMetadata {
   slug: string;
@@ -25,6 +40,7 @@ export interface BoardMetadata {
   workspaceRoot: string;
   attachmentsRoot: string;
   logsRoot: string;
+  orchestration: BoardOrchestrationSettings;
   counts?: Record<TaskStatus, number> | undefined;
 }
 
@@ -34,6 +50,7 @@ export interface BoardUpdate {
   icon?: string | undefined;
   color?: string | undefined;
   defaultWorkdir?: string | null | undefined;
+  orchestration?: Partial<BoardOrchestrationSettings> | undefined;
 }
 
 const BOARD_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -65,6 +82,33 @@ function safeMetadata(path: string): Partial<BoardMetadata> {
   } catch {
     return {};
   }
+}
+
+function orchestrationSettings(raw: Partial<BoardOrchestrationSettings> | undefined): BoardOrchestrationSettings {
+  const profiles = Array.isArray(raw?.profiles)
+    ? raw.profiles.filter((profile): profile is BoardProfile =>
+        Boolean(profile && typeof profile.name === "string" &&
+          (profile.runtime === "claude" || profile.runtime === "codex")),
+      ).map((profile) => ({
+        name: profile.name.trim(),
+        runtime: profile.runtime,
+        description: typeof profile.description === "string" ? profile.description : "",
+      })).filter((profile) => profile.name)
+    : [];
+  return {
+    autoDecompose: raw?.autoDecompose === true,
+    autoDecomposePerTick: Number.isInteger(raw?.autoDecomposePerTick) && (raw?.autoDecomposePerTick ?? 0) > 0
+      ? raw!.autoDecomposePerTick!
+      : 3,
+    plannerRuntime: raw?.plannerRuntime === "claude" ? "claude" : "codex",
+    defaultProfile: typeof raw?.defaultProfile === "string" && raw.defaultProfile.trim()
+      ? raw.defaultProfile.trim()
+      : null,
+    orchestratorProfile: typeof raw?.orchestratorProfile === "string" && raw.orchestratorProfile.trim()
+      ? raw.orchestratorProfile.trim()
+      : null,
+    profiles,
+  };
 }
 
 export class BoardManager {
@@ -129,6 +173,7 @@ export class BoardManager {
       workspaceRoot: this.workspaceRoot(slug),
       attachmentsRoot: this.attachmentsRoot(slug),
       logsRoot: this.logsRoot(slug),
+      orchestration: orchestrationSettings(raw.orchestration),
     };
   }
 
@@ -143,6 +188,7 @@ export class BoardManager {
       color: update.color ?? existing.color,
       defaultWorkdir: update.defaultWorkdir === undefined ? existing.defaultWorkdir : update.defaultWorkdir,
       archived: update.archived ?? existing.archived,
+      orchestration: orchestrationSettings({ ...existing.orchestration, ...(update.orchestration ?? {}) }),
       createdAt: existing.createdAt ?? new Date().toISOString(),
     };
     const path = this.metadataPath(slug);
@@ -156,6 +202,7 @@ export class BoardManager {
       defaultWorkdir: metadata.defaultWorkdir,
       createdAt: metadata.createdAt,
       archived: metadata.archived,
+      orchestration: metadata.orchestration,
     };
     writeFileSync(path, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
     return metadata;

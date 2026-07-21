@@ -317,38 +317,47 @@ async function decomposeBoardTriage(
   boards: string[],
   options: DispatcherOptions,
 ): Promise<void> {
-  if (!options.autoDecompose) return;
-  let remaining = Math.max(1, options.autoDecomposePerTick ?? 3);
-  const plannerRuntime = options.plannerRuntime ?? "codex";
-  const planner = options.decompositionPlanner ?? createCliPlanner({
-    runtime: plannerRuntime,
-    cwd: process.cwd(),
-    timeoutMs: options.plannerTimeoutMs ?? 120_000,
-  });
+  let remaining = Math.max(1, options.autoDecomposePerTick ?? 500);
   for (const board of boards) {
     if (remaining <= 0) break;
+    const settings = manager.read(board).orchestration;
+    if (!(options.autoDecompose ?? settings.autoDecompose)) continue;
+    let boardRemaining = Math.min(remaining, options.autoDecomposePerTick ?? settings.autoDecomposePerTick);
+    const plannerRuntime = options.plannerRuntime ?? settings.plannerRuntime;
+    const planner = options.decompositionPlanner ?? createCliPlanner({
+      runtime: plannerRuntime,
+      cwd: process.cwd(),
+      timeoutMs: options.plannerTimeoutMs ?? 120_000,
+    });
     const store = manager.openStore(board);
     try {
-      const triage = store.listTasks({ status: "triage", limit: remaining });
+      const triage = store.listTasks({ status: "triage", limit: boardRemaining });
       const discovered = store.listTasks({ includeArchived: true, limit: 500 })
         .filter((task) => task.assignee && task.runtime !== "manual")
         .map((task) => ({
           name: task.assignee!,
           runtime: task.runtime as Exclude<Runtime, "manual">,
         } satisfies ProfileRoute));
+      const configuredProfiles = options.decompositionProfiles ?? settings.profiles;
       const profiles = [...new Map(
-        [...discovered, ...(options.decompositionProfiles ?? [])].map((profile) => [profile.name, profile]),
+        [...discovered, ...configuredProfiles].map((profile) => [profile.name, profile]),
       ).values()];
       for (const task of triage) {
-        const fallback = options.defaultDecompositionProfile ??
+        const configuredDefault = settings.defaultProfile
+          ? profiles.find((profile) => profile.name === settings.defaultProfile)
+          : undefined;
+        const fallback = options.defaultDecompositionProfile ?? configuredDefault ??
           (task.assignee && task.runtime !== "manual"
             ? { name: task.assignee, runtime: task.runtime as Exclude<Runtime, "manual"> }
             : profiles[0] ?? { name: `${plannerRuntime}-worker`, runtime: plannerRuntime });
+        const configuredOrchestrator = settings.orchestratorProfile
+          ? profiles.find((profile) => profile.name === settings.orchestratorProfile)
+          : undefined;
         try {
           const result = await decomposeTriageTask(store, task.id, {
             profiles,
             defaultProfile: fallback,
-            orchestratorProfile: options.orchestratorProfile ?? fallback,
+            orchestratorProfile: options.orchestratorProfile ?? configuredOrchestrator ?? fallback,
             planner,
           });
           options.onLog?.(`auto-${result.fanout ? "decomposed" : "specified"} ${task.id}: ${result.reason}`);
@@ -356,7 +365,8 @@ async function decomposeBoardTriage(
           options.onLog?.(`auto-decompose failed ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
         }
         remaining -= 1;
-        if (remaining <= 0) break;
+        boardRemaining -= 1;
+        if (remaining <= 0 || boardRemaining <= 0) break;
       }
     } finally {
       store.close();
