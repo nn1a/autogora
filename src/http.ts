@@ -185,7 +185,7 @@ function profileRoute(value: unknown): ProfileRoute {
   const route = value as JsonObject;
   const name = stringValue(route.name)?.trim();
   const runtime = runtimeValue(route.runtime);
-  if (!name || !runtime || runtime === "manual") throw new Error("Profile route requires name and a Claude/Codex runtime");
+  if (!name || !runtime || runtime === "manual") throw new Error("Profile route requires name and a worker runtime");
   return { name, runtime, description: stringValue(route.description) };
 }
 
@@ -696,7 +696,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         const metadata = manager.read(board);
         const existing = metadata.orchestration.profiles.find((profile) => profile.name === segments[2]);
         const runtime = existing?.runtime ?? runtimeValue(body.runtime);
-        if (!runtime || runtime === "manual") throw new Error("Profile auto-description requires a Claude/Codex runtime");
+        if (!runtime || runtime === "manual") throw new Error("Profile auto-description requires a worker runtime");
         const evidence = await withStore(manager, board, (store) => store.listTasks({
           assignee: segments[2], includeArchived: true, limit: 50,
         }).map((task) => ({ title: task.title, body: task.body, skills: task.skills })));

@@ -468,10 +468,12 @@ export class KanbanStore {
       .get() as { sql: string } | undefined;
     if (existing && (!existing.sql.includes("'scheduled'") || !existing.sql.includes("idempotency_key"))) {
       this.migrateLegacySchema();
+    } else if (existing && !existing.sql.includes("'cline'")) {
+      this.migrateRuntimeSchema();
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 4");
+    this.db.exec("PRAGMA user_version = 5");
   }
 
   private createLatestSchema(): void {
@@ -484,7 +486,7 @@ export class KanbanStore {
         title TEXT NOT NULL,
         body TEXT NOT NULL DEFAULT '',
         assignee TEXT,
-        runtime TEXT NOT NULL DEFAULT 'manual' CHECK (runtime IN ('claude', 'codex', 'manual')),
+        runtime TEXT NOT NULL DEFAULT 'manual' CHECK (runtime IN ('claude', 'codex', 'cline', 'manual')),
         status TEXT NOT NULL CHECK (status IN ('triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done', 'archived')),
         priority INTEGER NOT NULL DEFAULT 0,
         workspace TEXT,
@@ -527,7 +529,7 @@ export class KanbanStore {
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         worker_id TEXT NOT NULL,
-        runtime TEXT NOT NULL CHECK (runtime IN ('claude', 'codex', 'manual')),
+        runtime TEXT NOT NULL CHECK (runtime IN ('claude', 'codex', 'cline', 'manual')),
         status TEXT NOT NULL,
         claim_token TEXT NOT NULL,
         claimed_at TEXT NOT NULL,
@@ -608,6 +610,37 @@ export class KanbanStore {
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due
         ON notification_deliveries(status, next_attempt_at, lease_expires_at);
     `);
+  }
+
+  private migrateRuntimeSchema(): void {
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("PRAGMA legacy_alter_table = ON");
+    try {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        DROP INDEX IF EXISTS idx_tasks_queue;
+        DROP INDEX IF EXISTS idx_tasks_idempotency;
+        DROP INDEX IF EXISTS idx_runs_task;
+        ALTER TABLE task_runs RENAME TO task_runs_runtime_legacy;
+        ALTER TABLE tasks RENAME TO tasks_runtime_legacy;
+      `);
+      this.createLatestSchema();
+      this.db.exec(`
+        INSERT INTO tasks SELECT * FROM tasks_runtime_legacy;
+        INSERT INTO task_runs SELECT * FROM task_runs_runtime_legacy;
+        DROP TABLE task_runs_runtime_legacy;
+        DROP TABLE tasks_runtime_legacy;
+      `);
+      const violations = this.db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) throw new Error(`Runtime migration produced ${violations.length} foreign key violation(s)`);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.db.exec("PRAGMA legacy_alter_table = OFF");
+      this.db.exec("PRAGMA foreign_keys = ON");
+    }
   }
 
   private migrateLegacySchema(): void {

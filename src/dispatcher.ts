@@ -1,6 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, mkdirSync } from "node:fs";
+import {
+  createWriteStream,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
@@ -14,7 +23,7 @@ import {
   type StructuredPlanner,
 } from "./orchestration.js";
 import { KanbanStore } from "./store.js";
-import type { ClaimedTask, Runtime } from "./types.js";
+import type { ClaimedTask, PlannerRuntime, WorkerRuntime } from "./types.js";
 import { WorkspaceManager } from "./workspaces.js";
 
 export interface RunnerCommand {
@@ -22,6 +31,10 @@ export interface RunnerCommand {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  toolApproval?: {
+    directory: string;
+    commandPrefix: string;
+  } | undefined;
 }
 
 export interface DispatcherOptions {
@@ -51,29 +64,47 @@ export interface DispatcherOptions {
   decompositionProfiles?: ProfileRoute[] | undefined;
   defaultDecompositionProfile?: ProfileRoute | undefined;
   orchestratorProfile?: ProfileRoute | undefined;
-  plannerRuntime?: Exclude<Runtime, "manual"> | undefined;
+  plannerRuntime?: PlannerRuntime | undefined;
   plannerTimeoutMs?: number | undefined;
   decompositionPlanner?: StructuredPlanner | undefined;
   allowWrites?: boolean | undefined;
   workspaceRoot?: string | undefined;
   attachmentsRoot?: string | undefined;
   logsRoot?: string | undefined;
+  clineApprovalDir?: string | undefined;
   signal?: AbortSignal | undefined;
   onLog?: ((message: string) => void) | undefined;
 }
 
-function workerPrompt(claim: ClaimedTask): string {
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function workerPrompt(claim: ClaimedTask, cliEntry: string): string {
   const { task } = claim.task;
-  const instructions = [
-    `You are the assigned Kanban worker for ${task.id}.`,
-    "Call kanban_show first without a task_id. Work only on that task in the current workspace.",
-    "Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
-    "Do not claim, create, reassign, unblock, or modify unrelated tasks.",
-  ];
+  const instructions = [`You are the assigned Kanban worker for ${task.id}.`];
+  if (task.runtime === "cline") {
+    const bridge = `${shellQuote(process.execPath)} ${shellQuote(resolve(cliEntry))}`;
+    instructions.push(
+      "MCP is unavailable in this Cline build. Use only the scoped Kanban CLI bridge for task lifecycle communication.",
+      `First run ${bridge} show "$KANBAN_TASK_ID". For long work run ${bridge} heartbeat "$KANBAN_TASK_ID" --note "progress".`,
+      `Record handoffs with ${bridge} comment "$KANBAN_TASK_ID" "message".`,
+      `Finish exactly once with ${bridge} complete "$KANBAN_TASK_ID" --summary "summary" or ${bridge} block "$KANBAN_TASK_ID" "reason" --kind needs_input.`,
+      "The dispatcher scopes these commands to the active task and claim. Do not claim, create, reassign, unblock, or modify unrelated tasks.",
+    );
+  } else {
+    instructions.push(
+      "Call kanban_show first without a task_id. Work only on that task in the current workspace.",
+      "Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
+      "Do not claim, create, reassign, unblock, or modify unrelated tasks.",
+    );
+  }
   if (task.goalMode) {
     instructions.push(
       "This card is in goal mode. Call kanban_complete only when every acceptance criterion is demonstrably satisfied, or kanban_block for a real blocker.",
-      "If meaningful work remains after this turn, leave the task running and end your response with a concise progress handoff; an independent judge will continue this same session.",
+      task.runtime === "cline"
+        ? "If meaningful work remains after this turn, leave the task running and end with a concise progress handoff; an independent judge may continue the goal in a fresh Cline turn."
+        : "If meaningful work remains after this turn, leave the task running and end your response with a concise progress handoff; an independent judge will continue this same session.",
     );
   } else {
     instructions.push("You must end exactly once by calling kanban_complete with verification evidence, or kanban_block with the concrete reason.");
@@ -96,7 +127,7 @@ export function buildRunnerCommand(
   claim: ClaimedTask,
   options: Pick<
     DispatcherOptions,
-    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot"
+    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot" | "clineApprovalDir"
   >,
   sessionId?: string,
 ): RunnerCommand {
@@ -117,7 +148,7 @@ export function buildRunnerCommand(
     KANBAN_ATTACHMENTS_ROOT: options.attachmentsRoot,
     KANBAN_LOGS_ROOT: options.logsRoot,
   };
-  const prompt = workerPrompt(claim);
+  const prompt = workerPrompt(claim, options.cliEntry);
 
   if (task.runtime === "codex") {
     return {
@@ -183,21 +214,51 @@ export function buildRunnerCommand(
     };
   }
 
-  throw new Error(`Dispatcher cannot launch runtime: ${task.runtime satisfies Runtime}`);
+  if (task.runtime === "cline") {
+    const allowWrites = options.allowWrites === true;
+    if (!allowWrites && !options.clineApprovalDir) {
+      throw new Error("Read-only Cline execution requires a scoped tool approval directory");
+    }
+    const commandPrefix = `${shellQuote(process.execPath)} ${shellQuote(resolve(options.cliEntry))}`;
+    const clineEnv = allowWrites
+      ? env
+      : {
+          ...env,
+          CLINE_TOOL_APPROVAL_MODE: "desktop",
+          CLINE_TOOL_APPROVAL_DIR: options.clineApprovalDir,
+        };
+    return {
+      command: process.env.KANBAN_CLINE_BIN ?? "cline",
+      cwd,
+      env: clineEnv,
+      args: [
+        "--json",
+        "--auto-approve", allowWrites ? "true" : "false",
+        "--cwd", cwd,
+        prompt,
+      ],
+      toolApproval: allowWrites
+        ? undefined
+        : { directory: options.clineApprovalDir!, commandPrefix },
+    };
+  }
+
+  throw new Error(`Dispatcher cannot launch runtime: ${task.runtime}`);
 }
 
 function buildGoalContinuationCommand(
   claim: ClaimedTask,
   options: Pick<
     DispatcherOptions,
-    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot"
+    "dbPath" | "cliEntry" | "allowWrites" | "workspaceRoot" | "attachmentsRoot" | "logsRoot" | "clineApprovalDir"
   >,
-  sessionId: string,
+  sessionId: string | null,
   prompt: string,
 ): RunnerCommand {
   const task = claim.task.task;
   const initial = buildRunnerCommand(claim, options);
   if (task.runtime === "codex") {
+    if (!sessionId) throw new Error("Codex goal continuation requires a session id");
     return {
       ...initial,
       args: [
@@ -211,10 +272,18 @@ function buildGoalContinuationCommand(
     };
   }
   if (task.runtime === "claude") {
-    const promptIndex = initial.args.indexOf(workerPrompt(claim));
+    if (!sessionId) throw new Error("Claude goal continuation requires a session id");
+    const promptIndex = initial.args.indexOf(workerPrompt(claim, options.cliEntry));
     const args = [...initial.args];
     if (promptIndex >= 0) args[promptIndex] = prompt;
     args.push("--resume", sessionId);
+    return { ...initial, args };
+  }
+  if (task.runtime === "cline") {
+    const initialPrompt = workerPrompt(claim, options.cliEntry);
+    const promptIndex = initial.args.indexOf(initialPrompt);
+    const args = [...initial.args];
+    if (promptIndex >= 0) args[promptIndex] = `${initialPrompt}\nContinuation focus: ${prompt}`;
     return { ...initial, args };
   }
   throw new Error(`Goal continuation cannot launch runtime: ${task.runtime}`);
@@ -337,7 +406,7 @@ async function decomposeBoardTriage(
         .filter((task) => task.assignee && task.runtime !== "manual")
         .map((task) => ({
           name: task.assignee!,
-          runtime: task.runtime as Exclude<Runtime, "manual">,
+          runtime: task.runtime as WorkerRuntime,
         } satisfies ProfileRoute));
       const configuredProfiles = options.decompositionProfiles ?? settings.profiles;
       const profiles = [...new Map(
@@ -349,7 +418,7 @@ async function decomposeBoardTriage(
           : undefined;
         const fallback = options.defaultDecompositionProfile ?? configuredDefault ??
           (task.assignee && task.runtime !== "manual"
-            ? { name: task.assignee, runtime: task.runtime as Exclude<Runtime, "manual"> }
+            ? { name: task.assignee, runtime: task.runtime as WorkerRuntime }
             : profiles[0] ?? { name: `${plannerRuntime}-worker`, runtime: plannerRuntime });
         const configuredOrchestrator = settings.orchestratorProfile
           ? profiles.find((profile) => profile.name === settings.orchestratorProfile)
@@ -390,13 +459,85 @@ function sessionIdFromOutput(output: string): string | null {
     if (!line.trim().startsWith("{")) continue;
     try {
       const event = JSON.parse(line) as Record<string, unknown>;
-      const sessionId = event.thread_id ?? event.session_id;
+      const nested = event.event && typeof event.event === "object" ? event.event as Record<string, unknown> : null;
+      const sessionId = event.thread_id ?? event.session_id ?? event.sessionId ?? nested?.session_id ?? nested?.sessionId;
       if (typeof sessionId === "string" && sessionId) return sessionId;
     } catch {
       // Non-JSON lines are still useful to the goal judge.
     }
   }
   return null;
+}
+
+const CLINE_READ_ONLY_TOOLS = new Set([
+  "read_files",
+  "read_file",
+  "list_files",
+  "list_code_definition_names",
+  "search_codebase",
+  "search_files",
+  "fetch_web_content",
+  "skills",
+]);
+
+function approvalCommands(input: unknown): string[] {
+  if (typeof input === "string") return [input];
+  if (Array.isArray(input)) return input.flatMap(approvalCommands);
+  if (!input || typeof input !== "object") return [];
+  const record = input as Record<string, unknown>;
+  if (record.commands !== undefined) return approvalCommands(record.commands);
+  if (typeof record.command === "string" && Array.isArray(record.args) && record.args.every((arg) => typeof arg === "string")) {
+    return [`${shellQuote(record.command)} ${record.args.map((arg) => shellQuote(arg as string)).join(" ")}`];
+  }
+  if (typeof record.command === "string") return [record.command];
+  if (typeof record.cmd === "string") return [record.cmd];
+  return [];
+}
+
+function isScopedBridgeCommand(command: string, commandPrefix: string): boolean {
+  const normalized = command.trim();
+  if (!normalized.startsWith(`${commandPrefix} `)) return false;
+  if (/[\n\r;|&<>`]/.test(normalized) || normalized.includes("$(")) return false;
+  const subcommand = normalized.slice(commandPrefix.length).trimStart().split(/\s+/, 1)[0];
+  return ["show", "context", "heartbeat", "comment", "complete", "block"].includes(subcommand ?? "");
+}
+
+function startToolApprovalBroker(policy: NonNullable<RunnerCommand["toolApproval"]>): () => void {
+  mkdirSync(policy.directory, { recursive: true });
+  const handled = new Set<string>();
+  const sweep = (): void => {
+    let names: string[];
+    try {
+      names = readdirSync(policy.directory);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (handled.has(name) || !name.includes(".request.") || !name.endsWith(".json")) continue;
+      try {
+        const request = JSON.parse(readFileSync(join(policy.directory, name), "utf8")) as Record<string, unknown>;
+        const toolName = typeof request.toolName === "string" ? request.toolName : "";
+        const commands = approvalCommands(request.input);
+        const approved = CLINE_READ_ONLY_TOOLS.has(toolName) ||
+          (["run_commands", "execute_command"].includes(toolName) && commands.length > 0 &&
+            commands.every((command) => isScopedBridgeCommand(command, policy.commandPrefix)));
+        const decisionName = name.replace(".request.", ".decision.");
+        writeFileSync(join(policy.directory, decisionName), `${JSON.stringify({
+          approved,
+          reason: approved ? "Approved by the scoped Kanban read-only policy" : "Denied by the scoped Kanban read-only policy",
+        })}\n`, "utf8");
+        handled.add(name);
+      } catch {
+        // The Cline process may still be finishing its atomic request write; retry next sweep.
+      }
+    }
+  };
+  const timer = setInterval(sweep, 50);
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+    sweep();
+  };
 }
 
 async function executeTurn(
@@ -414,6 +555,7 @@ async function executeTurn(
       env: command.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const stopApprovalBroker = command.toolApproval ? startToolApprovalBroker(command.toolApproval) : undefined;
     children.add(child);
     if (child.pid !== undefined) store.recordSpawn(scope, child.pid, logPath);
     let output = "";
@@ -440,6 +582,7 @@ async function executeTurn(
       if (runtimeTimer) clearTimeout(runtimeTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       children.delete(child);
+      stopApprovalBroker?.();
       logStream.end();
       resolveTurn({ code, signal, spawnError, timedOut, output, sessionId: sessionIdFromOutput(output) });
     });
@@ -483,7 +626,7 @@ async function runClaim(
   const runStartedAt = Date.parse(preparedClaim.run.claimedAt);
   const defaultGoalPlanner = goalMode && !options.goalJudge
       ? createCliPlanner({
-        runtime: preparedClaim.task.task.runtime as Exclude<Runtime, "manual">,
+        runtime: preparedClaim.task.task.runtime as PlannerRuntime,
         cwd: preparedClaim.task.task.workspace ?? process.cwd(),
         timeoutMs: options.plannerTimeoutMs ?? 120_000,
       })
@@ -501,7 +644,7 @@ async function runClaim(
   };
 
   while (true) {
-    const command = continuationPrompt && sessionId
+    const command = continuationPrompt && (sessionId || preparedClaim.task.task.runtime === "cline")
       ? buildGoalContinuationCommand(preparedClaim, runnerOptions, sessionId, continuationPrompt)
       : buildRunnerCommand(preparedClaim, runnerOptions, sessionId ?? undefined);
     const maxRuntimeMs = preparedClaim.task.task.maxRuntimeSeconds === null
@@ -560,7 +703,7 @@ async function runClaim(
 
     store.pauseGoalRun(scope, turn);
     sessionId = sessionId ?? execution.sessionId;
-    if (!sessionId) {
+    if (!sessionId && preparedClaim.task.task.runtime !== "cline") {
       store.failRun(scope, "Goal-mode runner did not report a resumable session id", {
         outcome: "protocol_violation",
         failureLimit: options.failureLimit,
@@ -606,6 +749,7 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
   const workspaces = new WorkspaceManager(manager);
   const active = new Set<Promise<void>>();
   const children = new Set<ChildProcess>();
+  let generatedClineApprovalDir: string | undefined;
   const maxWorkers = Math.max(1, options.maxWorkers ?? 2);
   const intervalMs = Math.max(250, options.intervalMs ?? 2_000);
 
@@ -644,11 +788,17 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
           }
           foundInPass = true;
           launched = true;
+          const claimOptions = claim.task.task.runtime === "cline" && !options.clineApprovalDir
+            ? {
+                ...options,
+                clineApprovalDir: generatedClineApprovalDir ??= mkdtempSync(join(tmpdir(), "kanban-cline-approvals-")),
+              }
+            : options;
           let running: Promise<void>;
           running = runClaim(
             store,
             claim,
-            options,
+            claimOptions,
             children,
             manager.logsRoot(board),
             workspaces,
@@ -679,5 +829,6 @@ export async function runDispatcher(options: DispatcherOptions): Promise<void> {
     await Promise.all(active);
   } finally {
     options.signal?.removeEventListener("abort", stopChildren);
+    if (generatedClineApprovalDir) rmSync(generatedClineApprovalDir, { recursive: true, force: true });
   }
 }

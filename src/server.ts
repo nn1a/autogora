@@ -13,11 +13,21 @@ import {
   type DecompositionPlan,
 } from "./orchestration.js";
 import { KanbanStore, type RunScope } from "./store.js";
-import { BLOCK_KINDS, RUNTIMES, TASK_STATUSES, type BlockKind, type Runtime, type TaskStatus } from "./types.js";
+import {
+  BLOCK_KINDS,
+  PLANNER_RUNTIMES,
+  RUNTIMES,
+  TASK_STATUSES,
+  WORKER_RUNTIMES,
+  type BlockKind,
+  type Runtime,
+  type TaskStatus,
+} from "./types.js";
 
 const runtimeSchema = z.enum(RUNTIMES);
 const statusSchema = z.enum(TASK_STATUSES);
-const workerRuntimeSchema = z.enum(["claude", "codex"]);
+const workerRuntimeSchema = z.enum(WORKER_RUNTIMES);
+const plannerRuntimeSchema = z.enum(PLANNER_RUNTIMES);
 const profileRouteSchema = z.object({
   name: z.string().min(1),
   runtime: workerRuntimeSchema,
@@ -43,7 +53,7 @@ const boardOrchestrationSchema = z.object({
   autoDecompose: z.boolean().optional(),
   autoDecomposePerTick: z.number().int().min(1).max(100).optional(),
   autoPromoteChildren: z.boolean().optional(),
-  plannerRuntime: workerRuntimeSchema.optional(),
+  plannerRuntime: plannerRuntimeSchema.optional(),
   defaultProfile: z.string().nullable().optional(),
   orchestratorProfile: z.string().nullable().optional(),
   profiles: z.array(profileRouteSchema.extend({ description: z.string().default("") })).max(200).optional(),
@@ -220,7 +230,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_create",
     {
       title: "Create Kanban task",
-      description: "Create a durable task, optionally assigned to a Claude or Codex worker and gated by parent tasks.",
+      description: "Create a durable task, optionally assigned to a Claude, Codex, or Cline worker and gated by parent tasks.",
       inputSchema: z.object({
         title: z.string().min(1),
         body: z.string().default(""),
@@ -574,14 +584,14 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_specify",
     {
       title: "Specify a Kanban triage task",
-      description: "Rewrite a rough triage card into an executable specification and move it to todo. Provide title/body directly or use a Claude/Codex auxiliary planner.",
+      description: "Rewrite a rough triage card into an executable specification and move it to todo. Provide title/body directly or use a Claude, Codex, or Cline auxiliary planner.",
       inputSchema: z.object({
         board: z.string().optional(),
         task_id: z.string(),
         title: z.string().min(1).optional(),
         body: z.string().min(1).optional(),
         author: z.string().optional(),
-        planner_runtime: workerRuntimeSchema.default("codex"),
+        planner_runtime: plannerRuntimeSchema.default("codex"),
         planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
       }).refine(({ title, body }) => (title === undefined) === (body === undefined), {
         message: "title and body must be provided together",
@@ -609,7 +619,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_decompose",
     {
       title: "Decompose a Kanban triage task",
-      description: "Use an explicit or Claude/Codex-generated plan to atomically create and route a child task graph. Unknown assignees fall back to default_profile.",
+      description: "Use an explicit or agent-generated plan to atomically create and route a child task graph. Unknown assignees fall back to default_profile.",
       inputSchema: z.object({
         board: z.string().optional(),
         task_id: z.string(),
@@ -618,7 +628,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         orchestrator_profile: profileRouteSchema.optional(),
         auto_promote_children: z.boolean().optional(),
         plan: decompositionPlanSchema.optional(),
-        planner_runtime: workerRuntimeSchema.default("codex"),
+        planner_runtime: plannerRuntimeSchema.default("codex"),
         planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -662,7 +672,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
         board: z.string().optional(),
         name: z.string().min(1),
         runtime: workerRuntimeSchema,
-        planner_runtime: workerRuntimeSchema.optional(),
+        planner_runtime: plannerRuntimeSchema.optional(),
         planner_timeout_ms: z.number().int().min(1_000).max(600_000).default(120_000),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

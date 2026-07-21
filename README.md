@@ -1,11 +1,11 @@
 # Hermes-style Kanban MCP MVP
 
-A local, durable Kanban control plane that Claude Code and Codex can share through MCP. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
+A local, durable Kanban control plane for Claude Code, Codex, and Cline. Claude and Codex use MCP; MCP-disabled Cline builds use a scoped CLI bridge. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
 
 ## Requirements
 
 - Node.js 24 or newer
-- Claude Code and/or Codex CLI only when using the dispatcher
+- Claude Code, Codex, and/or Cline CLI only for the runtimes used by the dispatcher
 
 ## Set up
 
@@ -29,7 +29,24 @@ codex mcp add kanban -- \
   node "$PWD/dist/cli.js" serve --db "$PWD/data/kanban.db"
 ```
 
-The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json) and [examples/codex.config.toml](examples/codex.config.toml).
+The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json), [examples/codex.config.toml](examples/codex.config.toml), and the [MCP-disabled Cline CLI bridge contract](examples/cline-cli-bridge.md).
+
+For an MCP-disabled Cline build, no Cline MCP configuration is required. Point
+the dispatcher at the executable when it is not named `cline`:
+
+```bash
+export KANBAN_CLINE_BIN=/absolute/path/to/modified-cline
+node dist/cli.js create "Inspect the Cline integration" \
+  --assignee cline-worker --runtime cline --workspace "$PWD"
+node dist/cli.js dispatch --once
+```
+
+The dispatcher launches Cline with `--json`, `--cwd`, and `--auto-approve` and
+puts the exact scoped Kanban CLI commands in the worker prompt. The child
+inherits `KANBAN_TASK_ID`, `KANBAN_RUN_ID`, `KANBAN_CLAIM_TOKEN`,
+`KANBAN_BOARD`, and `KANBAN_DB`; lifecycle commands validate that scope before
+changing state. The Cline build therefore needs shell-command support, but it
+does not need an MCP client.
 
 ## Web dashboard and HTTP API
 
@@ -126,10 +143,13 @@ Scheduled cards are promoted when they become due. Repeating the same non-empty
 idempotency key on a board returns the existing non-archived task.
 
 Goal-mode cards run differently from ordinary one-shot work. After a worker
-turn exits without a terminal MCP call, an independent structured-output judge
+turn exits without a terminal lifecycle call, an independent structured-output judge
 checks the card's title/body acceptance criteria. An incomplete card resumes
-the same Claude/Codex session with the judge's next instruction. Acceptance
-completes the task; exhausting `goal_max_turns` blocks it for human review.
+the same Claude/Codex session with the judge's next instruction. Stock Cline's
+headless JSON mode does not support prompt-based `--id` resume, so Cline goals
+continue in a fresh turn using the same workspace and durable Kanban handoff.
+Acceptance completes the task; exhausting `goal_max_turns` blocks it for human
+review.
 
 ## Multiple boards
 
@@ -249,17 +269,24 @@ by CLI or MCP reads.
 ## Triage and orchestration
 
 `specify` turns a rough `triage` card into a scoped task with deliverables,
-acceptance criteria, constraints, and verification. `decompose` asks Claude or
-Codex for a structured acyclic graph, validates every route, substitutes a
+acceptance criteria, constraints, and verification. `decompose` asks Claude,
+Codex, or Cline for a structured acyclic graph, validates every route, substitutes a
 configured fallback for unknown assignees, and applies all children, links, and
 root changes in one SQLite transaction. If fan-out adds no value, decomposition
 falls back to specification.
 
+Codex and Claude receive their native structured-output schema flags. Cline has
+no equivalent CLI flag, so the planner prompt includes the schema and the
+dispatcher extracts the final `run_result`/`done` text from NDJSON, parses it as
+JSON, and applies the same domain validation before any board mutation.
+
 ```bash
 node dist/cli.js specify <triage-id> --planner-runtime codex
+node dist/cli.js specify <triage-id> --planner-runtime cline
 node dist/cli.js decompose <triage-id> \
   --profile "researcher:codex:finds primary sources" \
   --profile "writer:claude:synthesizes verified reports" \
+  --profile "reviewer:cline:checks the implementation through the CLI bridge" \
   --default-profile researcher:codex \
   --orchestrator-profile writer:claude
 ```
@@ -278,7 +305,7 @@ verifier:
 
 ```bash
 node dist/cli.js swarm "Design a multi-region failover plan" \
-  --workers researcher:codex,architect:claude,sre:codex \
+  --workers researcher:codex,architect:claude,sre:cline \
   --verifier reviewer:claude --synthesizer writer:claude
 ```
 
@@ -319,7 +346,7 @@ Restart the client if it does not detect the new skills.
 
 ## Safety and scope
 
-- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust.
+- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust. In read-only Cline runs, the dispatcher approval broker permits read/search tools and only the scoped Kanban CLI lifecycle commands.
 - The MCP server is local stdio only; there is no multi-user isolation.
 - The optional dashboard is authenticated but remains a trusted-local-user,
   single-tenant surface; its bearer token is not a substitute for TLS on an

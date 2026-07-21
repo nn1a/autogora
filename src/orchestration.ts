@@ -7,12 +7,17 @@ import {
   KanbanStore,
   type TaskGraphResult,
 } from "./store.js";
-import { RUNTIMES, type Runtime, type TaskDetail } from "./types.js";
+import {
+  WORKER_RUNTIMES,
+  type PlannerRuntime,
+  type TaskDetail,
+  type WorkerRuntime,
+} from "./types.js";
 
 export interface ProfileRoute {
   name: string;
   description?: string | undefined;
-  runtime: Exclude<Runtime, "manual">;
+  runtime: WorkerRuntime;
 }
 
 export interface SpecificationPlan {
@@ -30,7 +35,7 @@ export interface DecompositionPlan {
     title: string;
     body: string;
     assignee: string;
-    runtime: Exclude<Runtime, "manual">;
+    runtime: WorkerRuntime;
     priority: number;
     skills: string[];
   }>;
@@ -80,7 +85,7 @@ const DECOMPOSITION_SCHEMA: Record<string, unknown> = {
           title: { type: "string", minLength: 1 },
           body: { type: "string", minLength: 1 },
           assignee: { type: "string", minLength: 1 },
-          runtime: { type: "string", enum: ["claude", "codex"] },
+          runtime: { type: "string", enum: [...WORKER_RUNTIMES] },
           priority: { type: "integer" },
           skills: { type: "array", items: { type: "string" } },
         },
@@ -149,8 +154,8 @@ function parseDecomposition(value: unknown): DecompositionPlan {
   }
   const tasks = plan.tasks.map((rawTask, index) => {
     const task = record(rawTask, `Decomposition task ${index + 1}`);
-    const runtime = requiredString(task.runtime, `Task ${index + 1} runtime`) as Runtime;
-    if (!RUNTIMES.includes(runtime) || runtime === "manual") throw new Error(`Invalid task runtime: ${runtime}`);
+    const runtime = requiredString(task.runtime, `Task ${index + 1} runtime`) as WorkerRuntime;
+    if (!WORKER_RUNTIMES.includes(runtime)) throw new Error(`Invalid task runtime: ${runtime}`);
     if (!Array.isArray(task.skills) || task.skills.some((skill) => typeof skill !== "string")) {
       throw new Error(`Task ${index + 1} skills must be strings`);
     }
@@ -160,7 +165,7 @@ function parseDecomposition(value: unknown): DecompositionPlan {
       title: requiredString(task.title, `Task ${index + 1} title`),
       body: requiredString(task.body, `Task ${index + 1} body`),
       assignee: requiredString(task.assignee, `Task ${index + 1} assignee`),
-      runtime: runtime as Exclude<Runtime, "manual">,
+      runtime,
       priority: task.priority as number,
       skills: [...new Set(task.skills.map((skill) => skill.trim()).filter(Boolean))],
     };
@@ -298,8 +303,43 @@ async function runProcess(
   });
 }
 
+function parseJsonObjectText(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : trimmed;
+  try {
+    return JSON.parse(unfenced) as unknown;
+  } catch {
+    const start = unfenced.indexOf("{");
+    const end = unfenced.lastIndexOf("}");
+    if (start >= 0 && end > start) return JSON.parse(unfenced.slice(start, end + 1)) as unknown;
+    throw new Error("Cline planner did not return a JSON object");
+  }
+}
+
+function clinePlannerOutput(stdout: string): unknown {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of lines.reverse()) {
+    if (!line.startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type === "run_result" && typeof event.text === "string") {
+        return parseJsonObjectText(event.text);
+      }
+      if (event.type === "agent_event" && event.event && typeof event.event === "object") {
+        const nested = event.event as Record<string, unknown>;
+        if (nested.type === "done" && typeof nested.text === "string") return parseJsonObjectText(nested.text);
+      }
+    } catch {
+      // Keep scanning earlier NDJSON events for the final structured response.
+    }
+  }
+  return parseJsonObjectText(stdout);
+}
+
 export function createCliPlanner(options: {
-  runtime: Exclude<Runtime, "manual">;
+  runtime: PlannerRuntime;
   cwd?: string | undefined;
   timeoutMs?: number | undefined;
 }): StructuredPlanner {
@@ -324,6 +364,21 @@ export function createCliPlanner(options: {
           prompt,
         ], cwd, timeoutMs);
         return unwrapPlannerOutput(JSON.parse(readFileSync(outputPath, "utf8")) as unknown);
+      }
+      if (options.runtime === "cline") {
+        const clinePrompt = [
+          prompt,
+          "",
+          "Do not call tools. Return exactly one JSON object and no prose or Markdown.",
+          `The JSON object must conform to this schema: ${JSON.stringify(schema)}`,
+        ].join("\n");
+        const output = await runProcess(process.env.KANBAN_CLINE_BIN ?? "cline", [
+          "--json",
+          "--auto-approve", "false",
+          "--cwd", cwd,
+          clinePrompt,
+        ], cwd, timeoutMs);
+        return unwrapPlannerOutput(clinePlannerOutput(output.stdout));
       }
       const output = await runProcess(process.env.KANBAN_CLAUDE_BIN ?? "claude", [
         "-p", prompt,
@@ -450,7 +505,7 @@ export async function describeProfileRoute(
     `- ${task.title}: ${task.body.slice(0, 300) || "(no body)"}; skills=${task.skills.join(", ") || "none"}`,
   ).join("\n");
   const prompt = [
-    "You describe a Claude/Codex Kanban worker profile for a task-routing planner.",
+    "You describe a Claude, Codex, or Cline Kanban worker profile for a task-routing planner.",
     "Write one concise capability description grounded only in the supplied evidence.",
     "State the work this profile should receive and any evident specialization. Do not use marketing language.",
     "Return only the requested structured object.",

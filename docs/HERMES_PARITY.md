@@ -1,7 +1,8 @@
 # Hermes Kanban parity contract
 
 This project targets the shipped, single-host Hermes Kanban feature set while
-using Claude Code and Codex as worker runtimes. Proposed Hermes v2 workflow
+using Claude Code, Codex, and Cline as worker runtimes. Cline can operate through
+the scoped CLI bridge when its MCP client is disabled. Proposed Hermes v2 workflow
 templates are not part of the v1 parity contract; their routing columns remain
 reserved for forward compatibility.
 
@@ -23,7 +24,7 @@ Authoritative references:
 - [x] Tenant namespace and idempotency keys
 - [x] Scheduled-start promotion and persisted runtime/skill/goal settings
 - [x] Maximum-runtime enforcement
-- [x] Goal-mode same-session continuation, independent judgment, and turn budget
+- [x] Goal-mode continuation, independent judgment, and turn budget (same-session for Claude/Codex; durable fresh-turn handoff for Cline)
 - [x] Typed blockers and repeated unblock/re-block loop breaker
 - [x] Synthetic human handoff runs and reclaimed-run invariant on administrative moves
 - [x] Unlink, archive, delete, promote, scheduling, and configurable sorting
@@ -48,7 +49,8 @@ Authoritative references:
 
 ### Dispatcher resilience
 
-- [x] Claude/Codex process launch, bounded parallelism, logs, terminal-call guard
+- [x] Claude/Codex/Cline process launch, bounded parallelism, logs, terminal-call guard
+- [x] MCP-independent, claim-scoped Cline CLI lifecycle bridge and read-only approval policy
 - [x] Claim TTL and safe stale-claim reclaim with live-PID termination deferral
 - [x] Worker PID tracking, crash detection, and heartbeat-stale detection
 - [x] Maximum-runtime termination and rate-limit-neutral cooldown/requeue
@@ -74,7 +76,8 @@ Authoritative references:
 - [x] Explicit auxiliary profile-description generation from durable task evidence
 - [x] Configurable automatic promotion of unblocked decomposition children
 - [x] Kanban Swarm blackboard/worker/verifier/synthesizer topology helper
-- [x] Per-task skill guidance injected into Claude/Codex workers
+- [x] Per-task skill guidance injected into Claude/Codex/Cline workers
+- [x] Claude/Codex/Cline auxiliary planner selection with validated structured output
 - [x] Goal-mode continuation and completion judgment
 
 ### Dashboard

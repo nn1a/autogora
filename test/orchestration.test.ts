@@ -177,6 +177,29 @@ test("Codex auxiliary planner uses a strict output schema and parsed last messag
   }
 });
 
+test("Cline auxiliary planner extracts and validates the final NDJSON response", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-cline-planner-"));
+  const fixture = resolve("test/fixtures/planner-cline-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const previous = process.env.KANBAN_CLINE_BIN;
+  process.env.KANBAN_CLINE_BIN = fixture;
+  const store = new KanbanStore(join(directory, "kanban.db"));
+  try {
+    const task = store.createTask({ title: "rough Cline planner input", status: "triage" });
+    const result = await specifyTriageTask(store, task.task.id, {
+      planner: createCliPlanner({ runtime: "cline", cwd: directory, timeoutMs: 5_000 }),
+    });
+    assert.equal(result.task.status, "todo");
+    assert.equal(result.task.title, "Cline-generated task specification");
+    assert.match(result.task.body, /CLI verification evidence/);
+  } finally {
+    store.close();
+    if (previous === undefined) delete process.env.KANBAN_CLINE_BIN;
+    else process.env.KANBAN_CLINE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("profile descriptions are generated through a constrained structured planner", async () => {
   let prompt = "";
   const described = await describeProfileRoute(

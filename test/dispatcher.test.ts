@@ -9,8 +9,9 @@ import { BoardManager } from "../src/boards.js";
 import { buildRunnerCommand, runDispatcher } from "../src/dispatcher.js";
 import { KanbanStore } from "../src/store.js";
 
-for (const runtime of ["claude", "codex"] as const) {
+for (const runtime of ["claude", "codex", "cline"] as const) {
   test(`builds a scoped ${runtime} runner without leaking the claim token into argv`, () => {
+    const directory = mkdtempSync(join(tmpdir(), "kanban-runner-command-"));
     const store = new KanbanStore(":memory:");
     try {
       const detail = store.createTask({
@@ -25,18 +26,63 @@ for (const runtime of ["claude", "codex"] as const) {
         dbPath: "/tmp/kanban-test.db",
         cliEntry: "/tmp/kanban-cli.js",
         allowWrites: false,
+        clineApprovalDir: directory,
       });
       assert.equal(command.env.KANBAN_TASK_ID, detail.task.id);
       assert.equal(command.env.KANBAN_BOARD, "default");
       assert.equal(command.env.KANBAN_RUN_ID, claim.run.id);
       assert.equal(command.env.KANBAN_CLAIM_TOKEN, claim.claimToken);
       assert.equal(command.args.includes(claim.claimToken), false);
-      assert.match(command.args.join(" "), /read-only|dontAsk/);
+      if (runtime === "cline") {
+        assert.equal(command.env.CLINE_TOOL_APPROVAL_MODE, "desktop");
+        assert.match(command.args.join(" "), /--auto-approve false/);
+        assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
+        assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
+      } else {
+        assert.match(command.args.join(" "), /read-only|dontAsk/);
+      }
     } finally {
       store.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 }
+
+test("dispatcher runs a Cline worker through the scoped CLI bridge without MCP", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-cline-dispatch-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/fake-cline-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "Cline CLI bridge e2e",
+    assignee: "cline-worker",
+    runtime: "cline",
+    workspace: directory,
+  });
+  store.close();
+  const previous = process.env.KANBAN_CLINE_BIN;
+  process.env.KANBAN_CLINE_BIN = fixture;
+  try {
+    await runDispatcher({ dbPath, cliEntry: resolve("dist/cli.js"), once: true, allowWrites: false });
+    const check = manager.openStore("default");
+    try {
+      const completed = check.getTask(task.task.id);
+      assert.equal(completed.task.status, "done");
+      assert.equal(completed.runs[0]?.runtime, "cline");
+      assert.equal(completed.runs[0]?.summary, "fake Cline worker completed through CLI");
+      assert.equal(completed.runs[0]?.metadata?.verification?.[0], "cline-cli-bridge-e2e");
+      assert.match(completed.comments[0]?.body ?? "", /scoped CLI bridge/);
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CLINE_BIN;
+    else process.env.KANBAN_CLINE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("dispatcher claims, launches, and observes a terminal MCP lifecycle call", async () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-dispatch-"));
@@ -230,6 +276,54 @@ test("goal mode resumes one worker session until completion", async () => {
   } finally {
     if (previous === undefined) delete process.env.KANBAN_CODEX_BIN;
     else process.env.KANBAN_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Cline goal mode continues through fresh CLI turns when headless resume is unavailable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-cline-goal-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/goal-cline-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "finish a Cline multi-turn goal",
+    body: "Acceptance: the second fresh turn records completion.",
+    assignee: "cline-worker",
+    runtime: "cline",
+    workspace: directory,
+    goalMode: true,
+    goalMaxTurns: 3,
+  });
+  store.close();
+  const previous = process.env.KANBAN_CLINE_BIN;
+  process.env.KANBAN_CLINE_BIN = fixture;
+  const judgedTurns: number[] = [];
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      goalJudge: async ({ turn }) => {
+        judgedTurns.push(turn);
+        return { complete: false, reason: "one gap remains", nextPrompt: "Finish the remaining gap." };
+      },
+    });
+    const check = manager.openStore("default");
+    try {
+      const completed = check.getTask(task.task.id);
+      assert.equal(completed.task.status, "done");
+      assert.equal(completed.runs[0]?.runtime, "cline");
+      assert.deepEqual(judgedTurns, [1]);
+      assert.equal(completed.events.filter((event) => event.kind === "spawned").length, 2);
+      assert.match(completed.comments[0]?.body ?? "", /durable handoff/);
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_CLINE_BIN;
+    else process.env.KANBAN_CLINE_BIN = previous;
     rmSync(directory, { recursive: true, force: true });
   }
 });

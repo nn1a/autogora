@@ -19,12 +19,16 @@ import { runStdioServer } from "./server.js";
 import { WorkspaceManager } from "./workspaces.js";
 import {
   BLOCK_KINDS,
+  PLANNER_RUNTIMES,
   RUNTIMES,
   TASK_STATUSES,
+  WORKER_RUNTIMES,
   type BlockKind,
   type ListTaskFilter,
+  type PlannerRuntime,
   type Runtime,
   type TaskStatus,
+  type WorkerRuntime,
 } from "./types.js";
 
 const HELP = `kanban-mcp <command> [options]
@@ -71,7 +75,7 @@ Commands:
   schedule <id>         Park a task until a start time
   archive <id>...       Archive tasks
   delete <id>...        Permanently delete tasks
-  dispatch              Run the Claude/Codex worker dispatcher
+  dispatch              Run the Claude/Codex/Cline worker dispatcher
   daemon --force        Run the deprecated standalone dispatcher alias
   dashboard             Run the authenticated local web dashboard
 
@@ -107,6 +111,22 @@ function managerFor(dbPath?: string): BoardManager {
 function openTaskStore(dbPath: string | undefined, board?: string) {
   const manager = managerFor(dbPath);
   return manager.openStore(manager.resolve(board));
+}
+
+function scopedCliTaskId(requested: string | undefined, command: string): string {
+  const pinned = process.env.KANBAN_TASK_ID?.trim();
+  if (pinned && requested && pinned !== requested) throw new Error(`${command} is scoped to task ${pinned}`);
+  const taskId = pinned ?? requested;
+  if (!taskId) throw new Error(`${command} requires a task id`);
+  return taskId;
+}
+
+function scopedCliRun(): { runId: string; claimToken: string } | null {
+  const runId = process.env.KANBAN_RUN_ID?.trim();
+  const claimToken = process.env.KANBAN_CLAIM_TOKEN?.trim();
+  if (!runId && !claimToken) return null;
+  if (!runId || !claimToken) throw new Error("Scoped worker commands require KANBAN_RUN_ID and KANBAN_CLAIM_TOKEN");
+  return { runId, claimToken };
 }
 
 function extractBoardOption(values: string[]): { args: string[]; board: string | undefined } {
@@ -152,21 +172,21 @@ function requireRuntime(value: string | undefined): Runtime {
   return runtime as Runtime;
 }
 
-function requirePlannerRuntime(value: string | undefined): Exclude<Runtime, "manual"> {
-  const runtime = value ?? "codex";
-  if (runtime !== "codex" && runtime !== "claude") throw new Error(`Invalid planner runtime: ${runtime}`);
+function requirePlannerRuntime(value: string | undefined): PlannerRuntime {
+  const runtime = (value ?? "codex") as PlannerRuntime;
+  if (!PLANNER_RUNTIMES.includes(runtime)) throw new Error(`Invalid planner runtime: ${runtime}`);
   return runtime;
 }
 
-function parseProfileRoute(value: string, fallbackRuntime: Exclude<Runtime, "manual"> = "codex"): ProfileRoute {
+function parseProfileRoute(value: string, fallbackRuntime: WorkerRuntime = "codex"): ProfileRoute {
   const [rawName, rawRuntime, ...descriptionParts] = value.split(":");
   const name = rawName?.trim();
   if (!name) throw new Error(`Invalid profile route: ${value}`);
   const runtime = rawRuntime?.trim() || fallbackRuntime;
-  if (!RUNTIMES.includes(runtime as Runtime) || runtime === "manual") {
+  if (!WORKER_RUNTIMES.includes(runtime as WorkerRuntime)) {
     throw new Error(`Invalid profile runtime in ${value}`);
   }
-  return { name, runtime: runtime as Exclude<Runtime, "manual">, description: descriptionParts.join(":").trim() || undefined };
+  return { name, runtime: runtime as WorkerRuntime, description: descriptionParts.join(":").trim() || undefined };
 }
 
 function requireStatus(value: string | undefined): TaskStatus | undefined {
@@ -205,7 +225,12 @@ function pause(milliseconds: number): Promise<void> {
 
 async function main(): Promise<void> {
   const [command, ...rawArgs] = process.argv.slice(2);
-  const { args, board: globalBoard } = extractBoardOption(rawArgs);
+  const { args, board: requestedBoard } = extractBoardOption(rawArgs);
+  const pinnedBoard = process.env.KANBAN_BOARD?.trim();
+  if (pinnedBoard && requestedBoard && pinnedBoard !== requestedBoard.trim().toLowerCase()) {
+    throw new Error(`This worker is scoped to board ${pinnedBoard}`);
+  }
+  const globalBoard = pinnedBoard ?? requestedBoard;
   if (!command || command === "help" || command === "--help" || command === "-h") {
     process.stdout.write(HELP);
     return;
@@ -430,8 +455,7 @@ async function main(): Promise<void> {
 
   if (command === "show") {
     const parsed = parseArgs({ args, allowPositionals: true, options: { db: { type: "string" } } });
-    const taskId = parsed.positionals[0];
-    if (!taskId) throw new Error("show requires a task id");
+    const taskId = scopedCliTaskId(parsed.positionals[0], "show");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.getTask(taskId), null, 2)}\n`);
@@ -451,8 +475,7 @@ async function main(): Promise<void> {
         "tail-bytes": { type: "string" },
       },
     });
-    const taskId = parsed.positionals[0];
-    if (!taskId) throw new Error(`${command} requires a task id`);
+    const taskId = scopedCliTaskId(parsed.positionals[0], command);
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       if (command === "context") process.stdout.write(`${store.buildWorkerContext(taskId)}\n`);
@@ -718,7 +741,7 @@ async function main(): Promise<void> {
         .filter((task) => task.assignee && task.runtime !== "manual")
         .map((task) => ({
           name: task.assignee!,
-          runtime: task.runtime as Exclude<Runtime, "manual">,
+          runtime: task.runtime as WorkerRuntime,
         } satisfies ProfileRoute));
       const profiles = [...new Map([...discoveredProfiles, ...explicitProfiles].map((profile) => [profile.name, profile])).values()];
       const explicitPlan = parsed.values["plan-json"]
@@ -741,7 +764,7 @@ async function main(): Promise<void> {
             const fallback = parsed.values["default-profile"]
               ? parseProfileRoute(parsed.values["default-profile"], plannerRuntime)
               : root.assignee && root.runtime !== "manual"
-                ? { name: root.assignee, runtime: root.runtime as Exclude<Runtime, "manual"> }
+                ? { name: root.assignee, runtime: root.runtime as WorkerRuntime }
                 : profiles[0] ?? { name: `${plannerRuntime}-worker`, runtime: plannerRuntime };
             const value = await decomposeTriageTask(store, taskId, {
               profiles,
@@ -946,11 +969,15 @@ async function main(): Promise<void> {
       allowPositionals: true,
       options: { db: { type: "string" }, note: { type: "string" } },
     });
-    const taskId = parsed.positionals[0];
-    if (!taskId) throw new Error("heartbeat requires a task id");
+    const taskId = scopedCliTaskId(parsed.positionals[0], "heartbeat");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      process.stdout.write(`${JSON.stringify(store.heartbeatTask(taskId, parsed.values.note), null, 2)}\n`);
+      const scope = scopedCliRun();
+      process.stdout.write(`${JSON.stringify(
+        scope ? store.heartbeat(scope, parsed.values.note) : store.heartbeatTask(taskId, parsed.values.note),
+        null,
+        2,
+      )}\n`);
     } finally {
       store.close();
     }
@@ -963,9 +990,10 @@ async function main(): Promise<void> {
       allowPositionals: true,
       options: { db: { type: "string" }, author: { type: "string" } },
     });
-    const [taskId, ...bodyParts] = parsed.positionals;
+    const [requestedTaskId, ...bodyParts] = parsed.positionals;
+    const taskId = scopedCliTaskId(requestedTaskId, "comment");
     const body = bodyParts.join(" ").trim();
-    if (!taskId || !body) throw new Error("comment requires a task id and text");
+    if (!body) throw new Error("comment requires text");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
       process.stdout.write(`${JSON.stringify(store.addComment(taskId, parsed.values.author ?? "human", body), null, 2)}\n`);
@@ -1010,7 +1038,10 @@ async function main(): Promise<void> {
         artifact: { type: "string", multiple: true },
       },
     });
-    if (parsed.positionals.length === 0) throw new Error("complete requires at least one task id");
+    const taskIds = parsed.positionals.length === 0 && process.env.KANBAN_TASK_ID
+      ? [process.env.KANBAN_TASK_ID]
+      : parsed.positionals;
+    if (taskIds.length === 0) throw new Error("complete requires at least one task id");
     if (
       parsed.positionals.length > 1 &&
       (parsed.values.summary || parsed.values.result || parsed.values.metadata || parsed.values.artifact)
@@ -1019,14 +1050,17 @@ async function main(): Promise<void> {
     }
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      const completed = parsed.positionals.map((taskId) =>
-        store.completeTask(taskId, {
-          summary: parsed.values.summary,
-          result: parsed.values.result,
-          metadata: parseMetadata(parsed.values.metadata),
-          artifacts: parsed.values.artifact,
-        })
-      );
+      const completion = {
+        summary: parsed.values.summary,
+        result: parsed.values.result,
+        metadata: parseMetadata(parsed.values.metadata),
+        artifacts: parsed.values.artifact,
+      };
+      const resolvedTaskIds = taskIds.map((taskId) => scopedCliTaskId(taskId, "complete"));
+      const scope = scopedCliRun();
+      const completed = scope
+        ? [store.completeRun(scope, completion)]
+        : resolvedTaskIds.map((taskId) => store.completeTask(taskId, completion));
       process.stdout.write(`${JSON.stringify(completed, null, 2)}\n`);
     } finally {
       store.close();
@@ -1040,16 +1074,20 @@ async function main(): Promise<void> {
       allowPositionals: true,
       options: { db: { type: "string" }, kind: { type: "string" }, ids: { type: "string", multiple: true } },
     });
-    const [taskId, reasonValue, ...positionalIds] = parsed.positionals;
+    const [requestedTaskId, reasonValue, ...positionalIds] = parsed.positionals;
+    const taskId = scopedCliTaskId(requestedTaskId, "block");
     const reason = reasonValue?.trim() ?? "";
-    if (!taskId || !reason) throw new Error("block requires a task id and reason");
+    if (!reason) throw new Error("block requires a reason");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      const taskIds = [taskId, ...positionalIds, ...(parsed.values.ids ?? [])];
-      process.stdout.write(`${JSON.stringify(taskIds.map((id) => store.blockTask(id, {
-        reason,
-        kind: requireBlockKind(parsed.values.kind),
-      })), null, 2)}\n`);
+      const scope = scopedCliRun();
+      const kind = requireBlockKind(parsed.values.kind);
+      const taskIds = [taskId, ...positionalIds, ...(parsed.values.ids ?? [])]
+        .map((id) => scopedCliTaskId(id, "block"));
+      const blocked = scope
+        ? [store.blockRun(scope, reason, kind)]
+        : taskIds.map((id) => store.blockTask(id, { reason, kind }));
+      process.stdout.write(`${JSON.stringify(blocked, null, 2)}\n`);
     } finally {
       store.close();
     }

@@ -48,15 +48,17 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
           autoDecompose: true,
           autoDecomposePerTick: 2,
           autoPromoteChildren: false,
-          plannerRuntime: "codex",
+          plannerRuntime: "cline",
           defaultProfile: "worker",
-          profiles: [{ name: "worker", runtime: "codex", description: "general work" }],
+          profiles: [{ name: "worker", runtime: "cline", description: "general work" }],
         },
       }),
     });
     assert.equal(orchestration.response.status, 200);
     assert.equal(orchestration.value.orchestration.autoDecompose, true);
     assert.equal(orchestration.value.orchestration.autoPromoteChildren, false);
+    assert.equal(orchestration.value.orchestration.plannerRuntime, "cline");
+    assert.equal(orchestration.value.orchestration.profiles[0]?.runtime, "cline");
     assert.equal(new BoardManager(dbPath).read("default").orchestration.profiles[0]?.name, "worker");
 
     const invalidSort = await request("/api/tasks?board=default&sort=drop-table");

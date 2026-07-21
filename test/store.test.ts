@@ -214,6 +214,56 @@ test("legacy MVP databases migrate without losing tasks, runs, links, comments, 
   }
 });
 
+test("runtime schema migration adds Cline without losing modern related records", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-runtime-migration-"));
+  const dbPath = join(directory, "kanban.db");
+  let taskId = "";
+  {
+    const store = new KanbanStore(dbPath);
+    const task = store.createTask({ title: "preserve modern data", assignee: "worker", runtime: "codex" });
+    taskId = task.task.id;
+    store.addComment(taskId, "human", "keep the comment");
+    store.attachUrl(taskId, "https://example.com/evidence", "evidence");
+    store.subscribeTask({ taskId, platform: "webhook", chatId: "https://example.com/hook" });
+    const claim = store.claimTask({ taskId });
+    assert.ok(claim);
+    store.completeRun({ runId: claim.run.id, claimToken: claim.claimToken }, "keep the completed run");
+    store.close();
+  }
+
+  const oldSchema = new DatabaseSync(dbPath);
+  oldSchema.enableDefensive(false);
+  oldSchema.exec("PRAGMA writable_schema = ON");
+  oldSchema.prepare(`
+    UPDATE sqlite_master
+    SET sql = replace(sql, '''claude'', ''codex'', ''cline'', ''manual''', '''claude'', ''codex'', ''manual''')
+    WHERE type = 'table' AND name IN ('tasks', 'task_runs')
+  `).run();
+  oldSchema.exec("PRAGMA writable_schema = OFF; PRAGMA user_version = 4");
+  oldSchema.close();
+
+  try {
+    const migrated = new KanbanStore(dbPath);
+    try {
+      const preserved = migrated.getTask(taskId);
+      assert.equal(preserved.comments[0]?.body, "keep the comment");
+      assert.equal(preserved.attachments[0]?.url, "https://example.com/evidence");
+      assert.equal(preserved.runs[0]?.summary, "keep the completed run");
+      assert.ok(preserved.events.some((event) => event.kind === "completed"));
+      assert.equal(migrated.listNotificationSubscriptions(taskId).length, 1);
+
+      const cline = migrated.createTask({ title: "new Cline task", assignee: "cline-worker", runtime: "cline" });
+      const claim = migrated.claimTask({ taskId: cline.task.id });
+      assert.ok(claim);
+      assert.equal(claim.run.runtime, "cline");
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("typed dependency blocks wait in todo and repeated human blockers escalate to triage", () => {
   const store = new KanbanStore(":memory:");
   try {

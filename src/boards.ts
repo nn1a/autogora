@@ -10,11 +10,18 @@ import {
 import { dirname, join, resolve } from "node:path";
 
 import { KanbanStore } from "./store.js";
-import { TASK_STATUSES, type Runtime, type TaskStatus } from "./types.js";
+import {
+  PLANNER_RUNTIMES,
+  TASK_STATUSES,
+  WORKER_RUNTIMES,
+  type PlannerRuntime,
+  type TaskStatus,
+  type WorkerRuntime,
+} from "./types.js";
 
 export interface BoardProfile {
   name: string;
-  runtime: Exclude<Runtime, "manual">;
+  runtime: WorkerRuntime;
   description: string;
 }
 
@@ -22,7 +29,7 @@ export interface BoardOrchestrationSettings {
   autoDecompose: boolean;
   autoDecomposePerTick: number;
   autoPromoteChildren: boolean;
-  plannerRuntime: Exclude<Runtime, "manual">;
+  plannerRuntime: PlannerRuntime;
   defaultProfile: string | null;
   orchestratorProfile: string | null;
   profiles: BoardProfile[];
@@ -89,7 +96,7 @@ function orchestrationSettings(raw: Partial<BoardOrchestrationSettings> | undefi
   const profiles = Array.isArray(raw?.profiles)
     ? raw.profiles.filter((profile): profile is BoardProfile =>
         Boolean(profile && typeof profile.name === "string" &&
-          (profile.runtime === "claude" || profile.runtime === "codex")),
+          WORKER_RUNTIMES.includes(profile.runtime as WorkerRuntime)),
       ).map((profile) => ({
         name: profile.name.trim(),
         runtime: profile.runtime,
@@ -102,7 +109,9 @@ function orchestrationSettings(raw: Partial<BoardOrchestrationSettings> | undefi
       ? raw!.autoDecomposePerTick!
       : 3,
     autoPromoteChildren: raw?.autoPromoteChildren !== false,
-    plannerRuntime: raw?.plannerRuntime === "claude" ? "claude" : "codex",
+    plannerRuntime: PLANNER_RUNTIMES.includes(raw?.plannerRuntime as PlannerRuntime)
+      ? raw!.plannerRuntime as PlannerRuntime
+      : "codex",
     defaultProfile: typeof raw?.defaultProfile === "string" && raw.defaultProfile.trim()
       ? raw.defaultProfile.trim()
       : null,

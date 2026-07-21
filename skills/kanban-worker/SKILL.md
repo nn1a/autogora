@@ -1,11 +1,13 @@
 ---
 name: kanban-worker
-description: Execute a dispatcher-claimed task through the Kanban MCP lifecycle. Use when a worker session has KANBAN_TASK_ID/KANBAN_RUN_ID scope or the user explicitly asks to work an assigned Kanban card; do not use for planning or routing unrelated cards.
+description: Execute a dispatcher-claimed task through the Kanban MCP or scoped CLI lifecycle. Use when a worker session has KANBAN_TASK_ID/KANBAN_RUN_ID scope or the user explicitly asks to work an assigned Kanban card; do not use for planning or routing unrelated cards.
 ---
 
 # Kanban Worker
 
-Treat Kanban MCP as the canonical task state. Finish the assigned work and leave a durable, verifiable handoff.
+Treat Kanban as the canonical task state. Finish the assigned work and leave a durable, verifiable handoff.
+
+Use the MCP tools when they are available. In an MCP-disabled Cline worker, use the exact scoped Kanban CLI bridge commands included in the dispatcher prompt; the environment already carries board, task, run, database, and claim-token scope.
 
 ## Workflow
 
@@ -16,7 +18,7 @@ Treat Kanban MCP as the canonical task state. Finish the assigned work and leave
 5. For an ordinary card, terminate exactly once:
    - Call `kanban_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$KANBAN_WORKSPACE` and must exist.
    - Call `kanban_block` with `kind=dependency`, `needs_input`, `capability`, or `transient` when work cannot continue.
-   For a goal-mode card whose acceptance criteria are not yet met, leave the run active and end the turn with a concise progress handoff. The dispatcher records an independent judgment and resumes the same session until acceptance or the turn budget is exhausted.
+   For a goal-mode card whose acceptance criteria are not yet met, leave the run active and end the turn with a concise progress handoff. The dispatcher records an independent judgment and continues until acceptance or the turn budget is exhausted. Claude and Codex resume the session; Cline may start a fresh turn from the durable handoff.
 
 Do not finish an ordinary card with prose alone. A dispatcher treats that as a failed run.
 

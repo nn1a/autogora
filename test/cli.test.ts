@@ -50,12 +50,23 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     assert.equal(claim.task.task.status, "running");
     assert.ok(claim.task.task.workspace);
     assert.ok(claim.claimToken);
+    const scopedWorkerEnv = {
+      ...process.env,
+      KANBAN_DB: dbPath,
+      KANBAN_BOARD: "default",
+      KANBAN_TASK_ID: created.task.id,
+      KANBAN_RUN_ID: claim.run.id,
+      KANBAN_CLAIM_TOKEN: claim.claimToken,
+    };
     const heartbeat = successfulJson<any>([
-      "heartbeat", created.task.id, "--db", dbPath, "--note", "CLI integration test",
-    ]);
+      "heartbeat", created.task.id, "--note", "CLI integration test",
+    ], scopedWorkerEnv);
     assert.equal(heartbeat.id, claim.run.id);
     assert.equal(heartbeat.status, "running");
-    successfulJson<any[]>(["complete", created.task.id, "--db", dbPath, "--summary", "CLI flow complete"]);
+    const stale = cli(["heartbeat", created.task.id], { ...scopedWorkerEnv, KANBAN_CLAIM_TOKEN: "stale" });
+    assert.equal(stale.status, 1);
+    assert.match(stale.stderr, /Invalid claim token/);
+    successfulJson<any[]>(["complete", created.task.id, "--summary", "CLI flow complete"], scopedWorkerEnv);
 
     const first = successfulJson<any>(["create", "First", "--db", dbPath]);
     const second = successfulJson<any>(["create", "Second", "--db", dbPath]);
@@ -80,7 +91,7 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     assert.equal(triage.task.status, "triage");
 
     const dispatchable = successfulJson<any>([
-      "create", "Dry run candidate", "--db", dbPath, "--assignee", "worker", "--runtime", "codex",
+      "create", "Dry run candidate", "--db", dbPath, "--assignee", "worker", "--runtime", "cline",
     ]);
     const dryRun = successfulJson<any>(["dispatch", "--db", dbPath, "--dry-run", "--max", "1"]);
     assert.equal(dryRun.dryRun, true);

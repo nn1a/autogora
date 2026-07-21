@@ -24,9 +24,15 @@ test("boards isolate databases and manage metadata, current selection, archive, 
       icon: "api",
       color: "#4f46e5",
       defaultWorkdir: "/work/api",
+      orchestration: {
+        plannerRuntime: "cline",
+        profiles: [{ name: "reviewer", runtime: "cline", description: "reviews through the CLI bridge" }],
+      },
     });
     assert.equal(project.slug, "project_api");
     assert.equal(project.defaultWorkdir, "/work/api");
+    assert.equal(project.orchestration.plannerRuntime, "cline");
+    assert.equal(project.orchestration.profiles[0]?.runtime, "cline");
     assert.ok(existsSync(project.dbPath));
     assert.ok(existsSync(project.workspaceRoot));
     assert.ok(existsSync(project.attachmentsRoot));
