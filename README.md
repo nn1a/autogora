@@ -1,6 +1,6 @@
 # Autogora
 
-A local, durable agent work control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. Autogora provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, planning, a dispatcher, and an authenticated Web UI.
+A local, durable agent work control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. Autogora provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, planning, a dispatcher, a terminal board, and an authenticated Web UI.
 
 Korean documentation: [installation and upgrades](docs/INSTALL_KO.md) · [practical workflow from Triage to Done](docs/WORKFLOW_KO.md)
 
@@ -154,6 +154,29 @@ The dispatcher uses Gemini headless `stream-json` output and a temporary,
 run-scoped policy. Read-only runs allow Gemini's normal read/search tools, deny
 MCP tools and all shell commands except the exact Autogora lifecycle bridge.
 `--allow-writes` is the explicit opt-in to Gemini `yolo` approval mode.
+
+## Terminal board
+
+Open the current board without starting a web server:
+
+```bash
+autogora tui
+# or select one explicitly
+autogora tui --board product-web
+```
+
+The full-screen TUI adapts its visible columns and detail panel to the terminal
+width. It refreshes every two seconds while preserving the selected task.
+Use the arrow keys or `h/j/k/l` to navigate, `/` to search, `tab` to switch
+between overview, relationships, and activity, and `a` to include archived
+tasks. Press `?` for the complete key map.
+
+Task creation, title and assignee edits, comments, promotion, blocking,
+unblocking, completion, and archiving use the same validated store operations
+as the CLI and dashboard. Lifecycle changes that can hide or finish work require
+confirmation, and the confirmation remains pinned to the displayed task ID if
+the board refreshes. An active worker still owns a Running task; the TUI does
+not bypass run termination or claim rules.
 
 ## Web dashboard and HTTP API
 

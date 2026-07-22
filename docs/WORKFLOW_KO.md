@@ -1,6 +1,6 @@
 # Autogora 실전 워크플로 가이드
 
-아이디어를 `Triage`에 등록하고 작업을 구체화한 뒤 에이전트에게 맡기고, 검증 근거와 함께 `Done`으로 마무리한다. Web UI, CLI, MCP는 모두 같은 SQLite 상태와 전이 규칙을 공유한다.
+아이디어를 `Triage`에 등록하고 작업을 구체화한 뒤 에이전트에게 맡기고, 검증 근거와 함께 `Done`으로 마무리한다. TUI, Web UI, CLI, MCP는 모두 같은 SQLite 상태와 전이 규칙을 공유한다.
 
 예제의 `<task-id>`와 `<board>`는 실제 출력값으로 바꿔야 한다. `claude`, `codex`, `cline`, `gemini` 중 설치된 런타임만 사용한다.
 
@@ -33,12 +33,12 @@ autogora version
 autogora init
 autogora setup --client codex --dry-run
 autogora setup --client codex
-autogora dashboard
+autogora tui
 ```
 
 `codex` 대신 실제 사용하는 `claude` 또는 `gemini`를 지정한다. MCP를 비활성화한 수정 Cline은 `setup`을 건너뛰고 dispatcher의 CLI 브리지를 사용한다.
 
-마지막 명령이 출력한 URL을 브라우저에서 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL의 일회용 토큰을 HTTP-only 세션 쿠키로 교환한다.
+TUI 대신 브라우저에서 운영하려면 `autogora dashboard`를 실행하고 출력된 URL을 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL의 일회용 토큰을 HTTP-only 세션 쿠키로 교환한다.
 
 별도 터미널에서 실행기를 시작한다.
 
@@ -79,6 +79,27 @@ Web UI의 `Dispatch now`는 기본적으로 `allowWrites=false`인 읽기 전용
 ```bash
 autogora dispatch --once --allow-writes --board product-web
 ```
+
+### TUI에서 보드를 운영하는 방법
+
+프로젝트 디렉터리에서 `autogora tui`를 실행한다. 다른 보드를 열려면 `--board <slug>`를 붙인다. 화면은 2초마다 갱신되며 선택한 task ID를 유지한다.
+
+| 키 | 동작 |
+| --- | --- |
+| 방향키, `h/j/k/l` | 컬럼과 카드 이동 |
+| `/` | 제목과 본문 검색. `Enter`로 적용하고 `Esc`로 취소 |
+| `Tab`, `1`~`3` | Overview, Relations, Activity 전환 |
+| `Page Up`, `Page Down` | 긴 상세 내용 스크롤 |
+| `a` | Archived 컬럼 표시 또는 숨김 |
+| `n` | `Triage` task 생성 |
+| `e`, `s`, `C` | 제목 수정, 담당자 변경, 댓글 추가 |
+| `p`, `u` | Promote, Unblock |
+| `b`, `c`, `x` | Block, Complete, Archive |
+| `r`, `?`, `q` | 즉시 갱신, 도움말, 종료 |
+
+`Promote`, `Unblock`, `Complete`, `Archive`는 확인창에 표시된 task ID를 기준으로 실행한다. 확인하는 동안 자동 갱신이나 선택 변경이 일어나도 다른 task에 적용되지 않는다. `Running` task의 제목, 담당자, 상태는 TUI에서 바꿀 수 없다. 먼저 Web UI나 `autogora terminate <task-id>`로 활성 run을 종료한다.
+
+관계와 실행 기록을 확인하면서 간단한 운영 작업을 처리할 때는 TUI가 빠르다. dependency 편집, 첨부 업로드, 실행 종료, planner 실행, 여러 task 일괄 변경은 Web UI나 CLI를 사용한다.
 
 ## 3. 상태를 읽는 법
 

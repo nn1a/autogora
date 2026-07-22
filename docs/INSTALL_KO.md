@@ -1,6 +1,6 @@
 # Autogora 설치 및 업그레이드
 
-Autogora는 Web UI와 SQLite 엔진을 포함한 단일 실행 파일이다. worker나 planner로 사용할 클라이언트만 설치하면 된다. Node.js, npm, Bun, Go, 별도 데이터베이스 서버는 필요하지 않다.
+Autogora는 TUI, Web UI, SQLite 엔진을 포함한 단일 실행 파일이다. worker나 planner로 사용할 클라이언트만 설치하면 된다. Node.js, npm, Bun, Go, 별도 데이터베이스 서버는 필요하지 않다.
 
 ## 1. 릴리스 바이너리 설치
 
@@ -63,6 +63,14 @@ autogora dashboard
 ```
 
 대시보드 명령이 출력한 bootstrap URL을 브라우저에서 한 번 연다. 브라우저는 URL 토큰을 HTTP-only 세션 쿠키로 교환한 뒤 토큰 없는 URL로 이동한다. 기본 주소는 `127.0.0.1:8420`이며 Web UI 파일은 바이너리에 들어 있다.
+
+브라우저 없이 현재 터미널에서 보드를 열 수도 있다.
+
+```bash
+autogora tui
+```
+
+별도 서버나 인증 토큰을 만들지 않고 현재 프로젝트의 SQLite DB를 직접 사용한다. 다른 보드는 `--board <slug>`, 다른 DB는 `--db <path>`로 선택한다.
 
 기본 데이터는 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장된다. 한 clone의 worktree들은 상태를 공유하고 다른 clone은 분리된다. 프로젝트의 어느 하위 디렉터리에서든 실제 경로를 확인할 수 있으며, `paths`는 디렉터리나 DB를 만들지 않는다.
 
