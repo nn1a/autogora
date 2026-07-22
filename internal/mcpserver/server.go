@@ -390,6 +390,4 @@ func pointerIfSet(value string) *string {
 	return &value
 }
 
-func (s *Service) registerMutations(_ *mcp.Server) {}
-
 func (s *Service) String() string { return fmt.Sprintf("TaskCircuit MCP (%s)", s.manager.Current()) }
