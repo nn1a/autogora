@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -480,6 +481,141 @@ func TestNotificationDeliveryLeasesHideSecretsAndRemoveTerminalSubscription(t *t
 	}
 	if len(listed) != 0 {
 		t.Fatalf("terminal subscription remains: %+v", listed)
+	}
+}
+
+func TestWorkerContextDiagnosticsAndBulkMutationShareStoreKernel(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	parent, err := store.CreateTask(ctx, CreateTaskInput{Title: "Research", Assignee: stringValue("researcher"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: parent.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "verified research handoff", Metadata: map[string]any{"sources": []string{"primary"}}}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.CreateTask(ctx, CreateTaskInput{
+		Title: "Write report", Body: "Use verified evidence.", Tenant: stringValue("acme"),
+		Assignee: stringValue("writer"), Runtime: model.RuntimeClaude, Parents: []string{parent.Task.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddComment(ctx, child.Task.ID, "human", "Use the 2026 figures."); err != nil {
+		t.Fatal(err)
+	}
+	workerContext, err := store.BuildWorkerContext(ctx, child.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Relationship and execution order", "Prerequisite handoffs", "verified research handoff", "Use the 2026 figures"} {
+		if !strings.Contains(workerContext, expected) {
+			t.Fatalf("worker context omitted %q:\n%s", expected, workerContext)
+		}
+	}
+
+	stranded, err := store.CreateTask(ctx, CreateTaskInput{Title: "Stranded", Status: model.TaskStatusReady})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagging, err := store.CreateTask(ctx, CreateTaskInput{Title: "Lagging", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex, Status: model.TaskStatusTodo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivedParent, err := store.CreateTask(ctx, CreateTaskInput{Title: "Abandoned", Assignee: stringValue("owner"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedChild, err := store.CreateTask(ctx, CreateTaskInput{Title: "Blocked by archive", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex, Parents: []string{archivedParent.Task.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ArchiveTask(ctx, archivedParent.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics, err := store.Diagnose(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics.Healthy || !hasDiagnostic(diagnostics.Issues, "stranded_in_ready", stranded.Task.ID) ||
+		!hasDiagnostic(diagnostics.Issues, "promotion_lag", lagging.Task.ID) ||
+		!hasDiagnostic(diagnostics.Issues, "terminal_prerequisite", blockedChild.Task.ID) {
+		t.Fatalf("diagnostics missed real-world queue failures: %+v", diagnostics)
+	}
+
+	priority := 9
+	assignee := "editor"
+	bulk := store.BulkMutate(ctx, []string{child.Task.ID, child.Task.ID, "t_missing"}, BulkMutation{
+		Assignee: OptionalString{Set: true, Value: &assignee}, Priority: &priority,
+	})
+	if len(bulk.OK) != 1 || len(bulk.Errors) != 1 {
+		t.Fatalf("unexpected bulk result: %+v", bulk)
+	}
+	updated, err := store.GetTask(ctx, child.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Task.Assignee == nil || *updated.Task.Assignee != assignee || updated.Task.Priority != priority {
+		t.Fatalf("bulk mutation was not applied: %+v", updated.Task)
+	}
+}
+
+func hasDiagnostic(issues []DiagnosticIssue, kind, taskID string) bool {
+	for _, issue := range issues {
+		if issue.Kind == kind && issue.TaskID == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWorkerContextBoundsLargeGraphsAndExcludesRelatedBodies(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root, err := store.CreateTask(ctx, CreateTaskInput{Title: "Large plan", Body: "root body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.withWrite(ctx, func(tx *sql.Tx) error {
+		for index := 0; index < 60; index++ {
+			childID, err := store.createTask(ctx, tx, CreateTaskInput{
+				Title: fmt.Sprintf("Node %d", index), Body: fmt.Sprintf("PRIVATE-RELATED-BODY-%d", index),
+				Assignee: stringValue("worker"), Runtime: model.RuntimeCodex,
+			})
+			if err != nil {
+				return err
+			}
+			position := index
+			if err := setSubtask(ctx, tx, root.Task.ID, childID, &position); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerContext, err := store.BuildWorkerContext(ctx, root.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(workerContext, "11 additional related node(s) omitted") {
+		t.Fatalf("bounded context did not report omitted nodes:\n%s", workerContext)
+	}
+	if strings.Contains(workerContext, "PRIVATE-RELATED-BODY") {
+		t.Fatal("worker context exposed another task body")
 	}
 }
 
