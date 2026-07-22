@@ -56,6 +56,10 @@ Options:
 
 func setupCommandHelp(command string) string {
 	switch command {
+	case "init":
+		return initHelp
+	case "paths":
+		return pathsHelp
 	case "skills":
 		return skillsHelp
 	case "mcp":

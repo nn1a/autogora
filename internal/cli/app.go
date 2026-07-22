@@ -23,6 +23,7 @@ const Help = `autogora <command> [options]
 Commands:
   serve                 Run the stdio MCP server
   init                  Initialize the SQLite database
+  paths                 Show resolved project data paths
   boards <action>       List, create, switch, show, rename, or remove boards
   create <title>        Create a task from the shell
   list                  List tasks
@@ -73,7 +74,7 @@ Commands:
   setup                 Install bundled Skills and register MCP together
 
 Common options:
-  --db <path>           SQLite path (default: ./data/autogora.db)
+  --db <path>           Override the project-specific SQLite path
   --board <slug>        Override the current board for this command
 `
 
@@ -107,26 +108,13 @@ func (a *App) workingDirectory() (string, error) {
 }
 
 func (a *App) defaultDBPath() (string, error) {
-	if value := a.env("AUTOGORA_DB"); value != "" {
-		return filepath.Abs(value)
-	}
-	cwd, err := a.workingDirectory()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(cwd, "data", "autogora.db"), nil
+	return a.databasePath("")
 }
 
 func (a *App) managerFor(value string) (*boards.Manager, error) {
-	dbPath, err := a.defaultDBPath()
+	dbPath, err := a.databasePath(value)
 	if err != nil {
 		return nil, err
-	}
-	if value != "" {
-		dbPath, err = filepath.Abs(value)
-		if err != nil {
-			return nil, err
-		}
 	}
 	if a.env("AUTOGORA_TASK_ID") != "" {
 		if pinned := a.env("AUTOGORA_DB"); pinned != "" {
@@ -255,6 +243,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runBoards(ctx, opts)
 	case "init":
 		return a.runInit(ctx, opts)
+	case "paths":
+		return a.runPaths(opts)
 	case "create":
 		return a.runCreate(ctx, opts)
 	case "list":
@@ -301,7 +291,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 }
 
 func (a *App) runInit(ctx context.Context, opts options) error {
-	manager, err := a.managerFor(opts.value("db"))
+	manager, err := a.initManager(opts)
 	if err != nil {
 		return err
 	}
