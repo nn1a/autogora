@@ -281,6 +281,9 @@ fi`)
 		return ""
 	}, GoalJudge: func(_ context.Context, _ model.TaskDetail, turn int, _ string) (orchestration.GoalJudgment, error) {
 		judged++
+		if judged == 2 {
+			return orchestration.GoalJudgment{Complete: true, Reason: "acceptance verified"}, nil
+		}
 		return orchestration.GoalJudgment{Complete: false, Reason: "one gap", NextPrompt: "finish the gap"}, nil
 	}})
 	if err != nil {
@@ -295,7 +298,7 @@ fi`)
 			spawned++
 		}
 	}
-	if detail.Task.Status != model.TaskStatusDone || judged != 1 || spawned != 2 {
+	if detail.Task.Status != model.TaskStatusDone || judged != 2 || spawned != 2 {
 		t.Fatalf("unexpected goal result: status=%s judged=%d spawned=%d detail=%#v", detail.Task.Status, judged, spawned, detail)
 	}
 }

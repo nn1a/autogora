@@ -134,6 +134,19 @@ type RunWorkspace struct {
 	PreparedAt     string        `json:"preparedAt"`
 }
 
+type TerminalRequest struct {
+	RunID       string         `json:"runId"`
+	Kind        string         `json:"kind"`
+	Summary     *string        `json:"summary"`
+	Result      *string        `json:"result"`
+	Metadata    map[string]any `json:"metadata"`
+	Artifacts   []string       `json:"artifacts"`
+	BlockKind   *BlockKind     `json:"blockKind"`
+	Reason      *string        `json:"reason"`
+	RequestedAt string         `json:"requestedAt"`
+	FinalizedAt *string        `json:"finalizedAt"`
+}
+
 type Comment struct {
 	ID        int64  `json:"id"`
 	TaskID    string `json:"taskId"`
@@ -165,18 +178,19 @@ type TaskEvent struct {
 }
 
 type TaskDetail struct {
-	Task          Task           `json:"task"`
-	Parents       []Task         `json:"parents"`
-	Children      []Task         `json:"children"`
-	Prerequisites []Task         `json:"prerequisites"`
-	Dependents    []Task         `json:"dependents"`
-	ParentTask    *Task          `json:"parentTask"`
-	Subtasks      []Task         `json:"subtasks"`
-	Comments      []Comment      `json:"comments"`
-	Attachments   []Attachment   `json:"attachments"`
-	Runs          []Run          `json:"runs"`
-	RunWorkspaces []RunWorkspace `json:"runWorkspaces"`
-	Events        []TaskEvent    `json:"events"`
+	Task             Task              `json:"task"`
+	Parents          []Task            `json:"parents"`
+	Children         []Task            `json:"children"`
+	Prerequisites    []Task            `json:"prerequisites"`
+	Dependents       []Task            `json:"dependents"`
+	ParentTask       *Task             `json:"parentTask"`
+	Subtasks         []Task            `json:"subtasks"`
+	Comments         []Comment         `json:"comments"`
+	Attachments      []Attachment      `json:"attachments"`
+	Runs             []Run             `json:"runs"`
+	RunWorkspaces    []RunWorkspace    `json:"runWorkspaces"`
+	TerminalRequests []TerminalRequest `json:"terminalRequests"`
+	Events           []TaskEvent       `json:"events"`
 }
 
 type ClaimedTask struct {

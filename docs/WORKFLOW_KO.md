@@ -521,7 +521,7 @@ autogora promote <task-id>
 
 ### 5.8 Done: 결과보다 검증 가능한 handoff를 남김
 
-dispatcher가 실행한 일반 worker는 성공 시 `autogora_complete`, 진행 불가 시 `autogora_block` 중 하나로 정확히 한 번 종료해야 한다. 완료 handoff에는 다음 정보를 권장한다.
+dispatcher가 실행한 일반 worker는 성공 시 `autogora_complete`, 진행 불가 시 `autogora_block` 중 하나를 정확히 한 번 호출하고 즉시 프로세스를 끝내야 한다. 이 호출은 종료 요청을 기록할 뿐이다. task와 workspace lease는 프로세스가 끝날 때까지 `Running`에 남고, dispatcher가 정상 exit와 최종 artifact를 확인한 뒤에만 상태를 확정하고 dependent를 해제한다. Goal mode의 완료 요청은 독립 judge가 승인해야 확정된다. 완료 handoff에는 다음 정보를 권장한다.
 
 ```json
 {

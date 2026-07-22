@@ -299,6 +299,12 @@ func hasDeferredReclaim(detail model.TaskDetail, runID string) bool {
 
 func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store, claim *model.ClaimedTask, options Options, processes *ProcessSet, clineApprovalDir string) {
 	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	if err := opened.MarkRunManaged(ctx, scope); err != nil {
+		durable, cancel := durableContext()
+		defer cancel()
+		_, _ = opened.FailRun(durable, scope, "Unable to register dispatcher ownership: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
+		return
+	}
 	workspaces := workspace.New(manager)
 	workspaces.SetAllowWrites(options.AllowWrites)
 	if options.WorkingDirectory != "" {
@@ -356,7 +362,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		if err != nil {
 			durable, cancel := durableContext()
 			defer cancel()
-			_, _ = opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge setup failed: " + err.Error(), Kind: model.BlockKindTransient})
+			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge setup failed: " + err.Error(), Kind: model.BlockKindTransient}); requestErr == nil {
+				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+			}
 			return
 		}
 	}
@@ -414,6 +422,31 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			options.log("reclaimed %s after deferred termination", taskID)
 			return
 		}
+		terminalRequest, requestErr := opened.GetRunTerminalRequest(durable, prepared.Run.ID)
+		if requestErr != nil {
+			cancel()
+			options.log("terminal request read failed %s: %v", taskID, requestErr)
+			return
+		}
+		executionSucceeded := !execution.TimedOut && execution.SpawnError == nil && execution.Code == 0 && !execution.Canceled
+		if terminalRequest != nil && terminalRequest.FinalizedAt == nil && executionSucceeded {
+			if goalMode && terminalRequest.Kind == "complete" {
+				if err := opened.DiscardRunTerminalRequest(durable, scope, "goal completion requires independent judgment"); err != nil {
+					cancel()
+					return
+				}
+			} else {
+				if _, err := opened.FinalizeRunTerminal(durable, prepared.Run.ID, execution.Code); err != nil {
+					_, _ = opened.FailRun(durable, scope, "Terminal finalization failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
+					cancel()
+					options.log("terminal finalization failed %s: %v", taskID, err)
+					return
+				}
+				cancel()
+				cleanupIfDone()
+				return
+			}
+		}
 		detail := fmt.Sprintf("Runner exited without a terminal Autogora call (%s)", execution.ExitDescription())
 		if execution.SpawnError != nil {
 			detail = execution.SpawnError.Error()
@@ -461,19 +494,25 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			judgment, err = orchestration.JudgeGoalProgress(durable, currentDetail, turn, execution.Output, goalPlanner)
 		}
 		if err != nil {
-			_, _ = opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge failed: " + err.Error(), Kind: model.BlockKindTransient})
+			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge failed: " + err.Error(), Kind: model.BlockKindTransient}); requestErr == nil {
+				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+			}
 			cancel()
 			return
 		}
 		_, _ = opened.RecordGoalJudgment(durable, scope, store.GoalJudgment{Turn: turn, Complete: judgment.Complete, Reason: judgment.Reason, NextPrompt: judgment.NextPrompt})
 		if judgment.Complete {
-			_, _ = opened.CompleteRun(durable, scope, store.CompletionInput{Summary: fmt.Sprintf("Goal accepted after %d turn(s): %s", turn, judgment.Reason), Metadata: map[string]any{"goalMode": true, "turns": turn, "judgeReason": judgment.Reason}})
+			if _, requestErr := opened.CompleteRun(durable, scope, store.CompletionInput{Summary: fmt.Sprintf("Goal accepted after %d turn(s): %s", turn, judgment.Reason), Metadata: map[string]any{"goalMode": true, "turns": turn, "judgeReason": judgment.Reason}}); requestErr == nil {
+				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+			}
 			cancel()
 			cleanupIfDone()
 			return
 		}
 		if turn >= prepared.Task.Task.GoalMaxTurns {
-			_, _ = opened.BlockRun(durable, scope, store.BlockInput{Reason: fmt.Sprintf("Goal turn budget exhausted after %d turns: %s", turn, judgment.Reason), Kind: model.BlockKindNeedsInput})
+			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: fmt.Sprintf("Goal turn budget exhausted after %d turns: %s", turn, judgment.Reason), Kind: model.BlockKindNeedsInput}); requestErr == nil {
+				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+			}
 			cancel()
 			return
 		}

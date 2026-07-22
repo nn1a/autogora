@@ -139,6 +139,95 @@ func TestMissingCompletionArtifactLeavesRunActive(t *testing.T) {
 	}
 }
 
+func TestManagedCompletionWaitsForProcessExitAndCapturesFinalArtifacts(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	workspace := filepath.Join(directory, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(filepath.Join(directory, "autogora.db"), "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assignee := "worker"
+	parent, err := store.CreateTask(ctx, CreateTaskInput{Title: "producer", Assignee: &assignee, Runtime: model.RuntimeCodex, Workspace: &workspace, WorkspaceKind: model.WorkspaceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.CreateTask(ctx, CreateTaskInput{Title: "consumer", Assignee: &assignee, Runtime: model.RuntimeCodex, Parents: []string{parent.Task.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: parent.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.BindRunWorkspace(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, BindRunWorkspaceInput{Path: workspace, Kind: model.WorkspaceDir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordSpawn(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, os.Getpid(), filepath.Join(directory, "worker.log")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(workspace, "result.txt")
+	if err := os.WriteFile(artifact, []byte("before request"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	requested, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "ready", Artifacts: []string{"result.txt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childBefore, _ := store.GetTask(ctx, child.Task.ID)
+	if requested.Task.Status != model.TaskStatusRunning || childBefore.Task.Status != model.TaskStatusTodo || len(requested.TerminalRequests) != 1 || requested.TerminalRequests[0].FinalizedAt != nil {
+		t.Fatalf("completion request released the task too early: parent=%+v child=%+v", requested, childBefore.Task)
+	}
+	if err := os.WriteFile(artifact, []byte("after request and before exit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childAfter, _ := store.GetTask(ctx, child.Task.ID)
+	if completed.Task.Status != model.TaskStatusDone || childAfter.Task.Status != model.TaskStatusReady || len(completed.Attachments) != 1 || completed.TerminalRequests[0].FinalizedAt == nil {
+		t.Fatalf("completion was not finalized atomically: parent=%+v child=%+v", completed, childAfter.Task)
+	}
+	contents, err := os.ReadFile(*completed.Attachments[0].Path)
+	if err != nil || string(contents) != "after request and before exit" {
+		t.Fatalf("artifact did not reflect the process-exit snapshot: %q err=%v", contents, err)
+	}
+}
+
+func TestManagedBlockWaitsForProcessExit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assignee := "worker"
+	task, _ := store.CreateTask(ctx, CreateTaskInput{Title: "blocked worker", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	claim, _ := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if _, err := store.RecordSpawn(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, os.Getpid(), filepath.Join(t.TempDir(), "worker.log")); err != nil {
+		t.Fatal(err)
+	}
+	requested, err := store.BlockRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, BlockInput{Reason: "need a decision", Kind: model.BlockKindNeedsInput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requested.Task.Status != model.TaskStatusRunning || requested.Task.CurrentRunID == nil {
+		t.Fatalf("block request released the active worker: %+v", requested.Task)
+	}
+	blocked, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Task.Status != model.TaskStatusBlocked || blocked.Task.CurrentRunID != nil || blocked.TerminalRequests[0].FinalizedAt == nil {
+		t.Fatalf("block was not finalized after exit: %+v", blocked)
+	}
+}
+
 func fileExistsForTest(path string) bool { _, err := os.Stat(path); return err == nil }
 
 func TestDependencyLifecycleAndRealWorldGraphEdits(t *testing.T) {

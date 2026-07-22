@@ -420,6 +420,9 @@ func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPat
 		if err != nil {
 			return err
 		}
+		if err := ensureNoTerminalRequest(ctx, tx, run.ID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET pid = ?, log_path = ? WHERE id = ?", pid, resolved, run.ID); err != nil {
 			return err
 		}
@@ -432,75 +435,7 @@ func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPat
 }
 
 func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
-	summary := strings.TrimSpace(completion.Summary)
-	result := strings.TrimSpace(completion.Result)
-	if summary == "" {
-		summary = result
-	}
-	if summary == "" {
-		return model.TaskDetail{}, errors.New("completion requires a summary or result")
-	}
-	preflight, _, err := requireActiveRun(ctx, s.db, scope)
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	captured, err := s.captureArtifacts(ctx, preflight, completion.Artifacts)
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	if len(captured) > 0 {
-		if completion.Metadata == nil {
-			completion.Metadata = map[string]any{}
-		}
-		artifacts := make([]map[string]any, 0, len(captured))
-		for _, attachment := range captured {
-			artifacts = append(artifacts, map[string]any{"id": attachment.ID, "name": attachment.Name, "path": attachment.Path})
-		}
-		completion.Metadata["artifacts"] = artifacts
-	}
-	var resultValue any
-	if result != "" {
-		resultValue = result
-	}
-	var metadata any
-	if completion.Metadata != nil {
-		encoded, err := json.Marshal(completion.Metadata)
-		if err != nil {
-			return model.TaskDetail{}, err
-		}
-		metadata = string(encoded)
-	}
-	taskID := ""
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		task, run, err := requireActiveRun(ctx, tx, scope)
-		if err != nil {
-			return err
-		}
-		open, err := hasOpenParents(ctx, tx, task.ID)
-		if err != nil {
-			return err
-		}
-		if open {
-			return errors.New("task prerequisites changed while the run was active; terminate or requeue the run before completing")
-		}
-		taskID = task.ID
-		timestamp := now()
-		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?, summary = ?, metadata_json = ? WHERE id = ?", timestamp, timestamp, summary, metadata, run.ID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'done', current_run_id = NULL, result = ?, failure_count = 0,
-			block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ? WHERE id = ?`, resultValue, timestamp, task.ID); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, task.ID, "completed", map[string]any{"summary": truncate(summary, 400), "resultLength": len(result)}, &run.ID); err != nil {
-			return err
-		}
-		return satisfyOutgoingDependencies(ctx, tx, task.ID, timestamp)
-	})
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	return s.GetTask(ctx, taskID)
+	return s.requestRunCompletion(ctx, scope, completion)
 }
 
 func syntheticRun(ctx context.Context, q querier, task model.Task, status model.RunStatus, summary string, metadata map[string]any, runError string) (string, error) {
@@ -634,23 +569,7 @@ func blockTaskRecord(ctx context.Context, q querier, task model.Task, input Bloc
 }
 
 func (s *Store) BlockRun(ctx context.Context, scope RunScope, input BlockInput) (model.TaskDetail, error) {
-	taskID := ""
-	err := s.withWrite(ctx, func(tx *sql.Tx) error {
-		task, run, err := requireActiveRun(ctx, tx, scope)
-		if err != nil {
-			return err
-		}
-		taskID = task.ID
-		timestamp := now()
-		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET status = 'blocked', ended_at = ?, heartbeat_at = ?, error = ? WHERE id = ?", timestamp, timestamp, strings.TrimSpace(input.Reason), run.ID); err != nil {
-			return err
-		}
-		return blockTaskRecord(ctx, tx, task, input, &run.ID)
-	})
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	return s.GetTask(ctx, taskID)
+	return s.requestRunBlock(ctx, scope, input)
 }
 
 func (s *Store) BlockTask(ctx context.Context, taskID string, input BlockInput) (model.TaskDetail, error) {

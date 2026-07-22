@@ -394,6 +394,8 @@ autogora complete <task-id> --summary "verified and delivered"
 ```
 
 `claim` prepares and prints the resolved workspace plus the scoped claim token.
+Manually claimed runs without a dispatcher process finalize terminal calls
+synchronously. Dispatcher-managed runs use the two-phase rule described below.
 Use `reassign <id>... <profile>` for partial-failure bulk routing, and
 `list --mine` with `AUTOGORA_PROFILE` or `AUTOGORA_WORKER_ID` for
 profile-local views.
@@ -506,6 +508,13 @@ through environment variables. Their lifecycle tools can omit those identifiers,
 and the server rejects attempts to operate on another scoped board, task, or
 run. Without `--board`, the dispatcher sweeps all active boards while preserving
 the global worker limit.
+
+For dispatcher-managed runs, `complete` and `block` record a terminal request
+but keep the task and workspace lease in `running`. The dispatcher waits for the
+worker process to exit successfully, captures the final artifacts, and only then
+finalizes the run and unlocks dependents in one transaction. Pending and
+finalized requests are visible in task details as `terminalRequests`. Goal-mode
+completion requests are discarded until the independent judge accepts the goal.
 
 Autogora keeps two relation types separate:
 

@@ -210,15 +210,19 @@ func (s *Store) RemoveAttachment(ctx context.Context, taskID, attachmentID strin
 }
 
 func (s *Store) captureArtifacts(ctx context.Context, task model.Task, artifacts []string) ([]model.Attachment, error) {
-	if len(artifacts) == 0 {
-		return nil, nil
-	}
 	workspace := ""
 	if task.Workspace != nil {
 		workspace = strings.TrimPrefix(strings.TrimPrefix(*task.Workspace, "dir:"), "worktree:")
 	}
 	if workspace == "" {
 		workspace, _ = os.Getwd()
+	}
+	return s.captureArtifactsAt(ctx, task, workspace, artifacts)
+}
+
+func (s *Store) captureArtifactsAt(ctx context.Context, task model.Task, workspace string, artifacts []string) ([]model.Attachment, error) {
+	if len(artifacts) == 0 {
+		return nil, nil
 	}
 	result := []model.Attachment{}
 	for _, artifact := range normalizeSkills(artifacts) {

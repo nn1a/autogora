@@ -51,7 +51,17 @@ func TestScratchWorkspaceIsBoundAndCleanedOnlyAtTrustedPath(t *testing.T) {
 	if info, err := os.Stat(prepared.Workspace.Path); err != nil || !info.IsDir() {
 		t.Fatalf("scratch workspace missing: %v", err)
 	}
+	if err := opened.MarkRunManaged(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}); err != nil {
+		t.Fatal(err)
+	}
 	completed, err := opened.CompleteRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.CompletionInput{Summary: "done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("prepared run completed before process-exit finalization: %s", completed.Task.Status)
+	}
+	completed, err = opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

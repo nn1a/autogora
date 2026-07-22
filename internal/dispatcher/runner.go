@@ -60,6 +60,7 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 			"Read relationshipGraph and workerContext from show. Work only on the current node; Autogora has already enforced every prerequisite, and your completion will unlock listed dependents.",
 			fmt.Sprintf(`Record handoffs with %s comment "$AUTOGORA_TASK_ID" "message".`, bridge),
 			fmt.Sprintf(`Finish exactly once with %s complete "$AUTOGORA_TASK_ID" --summary "summary" or %s block "$AUTOGORA_TASK_ID" "reason" --kind needs_input.`, bridge, bridge),
+			"A terminal command records a request. Stop modifying files and exit immediately after it succeeds; the dispatcher finalizes the task only after your process exits.",
 			"The dispatcher scopes these commands to the active task and claim. Do not claim, create, reassign, unblock, or modify unrelated tasks.",
 		)
 	} else {
@@ -81,6 +82,7 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 		}
 	} else {
 		instructions = append(instructions, "You must end exactly once by calling autogora_complete with verification evidence, or autogora_block with the concrete reason.")
+		instructions = append(instructions, "After a terminal tool succeeds, stop modifying files and end the process immediately. The dispatcher finalizes the task only after process exit.")
 	}
 	if len(task.Skills) > 0 {
 		instructions = append(instructions, "Load and follow these task-specific skills before working: "+strings.Join(task.Skills, ", ")+".")
