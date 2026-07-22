@@ -1,12 +1,22 @@
 const STATUSES = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"];
+const STATUS_LABELS = {
+  triage: "Triage", todo: "To do", scheduled: "Scheduled", ready: "Ready",
+  running: "Running", blocked: "Blocked", review: "Review", done: "Done", archived: "Archived",
+};
 const COLORS = {
   triage: "#a98cff", todo: "#8791a3", scheduled: "#e7b65b", ready: "#5e91ff",
   running: "#36c9b0", blocked: "#ff6978", review: "#de84ff", done: "#55d38b", archived: "#667085",
 };
 
+const storedTheme = localStorage.getItem("kanban.theme");
+let activeTheme = ["light", "dark"].includes(storedTheme)
+  ? storedTheme
+  : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+document.documentElement.dataset.theme = activeTheme;
+
 const state = {
   boards: [], board: localStorage.getItem("kanban.board") || "default", metadata: null,
-  tasks: [], stats: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
+  tasks: [], stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -14,6 +24,29 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
 })[char]);
+
+function initials(value) {
+  const words = String(value || "?").trim().split(/[\s._-]+/).filter(Boolean);
+  return words.slice(0, 2).map((word) => word[0]).join("").toUpperCase() || "?";
+}
+
+function setTheme(theme, persist = true) {
+  activeTheme = theme;
+  document.documentElement.dataset.theme = theme;
+  if (persist) localStorage.setItem("kanban.theme", theme);
+  const target = theme === "dark" ? "light" : "dark";
+  const button = $("#theme-toggle");
+  if (button) {
+    $(".theme-icon", button).textContent = target === "light" ? "☀" : "☾";
+    $(".theme-label", button).textContent = target === "light" ? "Light" : "Dark";
+    button.setAttribute("aria-label", `Switch to ${target} theme`);
+    button.title = `Switch to ${target} theme`;
+  }
+  document.querySelector('meta[name="theme-color"]')?.setAttribute(
+    "content",
+    theme === "dark" ? "#0b0e14" : "#f4f6fa",
+  );
+}
 
 function markdown(value = "") {
   let safe = escapeHtml(value);
@@ -60,6 +93,7 @@ async function api(path, options = {}) {
 }
 
 let toastTimer;
+let drawerReturnFocus = null;
 function toast(message, error = false) {
   const element = $("#toast");
   element.textContent = message;
@@ -86,6 +120,7 @@ async function loadBoard() {
   state.metadata = payload.board;
   state.tasks = payload.tasks;
   state.stats = payload.stats;
+  state.diagnostics = payload.diagnostics;
   renderFilters();
   renderBoard();
 }
@@ -108,21 +143,37 @@ function renderFilters() {
   $("#assignee-filter").innerHTML = `<option value="">All assignees</option>${assignees.map((item) => `<option>${escapeHtml(item)}</option>`).join("")}`;
   $("#tenant-filter").value = tenants.includes(tenant) ? tenant : "";
   $("#assignee-filter").value = assignees.includes(assignee) ? assignee : "";
-  $("#stats").textContent = `${state.stats?.total || 0} tasks · ${state.stats?.byStatus?.running || 0} running`;
+  const healthy = state.diagnostics?.healthy !== false;
+  $("#stats").innerHTML = `
+    <span class="metric"><strong>${state.stats?.total || 0}</strong><span>tasks</span></span>
+    <span class="metric"><strong>${state.stats?.byStatus?.running || 0}</strong><span>running</span></span>
+    <span class="health-chip ${healthy ? "healthy" : "attention"}"><span aria-hidden="true"></span>${healthy ? "Healthy" : "Needs attention"}</span>`;
 }
 
 function cardHtml(task) {
-  const progress = task.status !== "done" && task.status !== "archived" && task.childrenDone !== undefined
-    ? `<span class="pill">${task.childrenDone}/${task.childrenTotal}</span>` : "";
-  return `<article class="card ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" data-task="${escapeHtml(task.id)}">
-    <div class="card-top"><input type="checkbox" aria-label="Select ${escapeHtml(task.title)}" ${state.selected.has(task.id) ? "checked" : ""}><span class="mono">${escapeHtml(task.id)}</span>${progress}</div>
+  const owner = task.assignee || "Unassigned";
+  const progress = task.status !== "done" && task.status !== "archived" && task.childrenTotal > 0
+    ? `<span class="pill" title="Completed dependencies">${task.childrenDone}/${task.childrenTotal}</span>` : "";
+  const summary = task.body?.trim()
+    ? `<div class="card-summary">${escapeHtml(task.body.trim())}</div>`
+    : "";
+  return `<article class="card ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" tabindex="0" data-task="${escapeHtml(task.id)}"
+    style="--status-color:${COLORS[task.status]}" aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${task.runtime}`)}">
+    <div class="card-top"><input type="checkbox" aria-label="Select ${escapeHtml(task.title)}" ${state.selected.has(task.id) ? "checked" : ""}>
+      <span class="status-badge"><span class="status-dot"></span>${STATUS_LABELS[task.status]}</span>
+      <span class="mono card-id">${escapeHtml(task.id)}</span>${progress}</div>
     <div class="card-title">${escapeHtml(task.title)}</div>
-    <div class="card-meta">
+    ${summary}
+    <div class="card-owner ${task.assignee ? "" : "unassigned"}">
+      <span class="avatar" aria-hidden="true">${escapeHtml(initials(task.assignee))}</span>
+      <span class="owner-copy"><small>Owner</small><strong>${escapeHtml(owner)}</strong></span>
+      <span class="runtime-chip" title="Worker runtime">${escapeHtml(task.runtime)}</span>
+    </div>
+    <div class="card-foot">
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
-      <span>${escapeHtml(task.assignee || "unassigned")}</span><span>·</span><span>${escapeHtml(task.runtime)}</span>
-      ${task.commentsCount ? `<span>💬 ${task.commentsCount}</span>` : ""}${task.linksCount ? `<span>↔ ${task.linksCount}</span>` : ""}
-      <span>${relativeTime(task.createdAt)}</span>
+      ${task.commentsCount ? `<span title="Comments">💬 ${task.commentsCount}</span>` : ""}${task.linksCount ? `<span title="Dependencies">↔ ${task.linksCount}</span>` : ""}
+      <span class="updated">Updated ${relativeTime(task.updatedAt)}</span>
     </div>
   </article>`;
 }
@@ -146,7 +197,7 @@ function renderBoard() {
   $("#board").innerHTML = statuses.map((status) => {
     const cards = tasks.filter((task) => task.status === status);
     return `<section class="column" data-status="${status}" style="--status-color:${COLORS[status]}">
-      <header class="column-head"><span class="status-dot"></span><h2>${status}</h2><span class="count">${cards.length}</span>${status === "running" ? "" : `<button data-create-status="${status}" aria-label="Create in ${status}">+</button>`}</header>
+      <header class="column-head"><span class="status-dot"></span><h2>${STATUS_LABELS[status]}</h2><span class="count">${cards.length}</span>${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}</header>
       ${renderCardList(cards, status === "running" && $("#lane-profile").checked)}
     </section>`;
   }).join("");
@@ -163,6 +214,11 @@ function bindCards() {
         if (event.target.checked) state.selected.add(taskId); else state.selected.delete(taskId);
         renderBoard();
       } else openDrawer(taskId);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.target.matches("input") || (event.key !== "Enter" && event.key !== " ")) return;
+      event.preventDefault();
+      openDrawer(taskId);
     });
     card.addEventListener("dragstart", (event) => {
       event.dataTransfer.setData("text/plain", taskId);
@@ -237,14 +293,17 @@ function openTaskDialog(status = "todo") {
 
 async function openDrawer(taskId) {
   try {
+    if (!state.drawerTask) drawerReturnFocus = document.activeElement;
     const detail = await api(boardPath(`/api/tasks/${taskId}`));
     state.drawerTask = taskId;
     $("#drawer-id").textContent = taskId;
-    $("#drawer-status").textContent = detail.task.status;
+    $("#drawer-status").textContent = STATUS_LABELS[detail.task.status];
+    $("#drawer-status").style.setProperty("--status-color", COLORS[detail.task.status]);
     $("#drawer").classList.add("open");
     $("#drawer").setAttribute("aria-hidden", "false");
     $("#scrim").classList.remove("hidden");
     renderDrawer(detail);
+    $("#drawer-close").focus({ preventScroll: true });
   } catch (error) { toast(error.message, true); }
 }
 
@@ -253,6 +312,8 @@ function closeDrawer() {
   $("#drawer").classList.remove("open");
   $("#drawer").setAttribute("aria-hidden", "true");
   $("#scrim").classList.add("hidden");
+  if (drawerReturnFocus?.isConnected) drawerReturnFocus.focus({ preventScroll: true });
+  drawerReturnFocus = null;
 }
 
 function taskOptions(excludeId) {
@@ -263,21 +324,31 @@ function taskOptions(excludeId) {
 function renderDrawer(detail) {
   const task = detail.task;
   const runRows = detail.runs.slice().reverse().map((run) => `<div class="detail-row">
-    ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger">Terminate</button>` : ""}
-    <strong>${escapeHtml(run.status)} · ${escapeHtml(run.workerId)}</strong>
-    <span class="mono">${escapeHtml(run.id)} · ${escapeHtml(run.claimedAt)}</span>
+    ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger compact">Terminate</button>` : ""}
+    <strong>${escapeHtml(run.workerId)}</strong>
+    <span class="detail-status">${escapeHtml(run.status)}</span>
+    <span class="mono">${escapeHtml(run.id)} · ${relativeTime(run.claimedAt)}</span>
     ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
   </div>`).join("");
   const comments = detail.comments.map((comment) => `<div class="detail-row"><strong>${escapeHtml(comment.author)}</strong>${markdown(comment.body)}<div class="mono">${escapeHtml(comment.createdAt)}</div></div>`).join("");
   const attachments = detail.attachments.map((attachment) => `<div class="detail-row">
-    <button data-remove-attachment="${escapeHtml(attachment.id)}" aria-label="Remove">×</button>
+    <button class="icon-button compact" data-remove-attachment="${escapeHtml(attachment.id)}" aria-label="Remove ${escapeHtml(attachment.name)}" title="Remove attachment">×</button>
     <strong>${escapeHtml(attachment.name)}</strong>
     ${attachment.path ? `<a href="${boardPath(`/api/attachments/${attachment.id}/download?taskId=${task.id}`)}">Download</a>` : `<a href="${escapeHtml(attachment.url)}" target="_blank" rel="noopener noreferrer">Open URL</a>`}
   </div>`).join("");
   const events = detail.events.slice().reverse().slice(0, 30).map((event) => `<div class="detail-row"><strong>${escapeHtml(event.kind)}</strong><span class="mono">#${event.id} · ${escapeHtml(event.createdAt)}</span></div>`).join("");
   const dependency = (item) => `<div class="detail-row" data-open-task="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span class="mono">${escapeHtml(item.id)} · ${escapeHtml(item.status)}</span></div>`;
   $("#drawer-content").innerHTML = `
-    <label>Title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
+    <div class="drawer-title-block"><span class="eyebrow">Task</span><h1>${escapeHtml(task.title)}</h1></div>
+    <div class="task-context">
+      <div class="task-context-owner ${task.assignee ? "" : "unassigned"}">
+        <span class="avatar" aria-hidden="true">${escapeHtml(initials(task.assignee))}</span>
+        <span><small>Owner</small><strong>${escapeHtml(task.assignee || "Unassigned")}</strong></span>
+      </div>
+      <div><small>Runtime</small><strong>${escapeHtml(task.runtime)}</strong></div>
+      <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
+    </div>
+    <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
     <div class="drawer-grid">
       <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
       <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
@@ -440,6 +511,7 @@ function bindGlobalActions() {
   $("#new-board").addEventListener("click", () => { $("#board-form").reset(); $("#board-dialog").showModal(); });
   $("#new-swarm").addEventListener("click", () => { $("#swarm-form").reset(); $("#swarm-dialog").showModal(); });
   $("#nudge").addEventListener("click", async () => { await api(boardPath("/api/dispatch"), { method: "POST", body: "{}" }); toast("Dispatcher pass started"); });
+  $("#theme-toggle").addEventListener("click", () => setTheme(activeTheme === "dark" ? "light" : "dark"));
   $("#board-settings").addEventListener("click", openSettings);
   $("#task-form").addEventListener("submit", submitTask);
   $("#board-form").addEventListener("submit", submitBoard);
@@ -545,7 +617,7 @@ async function archiveBoard(event) {
 }
 
 async function main() {
-  initializeSelects(); bindGlobalActions();
+  setTheme(activeTheme, false); initializeSelects(); bindGlobalActions();
   try { await loadBoards(); await loadBoard(); connectEvents(); }
   catch (error) { toast(error.message, true); }
 }

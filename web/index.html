@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0e14">
   <title>Kanban Control Plane</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -18,8 +19,11 @@
       <button id="new-board" class="ghost">New board</button>
       <button id="board-settings" class="ghost">Settings</button>
       <button id="new-swarm" class="ghost">Swarm</button>
-      <button id="nudge" class="primary">Nudge dispatcher</button>
-      <span id="connection" class="connection" title="Live event connection">offline</span>
+      <button id="nudge" class="primary"><span class="nudge-wide">Dispatch now</span><span class="nudge-short">Run now</span></button>
+      <button id="theme-toggle" class="ghost theme-toggle" type="button" aria-label="Switch to light theme">
+        <span class="theme-icon" aria-hidden="true">☀</span><span class="theme-label">Light</span>
+      </button>
+      <span id="connection" class="connection" title="Live event connection" aria-live="polite">offline</span>
     </div>
   </header>
 
@@ -47,7 +51,7 @@
     <div id="trash-drop" class="trash-drop" aria-label="Delete task drop zone">Drop here to delete</div>
   </main>
 
-  <aside id="drawer" class="drawer" aria-hidden="true">
+  <aside id="drawer" class="drawer" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Task details" tabindex="-1">
     <div class="drawer-head">
       <div><span id="drawer-id" class="mono"></span><span id="drawer-status" class="status-chip"></span></div>
       <button id="drawer-close" class="icon-button" aria-label="Close">×</button>
