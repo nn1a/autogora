@@ -669,7 +669,11 @@ func (s *Store) listTaskEvents(ctx context.Context, taskID string) ([]model.Task
 		}
 		result = append(result, value)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	slices.Reverse(result)
+	return result, nil
 }
 
 func (s *Store) AddComment(ctx context.Context, taskID, author, body string) (model.Comment, error) {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/nn1a/kanban/internal/model"
@@ -63,6 +65,193 @@ func TestCreateListAndReadTaskUsingExistingJSONContract(t *testing.T) {
 	}
 	if stats.Total != 2 || stats.ByStatus[model.TaskStatusTodo] != 2 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestDependencyLifecycleAndRealWorldGraphEdits(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	parent, err := store.CreateTask(ctx, CreateTaskInput{Title: "Parent", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.CreateTask(ctx, CreateTaskInput{Title: "Child", Assignee: stringValue("reviewer"), Runtime: model.RuntimeClaude, Parents: []string{parent.Task.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Task.Status != model.TaskStatusTodo {
+		t.Fatalf("child status = %s", child.Task.Status)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: parent.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim parent: claim=%v err=%v", claim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "verified"}); err != nil {
+		t.Fatal(err)
+	}
+	child, err = store.GetTask(ctx, child.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Task.Status != model.TaskStatusReady {
+		t.Fatalf("completed dependency left child in %s", child.Task.Status)
+	}
+	if _, err := store.LinkTasks(ctx, child.Task.ID, parent.Task.ID); err == nil || !strings.Contains(strings.ToLower(err.Error()), "cycle") {
+		t.Fatalf("dependency cycle error = %v", err)
+	}
+
+	late, err := store.CreateTask(ctx, CreateTaskInput{Title: "Late prerequisite", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childClaim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: child.Task.ID})
+	if err != nil || childClaim == nil {
+		t.Fatalf("claim child: claim=%v err=%v", childClaim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: childClaim.Run.ID, ClaimToken: childClaim.ClaimToken}, CompletionInput{Summary: "initial completion"}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.LinkTasks(ctx, late.Task.ID, child.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Task.Status != model.TaskStatusTodo {
+		t.Fatalf("late prerequisite did not reopen done task: %s", reopened.Task.Status)
+	}
+}
+
+func TestConcurrentClaimHasSingleWinner(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "claims.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Exactly once", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const contenders = 12
+	var wait sync.WaitGroup
+	winners := make(chan *model.ClaimedTask, contenders)
+	errors := make(chan error, contenders)
+	for index := 0; index < contenders; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+			if err != nil {
+				errors <- err
+				return
+			}
+			if claim != nil {
+				winners <- claim
+			}
+		}()
+	}
+	wait.Wait()
+	close(winners)
+	close(errors)
+	for err := range errors {
+		t.Fatalf("concurrent claim: %v", err)
+	}
+	if got := len(winners); got != 1 {
+		t.Fatalf("claim winners = %d, want 1", got)
+	}
+}
+
+func TestBlockLoopAndActiveMutationGuards(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Needs policy", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.ArchiveTask(ctx, task.Task.ID); err == nil || !strings.Contains(err.Error(), "terminate") {
+		t.Fatalf("archive active run error = %v", err)
+	}
+	blocked, err := store.BlockRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, BlockInput{Reason: "choose retention", Kind: model.BlockKindNeedsInput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Task.Status != model.TaskStatusBlocked || blocked.Task.BlockRecurrences != 1 {
+		t.Fatalf("first block = %+v", blocked.Task)
+	}
+	if _, err := store.UnblockTask(ctx, task.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("second claim: %v %v", claim, err)
+	}
+	blocked, err = store.BlockRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, BlockInput{Reason: "choose retention", Kind: model.BlockKindNeedsInput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Task.Status != model.TaskStatusTriage || blocked.Task.BlockRecurrences != 2 {
+		t.Fatalf("repeated block did not escalate: %+v", blocked.Task)
+	}
+}
+
+func TestRelationshipGraphSeparatesHierarchyFromDependencies(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root, err := store.CreateTask(ctx, CreateTaskInput{Title: "Root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.CreateTask(ctx, CreateTaskInput{Title: "Analyze", Assignee: stringValue("analyst"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateTask(ctx, CreateTaskInput{Title: "Implement", Assignee: stringValue("builder"), Runtime: model.RuntimeClaude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	position0, position1 := 0, 1
+	if _, err := store.SetSubtaskParent(ctx, root.Task.ID, first.Task.ID, &position0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetSubtaskParent(ctx, root.Task.ID, second.Task.ID, &position1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LinkTasks(ctx, first.Task.ID, second.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	graph, err := store.RelationshipGraph(ctx, second.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.RootTaskID != root.Task.ID || graph.TotalConnectedNodes != 3 || graph.TotalPhases != 2 {
+		t.Fatalf("unexpected graph summary: %+v", graph)
+	}
+	if len(graph.Hierarchy) != 2 || len(graph.Dependencies) != 1 {
+		t.Fatalf("graph conflated hierarchy and dependencies: %+v", graph)
+	}
+	var implementationNode *model.RelationshipNode
+	for index := range graph.Nodes {
+		if graph.Nodes[index].Task.ID == second.Task.ID {
+			implementationNode = &graph.Nodes[index]
+		}
+	}
+	if implementationNode == nil || len(implementationNode.BlockedBy) != 1 || implementationNode.BlockedBy[0] != first.Task.ID {
+		t.Fatalf("worker-safe dependency context missing: %+v", implementationNode)
 	}
 }
 
