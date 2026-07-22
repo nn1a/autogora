@@ -69,6 +69,7 @@ Commands:
   delete <id>...        Permanently delete tasks
   dispatch              Run the worker dispatcher
   dashboard             Run the authenticated local web dashboard
+  tui                   Open the interactive terminal board
   skills <action>       Install, inspect, or uninstall bundled Agent Skills
   mcp <action>          Register, inspect, or unregister the MCP server
   setup                 Install bundled Skills and register MCP together
@@ -79,6 +80,7 @@ Common options:
 `
 
 type App struct {
+	Stdin         io.Reader
 	Stdout        io.Writer
 	Stderr        io.Writer
 	Cwd           string
@@ -88,7 +90,7 @@ type App struct {
 }
 
 func New(stdout, stderr io.Writer) *App {
-	return &App{Stdout: stdout, Stderr: stderr, Getenv: os.Getenv, Version: "dev"}
+	return &App{Stdin: os.Stdin, Stdout: stdout, Stderr: stderr, Getenv: os.Getenv, Version: "dev"}
 }
 
 func (a *App) env(names ...string) string {
@@ -265,6 +267,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runDispatch(ctx, command, opts)
 	case "dashboard":
 		return a.runDashboard(ctx, opts)
+	case "tui":
+		return a.runTUI(ctx, opts)
 	case "skills":
 		return a.runSkills(opts)
 	case "mcp":
