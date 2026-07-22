@@ -2,6 +2,8 @@
 
 A local, durable Kanban control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
 
+한국어 사용 안내는 [Triage에서 Done까지의 실전 워크플로 가이드](docs/WORKFLOW_KO.md)를 참고하세요. Web UI 화면과 간단한 기능 구현, 코드 분석 후 문서화, 분석 → 구현 → 리뷰 예제를 포함합니다.
+
 ## Requirements
 
 - Node.js 24 or newer
