@@ -14,6 +14,7 @@ import (
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/mcpserver"
 	"github.com/nn1a/autogora/internal/model"
+	setupcfg "github.com/nn1a/autogora/internal/setup"
 	"github.com/nn1a/autogora/internal/store"
 )
 
@@ -68,6 +69,8 @@ Commands:
   dispatch              Run the worker dispatcher
   dashboard             Run the authenticated local web dashboard
   skills <action>       Install, inspect, or uninstall bundled Agent Skills
+  mcp <action>          Register, inspect, or unregister the MCP server
+  setup                 Install bundled Skills and register MCP together
 
 Common options:
   --db <path>           SQLite path (default: ./data/autogora.db)
@@ -75,11 +78,12 @@ Common options:
 `
 
 type App struct {
-	Stdout  io.Writer
-	Stderr  io.Writer
-	Cwd     string
-	Getenv  func(string) string
-	Version string
+	Stdout        io.Writer
+	Stderr        io.Writer
+	Cwd           string
+	Getenv        func(string) string
+	Version       string
+	CommandRunner setupcfg.CommandRunner
 }
 
 func New(stdout, stderr io.Writer) *App {
@@ -209,6 +213,18 @@ func stringPointer(value string) *string {
 }
 
 func (a *App) Run(ctx context.Context, args []string) error {
+	if len(args) > 1 && args[0] == "help" {
+		if help := setupCommandHelp(args[1]); help != "" {
+			_, err := io.WriteString(a.Stdout, help)
+			return err
+		}
+	}
+	if len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		if help := setupCommandHelp(args[0]); help != "" {
+			_, err := io.WriteString(a.Stdout, help)
+			return err
+		}
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		_, err := io.WriteString(a.Stdout, Help)
 		return err
@@ -261,6 +277,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runDashboard(ctx, opts)
 	case "skills":
 		return a.runSkills(opts)
+	case "mcp":
+		return a.runMCP(ctx, opts)
+	case "setup":
+		return a.runSetup(ctx, opts)
 	case "claim":
 		return a.runClaim(ctx, opts)
 	case "terminate":
