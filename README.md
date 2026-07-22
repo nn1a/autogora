@@ -2,7 +2,7 @@
 
 A local, durable agent work control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. Autogora provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, planning, a dispatcher, and an authenticated Web UI.
 
-한국어 안내는 [설치 및 업그레이드](docs/INSTALL_KO.md)와 [Triage에서 Done까지의 실전 워크플로 가이드](docs/WORKFLOW_KO.md)를 참고하세요. Web UI 화면과 간단한 기능 구현, 코드 분석 후 문서화, 분석 → 구현 → 리뷰 예제를 포함합니다.
+Korean documentation: [installation and upgrades](docs/INSTALL_KO.md) · [practical workflow from Triage to Done](docs/WORKFLOW_KO.md)
 
 ## Install
 
@@ -365,12 +365,12 @@ archive removes the subscription automatically.
 
 ```bash
 autogora notify-subscribe <task-id> \
-  --platform webhook --chat-id https://example.com/hooks/kanban \
+  --platform webhook --chat-id https://example.com/hooks/autogora \
   --thread-id release --secret "$AUTOGORA_WEBHOOK_SECRET"
 autogora notify-list <task-id>
 autogora notify-deliver
 autogora notify-unsubscribe <task-id> \
-  --platform webhook --chat-id https://example.com/hooks/kanban \
+  --platform webhook --chat-id https://example.com/hooks/autogora \
   --thread-id release
 ```
 

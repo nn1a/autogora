@@ -1,12 +1,10 @@
 # Autogora 실전 워크플로 가이드
 
-이 문서는 처음 사용하는 사람이 아이디어를 `Triage`에 등록한 뒤 작업을 구체화하고, 에이전트에게 실행시키고, 검증 가능한 결과를 `Done`으로 남기는 방법을 설명한다. Web UI, CLI, MCP 중 어느 화면을 사용해도 같은 SQLite 상태와 전이 규칙을 사용한다.
+아이디어를 `Triage`에 등록하고 작업을 구체화한 뒤 에이전트에게 맡기고, 검증 근거와 함께 `Done`으로 마무리한다. Web UI, CLI, MCP는 모두 같은 SQLite 상태와 전이 규칙을 공유한다.
 
 예제의 `<task-id>`와 `<board>`는 실제 출력값으로 바꿔야 한다. `claude`, `codex`, `cline`, `gemini` 중 설치된 런타임만 사용한다.
 
 ## 1. 가장 짧은 성공 경로
-
-기본 경로는 다음과 같다.
 
 ```text
 Triage ── specify ──> Todo ── promote/조건 충족 ──> Ready
@@ -22,13 +20,11 @@ Triage ── specify ──> Todo ── promote/조건 충족 ──> Ready
                                                        Done
 ```
 
-처음에는 아래 다섯 단계만 기억하면 된다.
-
 1. 불명확한 요청은 `Triage`에 등록한다.
 2. 한 작업이면 `Specify`, 여러 독립 작업이면 `Decompose`를 사용한다.
 3. 담당자, 런타임, 작업 디렉터리, 완료 조건을 확인하고 `Ready`로 보낸다.
 4. dispatcher가 `Ready` 작업을 claim하여 `Running`으로 만들고 에이전트를 실행한다.
-5. 에이전트가 테스트·검증 근거와 함께 완료하면 `Done`이 된다.
+5. 에이전트가 테스트·검증 근거를 남기고 작업을 `Done`으로 마친다.
 
 ## 2. 최초 실행
 
@@ -40,9 +36,9 @@ autogora setup --client codex
 autogora dashboard
 ```
 
-`codex` 대신 실제 사용하는 `claude` 또는 `gemini`를 지정한다. MCP가 비활성화된 수정 Cline은 `setup` 대상이 아니며, 아래의 dispatcher 기반 CLI 브리지를 사용한다. 설치 위치와 범위, 충돌 복구는 [설치 및 업그레이드 안내](INSTALL_KO.md#3-권장-자동-설정-skill-설치와-mcp-등록)를 참고한다.
+`codex` 대신 실제 사용하는 `claude` 또는 `gemini`를 지정한다. MCP를 비활성화한 수정 Cline은 `setup`을 건너뛰고 dispatcher의 CLI 브리지를 사용한다.
 
-마지막 명령이 출력한 URL을 브라우저에서 연다. 기본 주소는 `127.0.0.1:8420`이며, URL의 일회용 토큰은 세션 쿠키로 교환된다.
+마지막 명령이 출력한 URL을 브라우저에서 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL의 일회용 토큰을 HTTP-only 세션 쿠키로 교환한다.
 
 별도 터미널에서 실행기를 시작한다.
 
@@ -72,11 +68,11 @@ Git 저장소를 보드의 기본 작업 디렉터리로 지정하고 작업별 
 1. `Triage` 컬럼 제목의 `+`를 눌러 요청을 등록한다.
 2. 생성된 카드를 눌러 상세 패널을 연다.
 3. 한 작업이면 `Specify`, 여러 역할로 나눌 일이면 `Decompose`를 누른다.
-4. `Todo` 카드에서 Assignee, Runtime, Priority와 Description을 확인한 뒤 `Save changes`를 누른다. 실행 조건이 모두 맞으면 저장과 함께 `Ready`가 될 수 있다.
+4. `Todo` 카드에서 Assignee, Runtime, Priority와 Description을 확인한 뒤 `Save changes`를 누른다. 실행 조건을 모두 충족하면 Autogora가 카드를 `Ready`로 옮긴다.
 5. 여전히 `Todo`이고 `Promote` 버튼이 보일 때만 승격한다. 승격 후에도 `Todo`라면 미완료 dependency나 빠진 담당자를 확인한다.
 6. 읽기·분석 작업은 상단의 `Dispatch now`로 한 번 실행할 수 있다.
 7. 카드가 `Running`이면 상세 화면의 Run history와 Recent events를 확인한다.
-8. 성공하면 `Done`, 사람의 결정이 필요하면 `Blocked`에 도착한다.
+8. 성공한 작업은 `Done`에서, 사람의 결정이 필요한 작업은 `Blocked`에서 확인한다.
 
 Web UI의 `Dispatch now`는 기본적으로 `allowWrites=false`인 읽기 전용 1회 실행이다. 코드나 문서 파일을 수정해야 하는 작업은 별도 터미널에서 다음과 같이 실행한다.
 
@@ -89,36 +85,38 @@ autogora dispatch --once --allow-writes --board product-web
 | 상태 | 의미 | 일반적인 진입 | 다음 행동 |
 | --- | --- | --- | --- |
 | `Triage` | 아직 범위·완료 조건·담당 경로가 불명확한 요청 | `create --triage` 또는 UI에서 Triage 선택 | `Specify` 또는 `Decompose` |
-| `Todo` | 실행 규격은 있지만 담당자, 런타임, 의존성 또는 수동 승인이 남음 | specify, 미완료 부모 연결, 미할당 작업 | 필드 보완 후 `Promote` |
+| `Todo` | 실행 규격은 있지만 담당자, 런타임, 의존성 또는 수동 승인이 남음 | specify, 미완료 선행 작업 연결, 미할당 작업 | 필드 보완 후 `Promote` |
 | `Scheduled` | 미래 시각 또는 수동 재개까지 보류 | `schedule`, `--scheduled-at` | 시간이 되면 자동 승격하거나 `Promote` |
-| `Ready` | 지금 claim 가능한 실행 대기 작업 | 담당자·비수동 런타임·의존성 조건 충족 | dispatcher가 claim |
-| `Running` | 한 실행이 원자적으로 claim하여 작업 중 | dispatcher 또는 `claim` | heartbeat 후 `Complete` 또는 `Block` |
+| `Ready` | 지금 claim할 수 있는 실행 대기 작업 | 담당자·비수동 런타임·의존성 조건 충족 | dispatcher가 claim |
+| `Running` | worker가 원자적으로 claim한 작업 | dispatcher 또는 `claim` | heartbeat 후 `Complete` 또는 `Block` |
 | `Blocked` | 사람의 입력, 기능 부족, 일시 장애 등으로 진행 불가 | `block` | 원인 해결 후 `Unblock` |
 | `Review` | 자동 실행 단계가 아닌 수동 검토 보류 레인 | UI 이동 또는 `edit --status review` | 승인 시 `Complete`, 재작업 시 `Promote` |
 | `Done` | 결과와 검증 근거가 남은 완료 상태 | worker `complete` 또는 사람의 완료 처리 | 필요하면 `Archive` |
 | `Archived` | 기본 보드에서 숨긴 보관 상태 | `archive` | 일반 목록에서는 제외 |
 
-다음 조건을 만족하면 작업은 `Ready`가 될 수 있다.
+Autogora는 다음 조건을 모두 충족한 작업을 `Ready`로 보낸다.
 
-- `assignee`가 지정되어 있다.
+- `assignee`를 지정했다.
 - 런타임이 `manual`이 아니라 `claude`, `codex`, `cline`, `gemini` 중 하나다.
-- 모든 prerequisite handoff가 완료되어 있다.
+- 모든 prerequisite handoff를 완료했다.
 - 예약 시간이 지났거나 예약이 없다.
 
-`Running`은 상태를 직접 수정해서 진입하지 않는다. 반드시 claim을 통해 실행 ID, lease, claim token이 함께 생성되어야 한다.
+상태를 직접 수정해서 `Running`으로 진입할 수는 없다. claim이 실행 ID, lease, claim token을 함께 만들어야 한다.
 
 ### 관계 모델과 실행 순서
 
-Autogora은 관계를 두 종류로 분리한다.
+Autogora는 관계를 두 종류로 분리한다.
 
 | 관계 | 의미 | 실행 순서에 미치는 영향 |
 | --- | --- | --- |
-| Parent task → Subtask | 어떤 목표를 위해 생성된 하위 작업인지 나타내는 소속 관계 | 직접적인 claim 차단 없음 |
-| Prerequisite → Dependent | 선행 작업 결과를 어떤 후속 작업이 소비하는지 나타내는 실행 관계 | 모든 prerequisite handoff가 완료되어야 dependent가 `Ready`가 됨 |
+| Parent task → Subtask | 어떤 목표에 속한 하위 작업인지 나타내는 관계 | 직접적인 claim 차단 없음 |
+| Prerequisite → Dependent | 선행 작업 결과를 어떤 후속 작업이 소비하는지 나타내는 관계 | 모든 prerequisite handoff가 끝나야 dependent가 `Ready`로 이동 |
 
-Prerequisite가 한 번 완료되면 해당 dependency edge에 완료 시각이 handoff로 저장된다. 이후 선행 task를 보관하거나 다시 열어도 이미 소비된 handoff를 소급해서 무효화하지 않는다. 새 완료 결과를 반드시 기다리게 하려면 dependency를 unlink한 뒤 다시 link한다. 실행 중인 dependent에는 완료되지 않은 prerequisite를 추가할 수 없지만, 이미 완료된 prerequisite는 작업을 중단하지 않고 연결할 수 있다.
+Prerequisite가 완료되면 Autogora가 dependency edge에 완료 시각을 handoff로 기록한다. 이후 선행 task를 보관하거나 다시 열어도 이미 소비한 handoff는 유효하다. dependent가 새 완료 결과를 기다려야 한다면 dependency를 unlink한 뒤 다시 link한다.
 
-Triage 카드를 `Decompose`하면 생성된 모든 작업은 원본 카드의 subtask로 기록된다. 동시에 planner가 만든 dependency DAG가 별도로 저장된다. DAG의 진입점은 병렬로 `Ready`가 될 수 있고, 후속 subtask는 선행 handoff가 완료될 때까지 `Todo`에 머문다. 모든 말단 subtask가 끝나면 원본 root task가 마지막 종합·검증 단계로 `Ready`가 된다.
+실행 중인 dependent에는 미완료 prerequisite를 추가할 수 없다. 완료한 prerequisite는 실행을 중단하지 않고 연결할 수 있다.
+
+`Decompose`는 생성한 작업을 원본 Triage 카드의 subtask로 묶고 planner의 dependency DAG를 별도로 저장한다. Autogora는 DAG 진입점을 병렬로 `Ready`에 보내고, 후속 subtask는 선행 handoff가 끝날 때까지 `Todo`에 둔다. 모든 말단 subtask가 끝나면 원본 root task가 마지막 종합·검증 단계로 `Ready`에 들어간다.
 
 예를 들어 다음 관계는 hierarchy 하나와 dependency 세 개를 가진다.
 
@@ -147,7 +145,9 @@ autogora link <prerequisite-id> <dependent-id>
 autogora unlink <prerequisite-id> <dependent-id>
 ```
 
-MCP에서는 `autogora_graph`, `autogora_subtask_set`, `autogora_subtask_remove`, `autogora_link`, `autogora_unlink`를 사용한다. 응답의 `parents`/`children` 필드는 각각 `prerequisites`/`dependents`를 뜻하고, hierarchy는 `parentTask`/`subtasks` 필드로 구분된다.
+작업 생성 시 사용하는 `--parent <id>`는 이름과 달리 prerequisite dependency를 추가한다. hierarchy parent는 `subtask-add`로 설정한다.
+
+MCP에서는 `autogora_graph`, `autogora_subtask_set`, `autogora_subtask_remove`, `autogora_link`, `autogora_unlink`를 사용한다. 응답의 `parents`/`children` 필드는 각각 `prerequisites`/`dependents`를 뜻한다. hierarchy는 `parentTask`/`subtasks` 필드를 사용한다.
 
 모든 worker에게 전체 graph의 상세 데이터를 전달하지 않는다. 실행 worker가 받는 범위는 다음과 같다.
 
@@ -157,30 +157,30 @@ MCP에서는 `autogora_graph`, `autogora_subtask_set`, `autogora_subtask_remove`
 - 완료 시 열리는 직접 dependent
 - 같은 workflow node의 ID, 제목, 상태, phase 요약
 
-다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. 전체 topology 변경은 orchestrator 또는 관리 화면에서 수행하고, worker는 자신에게 claim된 node만 구현한다.
+다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. orchestrator나 관리 화면에서 전체 topology를 변경한다. worker는 자신이 claim한 node만 구현한다.
 
-연결된 graph가 500개 node를 넘더라도 worker 시작을 실패시키지 않는다. `autogora_graph`와 Web UI는 focus task, hierarchy root, 직접 관계를 우선해 최대 500개를 보여주고 `totalConnectedNodes`, `truncated`, `omittedNodeCount`로 생략 범위를 알린다. worker context는 이 중 필요한 50개 요약만 사용한다.
+연결된 graph가 500개 node를 넘어도 worker는 정상적으로 시작한다. `autogora_graph`와 Web UI는 focus task, hierarchy root, 직접 관계를 우선해 최대 500개를 보여준다. `totalConnectedNodes`, `truncated`, `omittedNodeCount`에서 생략 범위를 확인할 수 있다. worker context는 필요한 node 50개의 요약만 사용한다.
 
 ![Task hierarchy와 실행 dependency를 분리해 보여주는 실제 화면](images/workflow-05-task-relationships.png)
 
-*실제 Web UI의 관계 관리 화면. 위쪽 phase 목록은 실행 순서를, Task hierarchy는 소속을, Execution dependencies는 claim을 차단하는 선행 관계를 나타낸다.*
+*위쪽 phase 목록은 실행 순서를, Task hierarchy는 소속을, Execution dependencies는 claim을 차단하는 선행 관계를 보여준다.*
 
-![계획 단계의 실제 Kanban 보드](images/workflow-01-board-planning.png)
+![계획 단계의 실제 작업 보드](images/workflow-01-board-planning.png)
 
-*실제 Web UI의 계획 구간. 카드에서 상태, 담당자, 런타임, 우선순위와 갱신 시각을 함께 확인할 수 있다.*
+*계획 구간의 카드에서 상태, 담당자, 런타임, 우선순위와 갱신 시각을 함께 확인한다.*
 
 ### Review에 대한 중요한 차이
 
-현재 일반 worker가 `autogora_complete`를 호출하면 `Running`에서 바로 `Done`으로 간다. `Review`는 자동 품질 게이트가 아니라 사람이 카드를 잠시 보류하는 레인이다.
+일반 worker가 `autogora_complete`를 호출하면 카드가 `Running`에서 바로 `Done`으로 이동한다. `Review`는 자동 품질 게이트가 아니라 사람이 카드를 잠시 보류하는 레인이다.
 
-필수 리뷰가 필요하면 구현 카드를 억지로 `Review`로 옮기기보다 별도의 리뷰 카드를 만들고 구현 카드를 부모로 연결하는 방식을 권장한다.
+필수 리뷰가 필요하면 구현 카드를 억지로 `Review`로 옮기기보다 별도의 리뷰 카드를 만들고 구현 카드를 prerequisite로 연결한다.
 
 ```text
 분석 작업 ──> 구현 작업 ──> 리뷰 작업
    Done          Done       Ready → Running → Done
 ```
 
-이 구조에서는 구현 완료 요약과 metadata가 리뷰 worker의 부모 handoff로 자동 전달된다.
+Autogora는 구현 완료 요약과 metadata를 리뷰 worker의 prerequisite handoff로 전달한다.
 
 ## 4. 좋은 카드 작성 규칙
 
@@ -283,7 +283,7 @@ autogora specify <task-id> \
   --body $'## 목표\n현재 필터 결과를 CSV로 다운로드한다.\n\n## 완료 조건\n- 화면에 Export CSV 버튼이 있다.\n- 현재 필터 결과만 포함한다.\n- UTF-8 CSV를 생성한다.\n- 빈 결과에서도 헤더를 포함한다.\n\n## 검증\n- 단위 테스트와 브라우저 동작을 확인한다.'
 ```
 
-`Specify`가 끝나면 카드는 `Todo`가 된다. 결과를 반드시 확인한다.
+`Specify`가 끝나면 Autogora가 카드를 `Todo`로 옮긴다. 규격을 확인한다.
 
 ```bash
 autogora show <task-id>
@@ -301,14 +301,14 @@ autogora decompose <task-id> \
   --orchestrator-profile implementer:codex
 ```
 
-planner가 만든 그래프는 한 트랜잭션으로 적용되고 순환 의존성은 거부된다. 결과를 확인하여 제목, 담당자, 런타임과 의존성 방향이 맞는지 검토한다.
+Autogora는 planner가 만든 그래프를 한 트랜잭션으로 적용하고 순환 의존성을 거부한다. 제목, 담당자, 런타임과 의존성 방향을 검토한다.
 
 ```bash
 autogora show <root-task-id>
 autogora list --sort status
 ```
 
-의존성은 `prerequisite → dependent`, 즉 선행 handoff가 먼저 완료되어야 후속 task가 `Ready`가 된다는 뜻이다.
+`prerequisite → dependent`는 선행 handoff를 마쳐야 후속 task가 `Ready`로 이동한다는 뜻이다.
 
 ```bash
 autogora link <prerequisite-id> <dependent-id>
@@ -337,13 +337,13 @@ autogora edit <task-id> \
 autogora show <task-id>
 ```
 
-필드 저장 과정에서 조건이 충족되면 자동으로 `Ready`가 될 수 있다. `Specify` 직후처럼 카드가 여전히 `Todo`에 머물러 있을 때만 승격한다.
+필드를 저장할 때 실행 조건을 모두 충족하면 Autogora가 카드를 `Ready`로 옮긴다. `Specify` 직후처럼 카드가 여전히 `Todo`에 있을 때만 직접 승격한다.
 
 ```bash
 autogora promote <task-id>
 ```
 
-승격 후에도 `Todo`라면 미완료 부모, 미할당 담당자, `manual` 런타임을 확인한다.
+승격 후에도 `Todo`라면 미완료 prerequisite, 빠진 담당자, `manual` 런타임을 확인한다.
 
 ### 5.5 Ready와 Running: dispatcher에 실행 위임
 
@@ -370,7 +370,7 @@ autogora dispatch --watch \
   --board product-web
 ```
 
-dispatcher는 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. worker는 시작할 때 카드와 부모 handoff를 읽고, 오래 걸리는 작업 중에는 heartbeat를 남겨야 한다.
+dispatcher는 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. worker는 시작할 때 카드와 prerequisite handoff를 읽고, 오래 걸리는 작업 중에는 heartbeat를 남겨야 한다.
 
 ![Running 카드의 실제 상세 화면](images/workflow-03-running-detail.png)
 
@@ -400,9 +400,7 @@ autogora block <task-id> \
   --kind needs_input
 ```
 
-종류의 의미:
-
-- `dependency`: 다른 작업 결과를 기다린다. 이 종류는 별도 `Blocked`가 아니라 `Todo` 대기로 돌아간다.
+- `dependency`: 다른 작업 결과를 기다린다. Autogora는 카드를 `Blocked`가 아닌 `Todo` 대기로 돌려보낸다.
 - `needs_input`: 사람의 결정이나 자격 증명이 필요하다.
 - `capability`: 현재 runtime이나 도구로 수행할 수 없다.
 - `transient`: 일시적인 외부 장애다.
@@ -443,7 +441,9 @@ autogora comment <task-id> \
 autogora promote <task-id>
 ```
 
-`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `autogora_run_terminate`로 활성 worker에 종료 신호를 보낸다. 실제 PID에 신호를 보낸 경우 응답의 `pending`이 `true`이고 dispatcher가 프로세스 종료를 확인할 때까지 `Running`을 유지해 기존 worker와 대체 worker의 중복 실행을 막는다. PID가 없거나 이미 종료됐으면 즉시 run을 회수한다. 제목·본문·우선순위 설명은 실행 중에도 보완할 수 있지만 assignee, runtime, workspace, branch는 현재 실행과 어긋나지 않도록 고정된다. 필수 코드 리뷰는 별도 리뷰 카드를 만드는 것이 안전하다.
+`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `autogora_run_terminate`로 활성 worker에 종료 신호를 보낸다. PID에 신호를 보냈다면 dispatcher는 프로세스 종료를 확인할 때까지 카드를 `Running`에 두고 응답에 `pending: true`를 표시한다. 이 과정이 기존 worker와 대체 worker의 중복 실행을 막는다. PID가 없거나 프로세스가 이미 끝났다면 즉시 run을 회수한다.
+
+실행 중에는 제목·본문·우선순위 설명만 보완할 수 있으며 assignee, runtime, workspace, branch는 바꿀 수 없다. 필수 코드 리뷰에는 별도 리뷰 카드를 사용한다.
 
 ### 5.8 Done: 결과보다 검증 가능한 handoff를 남김
 
@@ -461,7 +461,7 @@ dispatcher가 실행한 일반 worker는 성공 시 `autogora_complete`, 진행 
 }
 ```
 
-파일 artifact를 선언하면 모든 경로가 workspace 안에 실제로 존재해야 `Done`이 된다. 완료 후 확인한다.
+파일 artifact를 선언하려면 모든 경로가 workspace 안에 실제로 있어야 한다. 다음 명령으로 완료 handoff를 확인한다.
 
 ```bash
 autogora show <task-id>
@@ -470,9 +470,9 @@ autogora runs <task-id>
 
 ![Blocked, Review, Done 상태의 실제 보드](images/workflow-04-outcome-states.png)
 
-*실제 결과 구간. Blocked에는 해결해야 할 원인이, Review에는 검토 담당자가, Done에는 완료된 결과가 남는다.*
+*Blocked에서는 해결할 원인을, Review에서는 검토 담당자를, Done에서는 완료 결과를 확인한다.*
 
-`Done`은 결과가 검증되었다는 의미다. 단순히 보드에서 숨기려면 `Done` 대신 `Archive`를 사용하지 말고, 완료 후 필요할 때 별도로 보관한다.
+`Done`은 결과와 검증 근거를 남긴 완료 상태다. 카드를 숨길 목적으로 `Done`으로 바꾸지 않는다. 이미 완료한 카드는 필요할 때 `Archive`로 보관한다.
 
 ## 6. 예제 1: 간단한 기능 구현
 
@@ -563,7 +563,7 @@ ANALYSIS_ID=<분석-task-id>
 
 ```bash
 autogora create "인증 흐름 문서 작성" \
-  --body $'## 목표\n부모 분석 handoff와 실제 코드를 근거로 docs/AUTH_FLOW.md를 작성한다.\n\n## 완료 조건\n- 진입점, 정상 흐름, 실패 흐름, 보안 주의사항을 포함한다.\n- Mermaid 또는 텍스트 순서도를 포함한다.\n- 코드와 다른 추측은 쓰지 않는다.\n- 문서 링크와 검증 내용을 완료 요약에 남긴다.' \
+  --body $'## 목표\n선행 분석 handoff와 실제 코드를 근거로 docs/AUTH_FLOW.md를 작성한다.\n\n## 완료 조건\n- 진입점, 정상 흐름, 실패 흐름, 보안 주의사항을 포함한다.\n- Mermaid 또는 텍스트 순서도를 포함한다.\n- 코드와 다른 추측은 쓰지 않는다.\n- 문서 링크와 검증 내용을 완료 요약에 남긴다.' \
   --assignee writer \
   --runtime claude \
   --workspace "$PWD" \
@@ -575,7 +575,7 @@ autogora create "인증 흐름 문서 작성" \
 DOC_ID=<문서-task-id>
 ```
 
-분석 카드가 완료되기 전에는 문서 카드가 `Todo`에 머문다. 분석이 `Done`이 되면 completion summary와 metadata가 문서 worker의 `Prerequisite handoffs`에 포함되고 문서 카드가 자동으로 `Ready`가 된다.
+분석 카드가 끝날 때까지 문서 카드는 `Todo`에 머문다. 분석 worker가 작업을 완료하면 Autogora가 completion summary와 metadata를 문서 worker의 `Prerequisite handoffs`에 넣고 문서 카드를 `Ready`로 옮긴다.
 
 ### 3단계: 문서 검토 카드
 
@@ -595,9 +595,9 @@ autogora create "인증 흐름 문서 정확성 검토" \
 autogora dispatch --watch --max-workers 1 --allow-writes --board product-web
 ```
 
-공유 `dir` workspace에서는 동시에 여러 쓰기 작업을 실행하지 않는다. 분석 → 문서 → 리뷰 의존성 덕분에 이 세 작업은 순서대로 실행된다.
+공유 `dir` workspace에서는 여러 쓰기 작업을 동시에 실행하지 않는다. 분석 → 문서 → 리뷰 dependency가 세 작업의 실행 순서를 보장한다.
 
-진행 상황 확인:
+다음 명령으로 진행 상황을 확인한다.
 
 ```bash
 autogora list --sort status
@@ -626,7 +626,7 @@ ANALYSIS_ID=<분석-task-id>
 
 ```bash
 autogora create "API 타임아웃 처리 개선" \
-  --body "부모 분석 결과를 기반으로 최소 변경을 구현한다. timeout과 retry의 상호작용을 테스트하고 npm test를 통과시킨다. 변경 파일, 테스트, 잔여 위험을 완료 metadata에 남긴다." \
+  --body "선행 분석 결과를 기반으로 최소 변경을 구현한다. timeout과 retry의 상호작용을 테스트하고 npm test를 통과시킨다. 변경 파일, 테스트, 잔여 위험을 완료 metadata에 남긴다." \
   --assignee implementer --runtime codex \
   --workspace "$PWD" --workspace-kind dir \
   --parent "$ANALYSIS_ID"
@@ -640,7 +640,7 @@ IMPLEMENT_ID=<구현-task-id>
 
 ```bash
 autogora create "API 타임아웃 변경 독립 리뷰" \
-  --body "부모 구현의 diff와 테스트 결과를 검토하되 파일은 수정하지 않는다. 오류 분류, 재시도 중복, 취소 신호, 기존 API 호환성을 확인한다. 승인 시 근거와 함께 complete하고, 결함이 있으면 파일/조건/재현법을 포함해 block한다." \
+  --body "선행 구현의 diff와 테스트 결과를 검토하되 파일은 수정하지 않는다. 오류 분류, 재시도 중복, 취소 신호, 기존 API 호환성을 확인한다. 승인 시 근거와 함께 complete하고, 결함이 있으면 파일/조건/재현법을 포함해 block한다." \
   --assignee reviewer --runtime claude \
   --workspace "$PWD" --workspace-kind dir \
   --parent "$IMPLEMENT_ID"
@@ -650,13 +650,13 @@ autogora create "API 타임아웃 변경 독립 리뷰" \
 REVIEW_ID=<리뷰-task-id>
 ```
 
-dispatcher를 시작하면 분석만 먼저 `Ready`이고, 각 부모가 `Done`이 될 때 다음 카드가 자동으로 열린다.
+dispatcher를 시작하면 분석 카드만 `Ready`에 있다. 각 prerequisite가 끝날 때마다 Autogora가 다음 카드를 `Ready`로 옮긴다.
 
 ```bash
 autogora dispatch --watch --max-workers 1 --allow-writes --board product-web
 ```
 
-리뷰가 결함 때문에 `Blocked`되면 재작업 카드를 만들고 리뷰 카드의 새 부모로 연결한다.
+리뷰가 결함 때문에 `Blocked`되면 재작업 카드를 만들고 리뷰 카드의 새 prerequisite로 연결한다.
 
 ```bash
 autogora create "리뷰 지적 타임아웃 회귀 수정" \
@@ -672,7 +672,7 @@ autogora link "$FIX_ID" "$REVIEW_ID"
 autogora unblock "$REVIEW_ID"
 ```
 
-수정 카드가 `Done`이 될 때까지 리뷰 카드는 `Todo`에 머물고, 완료 후 다시 `Ready`가 되어 독립 검증을 반복한다.
+수정 카드가 끝날 때까지 리뷰 카드는 `Todo`에 머문다. 수정이 끝나면 Autogora가 리뷰 카드를 다시 `Ready`로 보내 독립 검증을 이어간다.
 
 ## 9. MCP 사용자용 요청 문장 모음
 
@@ -697,7 +697,7 @@ Autogora MCP를 사용해 이 요청을 triage에 등록해줘.
 ```text
 <task-id>를 분석 → 구현 → 독립 리뷰 의존성 그래프로 decompose해줘.
 analyst/codex, implementer/codex, reviewer/claude 프로필만 사용하고,
-각 카드가 부모 completion summary만으로 이어서 작업할 수 있게 본문을 작성해줘.
+각 카드가 prerequisite completion summary만으로 이어서 작업할 수 있게 본문을 작성해줘.
 생성 후 루트와 자식의 상태 및 의존성 방향을 검토해줘.
 ```
 
@@ -705,7 +705,7 @@ analyst/codex, implementer/codex, reviewer/claude 프로필만 사용하고,
 
 ```text
 Autogora MCP로 현재 보드를 점검해줘.
-오래된 Running, 원인 없는 Blocked, 담당자 없는 Todo, 부모가 끝났는데 Ready가 아닌 카드를 찾고
+오래된 Running, 원인 없는 Blocked, 담당자 없는 Todo, prerequisite가 끝났는데 Ready가 아닌 카드를 찾고
 상태를 임의로 바꾸지 말고 먼저 진단 결과와 권장 조치를 알려줘.
 ```
 
@@ -714,15 +714,15 @@ Autogora MCP로 현재 보드를 점검해줘.
 ### 작업 시작 전
 
 - 기존 카드와 중복되지 않는가?
-- 카드 하나의 결과가 한 문장으로 설명되는가?
+- 카드 하나의 결과를 한 문장으로 설명할 수 있는가?
 - 완료 조건과 검증 방법이 있는가?
-- assignee와 runtime이 실제 설치·설정되어 있는가?
+- assignee와 runtime을 실제로 사용할 수 있는가?
 - workspace가 안전하고 의도한 저장소를 가리키는가?
-- 부모 의존성 방향이 맞는가?
+- prerequisite dependency 방향이 맞는가?
 
 ### Running 중
 
-- heartbeat가 갱신되는가?
+- worker가 heartbeat를 갱신하는가?
 - `runs`, `log`, `tail`에서 진행 근거를 확인할 수 있는가?
 - worker가 범위를 벗어난 파일을 수정하지 않는가?
 - 사람의 결정이 필요한데 무의미한 재시도를 반복하지 않는가?
@@ -730,10 +730,10 @@ Autogora MCP로 현재 보드를 점검해줘.
 ### Done 전
 
 - 완료 조건을 모두 검증했는가?
-- 테스트 또는 리뷰 명령이 기록되어 있는가?
-- 변경 파일이나 문서 경로가 metadata/artifact에 남았는가?
-- 잔여 위험이 명시되어 있는가?
-- 필수 리뷰가 별도 카드로 완료되었는가?
+- 테스트 또는 리뷰 명령을 기록했는가?
+- 변경 파일이나 문서 경로를 metadata/artifact에 남겼는가?
+- 잔여 위험을 명시했는가?
+- 별도 카드에서 필수 리뷰를 마쳤는가?
 
 ## 11. 자주 막히는 원인
 
@@ -743,11 +743,9 @@ Autogora MCP로 현재 보드를 점검해줘.
 autogora show <task-id>
 ```
 
-다음을 확인한다.
-
 - assignee가 비어 있음
 - runtime이 `manual`
-- 미완료 parent가 있음
+- 미완료 prerequisite가 있음
 - 예약 시간이 남아 있음
 - specify 후 아직 promote하지 않음
 
@@ -765,13 +763,13 @@ heartbeat, worker PID, claim 만료 시각과 로그를 확인한다. Web UI의 
 autogora terminate <task-id> --reason "heartbeat 정지로 관리자 종료"
 ```
 
-`diagnostics`에서 `terminal_prerequisite`가 보이면 완료되지 않은 선행 task가 보관된 상태다. 요구가 더 이상 필요 없으면 dependency를 unlink하고, 여전히 필요하면 prerequisite를 다시 열어 완료한다. `stalled_prerequisite`는 선행 task가 `Blocked`, `Triage`, `Review`에서 사람의 처리를 기다린다는 뜻이다.
+`diagnostics`의 `terminal_prerequisite`는 완료하지 않은 선행 task를 보관했다는 뜻이다. 해당 선행 작업이 더 이상 필요 없다면 dependency를 unlink한다. 여전히 필요하다면 prerequisite를 다시 열어 완료한다. `stalled_prerequisite`는 선행 task가 `Blocked`, `Triage`, `Review`에서 사람의 처리를 기다린다는 뜻이다.
 
-Web UI에서는 상단 `Needs attention (N)` 칩을 눌러 최대 20개의 진단 원인과 task ID를 바로 확인할 수 있다. 대형 graph drawer는 현재 task와 hierarchy root를 우선해 100개만 렌더링하며, 전체 연결 수와 생략 수는 상단 안내에 유지된다.
+Web UI 상단의 `Needs attention (N)` 칩에서 진단 원인과 task ID를 최대 20개까지 확인할 수 있다.
 
 ### worker가 말만 하고 Done이 되지 않음
 
-일반 worker는 최종 답변만 출력해서는 완료되지 않는다. `autogora_complete` 또는 dispatcher가 제공한 scoped CLI `complete` 명령을 호출해야 한다. MCP가 비활성화된 Cline과 격리된 Gemini worker는 dispatcher prompt에 포함된 정확한 CLI lifecycle bridge를 사용한다.
+일반 worker는 최종 답변만 출력해서 작업을 끝낼 수 없다. `autogora_complete` 또는 dispatcher가 제공한 scoped CLI `complete` 명령을 호출해야 한다. MCP를 비활성화한 Cline과 격리된 Gemini worker는 dispatcher prompt에 포함된 정확한 CLI lifecycle bridge를 사용한다.
 
 ### Review와 Done의 경계가 모호함
 
@@ -793,4 +791,4 @@ autogora diagnostics
 autogora watch --since 0 --follow
 ```
 
-보드의 canonical state는 Autogora에 있다. 대화 기록에만 결정이나 작업 결과를 남기지 말고 카드 본문, comment, completion summary, metadata 또는 artifact에 durable handoff를 남긴다.
+Autogora의 보드 상태를 작업의 기준으로 삼는다. 결정과 결과를 대화 기록에만 두지 말고 카드 본문, comment, completion summary, metadata 또는 artifact에 지속 가능한 handoff로 남긴다.
