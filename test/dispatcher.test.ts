@@ -37,16 +37,23 @@ for (const runtime of ["claude", "codex", "cline", "gemini"] as const) {
         assert.equal(command.env.CLINE_TOOL_APPROVAL_MODE, "desktop");
         assert.match(command.args.join(" "), /--auto-approve false/);
         assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
-        assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
+        assert.match(command.args.at(-1) ?? "", /scoped TaskCircuit CLI bridge/);
       } else if (runtime === "gemini") {
         assert.match(command.args.join(" "), /--approval-mode default/);
         assert.match(command.args.join(" "), /--policy/);
         assert.match(command.policyFile?.content ?? "", /commandPrefix/);
         assert.match(command.policyFile?.content ?? "", /toolName = "mcp_\*"/);
         assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
-        assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
+        assert.match(command.args.at(-1) ?? "", /scoped TaskCircuit CLI bridge/);
       } else {
         assert.match(command.args.join(" "), /read-only|dontAsk/);
+        if (runtime === "claude") {
+          assert.match(command.args.join(" "), /taskcircuit/);
+          assert.match(command.args.join(" "), /mcp__taskcircuit__kanban_complete/);
+        } else {
+          assert.match(command.args.join(" "), /mcp_servers\.taskcircuit\.command/);
+          assert.match(command.args.join(" "), /mcp_servers\.taskcircuit\.required=true/);
+        }
       }
     } finally {
       store.close();

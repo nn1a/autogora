@@ -12,7 +12,7 @@ const prompt = process.argv.at(-1) ?? "";
 if (!process.argv.includes("--json") || process.argv.some((arg) => arg.includes("mcpServers"))) {
   throw new Error("Cline runner must use JSON mode without injected MCP configuration");
 }
-if (!prompt.includes("scoped Kanban CLI bridge")) throw new Error("Cline runner prompt is missing the CLI bridge");
+if (!prompt.includes("scoped TaskCircuit CLI bridge")) throw new Error("Cline runner prompt is missing the CLI bridge");
 
 const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
 const requestApproval = async (id, toolName, input) => {
@@ -35,7 +35,7 @@ const bridge = `${shellQuote(process.execPath)} ${shellQuote(cliEntry)}`;
 const allowed = await requestApproval("allowed", "run_commands", {
   commands: [`${bridge} show "$KANBAN_TASK_ID"`],
 });
-if (allowed.approved !== true) throw new Error("Scoped Kanban CLI command was not approved");
+if (allowed.approved !== true) throw new Error("Scoped TaskCircuit CLI command was not approved");
 const denied = await requestApproval("denied", "run_commands", { commands: ["touch /tmp/not-allowed"] });
 if (denied.approved !== false) throw new Error("Unrelated read-only shell command was not denied");
 
@@ -59,5 +59,5 @@ run(
 process.stdout.write(`${JSON.stringify({
   type: "run_result",
   finishReason: "completed",
-  text: "Completed through the scoped Kanban CLI bridge.",
+  text: "Completed through the scoped TaskCircuit CLI bridge.",
 })}\n`);

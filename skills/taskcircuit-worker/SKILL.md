@@ -1,13 +1,13 @@
 ---
-name: kanban-worker
-description: Execute a dispatcher-claimed task through the Kanban MCP or scoped CLI lifecycle. Use when a worker session has KANBAN_TASK_ID/KANBAN_RUN_ID scope or the user explicitly asks to work an assigned Kanban card; do not use for planning or routing unrelated cards.
+name: taskcircuit-worker
+description: Execute a dispatcher-claimed task through TaskCircuit MCP or its scoped CLI lifecycle. Use when a worker session has KANBAN_TASK_ID/KANBAN_RUN_ID scope or the user explicitly asks to work an assigned TaskCircuit card; do not use for planning or routing unrelated cards.
 ---
 
-# Kanban Worker
+# TaskCircuit Worker
 
-Treat Kanban as the canonical task state. Finish the assigned work and leave a durable, verifiable handoff.
+Treat TaskCircuit as the canonical task state. Finish the assigned work and leave a durable, verifiable handoff.
 
-Use the MCP tools when they are available. In an MCP-disabled Cline worker or an isolated Gemini dispatcher run, use the exact scoped Kanban CLI bridge commands included in the dispatcher prompt; the environment already carries board, task, run, database, and claim-token scope.
+Use the MCP tools when they are available. In an MCP-disabled Cline worker or an isolated Gemini dispatcher run, use the exact scoped TaskCircuit CLI bridge commands included in the dispatcher prompt; the environment already carries board, task, run, database, and claim-token scope.
 
 ## Workflow
 

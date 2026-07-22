@@ -1,4 +1,4 @@
-# Hermes Kanban 실전 워크플로 가이드
+# TaskCircuit 실전 워크플로 가이드
 
 이 문서는 처음 사용하는 사람이 아이디어를 `Triage`에 등록한 뒤 작업을 구체화하고, 에이전트에게 실행시키고, 검증 가능한 결과를 `Done`으로 남기는 방법을 설명한다. Web UI, CLI, MCP 중 어느 화면을 사용해도 같은 SQLite 상태와 전이 규칙을 사용한다.
 
@@ -190,7 +190,7 @@ node dist/cli.js create "CSV 내보내기 요구사항 정리" \
 MCP를 사용하는 Claude/Codex 대화 예제:
 
 ```text
-Kanban MCP를 사용해서 아래 요청을 product-web 보드의 triage 카드로 등록해줘.
+TaskCircuit MCP를 사용해서 아래 요청을 product-web 보드의 triage 카드로 등록해줘.
 아직 구현하지 말고, 결정되지 않은 사항과 기대 결과를 카드 본문에 구분해서 남겨줘.
 
 요청: 현재 검색 결과를 CSV로 내려받는 기능이 필요하다.
@@ -469,7 +469,7 @@ node dist/cli.js log "$TASK_ID"
 MCP 대화로 같은 흐름을 요청하는 예제:
 
 ```text
-Kanban MCP를 사용해 "검색 필터 초기화 버튼" 요청을 triage로 등록해줘.
+TaskCircuit MCP를 사용해 "검색 필터 초기화 버튼" 요청을 triage로 등록해줘.
 한 작업으로 끝낼 수 있으면 specify하고, implementer/codex에 배정해줘.
 완료 조건에는 키보드 접근성, 모바일 레이아웃, 관련 테스트를 포함해줘.
 계획만 만들고 직접 구현하지는 마.
@@ -616,7 +616,7 @@ node dist/cli.js unblock "$REVIEW_ID"
 ### 요청만 등록
 
 ```text
-Kanban MCP를 사용해 이 요청을 triage에 등록해줘.
+TaskCircuit MCP를 사용해 이 요청을 triage에 등록해줘.
 기존 중복 카드를 먼저 검색하고, 구현이나 claim은 하지 마.
 요청 원문, 미결정 사항, 기대 결과를 본문에 나눠서 써줘.
 ```
@@ -641,7 +641,7 @@ analyst/codex, implementer/codex, reviewer/claude 프로필만 사용하고,
 ### 보드 상태 점검
 
 ```text
-Kanban MCP로 현재 보드를 점검해줘.
+TaskCircuit MCP로 현재 보드를 점검해줘.
 오래된 Running, 원인 없는 Blocked, 담당자 없는 Todo, 부모가 끝났는데 Ready가 아닌 카드를 찾고
 상태를 임의로 바꾸지 말고 먼저 진단 결과와 권장 조치를 알려줘.
 ```
@@ -722,4 +722,4 @@ node dist/cli.js diagnostics
 node dist/cli.js watch --since 0 --follow
 ```
 
-보드의 canonical state는 Kanban에 있다. 대화 기록에만 결정이나 작업 결과를 남기지 말고 카드 본문, comment, completion summary, metadata 또는 artifact에 durable handoff를 남긴다.
+보드의 canonical state는 TaskCircuit에 있다. 대화 기록에만 결정이나 작업 결과를 남기지 말고 카드 본문, comment, completion summary, metadata 또는 artifact에 durable handoff를 남긴다.

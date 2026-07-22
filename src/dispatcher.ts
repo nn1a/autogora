@@ -86,13 +86,13 @@ function shellQuote(value: string): string {
 
 function workerPrompt(claim: ClaimedTask, cliEntry: string): string {
   const { task } = claim.task;
-  const instructions = [`You are the assigned Kanban worker for ${task.id}.`];
+  const instructions = [`You are the assigned TaskCircuit worker for ${task.id}.`];
   if (task.runtime === "cline" || task.runtime === "gemini") {
     const bridge = `${shellQuote(process.execPath)} ${shellQuote(resolve(cliEntry))}`;
     instructions.push(
       task.runtime === "cline"
-        ? "MCP is unavailable in this Cline build. Use only the scoped Kanban CLI bridge for task lifecycle communication."
-        : "Use only the scoped Kanban CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.",
+        ? "MCP is unavailable in this Cline build. Use only the scoped TaskCircuit CLI bridge for task lifecycle communication."
+        : "Use only the scoped TaskCircuit CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.",
       `First run ${bridge} show "$KANBAN_TASK_ID". For long work run ${bridge} heartbeat "$KANBAN_TASK_ID" --note "progress".`,
       `Record handoffs with ${bridge} comment "$KANBAN_TASK_ID" "message".`,
       `Finish exactly once with ${bridge} complete "$KANBAN_TASK_ID" --summary "summary" or ${bridge} block "$KANBAN_TASK_ID" "reason" --kind needs_input.`,
@@ -172,11 +172,11 @@ export function buildRunnerCommand(
         "-C",
         cwd,
         "-c",
-        `mcp_servers.kanban.command=${codexConfigString(process.execPath)}`,
+        `mcp_servers.taskcircuit.command=${codexConfigString(process.execPath)}`,
         "-c",
-        `mcp_servers.kanban.args=${JSON.stringify(serverArgs)}`,
+        `mcp_servers.taskcircuit.args=${JSON.stringify(serverArgs)}`,
         "-c",
-        "mcp_servers.kanban.required=true",
+        "mcp_servers.taskcircuit.required=true",
         prompt,
       ],
     };
@@ -185,15 +185,15 @@ export function buildRunnerCommand(
   if (task.runtime === "claude") {
     const mcpConfig = JSON.stringify({
       mcpServers: {
-        kanban: { type: "stdio", command: process.execPath, args: serverArgs },
+        taskcircuit: { type: "stdio", command: process.execPath, args: serverArgs },
       },
     });
     const lifecycleTools = [
-      "mcp__kanban__kanban_show",
-      "mcp__kanban__kanban_comment",
-      "mcp__kanban__kanban_heartbeat",
-      "mcp__kanban__kanban_complete",
-      "mcp__kanban__kanban_block",
+      "mcp__taskcircuit__kanban_show",
+      "mcp__taskcircuit__kanban_comment",
+      "mcp__taskcircuit__kanban_heartbeat",
+      "mcp__taskcircuit__kanban_complete",
+      "mcp__taskcircuit__kanban_block",
     ];
     const builtInTools = options.allowWrites
       ? ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "Skill"]
@@ -577,7 +577,7 @@ function startToolApprovalBroker(policy: NonNullable<RunnerCommand["toolApproval
         const decisionName = name.replace(".request.", ".decision.");
         writeFileSync(join(policy.directory, decisionName), `${JSON.stringify({
           approved,
-          reason: approved ? "Approved by the scoped Kanban read-only policy" : "Denied by the scoped Kanban read-only policy",
+          reason: approved ? "Approved by the scoped TaskCircuit read-only policy" : "Denied by the scoped TaskCircuit read-only policy",
         })}\n`, "utf8");
         handled.add(name);
       } catch {
@@ -727,7 +727,7 @@ async function runClaim(
     }
 
     const detail = execution.spawnError?.message ??
-      `Runner exited without a terminal Kanban call (code=${execution.code}, signal=${execution.signal ?? "none"})`;
+      `Runner exited without a terminal TaskCircuit call (code=${execution.code}, signal=${execution.signal ?? "none"})`;
     if (execution.timedOut || (maxRuntimeMs !== null && maxRuntimeMs <= 0)) {
       store.failRun(scope, detail, { outcome: "timed_out", failureLimit: options.failureLimit });
       options.onLog?.(`requeue/fail ${taskId}: ${detail}`);

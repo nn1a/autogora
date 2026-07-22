@@ -40,6 +40,8 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     const html = await fetch(`${dashboard.url}/`, { headers: sessionHeaders });
     assert.equal(html.status, 200);
     const htmlText = await html.text();
+    assert.match(htmlText, /<title>TaskCircuit<\/title>/);
+    assert.match(htmlText, /<strong>TaskCircuit<\/strong>/);
     assert.match(htmlText, /<option>gemini<\/option>/);
     assert.match(htmlText, /id="theme-toggle"/);
     assert.match(htmlText, /role="dialog" aria-modal="true" aria-label="Task details"/);

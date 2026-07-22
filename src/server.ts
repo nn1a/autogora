@@ -118,11 +118,11 @@ function usingStore<T>(
 
 export function createKanbanServer(manager: BoardManager): McpServer {
   const server = new McpServer(
-    { name: "hermes-kanban-mcp", version: "0.1.0" },
+    { name: "taskcircuit", version: "0.1.0" },
     {
       capabilities: { logging: {} },
       instructions:
-        "Use this server as the canonical Kanban state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with kanban_complete or kanban_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it.",
+        "Use TaskCircuit as the canonical task state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with kanban_complete or kanban_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it.",
     },
   );
 

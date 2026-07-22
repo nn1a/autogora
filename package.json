@@ -1,11 +1,11 @@
 {
-  "name": "hermes-kanban-mcp",
+  "name": "taskcircuit",
   "version": "0.1.0",
   "private": true,
-  "description": "A durable local Kanban MCP server and Claude/Codex/Cline/Gemini worker dispatcher.",
+  "description": "A durable local agent task control plane for Claude, Codex, Cline, and Gemini.",
   "type": "module",
   "bin": {
-    "kanban-mcp": "dist/cli.js"
+    "taskcircuit": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

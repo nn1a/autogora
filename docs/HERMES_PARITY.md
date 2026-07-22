@@ -1,4 +1,4 @@
-# Hermes Kanban parity contract
+# TaskCircuit Hermes Kanban parity contract
 
 This project targets the shipped, single-host Hermes Kanban feature set while
 using Claude Code, Codex, Cline, and Gemini CLI as worker runtimes. Cline can operate through

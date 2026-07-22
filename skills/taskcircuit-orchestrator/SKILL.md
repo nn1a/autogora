@@ -1,11 +1,11 @@
 ---
-name: kanban-orchestrator
-description: Decompose a goal into durable Kanban tasks, assignees, runtimes, workspaces, and acyclic dependencies. Use for planning or routing multi-step work across Claude, Codex, Cline, and Gemini workers; do not use to implement claimed worker tasks.
+name: taskcircuit-orchestrator
+description: Decompose a goal into durable TaskCircuit tasks, assignees, runtimes, workspaces, and acyclic dependencies. Use for planning or routing multi-step work across Claude, Codex, Cline, and Gemini workers; do not use to implement claimed worker tasks.
 ---
 
-# Kanban Orchestrator
+# TaskCircuit Orchestrator
 
-Use Kanban MCP to turn a goal into a small dependency graph that workers can execute without hidden context.
+Use TaskCircuit MCP to turn a goal into a small dependency graph that workers can execute without hidden context.
 
 ## Workflow
 

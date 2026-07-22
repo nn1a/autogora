@@ -1,11 +1,11 @@
-# Replace /absolute/path/to/kanban with this repository's absolute path.
-[mcp_servers.kanban]
+# Replace /absolute/path/to/taskcircuit with this repository's absolute path.
+[mcp_servers.taskcircuit]
 command = "node"
 args = [
-  "/absolute/path/to/kanban/dist/cli.js",
+  "/absolute/path/to/taskcircuit/dist/cli.js",
   "serve",
   "--db",
-  "/absolute/path/to/kanban/data/kanban.db",
+  "/absolute/path/to/taskcircuit/data/kanban.db",
 ]
 required = true
 startup_timeout_sec = 10

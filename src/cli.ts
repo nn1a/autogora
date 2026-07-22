@@ -31,7 +31,7 @@ import {
   type WorkerRuntime,
 } from "./types.js";
 
-const HELP = `kanban-mcp <command> [options]
+const HELP = `taskcircuit <command> [options]
 
 Commands:
   serve                 Run the stdio MCP server
@@ -1272,6 +1272,6 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`kanban-mcp: ${message}\n`);
+  process.stderr.write(`taskcircuit: ${message}\n`);
   process.exitCode = 1;
 });

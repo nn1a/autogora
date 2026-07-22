@@ -23,7 +23,7 @@ if (!process.argv.includes("--skip-trust") || !process.argv.includes("none")) {
 if (!policy.includes("commandPrefix") || !policy.includes('toolName = "mcp_*"')) {
   throw new Error("Gemini worker must narrowly allow the bridge and deny MCP tools");
 }
-if (!prompt.includes("scoped Kanban CLI bridge")) throw new Error("Gemini worker prompt is missing the CLI bridge");
+if (!prompt.includes("scoped TaskCircuit CLI bridge")) throw new Error("Gemini worker prompt is missing the CLI bridge");
 
 const run = (...args) => execFileSync(process.execPath, [cliEntry, ...args], {
   env: process.env,

@@ -2,10 +2,10 @@
 
 Gemini CLI can use this project in two independent ways:
 
-1. Interactive sessions can register the Kanban stdio MCP server:
+1. Interactive sessions can register the TaskCircuit stdio MCP server:
 
    ```bash
-   gemini mcp add --scope project kanban node "$PWD/dist/cli.js" serve -- \
+   gemini mcp add --scope project taskcircuit node "$PWD/dist/cli.js" serve -- \
      --db "$PWD/data/kanban.db"
    ```
 
@@ -27,7 +27,7 @@ must match `KANBAN_DB`, `KANBAN_BOARD`, `KANBAN_TASK_ID`, `KANBAN_RUN_ID`, and
 
 Read-only dispatch is the default. A temporary Gemini policy denies MCP tools
 and denies `run_shell_command` except when its command begins with the exact
-Kanban CLI bridge prefix. The policy file is created immediately before the
+TaskCircuit CLI bridge prefix. The policy file is created immediately before the
 process starts and deleted when it exits. Extensions are disabled for the run.
 Use `--allow-writes` only for a trusted workspace; it selects Gemini's `yolo`
 approval mode, whose sandbox behavior remains controlled by the installed

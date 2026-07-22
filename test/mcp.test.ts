@@ -16,10 +16,10 @@ function textPayload(result: Awaited<ReturnType<Client["callTool"]>>): unknown {
 }
 
 test("stdio MCP administration can route work across Claude, Codex, Cline, and Gemini", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "kanban-mcp-"));
+  const directory = mkdtempSync(join(tmpdir(), "taskcircuit-mcp-"));
   const dbPath = join(directory, "kanban.db");
   new BoardManager(dbPath).create("project");
-  const client = new Client({ name: "kanban-test-client", version: "1.0.0" });
+  const client = new Client({ name: "taskcircuit-test-client", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [resolve("dist/cli.js"), "serve", "--db", dbPath],

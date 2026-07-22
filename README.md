@@ -1,6 +1,6 @@
-# Hermes-style Kanban MCP MVP
+# TaskCircuit
 
-A local, durable Kanban control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
+A local, durable agent work control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. TaskCircuit provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, planning, a dispatcher, and an authenticated Web UI.
 
 한국어 사용 안내는 [Triage에서 Done까지의 실전 워크플로 가이드](docs/WORKFLOW_KO.md)를 참고하세요. Web UI 화면과 간단한 기능 구현, 코드 분석 후 문서화, 분석 → 구현 → 리뷰 예제를 포함합니다.
 
@@ -20,21 +20,21 @@ node dist/cli.js init
 Connect Claude Code:
 
 ```bash
-claude mcp add --scope local kanban -- \
+claude mcp add --scope local taskcircuit -- \
   node "$PWD/dist/cli.js" serve --db "$PWD/data/kanban.db"
 ```
 
 Connect Codex:
 
 ```bash
-codex mcp add kanban -- \
+codex mcp add taskcircuit -- \
   node "$PWD/dist/cli.js" serve --db "$PWD/data/kanban.db"
 ```
 
 Connect Gemini CLI for interactive MCP use:
 
 ```bash
-gemini mcp add --scope project kanban node "$PWD/dist/cli.js" serve -- \
+gemini mcp add --scope project taskcircuit node "$PWD/dist/cli.js" serve -- \
   --db "$PWD/data/kanban.db"
 ```
 
@@ -51,7 +51,7 @@ node dist/cli.js dispatch --once
 ```
 
 The dispatcher launches Cline with `--json`, `--cwd`, and `--auto-approve` and
-puts the exact scoped Kanban CLI commands in the worker prompt. The child
+puts the exact scoped TaskCircuit CLI commands in the worker prompt. The child
 inherits `KANBAN_TASK_ID`, `KANBAN_RUN_ID`, `KANBAN_CLAIM_TOKEN`,
 `KANBAN_BOARD`, and `KANBAN_DB`; lifecycle commands validate that scope before
 changing state. The Cline build therefore needs shell-command support, but it
@@ -69,7 +69,7 @@ node dist/cli.js dispatch --once
 
 The dispatcher uses Gemini headless `stream-json` output and a temporary,
 run-scoped policy. Read-only runs allow Gemini's normal read/search tools, deny
-MCP tools and all shell commands except the exact Kanban lifecycle bridge.
+MCP tools and all shell commands except the exact TaskCircuit lifecycle bridge.
 `--allow-writes` is the explicit opt-in to Gemini `yolo` approval mode.
 
 ## Web dashboard and HTTP API
@@ -173,7 +173,7 @@ turn exits without a terminal lifecycle call, an independent structured-output j
 checks the card's title/body acceptance criteria. An incomplete card resumes
 the same Claude/Codex/Gemini session with the judge's next instruction. Stock Cline's
 headless JSON mode does not support prompt-based `--id` resume, so Cline goals
-continue in a fresh turn using the same workspace and durable Kanban handoff.
+continue in a fresh turn using the same workspace and durable TaskCircuit handoff.
 Acceptance completes the task; exhausting `goal_max_turns` blocks it for human
 review.
 
@@ -339,6 +339,11 @@ node dist/cli.js swarm "Design a multi-region failover plan" \
 
 ## MCP tools
 
+The product, package, CLI, and MCP registration name are `TaskCircuit`/`taskcircuit`.
+The established `kanban_*` tool names, `KANBAN_*` worker environment variables,
+session cookie, and default `kanban.db` filename remain unchanged for data and
+automation compatibility.
+
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
 - Boards: `kanban_boards_list`, `kanban_boards_create`, `kanban_boards_update`, `kanban_boards_switch`, `kanban_boards_remove`
 - Dispatch: `kanban_claim`
@@ -360,21 +365,21 @@ the global worker limit.
 
 The portable Agent Skills are under `skills/`:
 
-- `kanban-worker`: execute and close one claimed task
-- `kanban-orchestrator`: create an executable dependency graph
+- `taskcircuit-worker`: execute and close one claimed task
+- `taskcircuit-orchestrator`: create an executable dependency graph
 
 Install them into the client you use:
 
 ```bash
-cp -R skills/kanban-worker skills/kanban-orchestrator ~/.agents/skills/
-cp -R skills/kanban-worker skills/kanban-orchestrator ~/.claude/skills/
+cp -R skills/taskcircuit-worker skills/taskcircuit-orchestrator ~/.agents/skills/
+cp -R skills/taskcircuit-worker skills/taskcircuit-orchestrator ~/.claude/skills/
 ```
 
 Restart the client if it does not detect the new skills.
 
 ## Safety and scope
 
-- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust. Read-only Cline runs use the dispatcher approval broker; read-only Gemini runs use a temporary policy. Both permit only their normal read/search tools and the scoped Kanban CLI lifecycle bridge.
+- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust. Read-only Cline runs use the dispatcher approval broker; read-only Gemini runs use a temporary policy. Both permit only their normal read/search tools and the scoped TaskCircuit CLI lifecycle bridge.
 - The MCP server is local stdio only; there is no multi-user isolation.
 - The optional dashboard is authenticated but remains a trusted-local-user,
   single-tenant surface; its bearer token is not a substitute for TLS on an

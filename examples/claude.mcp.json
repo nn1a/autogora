@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "kanban": {
+    "taskcircuit": {
       "type": "stdio",
       "command": "node",
       "args": [
