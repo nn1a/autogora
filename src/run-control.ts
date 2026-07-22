@@ -24,10 +24,12 @@ export function terminateRun(store: KanbanStore, runId: string, reason = "Run te
   if (inspection.run.status !== "running" || inspection.task.currentRunId !== runId || inspection.task.status !== "running") {
     throw new Error(`Run is already terminal: ${inspection.run.status}`);
   }
-  const signaled = signalRunProcess(inspection.run.pid);
   const cleanReason = reason.trim() || "Run terminated administratively";
+  // Persist the termination intent before signaling so a dispatcher in another
+  // process cannot classify the resulting exit as a worker failure.
+  store.deferReclaim(runId, 15, cleanReason);
+  const signaled = signalRunProcess(inspection.run.pid);
   if (signaled) {
-    store.deferReclaim(runId, 15, cleanReason);
     return { runId, pid: inspection.run.pid, signaled, pending: true, task: store.getTask(inspection.task.id) };
   }
   const task = store.recoverAbandonedRun(runId, "reclaimed", cleanReason, false);

@@ -1127,7 +1127,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_unblock",
     {
       title: "Unblock Kanban task",
-      description: "Release a blocked task back to ready, or todo while a parent dependency remains open.",
+      description: "Release a blocked task back to ready, or todo while a prerequisite handoff remains open.",
       inputSchema: z.object({ task_id: z.string(), board: z.string().optional() }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
