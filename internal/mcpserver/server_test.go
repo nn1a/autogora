@@ -81,7 +81,7 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"kanban_create", "kanban_list", "kanban_show", "kanban_context", "kanban_graph", "kanban_diagnostics", "kanban_complete", "kanban_unlink", "kanban_schedule", "kanban_notify_subscribe", "kanban_swarm"} {
+	for _, expected := range []string{"kanban_create", "kanban_list", "kanban_show", "kanban_context", "kanban_graph", "kanban_diagnostics", "kanban_complete", "kanban_unlink", "kanban_schedule", "kanban_notify_subscribe", "kanban_specify", "kanban_decompose", "kanban_profile_describe_auto", "kanban_swarm"} {
 		found := false
 		for _, tool := range tools.Tools {
 			if tool.Name == expected {
@@ -149,5 +149,52 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	toolJSON(t, session, "kanban_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &completed)
 	if completed.Task.Status != model.TaskStatusDone || len(completed.Runs) != 1 || completed.Runs[0].Status != model.RunStatusCompleted {
 		t.Fatalf("scoped MCP lifecycle did not complete shared task: %+v", completed)
+	}
+}
+
+func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "kanban.db")
+	manager, err := boards.NewManager(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(ctx, "default", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	server, _ := New(manager, "test")
+	session, done := connectTestServer(t, server)
+	defer closeTestServer(t, session, done)
+
+	var rough struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "kanban_create", map[string]any{"title": "rough", "status": "triage"}, &rough)
+	var specified struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "kanban_specify", map[string]any{"task_id": rough.Task.ID, "title": "Precise", "body": "Acceptance: pass"}, &specified)
+	if specified.Task.Status != model.TaskStatusTodo || specified.Task.Title != "Precise" {
+		t.Fatalf("unexpected specified task: %+v", specified.Task)
+	}
+
+	var root struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "kanban_create", map[string]any{"title": "rough graph", "status": "triage"}, &root)
+	plan := map[string]any{
+		"fanout": true, "rootTitle": "Coordinate", "rootBody": "Verify output", "reason": "parallel",
+		"tasks":        []any{map[string]any{"key": "child", "title": "Implement", "body": "Deliver", "assignee": "worker", "runtime": "codex", "priority": 1, "skills": []any{}}},
+		"dependencies": []any{},
+	}
+	var decomposed struct {
+		Fanout bool `json:"fanout"`
+		Graph  struct {
+			ChildIDs []string `json:"childIds"`
+		} `json:"graph"`
+	}
+	toolJSON(t, session, "kanban_decompose", map[string]any{"task_id": root.Task.ID, "default_profile": map[string]any{"name": "worker", "runtime": "codex"}, "plan": plan}, &decomposed)
+	if !decomposed.Fanout || len(decomposed.Graph.ChildIDs) != 1 {
+		t.Fatalf("unexpected decomposition: %+v", decomposed)
 	}
 }

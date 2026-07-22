@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nn1a/kanban/internal/boards"
 	"github.com/nn1a/kanban/internal/maintenance"
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/notifications"
+	"github.com/nn1a/kanban/internal/orchestration"
 	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
 	"github.com/nn1a/kanban/internal/workspace"
@@ -44,17 +46,39 @@ type notificationListInput struct {
 }
 
 type specifyInput struct {
-	Board  string `json:"board,omitempty"`
-	TaskID string `json:"task_id"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	Author string `json:"author,omitempty"`
+	Board            string        `json:"board,omitempty"`
+	TaskID           string        `json:"task_id"`
+	Title            *string       `json:"title,omitempty"`
+	Body             *string       `json:"body,omitempty"`
+	Author           string        `json:"author,omitempty"`
+	PlannerRuntime   model.Runtime `json:"planner_runtime,omitempty"`
+	PlannerTimeoutMS int           `json:"planner_timeout_ms,omitempty"`
 }
 
 type profileRoute struct {
 	Name        string        `json:"name"`
 	Runtime     model.Runtime `json:"runtime"`
 	Description string        `json:"description,omitempty"`
+}
+
+type decomposeInput struct {
+	Board               string                           `json:"board,omitempty"`
+	TaskID              string                           `json:"task_id"`
+	Profiles            []orchestration.ProfileRoute     `json:"profiles,omitempty"`
+	DefaultProfile      orchestration.ProfileRoute       `json:"default_profile"`
+	OrchestratorProfile *orchestration.ProfileRoute      `json:"orchestrator_profile,omitempty"`
+	AutoPromoteChildren *bool                            `json:"auto_promote_children,omitempty"`
+	Plan                *orchestration.DecompositionPlan `json:"plan,omitempty"`
+	PlannerRuntime      model.Runtime                    `json:"planner_runtime,omitempty"`
+	PlannerTimeoutMS    int                              `json:"planner_timeout_ms,omitempty"`
+}
+
+type profileDescribeInput struct {
+	Board            string        `json:"board,omitempty"`
+	Name             string        `json:"name"`
+	Runtime          model.Runtime `json:"runtime"`
+	PlannerRuntime   model.Runtime `json:"planner_runtime,omitempty"`
+	PlannerTimeoutMS int           `json:"planner_timeout_ms,omitempty"`
 }
 
 type swarmInput struct {
@@ -199,6 +223,30 @@ func optionalInt(value *int) store.OptionalInt {
 	return store.OptionalInt{Set: true, Value: value}
 }
 
+func validPlannerRuntime(runtime model.Runtime) bool {
+	return runtime == model.RuntimeClaude || runtime == model.RuntimeCodex || runtime == model.RuntimeCline || runtime == model.RuntimeGemini
+}
+
+func (s *Service) planner(runtime model.Runtime, timeoutMS int) (orchestration.Planner, error) {
+	if runtime == "" {
+		runtime = model.RuntimeCodex
+	}
+	if !validPlannerRuntime(runtime) {
+		return nil, fmt.Errorf("invalid planner runtime: %s", runtime)
+	}
+	if timeoutMS == 0 {
+		timeoutMS = 120_000
+	}
+	if timeoutMS < 1_000 || timeoutMS > 600_000 {
+		return nil, errors.New("planner_timeout_ms must be between 1000 and 600000")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: runtime, CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: s.getenv})
+}
+
 func (s *Service) registerMutations(server *mcp.Server) {
 	addTool(server, "kanban_notify_deliver", "Deliver pending Kanban notifications", "Claim and deliver pending terminal events through registered adapters.", false, false, false, true, func(ctx context.Context, input notificationDeliveryInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
@@ -293,16 +341,118 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		})
 		return map[string]any{"taskId": input.TaskID, "unsubscribed": removed}, err
 	})
-	addTool(server, "kanban_specify", "Specify a Kanban triage task", "Apply an explicit executable title and body to a triage task.", false, false, false, false, func(ctx context.Context, input specifyInput) (any, error) {
+	addTool(server, "kanban_specify", "Specify a Kanban triage task", "Rewrite a rough triage card into an executable specification with explicit input or a constrained CLI planner.", false, false, false, true, func(ctx context.Context, input specifyInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(input.Title) == "" || strings.TrimSpace(input.Body) == "" {
+		if (input.Title == nil) != (input.Body == nil) {
 			return nil, errors.New("title and body must be provided together")
 		}
+		var explicit *orchestration.SpecificationPlan
+		var planner orchestration.Planner
+		if input.Title != nil {
+			explicit = &orchestration.SpecificationPlan{Title: *input.Title, Body: *input.Body}
+		} else {
+			var err error
+			planner, err = s.planner(input.PlannerRuntime, input.PlannerTimeoutMS)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
-			return opened.SpecifyTask(ctx, input.TaskID, input.Title, input.Body, input.Author)
+			return orchestration.SpecifyTriageTask(ctx, opened, input.TaskID, planner, explicit, input.Author)
 		})
+	})
+	addTool(server, "kanban_decompose", "Decompose a Kanban triage task", "Use an explicit or constrained CLI planner-generated plan to atomically create and route an acyclic child task graph.", false, false, false, true, func(ctx context.Context, input decomposeInput) (any, error) {
+		if err := s.requireAdmin(); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(input.DefaultProfile.Name) == "" || !validPlannerRuntime(input.DefaultProfile.Runtime) {
+			return nil, errors.New("default_profile requires a name and worker runtime")
+		}
+		var planner orchestration.Planner
+		if input.Plan == nil {
+			var err error
+			planner, err = s.planner(input.PlannerRuntime, input.PlannerTimeoutMS)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) {
+			autoPromote := input.AutoPromoteChildren
+			if autoPromote == nil {
+				metadata, err := s.manager.Read(board)
+				if err != nil {
+					return nil, err
+				}
+				value := metadata.Orchestration.AutoPromoteChildren
+				autoPromote = &value
+			}
+			return orchestration.DecomposeTriageTask(ctx, opened, input.TaskID, orchestration.DecomposeOptions{
+				Profiles: input.Profiles, DefaultProfile: input.DefaultProfile, OrchestratorProfile: input.OrchestratorProfile,
+				AutoPromoteChildren: autoPromote, Planner: planner, Plan: input.Plan,
+			})
+		})
+	})
+	addTool(server, "kanban_profile_describe_auto", "Describe a Kanban routing profile", "Generate and persist a concise board routing description from prior task evidence.", false, false, false, true, func(ctx context.Context, input profileDescribeInput) (any, error) {
+		if err := s.requireAdmin(); err != nil {
+			return nil, err
+		}
+		input.Name = strings.TrimSpace(input.Name)
+		if input.Name == "" || !validPlannerRuntime(input.Runtime) {
+			return nil, errors.New("name and a worker runtime are required")
+		}
+		board, err := s.selectedBoard(input.Board)
+		if err != nil {
+			return nil, err
+		}
+		metadata, err := s.manager.Read(board)
+		if err != nil {
+			return nil, err
+		}
+		plannerRuntime := input.PlannerRuntime
+		if plannerRuntime == "" {
+			plannerRuntime = metadata.Orchestration.PlannerRuntime
+		}
+		planner, err := s.planner(plannerRuntime, input.PlannerTimeoutMS)
+		if err != nil {
+			return nil, err
+		}
+		opened, err := s.manager.OpenStore(ctx, board)
+		if err != nil {
+			return nil, err
+		}
+		defer opened.Close()
+		existingDescription := ""
+		for _, profile := range metadata.Orchestration.Profiles {
+			if profile.Name == input.Name {
+				existingDescription = profile.Description
+				break
+			}
+		}
+		tasks, err := opened.ListTasks(ctx, store.ListTaskFilter{Assignee: input.Name, IncludeArchived: true, Limit: 50})
+		if err != nil {
+			return nil, err
+		}
+		evidence := make([]orchestration.ProfileEvidence, 0, len(tasks))
+		for _, task := range tasks {
+			evidence = append(evidence, orchestration.ProfileEvidence{Title: task.Title, Body: task.Body, Skills: task.Skills})
+		}
+		described, err := orchestration.DescribeProfileRoute(ctx, orchestration.ProfileRoute{Name: input.Name, Runtime: input.Runtime, Description: existingDescription}, evidence, planner)
+		if err != nil {
+			return nil, err
+		}
+		profiles := make([]boards.Profile, 0, len(metadata.Orchestration.Profiles)+1)
+		for _, profile := range metadata.Orchestration.Profiles {
+			if profile.Name != input.Name {
+				profiles = append(profiles, profile)
+			}
+		}
+		profiles = append(profiles, boards.Profile{Name: described.Name, Runtime: described.Runtime, Description: described.Description})
+		if _, err := s.manager.Update(board, boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
+			return nil, err
+		}
+		return described, nil
 	})
 	addTool(server, "kanban_swarm", "Create a Kanban swarm", "Create a completed blackboard, parallel workers, verifier, and synthesizer.", false, false, false, false, func(ctx context.Context, input swarmInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
