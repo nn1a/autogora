@@ -196,6 +196,113 @@ func TestDependencyLifecycleAndRealWorldGraphEdits(t *testing.T) {
 	}
 }
 
+func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root, err := store.CreateTask(ctx, CreateTaskInput{Title: "rough goal", Status: model.TaskStatusTriage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := "worker"
+	result, err := store.ApplyTaskGraph(ctx, TaskGraphInput{
+		RootTaskID: root.Task.ID, RootTitle: "Analyzed goal", RootBody: "A verifiable execution plan.",
+		OrchestratorAssignee: "orchestrator", OrchestratorRuntime: model.RuntimeCodex,
+		Nodes: []TaskGraphNode{
+			{Key: "research", Title: "Research", Body: "Collect evidence", Assignee: worker, Runtime: model.RuntimeCodex},
+			{Key: "report", Title: "Report", Body: "Write report", Assignee: worker, Runtime: model.RuntimeClaude},
+		},
+		Dependencies: []TaskGraphDependency{{Parent: "research", Child: "report"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ChildIDs) != 2 || len(result.LeafIDs) != 1 || result.LeafIDs[0] != result.TasksByKey["report"] {
+		t.Fatalf("unexpected graph result: %+v", result)
+	}
+	if result.Root.Task.Status != model.TaskStatusTodo || result.Root.Task.Assignee == nil || *result.Root.Task.Assignee != "orchestrator" {
+		t.Fatalf("root was not converted into orchestrator: %+v", result.Root.Task)
+	}
+	if result.RelationshipGraph.TotalPhases != 3 || len(result.Root.Subtasks) != 2 {
+		t.Fatalf("graph topology mismatch: %+v", result.RelationshipGraph)
+	}
+
+	cyclic, err := store.CreateTask(ctx, CreateTaskInput{Title: "bad graph", Status: model.TaskStatusTriage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Stats(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ApplyTaskGraph(ctx, TaskGraphInput{
+		RootTaskID: cyclic.Task.ID, OrchestratorAssignee: "orchestrator", OrchestratorRuntime: model.RuntimeCodex,
+		Nodes: []TaskGraphNode{
+			{Key: "a", Title: "A", Body: "A", Assignee: worker, Runtime: model.RuntimeCodex},
+			{Key: "b", Title: "B", Body: "B", Assignee: worker, Runtime: model.RuntimeCodex},
+		},
+		Dependencies: []TaskGraphDependency{{Parent: "a", Child: "b"}, {Parent: "b", Child: "a"}},
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "cycle") {
+		t.Fatalf("cyclic graph was accepted: %v", err)
+	}
+	after, err := store.Stats(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Total != before.Total {
+		t.Fatalf("failed graph left partial children: before=%d after=%d", before.Total, after.Total)
+	}
+}
+
+func TestCreateSwarmBuildsParallelWorkersAndOrderedReview(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := store.CreateSwarm(ctx, SwarmInput{
+		Goal:        "Design failover",
+		Workers:     []SwarmRoute{{Assignee: "researcher", Runtime: model.RuntimeCodex}, {Assignee: "architect", Runtime: model.RuntimeClaude}},
+		Verifier:    SwarmRoute{Assignee: "reviewer", Runtime: model.RuntimeClaude},
+		Synthesizer: SwarmRoute{Assignee: "writer", Runtime: model.RuntimeCodex},
+		Blackboard:  map[string]any{"region": "ap-northeast"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Root.Task.Status != model.TaskStatusDone || len(result.Root.Comments) != 1 || len(result.Root.Subtasks) != 4 {
+		t.Fatalf("invalid swarm root: %+v", result.Root)
+	}
+	for _, workerID := range result.WorkerIDs {
+		worker, err := store.GetTask(ctx, workerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if worker.Task.Status != model.TaskStatusReady || worker.ParentTask == nil || worker.ParentTask.ID != result.Root.Task.ID {
+			t.Fatalf("worker is not immediately runnable: %+v", worker)
+		}
+	}
+	verifier, err := store.GetTask(ctx, result.VerifierID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifier.Task.Status != model.TaskStatusTodo || len(verifier.Parents) != len(result.WorkerIDs) {
+		t.Fatalf("verifier dependencies mismatch: %+v", verifier)
+	}
+	synthesizer, err := store.GetTask(ctx, result.SynthesizerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if synthesizer.Task.Status != model.TaskStatusTodo || len(synthesizer.Parents) != 1 || synthesizer.Parents[0].ID != result.VerifierID {
+		t.Fatalf("synthesizer dependency mismatch: %+v", synthesizer)
+	}
+}
+
 func TestConcurrentClaimHasSingleWinner(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "claims.db"), "default", "")
