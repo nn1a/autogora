@@ -1,6 +1,6 @@
 # Autogora 설치 및 업그레이드
 
-Autogora은 Web UI와 SQLite 엔진을 포함한 단일 실행 파일이다. 사용하는 컴퓨터에는 Node.js, npm, Bun, Go, 별도 데이터베이스 서버가 필요하지 않다. Claude Code, Codex, 수정된 Cline, Gemini CLI는 실제 worker 또는 planner로 선택한 것만 설치하면 된다.
+Autogora는 Web UI와 SQLite 엔진을 포함한 단일 실행 파일이다. 사용하는 컴퓨터에는 Node.js, npm, Bun, Go, 별도 데이터베이스 서버가 필요하지 않다. Claude Code, Codex, 수정된 Cline, Gemini CLI는 실제 worker 또는 planner로 선택한 것만 설치하면 된다.
 
 ## 1. 릴리스 바이너리 설치
 
@@ -64,10 +64,22 @@ autogora dashboard
 
 대시보드 명령이 출력한 bootstrap URL을 브라우저에서 한 번 연다. URL 토큰은 HTTP-only 세션 쿠키로 교환되고 깨끗한 URL로 리다이렉트된다. 기본 주소는 `127.0.0.1:8420`이며 Web UI 파일은 바이너리에 포함되어 있다.
 
-기본 데이터 위치는 실행한 디렉터리를 기준으로 다음과 같다.
+기본 데이터는 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장된다. 프로젝트 이름과 Git common directory의 해시를 조합하므로 한 clone에 연결된 worktree들은 같은 상태를 공유하고, 서로 다른 clone은 분리된다. 프로젝트의 어느 하위 디렉터리에서든 다음 명령으로 실제 경로를 확인할 수 있다. `paths`는 디렉터리나 DB를 생성하지 않는다.
+
+```bash
+autogora paths
+```
+
+| 운영체제 | 기본 Autogora 데이터 루트 |
+| --- | --- |
+| Linux | `$XDG_DATA_HOME/autogora` 또는 `~/.local/share/autogora` |
+| macOS | `~/Library/Application Support/autogora` |
+| Windows | `%LOCALAPPDATA%\autogora` |
+
+프로젝트별 경로 내부는 다음 구조를 사용한다.
 
 ```text
-data/
+<app-data-root>/projects/<project-name>-<hash>/
 ├─ autogora.db
 ├─ attachments/
 ├─ logs/
@@ -75,11 +87,33 @@ data/
 └─ boards/<board-slug>/
 ```
 
-서비스나 에디터에서 작업 디렉터리가 달라질 수 있으면 `--db`에 절대 경로를 지정한다.
+전체 Autogora 데이터 루트를 다른 디스크로 옮기려면 절대 경로의 `AUTOGORA_DATA_HOME`을 설정한다. 특정 명령만 다른 DB로 연결하려면 `--db` 또는 `AUTOGORA_DB`를 사용한다. 우선순위는 `--db`, `AUTOGORA_DB`, 저장된 프로젝트별 위치, 운영체제 기본 위치 순서다.
 
 ```bash
-autogora dashboard --db /absolute/path/to/data/autogora.db
-autogora serve --db /absolute/path/to/data/autogora.db
+export AUTOGORA_DATA_HOME=/absolute/path/to/autogora-data
+autogora dashboard --db /absolute/path/to/autogora.db
+autogora serve --db /absolute/path/to/autogora.db
+```
+
+데이터가 반드시 저장소 디렉터리 안에 있어야 한다면 일반적인 `data/`나 `.git/` 내부 대신 프로젝트 루트의 `.autogora/`를 사용한다.
+
+```bash
+autogora init --data-dir .autogora
+autogora paths
+```
+
+Autogora는 `.autogora/.gitignore`에 `*`를 기록하여 SQLite DB와 WAL, 로그, 첨부파일, 작업 공간이 Git 상태에 나타나지 않게 한다. `.git` 내부 경로는 거부한다. 기본 위치로 돌아가려면 다음 명령을 사용한다.
+
+```bash
+autogora init --reset-data-dir
+```
+
+위치 변경은 기존 데이터를 이동하거나 삭제하지 않고 선택한 위치에 기본 보드를 초기화한다. 기존 상태를 이어서 사용하려면 실행 중인 dispatcher와 dashboard를 종료하고 전체 데이터 루트를 직접 복사한 후 위치를 변경한다.
+
+저장소 디렉터리 자체를 이동하면 절대 Git common directory가 달라져 새 프로젝트 ID와 빈 기본 위치가 선택된다. 기존 데이터는 삭제되지 않는다. 이전 `autogora paths`에서 확인한 `dataRoot`를 계속 사용하려면 이동한 저장소에서 다음과 같이 다시 연결한다.
+
+```bash
+autogora init --data-dir /absolute/previous/dataRoot
 ```
 
 ## 3. 권장 자동 설정: Skill 설치와 MCP 등록
@@ -148,7 +182,8 @@ autogora setup --client claude \
 
 ```bash
 AUTOGORA_BIN=$(command -v autogora)
-AUTOGORA_DB="$PWD/data/autogora.db"
+autogora paths  # 출력의 database 절대 경로를 아래에 사용한다.
+AUTOGORA_DB=/absolute/path/printed/by/autogora/paths
 
 claude mcp add --scope local autogora -- \
   "$AUTOGORA_BIN" serve --db "$AUTOGORA_DB"
@@ -232,7 +267,7 @@ UPX와 전체 inlining 비활성화는 기본 빌드에 사용하지 않는다. 
 ## 7. 업그레이드와 백업
 
 1. 실행 중인 `dashboard`와 `dispatch --watch` 프로세스를 정상 종료한다.
-2. `data/autogora.db`, `data/boards/`, `data/attachments/`를 백업한다.
+2. `autogora paths`로 확인한 `dataRoot` 전체를 백업한다.
 3. 새 아카이브의 체크섬을 검증한다.
 4. 기존 실행 파일만 새 바이너리로 교체한다.
 5. `autogora version`, `autogora diagnostics`를 실행하고 대시보드를 확인한다.

@@ -1,11 +1,6 @@
-data/
-.kanban/
 /bin/
 /release/
 /autogora
 /autogora.exe
+/.playwright-mcp/
 coverage.out
-*.log
-*.db
-*.db-shm
-*.db-wal

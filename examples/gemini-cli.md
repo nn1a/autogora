@@ -6,8 +6,10 @@ Gemini CLI can use this project in two independent ways:
 
    ```bash
    AUTOGORA_BIN=$(command -v autogora)
+   autogora paths # copy the printed database path
+   AUTOGORA_DB=/absolute/path/printed/by/autogora/paths
    gemini mcp add --scope project autogora "$AUTOGORA_BIN" serve -- \
-     --db "$PWD/data/autogora.db"
+     --db "$AUTOGORA_DB"
    ```
 
 2. The dispatcher can launch Gemini as a worker or auxiliary planner without

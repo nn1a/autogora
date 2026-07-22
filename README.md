@@ -36,6 +36,39 @@ costs outweigh the small raw-binary savings for this SQLite-backed service.
 Claude Code, Codex, Cline, and Gemini CLI are needed only for the worker or
 planner runtimes you actually select.
 
+## Project data location
+
+Autogora keeps mutable project state outside the Git worktree by default. A
+readable project name plus a hash of Git's common directory gives clones
+separate state while all linked worktrees of one clone share it. Run this from
+any directory in the project to inspect the exact paths without creating them:
+
+```bash
+autogora paths
+```
+
+The native roots are `$XDG_DATA_HOME/autogora` (or
+`~/.local/share/autogora`) on Linux,
+`~/Library/Application Support/autogora` on macOS, and
+`%LOCALAPPDATA%\autogora` on Windows. `AUTOGORA_DATA_HOME` can replace the
+app-data root with an absolute path.
+
+To deliberately keep state in the repository directory, initialize an ignored
+hidden directory:
+
+```bash
+autogora init --data-dir .autogora
+```
+
+Autogora writes `.autogora/.gitignore` so the database, WAL files, logs,
+attachments, and scratch workspaces do not affect Git. It rejects `.git`
+internal paths. `autogora init --reset-data-dir` selects and initializes the
+native default again; changing locations never moves or deletes existing data.
+An explicit `--db` or `AUTOGORA_DB` remains the highest-priority per-command
+override. Moving the repository itself produces a new path-based project ID;
+reconnect the old state with
+`autogora init --data-dir /absolute/previous/dataRoot` when that is intended.
+
 ## Set up an agent client
 
 Autogora embeds its worker and orchestrator Skills and can register its stdio
@@ -63,27 +96,29 @@ Resolve the installed executable once so the client receives an absolute path:
 
 ```bash
 AUTOGORA_BIN=$(command -v autogora)
+autogora paths  # copy the printed "database" value below
+AUTOGORA_DB=/absolute/path/printed/by/autogora/paths
 ```
 
 Connect Claude Code:
 
 ```bash
 claude mcp add --scope local autogora -- \
-  "$AUTOGORA_BIN" serve --db "$PWD/data/autogora.db"
+  "$AUTOGORA_BIN" serve --db "$AUTOGORA_DB"
 ```
 
 Connect Codex:
 
 ```bash
 codex mcp add autogora -- \
-  "$AUTOGORA_BIN" serve --db "$PWD/data/autogora.db"
+  "$AUTOGORA_BIN" serve --db "$AUTOGORA_DB"
 ```
 
 Connect Gemini CLI for interactive MCP use:
 
 ```bash
 gemini mcp add --scope project autogora "$AUTOGORA_BIN" serve -- \
-  --db "$PWD/data/autogora.db"
+  --db "$AUTOGORA_DB"
 ```
 
 The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json), [examples/codex.config.toml](examples/codex.config.toml), the [MCP-disabled Cline CLI bridge contract](examples/cline-cli-bridge.md), and the [Gemini CLI runtime guide](examples/gemini-cli.md).
@@ -198,7 +233,8 @@ runtime limits. They recover dead or stale workers, terminate tasks that exceed
 limit. Optional `--max-in-progress` and `--max-per-assignee` caps coordinate
 multiple dispatcher processes through the database.
 
-Worker output is stored next to the database under `data/logs/`.
+Worker output is stored under the resolved board `logsRoot` shown by
+`autogora paths`.
 
 Automation-friendly task fields are available through both the CLI and MCP:
 
@@ -228,8 +264,9 @@ review.
 ## Multiple boards
 
 Named boards isolate their database, workspaces, attachments, and logs. The
-`default` board retains `data/autogora.db`; named boards live under
-`data/boards/<slug>/`.
+default board uses `<data-root>/autogora.db`; named boards live under
+`<data-root>/boards/<slug>/`. `autogora paths --board <slug>` shows the exact
+locations.
 
 ```bash
 autogora boards create project-api \

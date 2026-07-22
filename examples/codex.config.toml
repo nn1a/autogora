@@ -4,7 +4,7 @@ command = "/absolute/path/to/autogora"
 args = [
   "serve",
   "--db",
-  "/absolute/path/to/project/data/autogora.db",
+  "/absolute/database/path/from-autogora-paths",
 ]
 required = true
 startup_timeout_sec = 10
