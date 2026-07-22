@@ -1,12 +1,12 @@
 {
   "mcpServers": {
-    "taskcircuit": {
+    "autogora": {
       "type": "stdio",
-      "command": "/absolute/path/to/taskcircuit",
+      "command": "/absolute/path/to/autogora",
       "args": [
         "serve",
         "--db",
-        "${CLAUDE_PROJECT_DIR}/data/taskcircuit.db"
+        "${CLAUDE_PROJECT_DIR}/data/autogora.db"
       ]
     }
   }

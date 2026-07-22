@@ -2,8 +2,8 @@ data/
 .kanban/
 /bin/
 /release/
-/taskcircuit
-/taskcircuit.exe
+/autogora
+/autogora.exe
 coverage.out
 *.log
 *.db

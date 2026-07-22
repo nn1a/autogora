@@ -1,10 +1,10 @@
 # Replace both absolute paths with the installed binary and project database.
-[mcp_servers.taskcircuit]
-command = "/absolute/path/to/taskcircuit"
+[mcp_servers.autogora]
+command = "/absolute/path/to/autogora"
 args = [
   "serve",
   "--db",
-  "/absolute/path/to/project/data/taskcircuit.db",
+  "/absolute/path/to/project/data/autogora.db",
 ]
 required = true
 startup_timeout_sec = 10

@@ -1,0 +1,10 @@
+interface:
+  display_name: "Autogora Worker"
+  short_description: "Execute and report a claimed Autogora task"
+  default_prompt: "Use $autogora-worker to execute the assigned task and report its lifecycle through Autogora MCP."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "autogora"
+      description: "Durable Autogora task and run lifecycle tools"
+      transport: "stdio"
