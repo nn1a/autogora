@@ -60,6 +60,8 @@ func setupCommandHelp(command string) string {
 		return initHelp
 	case "paths":
 		return pathsHelp
+	case "github":
+		return githubHelp
 	case "skills":
 		return skillsHelp
 	case "mcp":

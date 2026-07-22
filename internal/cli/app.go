@@ -26,6 +26,7 @@ Commands:
   paths                 Show resolved project data paths
   boards <action>       List, create, switch, show, rename, or remove boards
   create <title>        Create a task from the shell
+  github import         Import GitHub issues into Triage through gh CLI
   list                  List tasks
   show <task-id>        Show task details and bounded worker context
   graph <task-id>       Show hierarchy, dependencies, and execution phases
@@ -249,6 +250,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runPaths(opts)
 	case "create":
 		return a.runCreate(ctx, opts)
+	case "github":
+		return a.runGitHub(ctx, opts)
 	case "list":
 		return a.runList(ctx, opts)
 	case "show", "graph", "context", "runs", "log":

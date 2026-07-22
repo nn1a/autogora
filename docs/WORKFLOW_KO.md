@@ -63,6 +63,44 @@ autogora boards create product-web \
 
 Git 저장소를 보드의 기본 작업 디렉터리로 지정하고 작업별 경로를 생략하면 dispatcher는 격리된 worktree를 준비한다. 현재 디렉터리를 직접 수정해야 한다면 작업 생성 시 `--workspace "$PWD" --workspace-kind dir`를 명시한다.
 
+### GitHub issue를 Triage로 가져오기
+
+로그인된 `gh` CLI를 통해 GitHub issue를 바로 가져올 수 있다. 먼저 변경 없이 대상을 확인한 다음 가져온다.
+
+```bash
+autogora github import \
+  --repo nn1a/autogora \
+  --label bug \
+  --search "no:assignee sort:created-asc" \
+  --limit 20 \
+  --dry-run
+
+autogora github import \
+  --repo nn1a/autogora \
+  --label bug \
+  --search "no:assignee sort:created-asc" \
+  --limit 20
+```
+
+특정 issue만 가져올 때는 `--issue`를 반복해서 사용한다. `--issue`는 `--label`, `--search`, `--state`와 함께 사용할 수 없다.
+
+```bash
+autogora github import --repo nn1a/autogora --issue 42 --issue 57
+```
+
+GitHub Enterprise Server는 host를 포함한 저장소 이름을 `gh`에 전달한다. 해당 host에 먼저 로그인하거나 `GH_ENTERPRISE_TOKEN`을 설정한다.
+
+```bash
+gh auth login --hostname github.corp.example
+autogora github import \
+  --host github.corp.example \
+  --repo platform/control \
+  --tenant platform \
+  --board product-web
+```
+
+가져온 task는 `Triage`에서 시작한다. 본문과 URL 첨부에 원본 issue 주소가 남는다. 같은 issue를 다시 가져오면 활성 task를 중복 생성하지 않는다. dispatcher의 auto-decompose가 켜져 있으면 다음 tick에서 해당 task를 구체화한다.
+
 ### Web UI에서 한 작업을 끝내는 순서
 
 1. `Triage` 컬럼 제목의 `+`를 눌러 요청을 등록한다.

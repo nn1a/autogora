@@ -249,6 +249,27 @@ Run one worker in read-only mode:
 autogora dispatch --once
 ```
 
+Import open GitHub issues directly into Triage through the authenticated `gh`
+CLI. Repeating an import returns the existing active task instead of creating a
+duplicate; the source URL is retained in both the task body and attachments.
+
+```bash
+autogora github import --repo nn1a/autogora --label bug --limit 20
+autogora github import --repo nn1a/autogora --issue 42 --dry-run
+```
+
+GitHub Enterprise Server uses the same command with an explicit host. Autogora
+passes the fully qualified repository to `gh`, so credentials, custom TLS, and
+host selection remain under GitHub CLI configuration.
+
+```bash
+gh auth login --hostname github.corp.example
+autogora github import \
+  --host github.corp.example \
+  --repo platform/control \
+  --tenant platform
+```
+
 For a trusted coding workspace, explicitly allow writes:
 
 ```bash

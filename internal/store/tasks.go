@@ -464,16 +464,61 @@ func (s *Store) createTask(ctx context.Context, q querier, input CreateTaskInput
 }
 
 func (s *Store) CreateTask(ctx context.Context, input CreateTaskInput) (model.TaskDetail, error) {
+	detail, _, err := s.CreateTaskWithDisposition(ctx, input)
+	return detail, err
+}
+
+// CreateTaskWithDisposition atomically reports whether this call inserted the
+// task or resolved an existing active idempotency key.
+func (s *Store) CreateTaskWithDisposition(ctx context.Context, input CreateTaskInput) (model.TaskDetail, bool, error) {
 	var taskID string
+	created := true
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		if key := normalizedPointer(input.IdempotencyKey); key != nil {
+			err := tx.QueryRowContext(ctx,
+				"SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'",
+				orFallback(input.Board, s.board), *key,
+			).Scan(&taskID)
+			if err == nil {
+				created = false
+				return nil
+			}
+			if err != sql.ErrNoRows {
+				return err
+			}
+		}
 		var err error
 		taskID, err = s.createTask(ctx, tx, input)
 		return err
 	})
 	if err != nil {
-		return model.TaskDetail{}, err
+		return model.TaskDetail{}, false, err
 	}
-	return s.GetTask(ctx, taskID)
+	detail, err := s.GetTask(ctx, taskID)
+	return detail, created, err
+}
+
+// FindTaskByIdempotencyKey returns the active task previously created for an
+// external source. Archived tasks are intentionally ignored so an explicitly
+// retired import can be brought back as a new task.
+func (s *Store) FindTaskByIdempotencyKey(ctx context.Context, key string) (*model.TaskDetail, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, errors.New("idempotency key cannot be empty")
+	}
+	var taskID string
+	err := s.db.QueryRowContext(ctx,
+		"SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'",
+		s.board, key,
+	).Scan(&taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	detail, err := s.GetTask(ctx, taskID)
+	return &detail, err
 }
 
 func (s *Store) ListTasks(ctx context.Context, filter ListTaskFilter) ([]model.Task, error) {
