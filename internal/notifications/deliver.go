@@ -145,12 +145,12 @@ func WebhookAdapter(client *http.Client) Adapter {
 			return err
 		}
 		request.Header.Set("content-type", "application/json")
-		request.Header.Set("x-kanban-delivery-id", delivery.ID)
-		request.Header.Set("x-kanban-event", delivery.Event.Kind)
+		request.Header.Set("x-taskcircuit-delivery-id", delivery.ID)
+		request.Header.Set("x-taskcircuit-event", delivery.Event.Kind)
 		if delivery.Secret != nil {
 			digest := hmac.New(sha256.New, []byte(*delivery.Secret))
 			_, _ = digest.Write(body)
-			request.Header.Set("x-kanban-signature", "sha256="+hex.EncodeToString(digest.Sum(nil)))
+			request.Header.Set("x-taskcircuit-signature", "sha256="+hex.EncodeToString(digest.Sum(nil)))
 		}
 		response, err := client.Do(request)
 		if err != nil {

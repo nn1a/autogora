@@ -46,6 +46,3 @@ taskcircuit decompose <triage-task-id> \
 Cline has no native output-schema flag. The planner prompt contains the schema;
 the final NDJSON `run_result.text` or `agent_event` done text must be one JSON
 object. TaskCircuit parses and validates it before mutating the board.
-
-The legacy `KANBAN_*` variable names remain accepted for compatibility, but new
-integrations should use `TASKCIRCUIT_*`.

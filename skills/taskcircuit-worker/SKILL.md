@@ -11,13 +11,13 @@ Use the MCP tools when they are available. In an MCP-disabled Cline worker or an
 
 ## Workflow
 
-1. Call `kanban_show` without `task_id`. Read the body, `relationshipGraph`, `workerContext`, prerequisite results, comments, prior runs, and workspace constraints. The hierarchy identifies the parent goal and sibling subtasks; dependency phases identify enforced execution order.
-2. Work only on that task under `$TASKCIRCUIT_WORKSPACE`. Read task attachments from the absolute paths returned by `kanban_show`. Do not claim, create, reassign, link, unblock, or update unrelated cards.
-3. Work only on the current graph node. Do not implement sibling or downstream nodes; completing this node unlocks the dependents listed in the context. For long work, call `kanban_heartbeat` after meaningful checkpoints. Use `kanban_comment` for intermediate findings another run must retain.
+1. Call `taskcircuit_show` without `task_id`. Read the body, `relationshipGraph`, `workerContext`, prerequisite results, comments, prior runs, and workspace constraints. The hierarchy identifies the parent goal and sibling subtasks; dependency phases identify enforced execution order.
+2. Work only on that task under `$TASKCIRCUIT_WORKSPACE`. Read task attachments from the absolute paths returned by `taskcircuit_show`. Do not claim, create, reassign, link, unblock, or update unrelated cards.
+3. Work only on the current graph node. Do not implement sibling or downstream nodes; completing this node unlocks the dependents listed in the context. For long work, call `taskcircuit_heartbeat` after meaningful checkpoints. Use `taskcircuit_comment` for intermediate findings another run must retain.
 4. Verify the acceptance criteria. For code, run focused tests and inspect the final diff.
 5. For an ordinary card, terminate exactly once:
-   - Call `kanban_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$TASKCIRCUIT_WORKSPACE` and must exist.
-   - Call `kanban_block` with `kind=dependency`, `needs_input`, `capability`, or `transient` when work cannot continue.
+   - Call `taskcircuit_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$TASKCIRCUIT_WORKSPACE` and must exist.
+   - Call `taskcircuit_block` with `kind=dependency`, `needs_input`, `capability`, or `transient` when work cannot continue.
    For a goal-mode card whose acceptance criteria are not yet met, leave the run active and end the turn with a concise progress handoff. The dispatcher records an independent judgment and continues until acceptance or the turn budget is exhausted. Claude, Codex, and Gemini resume the session; Cline may start a fresh turn from the durable handoff.
 
 Do not finish an ordinary card with prose alone. A dispatcher treats that as a failed run.

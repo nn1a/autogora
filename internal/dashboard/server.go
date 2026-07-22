@@ -114,7 +114,7 @@ func requestToken(request *http.Request) string {
 	if authorization := request.Header.Get("Authorization"); strings.HasPrefix(authorization, "Bearer ") {
 		return strings.TrimPrefix(authorization, "Bearer ")
 	}
-	if cookie, err := request.Cookie("kanban_session"); err == nil {
+	if cookie, err := request.Cookie("taskcircuit_session"); err == nil {
 		return cookie.Value
 	}
 	return request.URL.Query().Get("token")
@@ -196,7 +196,7 @@ func (s *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) 
 			sendJSON(response, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
 			return
 		}
-		http.SetCookie(response, &http.Cookie{Name: "kanban_session", Value: s.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+		http.SetCookie(response, &http.Cookie{Name: "taskcircuit_session", Value: s.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 		response.Header().Set("Cache-Control", "no-store")
 		http.Redirect(response, request, "/", http.StatusFound)
 		return

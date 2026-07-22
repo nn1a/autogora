@@ -11,7 +11,7 @@ import (
 
 func TestTerminateRunPersistsIntentAndReclaimsMissingProcess(t *testing.T) {
 	ctx := context.Background()
-	opened, err := store.Open(filepath.Join(t.TempDir(), "kanban.db"), "default", "")
+	opened, err := store.Open(filepath.Join(t.TempDir(), "taskcircuit.db"), "default", "")
 	if err != nil {
 		t.Fatal(err)
 	}

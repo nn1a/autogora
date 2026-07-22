@@ -21,7 +21,7 @@ func durationValue(value time.Duration) *time.Duration { return &value }
 
 func testManager(t *testing.T) (*boards.Manager, string) {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "kanban.db")
+	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
 	manager, err := boards.NewManager(dbPath)
 	if err != nil {
 		t.Fatal(err)

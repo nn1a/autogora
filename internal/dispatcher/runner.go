@@ -56,23 +56,23 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 			instructions = append(instructions, "Use only the scoped TaskCircuit CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.")
 		}
 		instructions = append(instructions,
-			fmt.Sprintf(`First run %s show "$KANBAN_TASK_ID". For long work run %s heartbeat "$KANBAN_TASK_ID" --note "progress".`, bridge, bridge),
+			fmt.Sprintf(`First run %s show "$TASKCIRCUIT_TASK_ID". For long work run %s heartbeat "$TASKCIRCUIT_TASK_ID" --note "progress".`, bridge, bridge),
 			"Read relationshipGraph and workerContext from show. Work only on the current node; TaskCircuit has already enforced every prerequisite, and your completion will unlock listed dependents.",
-			fmt.Sprintf(`Record handoffs with %s comment "$KANBAN_TASK_ID" "message".`, bridge),
-			fmt.Sprintf(`Finish exactly once with %s complete "$KANBAN_TASK_ID" --summary "summary" or %s block "$KANBAN_TASK_ID" "reason" --kind needs_input.`, bridge, bridge),
+			fmt.Sprintf(`Record handoffs with %s comment "$TASKCIRCUIT_TASK_ID" "message".`, bridge),
+			fmt.Sprintf(`Finish exactly once with %s complete "$TASKCIRCUIT_TASK_ID" --summary "summary" or %s block "$TASKCIRCUIT_TASK_ID" "reason" --kind needs_input.`, bridge, bridge),
 			"The dispatcher scopes these commands to the active task and claim. Do not claim, create, reassign, unblock, or modify unrelated tasks.",
 		)
 	} else {
 		instructions = append(instructions,
-			"Call kanban_show first without a task_id. Work only on that task in the current workspace.",
-			"Read relationshipGraph and workerContext from kanban_show. Follow the recorded dependency phase; do not implement sibling or downstream tasks.",
-			"Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
+			"Call taskcircuit_show first without a task_id. Work only on that task in the current workspace.",
+			"Read relationshipGraph and workerContext from taskcircuit_show. Follow the recorded dependency phase; do not implement sibling or downstream tasks.",
+			"Use taskcircuit_heartbeat for long-running work. Record durable intermediate handoffs with taskcircuit_comment.",
 			"Do not claim, create, reassign, unblock, or modify unrelated tasks.",
 		)
 	}
 	if task.GoalMode {
 		instructions = append(instructions,
-			"This card is in goal mode. Call kanban_complete only when every acceptance criterion is demonstrably satisfied, or kanban_block for a real blocker.",
+			"This card is in goal mode. Call taskcircuit_complete only when every acceptance criterion is demonstrably satisfied, or taskcircuit_block for a real blocker.",
 		)
 		if task.Runtime == model.RuntimeCline {
 			instructions = append(instructions, "If meaningful work remains after this turn, leave the task running and end with a concise progress handoff; an independent judge may continue the goal in a fresh Cline turn.")
@@ -80,7 +80,7 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 			instructions = append(instructions, "If meaningful work remains after this turn, leave the task running and end your response with a concise progress handoff; an independent judge will continue this same session.")
 		}
 	} else {
-		instructions = append(instructions, "You must end exactly once by calling kanban_complete with verification evidence, or kanban_block with the concrete reason.")
+		instructions = append(instructions, "You must end exactly once by calling taskcircuit_complete with verification evidence, or taskcircuit_block with the concrete reason.")
 	}
 	if len(task.Skills) > 0 {
 		instructions = append(instructions, "Load and follow these task-specific skills before working: "+strings.Join(task.Skills, ", ")+".")
@@ -100,10 +100,9 @@ func workerBinary(options RunnerOptions, runtime model.Runtime) string {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	for _, name := range []string{"TASKCIRCUIT_" + strings.ToUpper(string(runtime)) + "_BIN", "KANBAN_" + strings.ToUpper(string(runtime)) + "_BIN"} {
-		if value := strings.TrimSpace(getenv(name)); value != "" {
-			return value
-		}
+	name := "TASKCIRCUIT_" + strings.ToUpper(string(runtime)) + "_BIN"
+	if value := strings.TrimSpace(getenv(name)); value != "" {
+		return value
 	}
 	return string(runtime)
 }
@@ -114,23 +113,13 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 	if task.Tenant != nil {
 		tenant = *task.Tenant
 	}
-	values := map[string]string{
+	return map[string]string{
 		"TASKCIRCUIT_DB": dbPath, "TASKCIRCUIT_BOARD": task.Board, "TASKCIRCUIT_TASK_ID": task.ID,
 		"TASKCIRCUIT_RUN_ID": run.ID, "TASKCIRCUIT_CLAIM_TOKEN": claim.ClaimToken, "TASKCIRCUIT_WORKER_ID": run.WorkerID,
 		"TASKCIRCUIT_TENANT": tenant, "TASKCIRCUIT_WORKSPACE": cwd, "TASKCIRCUIT_WORKSPACES_ROOT": options.WorkspaceRoot,
 		"TASKCIRCUIT_ATTACHMENTS_ROOT": options.AttachmentsRoot, "TASKCIRCUIT_LOGS_ROOT": options.LogsRoot,
 		"TASKCIRCUIT_CLI": options.CLIPath,
 	}
-	for key, value := range map[string]string{
-		"KANBAN_DB": dbPath, "KANBAN_BOARD": task.Board, "KANBAN_TASK_ID": task.ID, "KANBAN_RUN_ID": run.ID,
-		"KANBAN_CLAIM_TOKEN": claim.ClaimToken, "KANBAN_WORKER_ID": run.WorkerID, "KANBAN_TENANT": tenant,
-		"KANBAN_WORKSPACE": cwd, "KANBAN_WORKSPACES_ROOT": options.WorkspaceRoot, "KANBAN_ATTACHMENTS_ROOT": options.AttachmentsRoot,
-		"KANBAN_LOGS_ROOT": options.LogsRoot,
-		"KANBAN_CLI_ENTRY": options.CLIPath,
-	} {
-		values[key] = value
-	}
-	return values
 }
 
 func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionID string) (RunnerCommand, error) {
@@ -174,7 +163,7 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 		}}, nil
 	case model.RuntimeClaude:
 		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"taskcircuit": map[string]any{"type": "stdio", "command": cliPath, "args": serverArgs}}})
-		lifecycle := []string{"mcp__taskcircuit__kanban_show", "mcp__taskcircuit__kanban_comment", "mcp__taskcircuit__kanban_heartbeat", "mcp__taskcircuit__kanban_complete", "mcp__taskcircuit__kanban_block"}
+		lifecycle := []string{"mcp__taskcircuit__taskcircuit_show", "mcp__taskcircuit__taskcircuit_comment", "mcp__taskcircuit__taskcircuit_heartbeat", "mcp__taskcircuit__taskcircuit_complete", "mcp__taskcircuit__taskcircuit_block"}
 		builtins := []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"}
 		permission := "dontAsk"
 		if options.AllowWrites {

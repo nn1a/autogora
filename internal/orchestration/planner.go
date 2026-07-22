@@ -62,11 +62,7 @@ func (w *limitedBuffer) String() string { return w.buffer.String() }
 
 func plannerBinary(getenv func(string) string, runtime model.Runtime) string {
 	name := "TASKCIRCUIT_" + strings.ToUpper(string(runtime)) + "_BIN"
-	legacy := "KANBAN_" + strings.ToUpper(string(runtime)) + "_BIN"
 	if value := strings.TrimSpace(getenv(name)); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(getenv(legacy)); value != "" {
 		return value
 	}
 	return string(runtime)

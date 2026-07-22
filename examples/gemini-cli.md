@@ -7,7 +7,7 @@ Gemini CLI can use this project in two independent ways:
    ```bash
    TASKCIRCUIT_BIN=$(command -v taskcircuit)
    gemini mcp add --scope project taskcircuit "$TASKCIRCUIT_BIN" serve -- \
-     --db "$PWD/data/kanban.db"
+     --db "$PWD/data/taskcircuit.db"
    ```
 
 2. The dispatcher can launch Gemini as a worker or auxiliary planner without

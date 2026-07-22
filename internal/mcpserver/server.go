@@ -14,7 +14,7 @@ import (
 	"github.com/nn1a/kanban/internal/store"
 )
 
-const instructions = "Use TaskCircuit as the canonical task state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with kanban_complete or kanban_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it."
+const instructions = "Use TaskCircuit as the canonical task state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with taskcircuit_complete or taskcircuit_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it."
 
 type Service struct {
 	manager *boards.Manager
@@ -53,14 +53,14 @@ func (s *Service) env(names ...string) string {
 }
 
 func (s *Service) requireAdmin() error {
-	if s.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID") != "" {
+	if s.env("TASKCIRCUIT_TASK_ID") != "" {
 		return errors.New("dispatcher-scoped workers cannot plan, route, claim, or unblock board tasks")
 	}
 	return nil
 }
 
 func (s *Service) scopedTaskID(requested string) (string, error) {
-	pinned := s.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID")
+	pinned := s.env("TASKCIRCUIT_TASK_ID")
 	if pinned != "" && requested != "" && pinned != requested {
 		return "", errors.New("this worker is scoped to a different task")
 	}
@@ -74,8 +74,8 @@ func (s *Service) scopedTaskID(requested string) (string, error) {
 }
 
 func (s *Service) scopedRun(runID, claimToken string) (store.RunScope, error) {
-	pinnedRun := s.env("TASKCIRCUIT_RUN_ID", "KANBAN_RUN_ID")
-	pinnedToken := s.env("TASKCIRCUIT_CLAIM_TOKEN", "KANBAN_CLAIM_TOKEN")
+	pinnedRun := s.env("TASKCIRCUIT_RUN_ID")
+	pinnedToken := s.env("TASKCIRCUIT_CLAIM_TOKEN")
 	if pinnedRun != "" && runID != "" && pinnedRun != runID {
 		return store.RunScope{}, errors.New("this worker is scoped to a different run")
 	}
@@ -95,7 +95,7 @@ func (s *Service) scopedRun(runID, claimToken string) (store.RunScope, error) {
 }
 
 func (s *Service) selectedBoard(requested string) (string, error) {
-	pinned := s.env("TASKCIRCUIT_BOARD", "KANBAN_BOARD")
+	pinned := s.env("TASKCIRCUIT_BOARD")
 	if pinned != "" && requested != "" && strings.ToLower(strings.TrimSpace(requested)) != strings.ToLower(pinned) {
 		return "", errors.New("this worker is scoped to a different board")
 	}
@@ -274,13 +274,13 @@ type logInput struct {
 }
 
 func (s *Service) registerCore(server *mcp.Server) {
-	addTool(server, "kanban_boards_list", "List Kanban boards", "List isolated boards with metadata, paths, and per-status task counts.", true, false, true, false, func(ctx context.Context, input boardsListInput) (any, error) {
+	addTool(server, "taskcircuit_boards_list", "List Kanban boards", "List isolated boards with metadata, paths, and per-status task counts.", true, false, true, false, func(ctx context.Context, input boardsListInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
 		return s.manager.List(ctx, input.IncludeArchived)
 	})
-	addTool(server, "kanban_boards_create", "Create Kanban board", "Create an isolated board with its own database, workspaces, attachments, and logs.", false, false, true, false, func(ctx context.Context, input boardCreateInput) (any, error) {
+	addTool(server, "taskcircuit_boards_create", "Create Kanban board", "Create an isolated board with its own database, workspaces, attachments, and logs.", false, false, true, false, func(ctx context.Context, input boardCreateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -299,7 +299,7 @@ func (s *Service) registerCore(server *mcp.Server) {
 		}
 		return metadata, err
 	})
-	addTool(server, "kanban_boards_update", "Update Kanban board", "Update board presentation metadata and its default project directory.", false, false, true, false, func(_ context.Context, input boardUpdateInput) (any, error) {
+	addTool(server, "taskcircuit_boards_update", "Update Kanban board", "Update board presentation metadata and its default project directory.", false, false, true, false, func(_ context.Context, input boardUpdateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -314,19 +314,19 @@ func (s *Service) registerCore(server *mcp.Server) {
 		}
 		return s.manager.Update(input.Slug, update)
 	})
-	addTool(server, "kanban_boards_switch", "Switch current Kanban board", "Persist the current board used when an explicit board is omitted.", false, false, true, false, func(_ context.Context, input boardSlugInput) (any, error) {
+	addTool(server, "taskcircuit_boards_switch", "Switch current Kanban board", "Persist the current board used when an explicit board is omitted.", false, false, true, false, func(_ context.Context, input boardSlugInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
 		return s.manager.Switch(input.Slug)
 	})
-	addTool(server, "kanban_boards_remove", "Remove Kanban board", "Archive a named board by default, or permanently delete it when hard_delete is true.", false, true, false, false, func(_ context.Context, input boardRemoveInput) (any, error) {
+	addTool(server, "taskcircuit_boards_remove", "Remove Kanban board", "Archive a named board by default, or permanently delete it when hard_delete is true.", false, true, false, false, func(_ context.Context, input boardRemoveInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
 		return s.manager.Remove(input.Slug, input.HardDelete)
 	})
-	addTool(server, "kanban_create", "Create Kanban task", "Create a durable task assigned to Claude, Codex, Cline, Gemini, or a human.", false, false, false, false, func(ctx context.Context, input createInput) (any, error) {
+	addTool(server, "taskcircuit_create", "Create Kanban task", "Create a durable task assigned to Claude, Codex, Cline, Gemini, or a human.", false, false, false, false, func(ctx context.Context, input createInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -348,7 +348,7 @@ func (s *Service) registerCore(server *mcp.Server) {
 				CurrentStepKey: input.CurrentStepKey, MaxRetries: input.MaxRetries, Parents: input.Parents})
 		})
 	})
-	addTool(server, "kanban_list", "List Kanban tasks", "List board tasks with optional status, assignee, runtime, and search filters.", true, false, true, false, func(ctx context.Context, input listInput) (any, error) {
+	addTool(server, "taskcircuit_list", "List Kanban tasks", "List board tasks with optional status, assignee, runtime, and search filters.", true, false, true, false, func(ctx context.Context, input listInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -364,7 +364,7 @@ func (s *Service) registerCore(server *mcp.Server) {
 				CurrentStepKey: input.CurrentStepKey, IncludeArchived: input.IncludeArchived, Search: input.Search, Sort: input.Sort, Limit: input.Limit})
 		})
 	})
-	addTool(server, "kanban_show", "Show Kanban task", "Read a task with dependencies, comments, run history, relationship graph, and bounded worker context.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
+	addTool(server, "taskcircuit_show", "Show Kanban task", "Read a task with dependencies, comments, run history, relationship graph, and bounded worker context.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
@@ -389,34 +389,34 @@ func (s *Service) registerCore(server *mcp.Server) {
 			}{TaskDetail: detail, RelationshipGraph: graph, WorkerContext: workerContext}, nil
 		})
 	})
-	addTool(server, "kanban_context", "Build Kanban worker context", "Return the bounded task body, execution order, handoffs, attachments, prior attempts, and comments.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
+	addTool(server, "taskcircuit_context", "Build Kanban worker context", "Return the bounded task body, execution order, handoffs, attachments, prior attempts, and comments.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) { return opened.BuildWorkerContext(ctx, taskID) })
 	})
-	addTool(server, "kanban_graph", "Show TaskCircuit relationship graph", "Show a bounded hierarchy and dependency DAG with execution phases.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
+	addTool(server, "taskcircuit_graph", "Show TaskCircuit relationship graph", "Show a bounded hierarchy and dependency DAG with execution phases.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) { return opened.RelationshipGraph(ctx, taskID) })
 	})
-	addTool(server, "kanban_stats", "Get Kanban statistics", "Count board tasks by status, assignee, runtime, and tenant.", true, false, true, false, func(ctx context.Context, input boardInput) (any, error) {
+	addTool(server, "taskcircuit_stats", "Get Kanban statistics", "Count board tasks by status, assignee, runtime, and tenant.", true, false, true, false, func(ctx context.Context, input boardInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) { return opened.Stats(ctx, board) })
 	})
-	addTool(server, "kanban_diagnostics", "Diagnose Kanban board", "Inspect task/run invariants, queue stalls, and active workers.", true, false, true, false, func(ctx context.Context, input boardInput) (any, error) {
+	addTool(server, "taskcircuit_diagnostics", "Diagnose Kanban board", "Inspect task/run invariants, queue stalls, and active workers.", true, false, true, false, func(ctx context.Context, input boardInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) { return opened.Diagnose(ctx, board) })
 	})
-	addTool(server, "kanban_events", "Read Kanban events", "Read the append-only board event stream by cursor, task, and kind.", true, false, true, false, func(ctx context.Context, input eventInput) (any, error) {
-		if s.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID") != "" {
+	addTool(server, "taskcircuit_events", "Read Kanban events", "Read the append-only board event stream by cursor, task, and kind.", true, false, true, false, func(ctx context.Context, input eventInput) (any, error) {
+		if s.env("TASKCIRCUIT_TASK_ID") != "" {
 			var err error
 			input.TaskID, err = s.scopedTaskID(input.TaskID)
 			if err != nil {
@@ -430,7 +430,7 @@ func (s *Service) registerCore(server *mcp.Server) {
 			return opened.ListEvents(ctx, store.EventFilter{TaskID: input.TaskID, SinceID: input.SinceID, Kinds: input.Kinds, Limit: input.Limit})
 		})
 	})
-	addTool(server, "kanban_runs", "List Kanban runs", "Read full attempt history for one task.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
+	addTool(server, "taskcircuit_runs", "List Kanban runs", "Read full attempt history for one task.", true, false, true, false, func(ctx context.Context, input taskInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
@@ -440,7 +440,7 @@ func (s *Service) registerCore(server *mcp.Server) {
 			return detail.Runs, err
 		})
 	})
-	addTool(server, "kanban_log", "Read Kanban worker log", "Read up to 1 MB from the tail of a task run log.", true, false, true, false, func(ctx context.Context, input logInput) (any, error) {
+	addTool(server, "taskcircuit_log", "Read Kanban worker log", "Read up to 1 MB from the tail of a task run log.", true, false, true, false, func(ctx context.Context, input logInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err

@@ -68,7 +68,7 @@ taskcircuit dashboard
 
 ```text
 data/
-├─ kanban.db
+├─ taskcircuit.db
 ├─ attachments/
 ├─ logs/
 ├─ workspaces/
@@ -78,8 +78,8 @@ data/
 서비스나 에디터에서 작업 디렉터리가 달라질 수 있으면 `--db`에 절대 경로를 지정한다.
 
 ```bash
-taskcircuit dashboard --db /absolute/path/to/data/kanban.db
-taskcircuit serve --db /absolute/path/to/data/kanban.db
+taskcircuit dashboard --db /absolute/path/to/data/taskcircuit.db
+taskcircuit serve --db /absolute/path/to/data/taskcircuit.db
 ```
 
 ## 3. Claude Code와 Codex에 MCP 연결
@@ -88,7 +88,7 @@ MCP 클라이언트에는 `taskcircuit`의 절대 경로를 등록하는 편이 
 
 ```bash
 TASKCIRCUIT_BIN=$(command -v taskcircuit)
-TASKCIRCUIT_DB="$PWD/data/kanban.db"
+TASKCIRCUIT_DB="$PWD/data/taskcircuit.db"
 
 claude mcp add --scope local taskcircuit -- \
   "$TASKCIRCUIT_BIN" serve --db "$TASKCIRCUIT_DB"
@@ -158,7 +158,7 @@ make release VERSION=v1.0.0
 ## 6. 업그레이드와 백업
 
 1. 실행 중인 `dashboard`와 `dispatch --watch` 프로세스를 정상 종료한다.
-2. `data/kanban.db`, `data/boards/`, `data/attachments/`를 백업한다.
+2. `data/taskcircuit.db`, `data/boards/`, `data/attachments/`를 백업한다.
 3. 새 아카이브의 체크섬을 검증한다.
 4. 기존 실행 파일만 새 바이너리로 교체한다.
 5. `taskcircuit version`, `taskcircuit diagnostics`를 실행하고 대시보드를 확인한다.

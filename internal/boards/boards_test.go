@@ -11,7 +11,7 @@ import (
 
 func TestBoardsIsolateStorageAndArchiveRecoverably(t *testing.T) {
 	ctx := context.Background()
-	manager, err := NewManager(filepath.Join(t.TempDir(), "kanban.db"))
+	manager, err := NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestBoardsIsolateStorageAndArchiveRecoverably(t *testing.T) {
 
 func TestBoardSlugAndEnvironmentSelection(t *testing.T) {
 	ctx := context.Background()
-	manager, err := NewManager(filepath.Join(t.TempDir(), "kanban.db"))
+	manager, err := NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

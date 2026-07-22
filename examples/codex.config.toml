@@ -4,7 +4,7 @@ command = "/absolute/path/to/taskcircuit"
 args = [
   "serve",
   "--db",
-  "/absolute/path/to/project/data/kanban.db",
+  "/absolute/path/to/project/data/taskcircuit.db",
 ]
 required = true
 startup_timeout_sec = 10

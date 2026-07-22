@@ -25,7 +25,7 @@ func runApp(t *testing.T, app *App, args ...string) string {
 
 func TestCoreCLIUsesOneBoardKernel(t *testing.T) {
 	directory := t.TempDir()
-	dbPath := filepath.Join(directory, "kanban.db")
+	dbPath := filepath.Join(directory, "taskcircuit.db")
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
 	app.Cwd = directory
 	app.Getenv = func(string) string { return "" }
@@ -65,7 +65,7 @@ func TestCoreCLIUsesOneBoardKernel(t *testing.T) {
 
 func TestBoardsAndBulkCommandsPreserveIsolationAndPartialErrors(t *testing.T) {
 	directory := t.TempDir()
-	dbPath := filepath.Join(directory, "kanban.db")
+	dbPath := filepath.Join(directory, "taskcircuit.db")
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
 	app.Getenv = func(string) string { return "" }
 	runApp(t, app, "init", "--db", dbPath)
@@ -113,7 +113,7 @@ func TestScopedWorkerCannotEscapeTaskOrCommandAllowlist(t *testing.T) {
 func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
 	ctx := context.Background()
 	directory := t.TempDir()
-	dbPath := filepath.Join(directory, "kanban.db")
+	dbPath := filepath.Join(directory, "taskcircuit.db")
 	opened, err := store.Open(dbPath, "default", filepath.Join(directory, "attachments"))
 	if err != nil {
 		t.Fatal(err)
@@ -130,8 +130,8 @@ func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
 		t.Fatal(err)
 	}
 	environment := map[string]string{
-		"KANBAN_DB": dbPath, "KANBAN_BOARD": "default", "KANBAN_TASK_ID": task.Task.ID,
-		"KANBAN_RUN_ID": claim.Run.ID, "KANBAN_CLAIM_TOKEN": claim.ClaimToken,
+		"TASKCIRCUIT_DB": dbPath, "TASKCIRCUIT_BOARD": "default", "TASKCIRCUIT_TASK_ID": task.Task.ID,
+		"TASKCIRCUIT_RUN_ID": claim.Run.ID, "TASKCIRCUIT_CLAIM_TOKEN": claim.ClaimToken,
 	}
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
 	app.Getenv = func(name string) string { return environment[name] }
@@ -155,7 +155,7 @@ func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
 
 func TestCLIExplicitSpecificationAndDecomposition(t *testing.T) {
 	directory := t.TempDir()
-	dbPath := filepath.Join(directory, "kanban.db")
+	dbPath := filepath.Join(directory, "taskcircuit.db")
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
 	app.Cwd = directory
 	app.Getenv = func(string) string { return "" }
@@ -189,7 +189,7 @@ func TestCLIExplicitSpecificationAndDecomposition(t *testing.T) {
 
 func TestDispatchDryRunFindsEligibleTasksWithoutClaiming(t *testing.T) {
 	directory := t.TempDir()
-	dbPath := filepath.Join(directory, "kanban.db")
+	dbPath := filepath.Join(directory, "taskcircuit.db")
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
 	app.Cwd = directory
 	app.Getenv = func(string) string { return "" }

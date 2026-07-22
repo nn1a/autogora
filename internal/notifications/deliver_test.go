@@ -50,13 +50,13 @@ func TestWebhookDeliverySignsPayloadAndRemovesTerminalSubscription(t *testing.T)
 		if err != nil {
 			t.Error(err)
 		}
-		receivedSignature = request.Header.Get("x-kanban-signature")
-		deliveryID = request.Header.Get("x-kanban-delivery-id")
-		eventKind = request.Header.Get("x-kanban-event")
+		receivedSignature = request.Header.Get("x-taskcircuit-signature")
+		deliveryID = request.Header.Get("x-taskcircuit-delivery-id")
+		eventKind = request.Header.Get("x-taskcircuit-event")
 		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	opened, err := store.Open(filepath.Join(t.TempDir(), "kanban.db"), "default", "")
+	opened, err := store.Open(filepath.Join(t.TempDir(), "taskcircuit.db"), "default", "")
 	if err != nil {
 		t.Fatal(err)
 	}

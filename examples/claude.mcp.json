@@ -6,7 +6,7 @@
       "args": [
         "serve",
         "--db",
-        "${CLAUDE_PROJECT_DIR}/data/kanban.db"
+        "${CLAUDE_PROJECT_DIR}/data/taskcircuit.db"
       ]
     }
   }

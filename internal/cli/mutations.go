@@ -219,7 +219,7 @@ func (a *App) runWorkerMutation(ctx context.Context, command string, opts option
 		return writeJSON(a.Stdout, run)
 	case "comment":
 		body := strings.TrimSpace(strings.Join(opts.positionals[1:], " "))
-		if a.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID") != "" && requested == "" {
+		if a.env("TASKCIRCUIT_TASK_ID") != "" && requested == "" {
 			body = strings.TrimSpace(strings.Join(opts.positionals, " "))
 		}
 		if body == "" {
@@ -284,7 +284,7 @@ func (a *App) runLifecycle(ctx context.Context, command string, opts options) er
 	if command == "complete" {
 		taskIDs := append([]string{}, opts.positionals...)
 		if len(taskIDs) == 0 {
-			if pinned := a.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID"); pinned != "" {
+			if pinned := a.env("TASKCIRCUIT_TASK_ID"); pinned != "" {
 				taskIDs = []string{pinned}
 			}
 		}
@@ -327,7 +327,7 @@ func (a *App) runLifecycle(ctx context.Context, command string, opts options) er
 		return writeJSON(a.Stdout, results)
 	}
 	if command == "block" {
-		if len(opts.positionals) == 0 && a.env("TASKCIRCUIT_TASK_ID", "KANBAN_TASK_ID") == "" {
+		if len(opts.positionals) == 0 && a.env("TASKCIRCUIT_TASK_ID") == "" {
 			return errors.New("block requires a task id")
 		}
 		requested := ""

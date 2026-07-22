@@ -73,7 +73,7 @@ func TestCreateListAndReadTaskUsingExistingJSONContract(t *testing.T) {
 func TestAttachmentsAndCompletionArtifactsRemainDurable(t *testing.T) {
 	ctx := context.Background()
 	directory := t.TempDir()
-	store, err := Open(filepath.Join(directory, "kanban.db"), "default", filepath.Join(directory, "attachments"))
+	store, err := Open(filepath.Join(directory, "taskcircuit.db"), "default", filepath.Join(directory, "attachments"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestIdempotencyKeyReturnsExistingTask(t *testing.T) {
 
 func TestLegacyMVPDatabaseMigratesWithoutDataLoss(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "kanban.db")
+	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
 	legacy, err := sql.Open("sqlite", dataSourceName(dbPath))
 	if err != nil {
 		t.Fatal(err)

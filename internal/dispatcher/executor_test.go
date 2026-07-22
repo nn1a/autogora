@@ -60,9 +60,9 @@ func TestScopedApprovalBrokerAllowsOnlyLifecycleBridge(t *testing.T) {
 	broker := &approvalBroker{policy: ToolApproval{Directory: directory, CommandPrefix: prefix}, handled: map[string]bool{}}
 	requests := map[string]map[string]any{
 		"a.request.1.json": {"toolName": "read_file", "input": map[string]any{"path": "README.md"}},
-		"b.request.2.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " complete $KANBAN_TASK_ID --summary ok"}},
+		"b.request.2.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " complete $TASKCIRCUIT_TASK_ID --summary ok"}},
 		"c.request.3.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " delete t_other"}},
-		"d.request.4.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " show $KANBAN_TASK_ID; rm -rf /tmp/x"}},
+		"d.request.4.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " show $TASKCIRCUIT_TASK_ID; rm -rf /tmp/x"}},
 	}
 	for name, request := range requests {
 		value, _ := json.Marshal(request)

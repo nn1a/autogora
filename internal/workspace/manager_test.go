@@ -14,7 +14,7 @@ import (
 
 func testManager(t *testing.T) (*boards.Manager, *store.Store) {
 	t.Helper()
-	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "kanban.db"))
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	}
 	git("add", "README.md")
 	git("commit", "-m", "fixture")
-	manager, err := boards.NewManager(filepath.Join(directory, "kanban.db"))
+	manager, err := boards.NewManager(filepath.Join(directory, "taskcircuit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

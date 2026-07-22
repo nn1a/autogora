@@ -14,7 +14,7 @@ import (
 
 func TestCollectDeletesOnlyExpiredKnownScratchData(t *testing.T) {
 	ctx := context.Background()
-	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "kanban.db"))
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

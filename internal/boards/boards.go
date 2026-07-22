@@ -155,7 +155,7 @@ func (m *Manager) DBPath(board string) (string, error) {
 		return m.defaultDBPath, nil
 	}
 	directory, _ := m.BoardDir(slug)
-	return filepath.Join(directory, "kanban.db"), nil
+	return filepath.Join(directory, "taskcircuit.db"), nil
 }
 func (m *Manager) WorkspaceRoot(board string) (string, error) {
 	slug, err := NormalizeSlug(defaultBoard(board))
@@ -458,18 +458,16 @@ func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, e
 		if slug == "" {
 			slug = regexp.MustCompile(`-\d+$`).ReplaceAllString(entry.Name(), "")
 		}
-		metadata := Metadata{Slug: slug, Name: raw.Name, Description: raw.Description, Icon: raw.Icon, Color: raw.Color, DefaultWorkdir: raw.DefaultWorkdir, CreatedAt: raw.CreatedAt, Archived: true, DBPath: filepath.Join(directory, "kanban.db"), WorkspaceRoot: filepath.Join(directory, "workspaces"), AttachmentsRoot: filepath.Join(directory, "attachments"), LogsRoot: filepath.Join(directory, "logs"), Orchestration: normalizeOrchestration(raw.Orchestration)}
+		metadata := Metadata{Slug: slug, Name: raw.Name, Description: raw.Description, Icon: raw.Icon, Color: raw.Color, DefaultWorkdir: raw.DefaultWorkdir, CreatedAt: raw.CreatedAt, Archived: true, DBPath: filepath.Join(directory, "taskcircuit.db"), WorkspaceRoot: filepath.Join(directory, "workspaces"), AttachmentsRoot: filepath.Join(directory, "attachments"), LogsRoot: filepath.Join(directory, "logs"), Orchestration: normalizeOrchestration(raw.Orchestration)}
 		result = append(result, metadata)
 	}
 	return result, nil
 }
 
 func (m *Manager) Current() string {
-	for _, name := range []string{"TASKCIRCUIT_BOARD", "KANBAN_BOARD"} {
-		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			if slug, err := NormalizeSlug(value); err == nil && m.Exists(slug) {
-				return slug
-			}
+	if value := strings.TrimSpace(os.Getenv("TASKCIRCUIT_BOARD")); value != "" {
+		if slug, err := NormalizeSlug(value); err == nil && m.Exists(slug) {
+			return slug
 		}
 	}
 	if contents, err := os.ReadFile(m.currentPath); err == nil {

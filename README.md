@@ -42,21 +42,21 @@ Connect Claude Code:
 
 ```bash
 claude mcp add --scope local taskcircuit -- \
-  "$TASKCIRCUIT_BIN" serve --db "$PWD/data/kanban.db"
+  "$TASKCIRCUIT_BIN" serve --db "$PWD/data/taskcircuit.db"
 ```
 
 Connect Codex:
 
 ```bash
 codex mcp add taskcircuit -- \
-  "$TASKCIRCUIT_BIN" serve --db "$PWD/data/kanban.db"
+  "$TASKCIRCUIT_BIN" serve --db "$PWD/data/taskcircuit.db"
 ```
 
 Connect Gemini CLI for interactive MCP use:
 
 ```bash
 gemini mcp add --scope project taskcircuit "$TASKCIRCUIT_BIN" serve -- \
-  --db "$PWD/data/kanban.db"
+  --db "$PWD/data/taskcircuit.db"
 ```
 
 The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json), [examples/codex.config.toml](examples/codex.config.toml), the [MCP-disabled Cline CLI bridge contract](examples/cline-cli-bridge.md), and the [Gemini CLI runtime guide](examples/gemini-cli.md).
@@ -201,7 +201,7 @@ review.
 ## Multiple boards
 
 Named boards isolate their database, workspaces, attachments, and logs. The
-`default` board retains `data/kanban.db`; named boards live under
+`default` board retains `data/taskcircuit.db`; named boards live under
 `data/boards/<slug>/`.
 
 ```bash
@@ -240,7 +240,7 @@ taskcircuit attach-url <task-id> https://example.com/design --name "Design"
 taskcircuit attachments <task-id>
 ```
 
-Workers can declare relative deliverables in `kanban_complete` through its
+Workers can declare relative deliverables in `taskcircuit_complete` through its
 `artifacts` array. Every path must exist before the task can become `done`; the
 server copies valid artifacts into durable storage and records them in run
 metadata.
@@ -271,8 +271,8 @@ taskcircuit complete <task-id> --summary "verified and delivered"
 
 `claim` prepares and prints the resolved workspace plus the scoped claim token.
 Use `reassign <id>... <profile>` for partial-failure bulk routing, and
-`list --mine` with `TASKCIRCUIT_PROFILE` (or legacy `HERMES_PROFILE`/
-`KANBAN_PROFILE`) for profile-local views.
+`list --mine` with `TASKCIRCUIT_PROFILE` or `TASKCIRCUIT_WORKER_ID` for
+profile-local views.
 
 Bulk mutations always report success or failure for each task instead of
 aborting the whole batch. Garbage collection is board-scoped and only removes
@@ -295,7 +295,7 @@ delivery pass is also available for cron and diagnostics.
 
 The standalone bundled adapter uses `platform=webhook` with the endpoint URL in
 `--chat-id`. An optional secret signs the exact JSON body with HMAC-SHA256 in
-`X-Kanban-Signature`. Delivery leases prevent concurrent dispatchers from
+`X-TaskCircuit-Signature`. Delivery leases prevent concurrent dispatchers from
 claiming the same event, failures use bounded backoff, and a completion or
 archive removes the subscription automatically.
 
@@ -362,22 +362,20 @@ taskcircuit swarm "Design a multi-region failover plan" \
 ## MCP tools
 
 The product, package, CLI, and MCP registration name are `TaskCircuit`/`taskcircuit`.
-The established `kanban_*` tool names, legacy `KANBAN_*` worker environment
-variables, session cookie, and default `kanban.db` filename remain available
-for data and automation compatibility. New integrations should use the matching
-`TASKCIRCUIT_*` environment variables.
+All MCP tools and worker environment variables use the `taskcircuit_*` and
+`TASKCIRCUIT_*` prefixes respectively.
 
-- Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
-- Relationships: `kanban_graph`, `kanban_subtask_set`, `kanban_subtask_remove`
-- Boards: `kanban_boards_list`, `kanban_boards_create`, `kanban_boards_update`, `kanban_boards_switch`, `kanban_boards_remove`
-- Dispatch: `kanban_claim`
-- Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
-- Attachments: `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_attachment_remove`
-- Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
-- Administration: `kanban_run_terminate`, `kanban_bulk`, `kanban_gc`
-- Notifications: `kanban_notify_subscribe`, `kanban_notify_list`, `kanban_notify_unsubscribe`, `kanban_notify_deliver`
-- Orchestration: `kanban_specify`, `kanban_decompose`, `kanban_profile_describe_auto`, `kanban_swarm`
-- Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
+- Planning: `taskcircuit_create`, `taskcircuit_list`, `taskcircuit_show`, `taskcircuit_update`, `taskcircuit_comment`, `taskcircuit_link`, `taskcircuit_unlink`
+- Relationships: `taskcircuit_graph`, `taskcircuit_subtask_set`, `taskcircuit_subtask_remove`
+- Boards: `taskcircuit_boards_list`, `taskcircuit_boards_create`, `taskcircuit_boards_update`, `taskcircuit_boards_switch`, `taskcircuit_boards_remove`
+- Dispatch: `taskcircuit_claim`
+- Worker lifecycle: `taskcircuit_heartbeat`, `taskcircuit_complete`, `taskcircuit_block`
+- Attachments: `taskcircuit_attach`, `taskcircuit_attach_url`, `taskcircuit_attachments`, `taskcircuit_attachment_remove`
+- Observability: `taskcircuit_context`, `taskcircuit_stats`, `taskcircuit_diagnostics`, `taskcircuit_events`, `taskcircuit_runs`, `taskcircuit_log`
+- Administration: `taskcircuit_run_terminate`, `taskcircuit_bulk`, `taskcircuit_gc`
+- Notifications: `taskcircuit_notify_subscribe`, `taskcircuit_notify_list`, `taskcircuit_notify_unsubscribe`, `taskcircuit_notify_deliver`
+- Orchestration: `taskcircuit_specify`, `taskcircuit_decompose`, `taskcircuit_profile_describe_auto`, `taskcircuit_swarm`
+- Human recovery: `taskcircuit_unblock`, `taskcircuit_promote`, `taskcircuit_schedule`, `taskcircuit_archive`, `taskcircuit_delete`
 
 Dispatcher-launched workers receive board, task, run, and claim-token scope
 through environment variables. Their lifecycle tools can omit those identifiers,
@@ -398,7 +396,7 @@ already running; completed prerequisites may be attached without interrupting it
 
 `decompose` atomically records every generated task under the triage root, applies
 the dependency DAG, and makes the root depend on all terminal subtasks. Use
-`taskcircuit graph <task-id>` or `kanban_graph` to inspect the combined topology
+`taskcircuit graph <task-id>` or `taskcircuit_graph` to inspect the combined topology
 and topological phases. A worker receives the root goal, current node, completed
 prerequisite handoffs, direct dependents, and a metadata-only phase map. Bodies,
 workspaces, attachments, and unfinished results from other nodes are not copied
@@ -412,7 +410,7 @@ counts, keeps the focus/root/direct neighborhood, and marks the response as
 
 Administrative completion, blocking, archiving, deletion, and ownership or
 workspace moves reject a task with an active run. Use
-`taskcircuit terminate <task-id>` or `kanban_run_terminate` first; this signals the recorded worker PID
+`taskcircuit terminate <task-id>` or `taskcircuit_run_terminate` first; this signals the recorded worker PID
 and reclaims the run. A live PID returns `pending: true` and remains `running`
 until the dispatcher observes process exit, preventing an old and a replacement
 worker from overlapping. A missing or already-dead PID is reclaimed immediately.

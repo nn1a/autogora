@@ -34,12 +34,12 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 	for _, runtime := range []model.Runtime{model.RuntimeClaude, model.RuntimeCodex, model.RuntimeCline, model.RuntimeGemini} {
 		t.Run(string(runtime), func(t *testing.T) {
 			claim := claimedTask(t, runtime)
-			options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "kanban.db"), CLIPath: filepath.Join(t.TempDir(), "taskcircuit"), ClineApprovalDir: t.TempDir()}
+			options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "taskcircuit.db"), CLIPath: filepath.Join(t.TempDir(), "taskcircuit"), ClineApprovalDir: t.TempDir()}
 			command, err := BuildRunnerCommand(claim, options, "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if command.Env["KANBAN_TASK_ID"] != claim.Task.Task.ID || command.Env["KANBAN_CLAIM_TOKEN"] != claim.ClaimToken {
+			if command.Env["TASKCIRCUIT_TASK_ID"] != claim.Task.Task.ID || command.Env["TASKCIRCUIT_CLAIM_TOKEN"] != claim.ClaimToken {
 				t.Fatalf("scope missing: %#v", command.Env)
 			}
 			if strings.Contains(strings.Join(command.Args, " "), claim.ClaimToken) {
@@ -48,15 +48,15 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 			joined := strings.Join(command.Args, " ")
 			switch runtime {
 			case model.RuntimeCline:
-				if command.ToolApproval == nil || !strings.Contains(joined, "--auto-approve false") || strings.Contains(joined, "mcpServers") || !strings.Contains(joined, "scoped TaskCircuit CLI bridge") {
+				if command.ToolApproval == nil || !strings.Contains(joined, "--auto-approve false") || strings.Contains(joined, "mcpServers") || !strings.Contains(joined, "scoped TaskCircuit CLI bridge") || !strings.Contains(joined, "$TASKCIRCUIT_TASK_ID") {
 					t.Fatalf("invalid Cline command: %#v", command)
 				}
 			case model.RuntimeGemini:
-				if command.PolicyFile == nil || !strings.Contains(joined, "--approval-mode default") || !strings.Contains(command.PolicyFile.Content, `toolName = "mcp_*"`) {
+				if command.PolicyFile == nil || !strings.Contains(joined, "--approval-mode default") || !strings.Contains(command.PolicyFile.Content, `toolName = "mcp_*"`) || !strings.Contains(joined, "$TASKCIRCUIT_TASK_ID") {
 					t.Fatalf("invalid Gemini command: %#v", command)
 				}
 			case model.RuntimeClaude:
-				if !strings.Contains(joined, "dontAsk") || !strings.Contains(joined, "mcp__taskcircuit__kanban_complete") {
+				if !strings.Contains(joined, "dontAsk") || !strings.Contains(joined, "mcp__taskcircuit__taskcircuit_complete") {
 					t.Fatalf("invalid Claude command: %#v", command)
 				}
 			case model.RuntimeCodex:
