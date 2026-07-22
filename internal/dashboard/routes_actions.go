@@ -21,7 +21,7 @@ import (
 	"github.com/nn1a/autogora/internal/orchestration"
 	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
-	"github.com/nn1a/autogora/internal/workspace"
+	"github.com/nn1a/autogora/internal/taskservice"
 )
 
 func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Request, segments []string, board, taskID string) error {
@@ -36,18 +36,7 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 			return err
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: taskID, ClaimTTLSeconds: intValue(body["ttlSeconds"], 900), WorkerID: firstText(stringValue(body["workerId"]), fmt.Sprintf("dashboard-%d", os.Getpid()))})
-			if err != nil {
-				return nil, err
-			}
-			if claim == nil {
-				return nil, fmt.Errorf("task is not claimable: %s", taskID)
-			}
-			prepared, err := workspace.New(s.manager).Prepare(ctx, opened, claim)
-			if err != nil {
-				_, _ = opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "Workspace preparation failed: "+err.Error(), store.FailRunOptions{})
-			}
-			return prepared, err
+			return taskservice.New(opened, s.manager, board).ClaimTaskForUser(ctx, taskID, intValue(body["ttlSeconds"], 900), firstText(stringValue(body["workerId"]), fmt.Sprintf("dashboard-%d", os.Getpid())))
 		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, value)
@@ -118,20 +107,12 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 		if err != nil {
 			return err
 		}
-		metadata, err := s.manager.Read(board)
-		if err != nil {
-			return err
-		}
-		planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: metadata.Orchestration.PlannerRuntime, Timeout: 120 * time.Second})
-		if err != nil {
-			return err
-		}
 		var explicit *orchestration.SpecificationPlan
 		if stringValue(body["title"]) != "" && stringValue(body["body"]) != "" {
 			explicit = &orchestration.SpecificationPlan{Title: stringValue(body["title"]), Body: stringValue(body["body"])}
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			return orchestration.SpecifyTriageTask(ctx, opened, taskID, planner, explicit, stringValue(body["author"]))
+			return taskservice.New(opened, s.manager, board).SpecifyTask(ctx, taskID, explicit, stringValue(body["author"]))
 		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, value)
@@ -143,33 +124,6 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 		if err != nil {
 			return err
 		}
-		metadata, err := s.manager.Read(board)
-		if err != nil {
-			return err
-		}
-		profiles := boardProfiles(metadata.Orchestration.Profiles)
-		fallback := orchestration.ProfileRoute{}
-		for _, profile := range profiles {
-			if metadata.Orchestration.DefaultProfile != nil && profile.Name == *metadata.Orchestration.DefaultProfile {
-				fallback = profile
-			}
-		}
-		if fallback.Name == "" && len(profiles) > 0 {
-			fallback = profiles[0]
-		}
-		if fallback.Name == "" {
-			fallback = orchestration.ProfileRoute{Name: string(metadata.Orchestration.PlannerRuntime) + "-worker", Runtime: metadata.Orchestration.PlannerRuntime}
-		}
-		orchestratorProfile := fallback
-		for _, profile := range profiles {
-			if metadata.Orchestration.OrchestratorProfile != nil && profile.Name == *metadata.Orchestration.OrchestratorProfile {
-				orchestratorProfile = profile
-			}
-		}
-		planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: metadata.Orchestration.PlannerRuntime, Timeout: 120 * time.Second})
-		if err != nil {
-			return err
-		}
 		var plan *orchestration.DecompositionPlan
 		if raw, exists := body["plan"]; exists {
 			plan = &orchestration.DecompositionPlan{}
@@ -178,7 +132,7 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 			}
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			return orchestration.DecomposeTriageTask(ctx, opened, taskID, orchestration.DecomposeOptions{Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &orchestratorProfile, AutoPromoteChildren: &metadata.Orchestration.AutoPromoteChildren, Planner: planner, Plan: plan})
+			return taskservice.New(opened, s.manager, board).DecomposeTask(ctx, taskID, plan)
 		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, value)
@@ -406,14 +360,6 @@ func (s *Server) handleNotifications(response http.ResponseWriter, request *http
 	return errors.New("notifications endpoint requires GET, POST, or DELETE")
 }
 
-func boardProfiles(values []boards.Profile) []orchestration.ProfileRoute {
-	result := make([]orchestration.ProfileRoute, 0, len(values))
-	for _, value := range values {
-		result = append(result, orchestration.ProfileRoute{Name: value.Name, Runtime: value.Runtime, Description: value.Description})
-	}
-	return result
-}
-
 func (s *Server) handleProfiles(response http.ResponseWriter, request *http.Request, segments []string, board string) error {
 	ctx := request.Context()
 	metadata, err := s.manager.Read(board)
@@ -421,29 +367,11 @@ func (s *Server) handleProfiles(response http.ResponseWriter, request *http.Requ
 		return err
 	}
 	if len(segments) == 2 && request.Method == http.MethodGet {
-		tasks, err := usingStore(ctx, s, board, func(opened *store.Store) ([]model.Task, error) {
-			return opened.ListTasks(ctx, store.ListTaskFilter{IncludeArchived: true, Limit: 500})
+		profiles, err := usingStore(ctx, s, board, func(opened *store.Store) ([]orchestration.ProfileRoute, error) {
+			return taskservice.New(opened, s.manager, board).ProfileRoutes(ctx, metadata)
 		})
 		if err != nil {
 			return err
-		}
-		profiles := []orchestration.ProfileRoute{}
-		index := map[string]int{}
-		for _, task := range tasks {
-			if task.Assignee != nil && task.Runtime != model.RuntimeManual {
-				if _, ok := index[*task.Assignee]; !ok {
-					index[*task.Assignee] = len(profiles)
-					profiles = append(profiles, orchestration.ProfileRoute{Name: *task.Assignee, Runtime: task.Runtime})
-				}
-			}
-		}
-		for _, profile := range boardProfiles(metadata.Orchestration.Profiles) {
-			if old, ok := index[profile.Name]; ok {
-				profiles[old] = profile
-			} else {
-				index[profile.Name] = len(profiles)
-				profiles = append(profiles, profile)
-			}
 		}
 		sendJSON(response, http.StatusOK, profiles)
 		return nil

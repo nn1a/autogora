@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/taskservice"
 )
 
 type fakeBackend struct {
@@ -27,6 +28,10 @@ func (f *fakeBackend) GetTask(_ context.Context, id string) (model.TaskDetail, e
 
 func (f *fakeBackend) RelationshipGraph(_ context.Context, id string) (model.RelationshipGraph, error) {
 	return model.RelationshipGraph{FocusTaskID: id, TotalConnectedNodes: 1}, nil
+}
+
+func (f *fakeBackend) BoardContext(context.Context) (taskservice.BoardContext, error) {
+	return taskservice.BoardContext{}, nil
 }
 
 func (f *fakeBackend) CreateTask(_ context.Context, input store.CreateTaskInput) (model.TaskDetail, error) {

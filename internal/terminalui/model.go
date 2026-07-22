@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/taskservice"
 )
 
 const refreshInterval = 2 * time.Second
@@ -41,6 +42,11 @@ type detailLoadedMsg struct {
 
 type refreshMsg time.Time
 
+type boardContextMsg struct {
+	context taskservice.BoardContext
+	err     error
+}
+
 type mutationMsg struct {
 	action string
 	id     string
@@ -58,6 +64,7 @@ type Model struct {
 	ctx              context.Context
 	backend          Backend
 	board            string
+	boardContext     *taskservice.BoardContext
 	width            int
 	height           int
 	column           int
@@ -94,7 +101,14 @@ func NewModel(ctx context.Context, backend Backend, board string) *Model {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(m.loadTasks(), tick())
+	return tea.Batch(m.loadTasks(), m.loadBoardContext(), tick())
+}
+
+func (m *Model) loadBoardContext() tea.Cmd {
+	return func() tea.Msg {
+		value, err := m.backend.BoardContext(m.ctx)
+		return boardContextMsg{context: value, err: err}
+	}
 }
 
 func tick() tea.Cmd {
@@ -447,6 +461,12 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.detail, m.graph, m.err = &message.detail, &message.graph, nil
+	case boardContextMsg:
+		if message.err != nil {
+			m.err = message.err
+			break
+		}
+		m.boardContext = &message.context
 	case mutationMsg:
 		m.busy = false
 		if message.err != nil {
@@ -460,7 +480,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		return m, m.loadTasks()
 	case refreshMsg:
-		return m, tea.Batch(m.loadTasks(), tick())
+		return m, tea.Batch(m.loadTasks(), m.loadBoardContext(), tick())
 	}
 	return m, nil
 }

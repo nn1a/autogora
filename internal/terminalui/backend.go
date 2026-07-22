@@ -5,6 +5,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/taskservice"
 )
 
 // Backend keeps the terminal UI independent from its transport. The local
@@ -21,4 +22,5 @@ type Backend interface {
 	UnblockTask(context.Context, string) (model.TaskDetail, error)
 	ArchiveTask(context.Context, string) (model.TaskDetail, error)
 	AddComment(context.Context, string, string, string) (model.Comment, error)
+	BoardContext(context.Context) (taskservice.BoardContext, error)
 }

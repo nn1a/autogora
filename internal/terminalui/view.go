@@ -225,8 +225,15 @@ func (m *Model) View() string {
 	if m.width < 10 || m.height < 6 {
 		return "Terminal is too small\n"
 	}
+	boardName := m.board
+	if m.boardContext != nil && m.boardContext.Metadata.Name != "" {
+		boardName = m.boardContext.Metadata.Name
+	}
 	header := lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("AUTOGORA") +
-		lipgloss.NewStyle().Foreground(colorText).Render("  "+m.board)
+		lipgloss.NewStyle().Foreground(colorText).Render("  "+boardName)
+	if m.boardContext != nil {
+		header += lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %d profiles · planner %s", len(m.boardContext.Profiles), m.boardContext.Metadata.Orchestration.PlannerRuntime))
+	}
 	if m.inputMode == "search" {
 		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  /" + m.searchDraft + "█")
 	} else if m.search != "" {
