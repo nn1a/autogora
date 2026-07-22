@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -54,6 +54,25 @@ for (const runtime of ["claude", "codex", "cline", "gemini"] as const) {
     }
   });
 }
+
+test("Gemini write opt-in selects yolo without the read-only policy", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const task = store.createTask({ title: "Gemini write task", assignee: "worker", runtime: "gemini" });
+    const claim = store.claimTask({ taskId: task.task.id });
+    assert.ok(claim);
+    const command = buildRunnerCommand(claim, {
+      dbPath: "/tmp/kanban-test.db",
+      cliEntry: "/tmp/kanban-cli.js",
+      allowWrites: true,
+    });
+    assert.match(command.args.join(" "), /--approval-mode yolo/);
+    assert.equal(command.args.includes("--policy"), false);
+    assert.equal(command.policyFile, undefined);
+  } finally {
+    store.close();
+  }
+});
 
 test("dispatcher runs a Cline worker through the scoped CLI bridge without MCP", async () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-cline-dispatch-"));
@@ -117,6 +136,7 @@ test("dispatcher runs a Gemini worker through the scoped CLI bridge", async () =
       assert.equal(completed.runs[0]?.summary, "fake Gemini worker completed through CLI");
       assert.equal(completed.runs[0]?.metadata?.verification?.[0], "gemini-cli-bridge-e2e");
       assert.match(completed.comments[0]?.body ?? "", /scoped CLI bridge/);
+      assert.equal(readdirSync(manager.logsRoot("default")).some((name) => name.endsWith(".policy.toml")), false);
     } finally {
       check.close();
     }
