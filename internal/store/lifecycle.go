@@ -54,6 +54,13 @@ type FailRunOptions struct {
 	FailureLimit    int
 }
 
+type GoalJudgment struct {
+	Turn       int
+	Complete   bool
+	Reason     string
+	NextPrompt string
+}
+
 type ActiveRun struct {
 	Task model.Task `json:"task"`
 	Run  model.Run  `json:"run"`
@@ -333,6 +340,74 @@ func (s *Store) HeartbeatTask(ctx context.Context, taskID, note string) (model.R
 		return model.Run{}, err
 	}
 	return s.Heartbeat(ctx, RunScope{RunID: *task.CurrentRunID, ClaimToken: token}, note)
+}
+
+func extendRunLease(ctx context.Context, tx *sql.Tx, task model.Task, run model.Run, clearPID bool) error {
+	expiry, expiryErr := time.Parse(time.RFC3339Nano, run.ClaimExpiresAt)
+	heartbeat, heartbeatErr := time.Parse(time.RFC3339Nano, run.HeartbeatAt)
+	ttl := 15 * time.Minute
+	if expiryErr == nil && heartbeatErr == nil {
+		ttl = max(time.Second, expiry.Sub(heartbeat))
+	}
+	timestamp := now()
+	expires := time.Now().Add(ttl).UTC().Format("2006-01-02T15:04:05.000Z")
+	statement := "UPDATE task_runs SET heartbeat_at = ?, claim_expires_at = ? WHERE id = ?"
+	if clearPID {
+		statement = "UPDATE task_runs SET pid = NULL, heartbeat_at = ?, claim_expires_at = ? WHERE id = ?"
+	}
+	if _, err := tx.ExecContext(ctx, statement, timestamp, expires, run.ID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, "UPDATE tasks SET updated_at = ? WHERE id = ?", timestamp, task.ID)
+	return err
+}
+
+func boundedGoalText(value string) string {
+	if len(value) > 2000 {
+		value = value[:2000]
+	}
+	return value
+}
+
+func (s *Store) RecordGoalJudgment(ctx context.Context, scope RunScope, input GoalJudgment) (model.Run, error) {
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		task, run, err := requireActiveRun(ctx, tx, scope)
+		if err != nil {
+			return err
+		}
+		if err := extendRunLease(ctx, tx, task, run, false); err != nil {
+			return err
+		}
+		var nextPrompt any
+		if value := boundedGoalText(input.NextPrompt); value != "" {
+			nextPrompt = value
+		}
+		return appendEvent(ctx, tx, task.ID, "goal_judged", map[string]any{
+			"turn": input.Turn, "complete": input.Complete,
+			"reason": boundedGoalText(input.Reason), "nextPrompt": nextPrompt,
+		}, &run.ID)
+	})
+	if err != nil {
+		return model.Run{}, err
+	}
+	return getRun(ctx, s.db, scope.RunID)
+}
+
+func (s *Store) PauseGoalRun(ctx context.Context, scope RunScope, turn int) (model.Run, error) {
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		task, run, err := requireActiveRun(ctx, tx, scope)
+		if err != nil {
+			return err
+		}
+		if err := extendRunLease(ctx, tx, task, run, true); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, task.ID, "goal_turn_finished", map[string]any{"turn": turn}, &run.ID)
+	})
+	if err != nil {
+		return model.Run{}, err
+	}
+	return getRun(ctx, s.db, scope.RunID)
 }
 
 func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPath string) (model.Run, error) {

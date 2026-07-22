@@ -344,6 +344,59 @@ func TestConcurrentClaimHasSingleWinner(t *testing.T) {
 	}
 }
 
+func TestGoalJudgmentExtendsLeaseAndPauseReleasesWorkerPID(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Persistent goal", Assignee: stringValue("worker"), Runtime: model.RuntimeCline, GoalMode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID, ClaimTTLSeconds: 60})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	spawned, err := store.RecordSpawn(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, 12345, filepath.Join(t.TempDir(), "worker.log"))
+	if err != nil || spawned.PID == nil {
+		t.Fatalf("record spawn: %+v %v", spawned, err)
+	}
+	judged, err := store.RecordGoalJudgment(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, GoalJudgment{
+		Turn: 1, Complete: false, Reason: "more verification is needed", NextPrompt: "run the remaining checks",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if judged.ClaimExpiresAt <= judged.HeartbeatAt {
+		t.Fatalf("goal judgment did not extend lease: %+v", judged)
+	}
+	paused, err := store.PauseGoalRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.PID != nil || paused.Status != model.RunStatusRunning {
+		t.Fatalf("goal pause should release PID but preserve claim: %+v", paused)
+	}
+	detail, err := store.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEventKind(detail.Events, "goal_judged") || !hasEventKind(detail.Events, "goal_turn_finished") {
+		t.Fatalf("goal audit events are missing: %+v", detail.Events)
+	}
+}
+
+func hasEventKind(events []model.TaskEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBlockLoopAndActiveMutationGuards(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(":memory:", "default", "")
