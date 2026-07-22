@@ -67,6 +67,7 @@ Commands:
   delete <id>...        Permanently delete tasks
   dispatch              Run the worker dispatcher
   dashboard             Run the authenticated local web dashboard
+  skills <action>       Install, inspect, or uninstall bundled Agent Skills
 
 Common options:
   --db <path>           SQLite path (default: ./data/autogora.db)
@@ -258,6 +259,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runDispatch(ctx, command, opts)
 	case "dashboard":
 		return a.runDashboard(ctx, opts)
+	case "skills":
+		return a.runSkills(opts)
 	case "claim":
 		return a.runClaim(ctx, opts)
 	case "terminate":
