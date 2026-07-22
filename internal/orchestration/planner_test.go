@@ -15,7 +15,7 @@ import (
 func fixturePath(t *testing.T, name string) string {
 	t.Helper()
 	_, source, _, _ := runtime.Caller(0)
-	path := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", "test", "fixtures", name))
+	path := filepath.Join(filepath.Dir(source), "testdata", name)
 	if err := os.Chmod(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -53,21 +53,21 @@ func plannerResult(t *testing.T, runtime model.Runtime, envName, fixture string)
 }
 
 func TestCodexCLIPlannerUsesStrictSchema(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCodex, "TASKCIRCUIT_CODEX_BIN", "planner-agent.mjs")
+	value := plannerResult(t, model.RuntimeCodex, "TASKCIRCUIT_CODEX_BIN", "planner-agent.sh")
 	if value["title"] != "Planner-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestClineCLIPlannerReadsFinalNDJSONResult(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCline, "TASKCIRCUIT_CLINE_BIN", "planner-cline-agent.mjs")
+	value := plannerResult(t, model.RuntimeCline, "TASKCIRCUIT_CLINE_BIN", "planner-cline-agent.sh")
 	if value["title"] != "Cline-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestGeminiCLIPlannerUsesDenyAllPolicy(t *testing.T) {
-	value := plannerResult(t, model.RuntimeGemini, "TASKCIRCUIT_GEMINI_BIN", "planner-gemini-agent.mjs")
+	value := plannerResult(t, model.RuntimeGemini, "TASKCIRCUIT_GEMINI_BIN", "planner-gemini-agent.sh")
 	if value["title"] != "Gemini-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
