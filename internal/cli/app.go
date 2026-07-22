@@ -247,6 +247,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runOrchestration(ctx, command, opts)
 	case "swarm":
 		return a.runSwarm(ctx, opts)
+	case "dispatch", "daemon":
+		return a.runDispatch(ctx, command, opts)
 	case "claim":
 		return a.runClaim(ctx, opts)
 	case "terminate":

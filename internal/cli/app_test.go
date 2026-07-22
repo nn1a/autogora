@@ -186,3 +186,37 @@ func TestCLIExplicitSpecificationAndDecomposition(t *testing.T) {
 		t.Fatalf("unexpected decompose output: %s", decomposed)
 	}
 }
+
+func TestDispatchDryRunFindsEligibleTasksWithoutClaiming(t *testing.T) {
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "kanban.db")
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Cwd = directory
+	app.Getenv = func(string) string { return "" }
+	runApp(t, app, "init", "--db", dbPath)
+	createdJSON := runApp(t, app, "create", "eligible", "--db", dbPath, "--assignee", "worker", "--runtime", "codex")
+	var created struct {
+		Task model.Task `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(createdJSON), &created); err != nil {
+		t.Fatal(err)
+	}
+	output := runApp(t, app, "dispatch", "--dry-run", "--max", "1", "--db", dbPath)
+	if !strings.Contains(output, `"dryRun": true`) || !strings.Contains(output, created.Task.ID) {
+		t.Fatalf("unexpected dry-run output: %s", output)
+	}
+	shown := runApp(t, app, "show", created.Task.ID, "--db", dbPath)
+	if !strings.Contains(shown, `"status": "ready"`) {
+		t.Fatalf("dry run changed task state: %s", shown)
+	}
+}
+
+func TestBooleanFalseOptionRemainsExplicit(t *testing.T) {
+	opts, err := parseOptions([]string{"--auto-decompose=false"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.present("auto-decompose") || opts.flags["auto-decompose"] {
+		t.Fatalf("explicit false option was lost: %#v", opts)
+	}
+}

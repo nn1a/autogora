@@ -15,6 +15,7 @@ type options struct {
 	positionals []string
 	values      map[string][]string
 	flags       map[string]bool
+	flagSet     map[string]bool
 }
 
 var booleanOptions = map[string]bool{
@@ -25,7 +26,7 @@ var booleanOptions = map[string]bool{
 }
 
 func parseOptions(args []string) (options, error) {
-	result := options{positionals: []string{}, values: map[string][]string{}, flags: map[string]bool{}}
+	result := options{positionals: []string{}, values: map[string][]string{}, flags: map[string]bool{}, flagSet: map[string]bool{}}
 	for index := 0; index < len(args); index++ {
 		argument := args[index]
 		if argument == "--" {
@@ -45,6 +46,7 @@ func parseOptions(args []string) (options, error) {
 			name, value, hasValue = nameValue[:split], nameValue[split+1:], true
 		}
 		if booleanOptions[name] {
+			result.flagSet[name] = true
 			if hasValue {
 				parsed, err := strconv.ParseBool(value)
 				if err != nil {
@@ -77,7 +79,7 @@ func (o options) value(name string) string {
 }
 
 func (o options) present(name string) bool {
-	return len(o.values[name]) > 0 || o.flags[name]
+	return len(o.values[name]) > 0 || o.flagSet[name]
 }
 
 func (o options) many(name string) []string {
