@@ -26,6 +26,7 @@ type Options struct {
 	DBPath                   string
 	CLIPath                  string
 	Board                    string
+	TaskID                   string
 	Once                     bool
 	Interval                 time.Duration
 	MaxWorkers               int
@@ -242,53 +243,24 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 			opened.Close()
 			continue
 		}
-		profiles := []orchestration.ProfileRoute{}
-		profileIndex := map[string]int{}
-		for _, task := range discovered {
-			if task.Assignee != nil && task.Runtime != model.RuntimeManual {
-				if _, exists := profileIndex[*task.Assignee]; !exists {
-					profileIndex[*task.Assignee] = len(profiles)
-					profiles = append(profiles, orchestration.ProfileRoute{Name: *task.Assignee, Runtime: task.Runtime})
-				}
-			}
-		}
 		configuredProfiles := boardProfiles(metadata.Orchestration.Profiles)
 		if options.DecompositionProfiles != nil {
 			configuredProfiles = options.DecompositionProfiles
 		}
-		for _, profile := range configuredProfiles {
-			if index, exists := profileIndex[profile.Name]; exists {
-				profiles[index] = profile
-			} else {
-				profileIndex[profile.Name] = len(profiles)
-				profiles = append(profiles, profile)
-			}
-		}
+		profiles := orchestration.ResolveProfileRoutes(discovered, configuredProfiles)
 		for _, task := range triage {
-			fallback := orchestration.ProfileRoute{}
+			defaultName, orchestratorName := metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile
+			fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, defaultName, orchestratorName, plannerRuntime)
 			if options.DefaultProfile != nil {
 				fallback = *options.DefaultProfile
-			} else if metadata.Orchestration.DefaultProfile != nil {
-				if index, ok := profileIndex[*metadata.Orchestration.DefaultProfile]; ok {
-					fallback = profiles[index]
-				}
 			}
-			if fallback.Name == "" && task.Assignee != nil && task.Runtime != model.RuntimeManual {
+			if options.DefaultProfile == nil && metadata.Orchestration.DefaultProfile == nil && task.Assignee != nil && task.Runtime != model.RuntimeManual {
 				fallback = orchestration.ProfileRoute{Name: *task.Assignee, Runtime: task.Runtime}
 			}
-			if fallback.Name == "" && len(profiles) > 0 {
-				fallback = profiles[0]
-			}
-			if fallback.Name == "" {
-				fallback = orchestration.ProfileRoute{Name: string(plannerRuntime) + "-worker", Runtime: plannerRuntime}
-			}
-			orchestrator := fallback
 			if options.OrchestratorProfile != nil {
 				orchestrator = *options.OrchestratorProfile
-			} else if metadata.Orchestration.OrchestratorProfile != nil {
-				if index, ok := profileIndex[*metadata.Orchestration.OrchestratorProfile]; ok {
-					orchestrator = profiles[index]
-				}
+			} else if metadata.Orchestration.OrchestratorProfile == nil && fallback.Name != orchestrator.Name {
+				orchestrator = fallback
 			}
 			value := metadata.Orchestration.AutoPromoteChildren
 			result, err := orchestration.DecomposeTriageTask(ctx, opened, task.ID, orchestration.DecomposeOptions{
@@ -529,6 +501,27 @@ func selectedBoards(ctx context.Context, manager *boards.Manager, requested stri
 	return result, nil
 }
 
+func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) error {
+	for _, board := range boardSlugs {
+		opened, err := manager.OpenStore(ctx, board)
+		if err != nil {
+			return err
+		}
+		if _, err := opened.PromoteDueTasks(ctx, board, time.Now()); err != nil {
+			opened.Close()
+			return err
+		}
+		if err := recoverAbandonedRuns(ctx, opened, board, options); err != nil {
+			opened.Close()
+			return err
+		}
+		if err := opened.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func Run(ctx context.Context, options Options) error {
 	options.normalize()
 	if options.DBPath == "" || options.CLIPath == "" {
@@ -542,6 +535,7 @@ func Run(ctx context.Context, options Options) error {
 	processes := NewProcessSet()
 	var active atomic.Int32
 	var workers sync.WaitGroup
+	workerFinished := make(chan struct{}, 1)
 	generatedClineApprovalDir := ""
 	defer func() {
 		cancelDispatcher()
@@ -562,6 +556,9 @@ func Run(ctx context.Context, options Options) error {
 		}
 		deliverBoardNotifications(ctx, manager, boardSlugs, options)
 		decomposeBoardTriage(ctx, manager, boardSlugs, options)
+		if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
+			return err
+		}
 		launched := false
 		foundInPass := true
 		for ctx.Err() == nil && int(active.Load()) < options.MaxWorkers && foundInPass {
@@ -574,15 +571,7 @@ func Run(ctx context.Context, options Options) error {
 				if err != nil {
 					return err
 				}
-				if _, err := opened.PromoteDueTasks(ctx, board, time.Now()); err != nil {
-					opened.Close()
-					return err
-				}
-				if err := recoverAbandonedRuns(ctx, opened, board, options); err != nil {
-					opened.Close()
-					return err
-				}
-				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
+				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
 					ClaimTTLSeconds: options.ClaimTTLSeconds, MaxInProgress: options.MaxInProgress, MaxInProgressPerAssignee: options.MaxInProgressPerAssignee})
 				if err != nil {
 					opened.Close()
@@ -608,6 +597,12 @@ func Run(ctx context.Context, options Options) error {
 				workers.Add(1)
 				go func(opened *store.Store, claim *model.ClaimedTask, approvalDir string) {
 					defer workers.Done()
+					defer func() {
+						select {
+						case workerFinished <- struct{}{}:
+						default:
+						}
+					}()
 					defer active.Add(-1)
 					defer opened.Close()
 					runClaim(ctx, manager, opened, claim, options, processes, approvalDir)
@@ -621,6 +616,22 @@ func Run(ctx context.Context, options Options) error {
 			}
 		}
 		if options.Once {
+			for active.Load() > 0 {
+				timer := time.NewTimer(options.Interval)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					processes.StopAll()
+					workers.Wait()
+					return nil
+				case <-workerFinished:
+					timer.Stop()
+				case <-timer.C:
+					if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
+						return err
+					}
+				}
+			}
 			workers.Wait()
 			deliverBoardNotifications(ctx, manager, boardSlugs, options)
 			return nil

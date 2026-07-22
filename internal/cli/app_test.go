@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nn1a/autogora/internal/dispatcher"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
 )
@@ -208,6 +209,24 @@ func TestDispatchDryRunFindsEligibleTasksWithoutClaiming(t *testing.T) {
 	shown := runApp(t, app, "show", created.Task.ID, "--db", dbPath)
 	if !strings.Contains(shown, `"status": "ready"`) {
 		t.Fatalf("dry run changed task state: %s", shown)
+	}
+}
+
+func TestDispatchLeavesBoardOrchestrationSettingsUnsetWithoutOverrides(t *testing.T) {
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "autogora.db")
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Cwd = directory
+	app.Getenv = func(string) string { return "" }
+	var captured dispatcher.Options
+	app.DispatchRunner = func(_ context.Context, options dispatcher.Options) error {
+		captured = options
+		return nil
+	}
+
+	runApp(t, app, "dispatch", "--once", "--db", dbPath)
+	if captured.PlannerRuntime != "" || captured.AutoDecomposePerTick != 0 || captured.DecompositionProfiles != nil || captured.DefaultProfile != nil || captured.OrchestratorProfile != nil {
+		t.Fatalf("dispatch defaults override board orchestration settings: %#v", captured)
 	}
 }
 

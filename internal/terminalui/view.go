@@ -70,7 +70,7 @@ func confirmationLabel(action string) string {
 	labels := map[string]string{
 		"promote": "Promote task?", "unblock": "Unblock task?", "archive": "Archive task?",
 		"delete": "Permanently delete task?", "specify": "Specify with the board planner?",
-		"decompose": "Decompose with the board planner?", "start": "Start manually and claim task?",
+		"decompose": "Decompose with the board planner?", "start": "Run this task with the dispatcher?",
 		"terminate": "Terminate active run?",
 	}
 	if label := labels[action]; label != "" {

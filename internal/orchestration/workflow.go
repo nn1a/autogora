@@ -295,6 +295,12 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 	}
 	if !plan.Fanout {
 		specified, err := opened.SpecifyTask(ctx, taskID, plan.RootTitle, plan.RootBody, "decomposer")
+		if err == nil && strings.TrimSpace(options.DefaultProfile.Name) != "" && options.DefaultProfile.Runtime != model.RuntimeManual && model.ValidRuntime(options.DefaultProfile.Runtime) {
+			assignee, runtime := options.DefaultProfile.Name, options.DefaultProfile.Runtime
+			specified, err = opened.UpdateTask(ctx, taskID, store.UpdateTaskInput{
+				Assignee: store.OptionalString{Set: true, Value: &assignee}, Runtime: &runtime,
+			})
+		}
 		return DecompositionResult{Fanout: false, Reason: plan.Reason, Task: specified}, err
 	}
 	nodes := make([]store.TaskGraphNode, 0, len(plan.Tasks))

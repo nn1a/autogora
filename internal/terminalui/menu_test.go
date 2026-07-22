@@ -115,3 +115,28 @@ func TestBoardFilterUsesSameTaskDataAsRelationshipPicker(t *testing.T) {
 		t.Fatal("filter changed the shared unfiltered task data")
 	}
 }
+
+func TestReadyTaskActionRunsDispatcherInsteadOfRawClaim(t *testing.T) {
+	task := testTask("ready", "Runnable", model.TaskStatusReady)
+	backend := &fakeBackend{details: map[string]model.TaskDetail{"ready": {Task: task}}}
+	m := NewModel(context.Background(), backend, "default")
+	menu := taskActionMenu(task, nil)
+	m.menu = menu
+	for index, item := range menu.items {
+		if item.action == "start" {
+			if item.label != "Run with dispatcher" {
+				t.Fatalf("misleading start label = %q", item.label)
+			}
+			m.menu.index = index
+		}
+	}
+	m.updateMenu(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.confirm == nil || m.confirm.action != "start" || m.confirm.id != task.ID {
+		t.Fatalf("dispatcher action confirmation = %#v", m.confirm)
+	}
+	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m.Update(command())
+	if len(backend.actions) != 1 || backend.actions[0] != "start:ready" {
+		t.Fatalf("ready task did not use targeted dispatcher: %v", backend.actions)
+	}
+}

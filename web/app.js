@@ -258,7 +258,8 @@ function bindCards() {
 async function moveTask(taskId, status) {
   try {
     if (status === "running") {
-      await api(boardPath(`/api/tasks/${taskId}/claim`), { method: "POST", body: "{}" });
+      await api(boardPath("/api/dispatch"), { method: "POST", body: JSON.stringify({ taskId }) });
+      toast("Task sent to the dispatcher");
       await loadBoard();
       return;
     }
@@ -386,7 +387,7 @@ function renderDrawer(detail) {
     <div class="action-row">
       ${task.status === "triage" ? '<button data-action="specify">Specify</button><button data-action="decompose">Decompose</button>' : ""}
       ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
-      ${task.status === "ready" ? '<button data-action="claim">Start manually</button>' : ""}
+      ${task.status === "ready" ? '<button data-action="dispatch" class="primary">Run task</button>' : ""}
       ${["todo", "scheduled", "blocked", "triage", "review"].includes(task.status) ? '<button data-action="promote">Promote</button>' : ""}
       ${!["running", "done", "archived"].includes(task.status) ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
       ${!["running", "archived"].includes(task.status) ? '<button data-action="archive">Archive</button>' : ""}
@@ -500,8 +501,9 @@ async function drawerAction(taskId, action) {
     } else if (action === "specify" || action === "decompose") {
       if (!confirm(`${action} this triage card using the board planner?`)) return;
       await api(boardPath(`/api/tasks/${taskId}/${action}`), { method: "POST", body: "{}" });
-    } else if (action === "claim") {
-      await api(boardPath(`/api/tasks/${taskId}/claim`), { method: "POST", body: "{}" });
+    } else if (action === "dispatch") {
+      await api(boardPath("/api/dispatch"), { method: "POST", body: JSON.stringify({ taskId }) });
+      toast("Task sent to the dispatcher");
     } else if (action === "archive") {
       if (!confirm("Archive this task?")) return;
       await api(boardPath(`/api/tasks/${taskId}/archive`), { method: "POST", body: "{}" }); closeDrawer();

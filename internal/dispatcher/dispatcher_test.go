@@ -106,6 +106,7 @@ func TestRecoveryRequeuesRecordedDeadWorker(t *testing.T) {
 func TestDispatcherAutoSpecifiesTriageWithInjectedPlanner(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
 	opened, _ := manager.OpenStore(ctx, "default")
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "rough operational idea", Status: model.TaskStatusTriage})
 	opened.Close()
@@ -114,14 +115,79 @@ func TestDispatcherAutoSpecifiesTriageWithInjectedPlanner(t *testing.T) {
 		kinds = append(kinds, request.Kind)
 		return map[string]any{"fanout": false, "rootTitle": "Audit backups", "rootBody": "Acceptance: record restore evidence.", "reason": "one specialist", "tasks": []any{}, "dependencies": []any{}}, nil
 	}
-	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, AutoDecompose: boolValue(true), DecompositionPlanner: planner}); err != nil {
+	fixture := executableFixture(t, `
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "automatic specification completed" >/dev/null
+printf '%s\n' '{"type":"run_result","text":"done"}'`)
+	profile := orchestration.ProfileRoute{Name: "operator", Runtime: model.RuntimeCline}
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Once: true, AutoDecompose: boolValue(true), DecompositionPlanner: planner,
+		DefaultProfile: &profile, Getenv: func(name string) string {
+			if name == "AUTOGORA_CLINE_BIN" {
+				return fixture
+			}
+			return ""
+		}}); err != nil {
 		t.Fatal(err)
 	}
 	check, _ := manager.OpenStore(ctx, "default")
 	defer check.Close()
 	detail, _ := check.GetTask(ctx, task.Task.ID)
-	if detail.Task.Status != model.TaskStatusTodo || !strings.Contains(detail.Task.Body, "Acceptance") || len(kinds) != 1 || kinds[0] != orchestration.PlannerDecompose {
+	if detail.Task.Status != model.TaskStatusDone || detail.Task.Assignee == nil || *detail.Task.Assignee != "operator" || !strings.Contains(detail.Task.Body, "Acceptance") || len(kinds) != 1 || kinds[0] != orchestration.PlannerDecompose {
 		t.Fatalf("unexpected auto specification: %#v, kinds=%v", detail, kinds)
+	}
+}
+
+func TestOneShotDispatcherReclaimsHungWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	manager, dbPath := testManager(t)
+	opened, _ := manager.OpenStore(ctx, "default")
+	assignee := "hung-worker"
+	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "hung", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	opened.Close()
+	fixture := executableFixture(t, `while :; do sleep 1; done`)
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, MaxWorkers: 1,
+		Interval: 250 * time.Millisecond, ClaimTTLSeconds: 1, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+			if name == "AUTOGORA_CODEX_BIN" {
+				return fixture
+			}
+			return ""
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	check, _ := manager.OpenStore(context.Background(), "default")
+	defer check.Close()
+	detail, _ := check.GetTask(context.Background(), task.Task.ID)
+	if detail.Task.Status == model.TaskStatusRunning || detail.Task.CurrentRunID != nil || len(detail.Runs) != 1 || detail.Runs[0].Status == model.RunStatusRunning {
+		t.Fatalf("one-shot watchdog left a stranded run: %#v", detail)
+	}
+}
+
+func TestTargetedDispatcherRunsOnlyRequestedTask(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
+	opened, _ := manager.OpenStore(ctx, "default")
+	assignee := "worker"
+	first, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "first", Assignee: &assignee, Runtime: model.RuntimeCline, Priority: 100})
+	second, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "second", Assignee: &assignee, Runtime: model.RuntimeCline})
+	opened.Close()
+	fixture := executableFixture(t, `
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "target complete" >/dev/null
+printf '%s\n' '{"type":"run_result","text":"done"}'`)
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Board: "default", TaskID: second.Task.ID, Once: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+		if name == "AUTOGORA_CLINE_BIN" {
+			return fixture
+		}
+		return ""
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	check, _ := manager.OpenStore(ctx, "default")
+	defer check.Close()
+	firstDetail, _ := check.GetTask(ctx, first.Task.ID)
+	secondDetail, _ := check.GetTask(ctx, second.Task.ID)
+	if firstDetail.Task.Status != model.TaskStatusReady || secondDetail.Task.Status != model.TaskStatusDone {
+		t.Fatalf("target dispatch changed the wrong task: first=%s second=%s", firstDetail.Task.Status, secondDetail.Task.Status)
 	}
 }
 

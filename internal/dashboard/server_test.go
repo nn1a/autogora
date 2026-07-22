@@ -216,3 +216,24 @@ func TestSSEStreamsTaskEvents(t *testing.T) {
 		t.Fatal("SSE event timeout")
 	}
 }
+
+func TestTargetedDispatchRejectsStrandedRoutesAndAcceptsRunnableTask(t *testing.T) {
+	server := startTestServer(t)
+	_, stranded := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{
+		"title": "No worker route", "status": "ready", "runtime": "manual",
+	})
+	strandedID := mapValue(t, mapValue(t, stranded)["task"])["id"].(string)
+	rejected, _ := apiRequest(t, server, http.MethodPost, "/api/dispatch", map[string]any{"taskId": strandedID})
+	if rejected.StatusCode != http.StatusConflict {
+		t.Fatalf("stranded targeted dispatch status = %d", rejected.StatusCode)
+	}
+
+	_, runnable := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{
+		"title": "Runnable", "status": "ready", "assignee": "worker", "runtime": "cline",
+	})
+	runnableID := mapValue(t, mapValue(t, runnable)["task"])["id"].(string)
+	accepted, value := apiRequest(t, server, http.MethodPost, "/api/dispatch", map[string]any{"taskId": runnableID})
+	if accepted.StatusCode != http.StatusAccepted || mapValue(t, value)["taskId"] != runnableID {
+		t.Fatalf("targeted dispatch response = %d %#v", accepted.StatusCode, value)
+	}
+}

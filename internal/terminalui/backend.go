@@ -27,7 +27,7 @@ type Backend interface {
 	BoardContext(context.Context) (taskservice.BoardContext, error)
 	SpecifyTask(context.Context, string, *orchestration.SpecificationPlan, string) (model.TaskDetail, error)
 	DecomposeTask(context.Context, string, *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error)
-	ClaimTaskForUser(context.Context, string, int, string) (*model.ClaimedTask, error)
+	DispatchTask(context.Context, string) error
 	TerminateRun(context.Context, string, string) (runcontrol.Termination, error)
 	DeleteTask(context.Context, string) error
 	ScheduleTask(context.Context, string, *string, string) (model.TaskDetail, error)

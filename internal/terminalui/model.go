@@ -295,10 +295,9 @@ func (m *Model) mutate(action, id, value string) tea.Cmd {
 			result, decomposeErr := m.backend.DecomposeTask(m.ctx, id, nil)
 			detail, err = result.Task, decomposeErr
 		case "start":
-			claim, claimErr := m.backend.ClaimTaskForUser(m.ctx, id, 900, "")
-			err = claimErr
-			if claim != nil {
-				detail = claim.Task
+			err = m.backend.DispatchTask(m.ctx, id)
+			if err == nil {
+				detail, err = m.backend.GetTask(m.ctx, id)
 			}
 		case "terminate":
 			termination, terminationErr := m.backend.TerminateRun(m.ctx, id, "Terminated from TUI")
@@ -375,7 +374,7 @@ func actionLabel(action string) string {
 		"create": "Task created", "edit": "Task updated", "title": "Title updated", "assign": "Assignee updated",
 		"comment": "Comment added", "promote": "Task promoted", "complete": "Task completed",
 		"block": "Task blocked", "unblock": "Task unblocked", "archive": "Task archived", "specify": "Task specified",
-		"decompose": "Task decomposed", "start": "Task claimed", "terminate": "Run termination requested", "delete": "Task deleted",
+		"decompose": "Task decomposed", "start": "Task run finished", "terminate": "Run termination requested", "delete": "Task deleted",
 		"schedule": "Task scheduled", "attach-file": "File attached", "attach-url": "URL attached",
 	}
 	if strings.HasPrefix(action, "move:") {

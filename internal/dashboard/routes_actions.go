@@ -302,12 +302,34 @@ func (s *Server) handleExtendedAPI(response http.ResponseWriter, request *http.R
 			if err != nil {
 				return err
 			}
+			taskID := strings.TrimSpace(stringValue(body["taskId"]))
+			if taskID != "" {
+				if _, err := usingStore(ctx, s, board, func(opened *store.Store) (model.Task, error) {
+					detail, err := opened.GetTask(ctx, taskID)
+					if err != nil {
+						return model.Task{}, err
+					}
+					if detail.Task.Status != model.TaskStatusReady || detail.Task.Assignee == nil || detail.Task.Runtime == model.RuntimeManual {
+						return model.Task{}, fmt.Errorf("cannot dispatch task that is not ready: %s", taskID)
+					}
+					return detail.Task, nil
+				}); err != nil {
+					return err
+				}
+			}
+			autoDecompose := (*bool)(nil)
+			if taskID != "" {
+				value := false
+				autoDecompose = &value
+			}
+			s.workers.Add(1)
 			go func() {
-				if err := dispatcher.Run(s.ctx, dispatcher.Options{DBPath: s.options.DBPath, CLIPath: s.options.CLIPath, Board: board, Once: true, MaxWorkers: intValue(body["maxWorkers"], 2), AllowWrites: boolValue(body["allowWrites"], false)}); err != nil && s.options.OnLog != nil {
+				defer s.workers.Done()
+				if err := dispatcher.Run(s.ctx, dispatcher.Options{DBPath: s.options.DBPath, CLIPath: s.options.CLIPath, Board: board, TaskID: taskID, Once: true, MaxWorkers: intValue(body["maxWorkers"], 2), AllowWrites: boolValue(body["allowWrites"], false), AutoDecompose: autoDecompose}); err != nil && s.options.OnLog != nil {
 					s.options.OnLog("dashboard dispatch failed: " + err.Error())
 				}
 			}()
-			sendJSON(response, http.StatusAccepted, map[string]any{"accepted": true, "board": board})
+			sendJSON(response, http.StatusAccepted, map[string]any{"accepted": true, "board": board, "taskId": taskID})
 			return nil
 		}
 	}

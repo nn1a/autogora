@@ -45,7 +45,7 @@ func taskActionMenu(task model.Task, detail *model.TaskDetail) *actionMenu {
 		items = append(items, menuItem{label: "Unblock", action: "unblock"})
 	}
 	if task.Status == model.TaskStatusReady {
-		items = append(items, menuItem{label: "Start manually (claim)", action: "start"})
+		items = append(items, menuItem{label: "Run with dispatcher", action: "start"})
 	}
 	if task.CurrentRunID != nil {
 		items = append(items, menuItem{label: "Terminate active run", action: "terminate:" + *task.CurrentRunID, danger: true})

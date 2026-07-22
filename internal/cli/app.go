@@ -81,13 +81,14 @@ Common options:
 `
 
 type App struct {
-	Stdin         io.Reader
-	Stdout        io.Writer
-	Stderr        io.Writer
-	Cwd           string
-	Getenv        func(string) string
-	Version       string
-	CommandRunner setupcfg.CommandRunner
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	Cwd            string
+	Getenv         func(string) string
+	Version        string
+	CommandRunner  setupcfg.CommandRunner
+	DispatchRunner DispatchRunner
 }
 
 func New(stdout, stderr io.Writer) *App {

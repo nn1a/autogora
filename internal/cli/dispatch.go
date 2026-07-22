@@ -14,6 +14,8 @@ import (
 	"github.com/nn1a/autogora/internal/store"
 )
 
+type DispatchRunner func(context.Context, dispatcher.Options) error
+
 func (a *App) dispatcherDBPath(value string) (string, error) {
 	if value == "" {
 		return a.defaultDBPath()
@@ -153,21 +155,26 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 	if err != nil {
 		return err
 	}
-	autoPerTick, err := numberOption(opts.value("auto-decompose-per-tick"), 3)
+	autoPerTick, err := numberOption(opts.value("auto-decompose-per-tick"), 0)
 	if err != nil {
 		return err
 	}
-	plannerRuntime, err := requirePlannerRuntime(opts.value("planner-runtime"))
-	if err != nil {
-		return err
+	plannerRuntime := model.Runtime("")
+	profileFallback := model.RuntimeCodex
+	if opts.present("planner-runtime") {
+		plannerRuntime, err = requirePlannerRuntime(opts.value("planner-runtime"))
+		if err != nil {
+			return err
+		}
+		profileFallback = plannerRuntime
 	}
 	plannerTimeoutMS, err := numberOption(opts.value("planner-timeout-ms"), 120_000)
 	if err != nil {
 		return err
 	}
-	profiles := make([]orchestration.ProfileRoute, 0, len(opts.many("profile")))
+	var profiles []orchestration.ProfileRoute
 	for _, raw := range opts.many("profile") {
-		profile, err := parseRoutingProfile(raw, plannerRuntime)
+		profile, err := parseRoutingProfile(raw, profileFallback)
 		if err != nil {
 			return err
 		}
@@ -175,14 +182,14 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 	}
 	var defaultProfile, orchestratorProfile *orchestration.ProfileRoute
 	if opts.present("default-profile") {
-		value, err := parseRoutingProfile(opts.value("default-profile"), plannerRuntime)
+		value, err := parseRoutingProfile(opts.value("default-profile"), profileFallback)
 		if err != nil {
 			return err
 		}
 		defaultProfile = &value
 	}
 	if opts.present("orchestrator-profile") {
-		value, err := parseRoutingProfile(opts.value("orchestrator-profile"), plannerRuntime)
+		value, err := parseRoutingProfile(opts.value("orchestrator-profile"), profileFallback)
 		if err != nil {
 			return err
 		}
@@ -194,7 +201,11 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		autoDecompose = &value
 	}
 	crashGrace, rateCooldown := time.Duration(crashSeconds)*time.Second, time.Duration(rateLimitSeconds)*time.Second
-	return dispatcher.Run(ctx, dispatcher.Options{
+	run := a.DispatchRunner
+	if run == nil {
+		run = dispatcher.Run
+	}
+	return run(ctx, dispatcher.Options{
 		DBPath: dbPath, CLIPath: cliPath, Board: a.board(opts), Once: command != "daemon" && opts.flags["once"],
 		Interval: time.Duration(intervalMS) * time.Millisecond, MaxWorkers: maxWorkers,
 		MaxInProgress: maxInProgress, MaxInProgressPerAssignee: maxPerAssignee,

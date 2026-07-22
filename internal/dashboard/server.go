@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nn1a/autogora/internal/boards"
@@ -39,6 +40,7 @@ type Server struct {
 	options  Options
 	ctx      context.Context
 	cancel   context.CancelFunc
+	workers  sync.WaitGroup
 }
 
 func randomToken() (string, error) {
@@ -96,7 +98,9 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 
 func (s *Server) Close(ctx context.Context) error {
 	s.cancel()
-	return s.HTTP.Shutdown(ctx)
+	err := s.HTTP.Shutdown(ctx)
+	s.workers.Wait()
+	return err
 }
 
 func securityHeaders(response http.ResponseWriter) {

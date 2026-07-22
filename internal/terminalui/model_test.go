@@ -46,9 +46,9 @@ func (f *fakeBackend) DecomposeTask(_ context.Context, id string, _ *orchestrati
 	return orchestration.DecompositionResult{Task: model.TaskDetail{Task: testTask(id, "decomposed", model.TaskStatusTodo)}}, nil
 }
 
-func (f *fakeBackend) ClaimTaskForUser(_ context.Context, id string, _ int, _ string) (*model.ClaimedTask, error) {
+func (f *fakeBackend) DispatchTask(_ context.Context, id string) error {
 	f.actions = append(f.actions, "start:"+id)
-	return &model.ClaimedTask{Task: model.TaskDetail{Task: testTask(id, "started", model.TaskStatusRunning)}}, nil
+	return nil
 }
 
 func (f *fakeBackend) TerminateRun(_ context.Context, id, _ string) (runcontrol.Termination, error) {

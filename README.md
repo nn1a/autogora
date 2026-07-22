@@ -182,7 +182,7 @@ Workspace kind; press `space` to toggle Goal mode. The form also shows these
 controls next to the focused selection field.
 
 Press `space` for the searchable task action palette. It includes status moves,
-Specify, Decompose, Promote, Unblock, manual claim, active-run termination,
+Specify, Decompose, Promote, Unblock, targeted dispatcher runs, active-run termination,
 scheduling, completion and blocking, hierarchy and dependency edits, comments,
 file/URL attachments, archive, and delete. These actions use the same in-process
 task service as the dashboard. Destructive and planner actions remain pinned to
@@ -213,7 +213,7 @@ The dashboard includes:
   and optional per-profile Running lanes;
 - create/edit drawers, safe Markdown rendering, dependencies, comments, run
   history and termination, attachments, and recent events;
-- progress/comment/link badges, drag/drop transitions, atomic manual starts,
+- progress/comment/link badges, drag/drop transitions, targeted dispatcher runs,
   a guarded trash target, and partial-failure bulk move, assign, archive, and
   delete actions;
 - isolated board switching/creation/settings, persisted profile routing and

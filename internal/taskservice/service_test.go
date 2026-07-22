@@ -93,3 +93,17 @@ func TestSharedServiceUsesBoardProfilesForExplicitDecomposition(t *testing.T) {
 		t.Fatalf("board profile was not applied to child: %#v", child)
 	}
 }
+
+func TestServiceDelegatesInteractiveDispatch(t *testing.T) {
+	called := ""
+	service := (&Service{}).WithTaskDispatcher(func(_ context.Context, taskID string) error {
+		called = taskID
+		return nil
+	})
+	if err := service.DispatchTask(context.Background(), "t_ready"); err != nil || called != "t_ready" {
+		t.Fatalf("dispatch delegation: called=%q err=%v", called, err)
+	}
+	if err := (&Service{}).DispatchTask(context.Background(), "t_ready"); err == nil {
+		t.Fatal("missing task dispatcher was accepted")
+	}
+}
