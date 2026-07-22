@@ -83,10 +83,14 @@ test("explicit termination signals the recorded worker before reclaiming its run
     const exited = once(child, "exit");
     const terminated = terminateTaskRun(store, task.task.id, "test termination");
     assert.equal(terminated.signaled, true);
+    assert.equal(terminated.pending, true);
     assert.equal(terminated.pid, child.pid);
-    assert.equal(terminated.task.task.status, "ready");
+    assert.equal(terminated.task.task.status, "running");
+    assert.equal(store.getTask(task.task.id).events.at(-1)?.kind, "reclaim_deferred");
     await exited;
     assert.notEqual(child.signalCode, null);
+    const reclaimed = store.recoverAbandonedRun(claim.run.id, "reclaimed", "worker exited after termination", false);
+    assert.equal(reclaimed.task.status, "ready");
   } finally {
     if (child?.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     store.close();

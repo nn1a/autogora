@@ -215,9 +215,10 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
         name: "kanban_run_terminate",
         arguments: { task_id: terminable.task.id, reason: "MCP administrative change" },
       }),
-    ) as { runId: string; signaled: boolean; task: { task: { status: string } } };
+    ) as { runId: string; signaled: boolean; pending: boolean; task: { task: { status: string } } };
     assert.equal(terminated.runId, terminableClaim.run.id);
     assert.equal(terminated.signaled, false);
+    assert.equal(terminated.pending, false);
     assert.equal(terminated.task.task.status, "ready");
     await client.callTool({
       name: "kanban_update",

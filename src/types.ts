@@ -167,6 +167,9 @@ export interface TaskRelationshipGraph {
   focusTaskId: string;
   rootTaskId: string;
   totalPhases: number;
+  totalConnectedNodes: number;
+  truncated: boolean;
+  omittedNodeCount: number;
   nodes: TaskRelationshipNode[];
   hierarchy: Array<{ parentTaskId: string; subtaskId: string; position: number }>;
   dependencies: Array<{ prerequisiteId: string; dependentId: string; satisfiedAt: string | null }>;

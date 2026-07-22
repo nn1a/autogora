@@ -382,11 +382,19 @@ workspaces, attachments, and unfinished results from other nodes are not copied
 into worker context. The dispatcher still rechecks the dependency gate inside
 the same transaction that claims a task.
 
+Relationship responses remain bounded at 500 nodes. Larger connected graphs no
+longer fail worker startup: TaskCircuit returns the exact total node and phase
+counts, keeps the focus/root/direct neighborhood, and marks the response as
+`truncated` with an `omittedNodeCount`.
+
 Administrative completion, blocking, archiving, deletion, and ownership or
 workspace moves reject a task with an active run. Use `taskcircuit terminate
 <task-id>` or `kanban_run_terminate` first; this signals the recorded worker PID
-and atomically reclaims the run. Title, body, and priority clarifications remain
-editable during a run, while workspace and branch identity stay fixed.
+and reclaims the run. A live PID returns `pending: true` and remains `running`
+until the dispatcher observes process exit, preventing an old and a replacement
+worker from overlapping. A missing or already-dead PID is reclaimed immediately.
+Title, body, and priority clarifications remain editable during a run, while
+workspace and branch identity stay fixed.
 
 ## Skills
 

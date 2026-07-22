@@ -122,6 +122,31 @@ test("dependency handoffs remain stable while real-world graph edits recompute s
   }
 });
 
+test("large connected graphs return a bounded worker-safe view instead of blocking execution", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const taskIds: string[] = [];
+    for (let index = 0; index < 501; index += 1) {
+      taskIds.push(store.createTask({ title: `large graph node ${index}` }).task.id);
+    }
+    for (let index = 1; index < taskIds.length; index += 1) {
+      store.linkTasks(taskIds[index - 1]!, taskIds[index]!);
+    }
+
+    const focusTaskId = taskIds[250]!;
+    const graph = store.getRelationshipGraph(focusTaskId);
+    assert.equal(graph.totalConnectedNodes, 501);
+    assert.equal(graph.truncated, true);
+    assert.equal(graph.nodes.length, 500);
+    assert.equal(graph.omittedNodeCount, 1);
+    assert.equal(graph.totalPhases, 501);
+    assert.equal(graph.nodes.find((node) => node.task.id === focusTaskId)?.phase, 250);
+    assert.match(store.buildWorkerContext(focusTaskId), /451 additional related node\(s\) omitted/);
+  } finally {
+    store.close();
+  }
+});
+
 test("task hierarchy stays separate from dependency order and claims follow graph phases", () => {
   const store = new KanbanStore(":memory:");
   try {

@@ -65,7 +65,7 @@ Authoritative references:
 - [x] Core MCP planning and worker lifecycle tools
 - [x] Scoped worker isolation and portable worker/orchestrator Skills
 - [x] Attachment MCP tools and attachment-aware task detail
-- [x] Bounded worker context with root goal, metadata-only phase map, prerequisite handoffs, and prior attempts
+- [x] Bounded worker context with root goal, metadata-only phase map, prerequisite handoffs, truncation metadata, and prior attempts
 - [x] CLI verbs for boards, tasks, claim/heartbeat, runs, events, logs, stats, diagnostics, and dry-run dispatch
 - [x] Terminal event watch/tail and machine-readable output
 - [x] Notification subscriptions and leased terminal-event delivery adapters

@@ -361,7 +361,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_graph",
     {
       title: "Show TaskCircuit relationship graph",
-      description: "Show the connected parent/subtask hierarchy and prerequisite/dependent DAG with enforced execution phases.",
+      description: "Show a bounded connected parent/subtask hierarchy and prerequisite/dependent DAG with enforced execution phases and truncation metadata.",
       inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -433,7 +433,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_run_terminate",
     {
       title: "Terminate a TaskCircuit worker run",
-      description: "Signal an active worker process and atomically reclaim its run before an administrative task transition.",
+      description: "Signal an active worker process before an administrative transition. A live PID remains pending until the dispatcher observes exit; a missing or dead PID is reclaimed immediately.",
       inputSchema: z.object({
         board: z.string().optional(),
         task_id: z.string().optional(),

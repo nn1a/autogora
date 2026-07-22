@@ -5,6 +5,7 @@ export interface RunTermination {
   runId: string;
   pid: number | null;
   signaled: boolean;
+  pending: boolean;
   task: TaskDetail;
 }
 
@@ -24,8 +25,13 @@ export function terminateRun(store: KanbanStore, runId: string, reason = "Run te
     throw new Error(`Run is already terminal: ${inspection.run.status}`);
   }
   const signaled = signalRunProcess(inspection.run.pid);
-  const task = store.recoverAbandonedRun(runId, "reclaimed", reason.trim() || "Run terminated administratively", false);
-  return { runId, pid: inspection.run.pid, signaled, task };
+  const cleanReason = reason.trim() || "Run terminated administratively";
+  if (signaled) {
+    store.deferReclaim(runId, 15, cleanReason);
+    return { runId, pid: inspection.run.pid, signaled, pending: true, task: store.getTask(inspection.task.id) };
+  }
+  const task = store.recoverAbandonedRun(runId, "reclaimed", cleanReason, false);
+  return { runId, pid: inspection.run.pid, signaled, pending: false, task };
 }
 
 export function terminateTaskRun(store: KanbanStore, taskId: string, reason?: string): RunTermination {

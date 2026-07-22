@@ -43,10 +43,21 @@ test("worker context, stats, diagnostics, event cursors, and bulk results share 
 
     const stranded = store.createTask({ title: "stranded", status: "ready" });
     const lagging = store.createTask({ title: "lagging", assignee: "worker", runtime: "codex", status: "todo" });
+    const archivedPrerequisite = store.createTask({ title: "abandoned prerequisite", assignee: "owner", runtime: "codex" });
+    const terminallyBlocked = store.createTask({
+      title: "blocked by archive",
+      assignee: "worker",
+      runtime: "codex",
+      parents: [archivedPrerequisite.task.id],
+    });
+    store.archiveTask(archivedPrerequisite.task.id);
     const diagnostics = store.diagnose();
     assert.equal(diagnostics.healthy, false);
     assert.ok(diagnostics.issues.some((issue) => issue.kind === "stranded_in_ready" && issue.taskId === stranded.task.id));
     assert.ok(diagnostics.issues.some((issue) => issue.kind === "promotion_lag" && issue.taskId === lagging.task.id));
+    assert.ok(diagnostics.issues.some((issue) =>
+      issue.kind === "terminal_prerequisite" && issue.taskId === terminallyBlocked.task.id
+    ));
 
     const firstPage = store.listEvents({ limit: 2 });
     assert.equal(firstPage.length, 2);

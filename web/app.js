@@ -346,6 +346,9 @@ function renderDrawer(detail) {
     <span class="mono">${escapeHtml(node.task.id)}${node.parentTaskId ? ` · subtask of ${escapeHtml(node.parentTaskId)}` : node.task.id === graph.rootTaskId ? " · hierarchy root" : ""}</span>
     <div>Requires: ${node.blockedBy.length > 0 ? escapeHtml(node.blockedBy.join(", ")) : "all prerequisites complete or none"}</div>
   </div>`).join("");
+  const graphLimitNotice = graph.truncated
+    ? `<div class="detail-row"><strong>Bounded graph view</strong><div>Showing ${graph.nodes.length} of ${graph.totalConnectedNodes} connected tasks. ${graph.omittedNodeCount} distant nodes are omitted without blocking worker context.</div></div>`
+    : "";
   const parentTask = detail.parentTask
     ? `<div class="detail-row" data-open-task="${escapeHtml(detail.parentTask.id)}"><button type="button" class="icon-button compact" data-remove-parent-task="${escapeHtml(detail.parentTask.id)}" aria-label="Remove parent task">×</button><strong>${escapeHtml(detail.parentTask.title)}</strong><span class="mono">${escapeHtml(detail.parentTask.id)}</span></div>`
     : "<small>No parent task</small>";
@@ -380,7 +383,7 @@ function renderDrawer(detail) {
     <h3>Rendered description</h3><div class="markdown">${markdown(task.body || "(empty)")}</div>
     <h3>Execution order</h3>
     <div class="detail-row"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>Claims are allowed only after every direct prerequisite handoff is satisfied.</div></div>
-    <div class="detail-list">${graphRows}</div>
+    <div class="detail-list">${graphLimitNotice}${graphRows}</div>
     <h3>Task hierarchy</h3>
     <small>Hierarchy records parent/subtask ownership. It does not control execution order.</small>
     <div class="detail-list">${parentTask}</div>
@@ -430,7 +433,8 @@ function bindDrawer(detail) {
   }));
   $$('[data-terminate-run]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {
     if (!confirm("Terminate this active run and release its task?")) return;
-    await api(boardPath(`/api/runs/${button.dataset.terminateRun}/terminate`), { method: "POST", body: JSON.stringify({ reason: "Terminated by dashboard user" }) });
+    const termination = await api(boardPath(`/api/runs/${button.dataset.terminateRun}/terminate`), { method: "POST", body: JSON.stringify({ reason: "Terminated by dashboard user" }) });
+    if (termination.pending) toast("Termination signal sent; the task will be released after the worker exits.");
     await openDrawer(taskId); await loadBoard();
   }));
   $$('[data-remove-attachment]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {

@@ -1517,7 +1517,47 @@ export class KanbanStore {
       `)
       .all(board) as unknown as { id: string }[];
     for (const task of promotable) {
-      issues.push({ kind: "promotion_lag", taskId: task.id, detail: "todo task has no open dependency" });
+      issues.push({
+        kind: "promotion_lag",
+        taskId: task.id,
+        detail: "todo task has no open dependency; promote it unless it is intentionally parked for manual review",
+      });
+    }
+    const invalidExecutionStates = this.db
+      .prepare(`
+        SELECT t.id, t.status, GROUP_CONCAT(l.parent_id) AS parent_ids
+        FROM tasks t JOIN task_links l ON l.child_id = t.id
+        WHERE t.board = ? AND t.status IN ('running', 'done') AND l.satisfied_at IS NULL
+        GROUP BY t.id, t.status
+        LIMIT 500
+      `)
+      .all(board) as unknown as Array<{ id: string; status: TaskStatus; parent_ids: string }>;
+    for (const task of invalidExecutionStates) {
+      issues.push({
+        kind: task.status === "running" ? "running_with_open_dependency" : "done_with_open_dependency",
+        taskId: task.id,
+        detail: `unsatisfied prerequisites=${task.parent_ids}`,
+      });
+    }
+    const stalledDependencies = this.db
+      .prepare(`
+        SELECT c.id AS child_id, p.id AS parent_id, p.status AS parent_status
+        FROM task_links l
+        JOIN tasks c ON c.id = l.child_id
+        JOIN tasks p ON p.id = l.parent_id
+        WHERE c.board = ? AND l.satisfied_at IS NULL
+          AND c.status NOT IN ('done', 'archived')
+          AND p.status IN ('archived', 'blocked', 'triage', 'review')
+        ORDER BY c.id, p.id
+        LIMIT 500
+      `)
+      .all(board) as unknown as Array<{ child_id: string; parent_id: string; parent_status: TaskStatus }>;
+    for (const dependency of stalledDependencies) {
+      issues.push({
+        kind: dependency.parent_status === "archived" ? "terminal_prerequisite" : "stalled_prerequisite",
+        taskId: dependency.child_id,
+        detail: `prerequisite=${dependency.parent_id}, status=${dependency.parent_status}; complete, unblock, or unlink it`,
+      });
     }
     const activeRuns = this.listActiveRuns(board);
     return { board, healthy: issues.length === 0, stats: this.getStats(board), issues, activeRuns };
@@ -1887,8 +1927,9 @@ export class KanbanStore {
         `  Requires: ${requires.length > 0 ? requires.join(", ") : "none"}; unlocks: ${node.unlocks.length > 0 ? node.unlocks.join(", ") : "none"}`,
       );
     }
-    if (graph.nodes.length > contextGraphNodes.length) {
-      lines.push(`- … ${graph.nodes.length - contextGraphNodes.length} additional related node(s) omitted; use kanban_graph from an orchestrator/admin session for the full topology.`);
+    const contextOmitted = graph.nodes.length - contextGraphNodes.length + graph.omittedNodeCount;
+    if (contextOmitted > 0) {
+      lines.push(`- … ${contextOmitted} additional related node(s) omitted from this bounded context; use kanban_graph from an orchestrator/admin session for the bounded topology view.`);
     }
 
     if (detail.parents.length > 0) {
@@ -2044,12 +2085,12 @@ export class KanbanStore {
 
     const connected = new Set<string>([taskId]);
     const queue = [taskId];
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    let queueIndex = 0;
+    while (queueIndex < queue.length) {
+      const current = queue[queueIndex++]!;
       for (const related of adjacency.get(current) ?? []) {
         if (connected.has(related)) continue;
         connected.add(related);
-        if (connected.size > 500) throw new Error("Task relationship graph exceeds 500 connected tasks");
         queue.push(related);
       }
     }
@@ -2100,9 +2141,10 @@ export class KanbanStore {
     }
     const phases = new Map([...connected].map((id) => [id, 0]));
     const topologicalQueue = [...connected].filter((id) => indegree.get(id) === 0).sort();
+    let topologicalIndex = 0;
     let processed = 0;
-    while (topologicalQueue.length > 0) {
-      const current = topologicalQueue.shift()!;
+    while (topologicalIndex < topologicalQueue.length) {
+      const current = topologicalQueue[topologicalIndex++]!;
       processed += 1;
       for (const dependent of downstream.get(current) ?? []) {
         phases.set(dependent, Math.max(phases.get(dependent) ?? 0, (phases.get(current) ?? 0) + 1));
@@ -2110,7 +2152,6 @@ export class KanbanStore {
         indegree.set(dependent, remaining);
         if (remaining === 0) {
           topologicalQueue.push(dependent);
-          topologicalQueue.sort();
         }
       }
     }
@@ -2118,7 +2159,7 @@ export class KanbanStore {
       for (const [id, remaining] of indegree) if (remaining > 0) phases.set(id, -1);
     }
 
-    const nodes = [...connected].map((id) => {
+    const allNodes = [...connected].map((id) => {
       const row = tasksById.get(id);
       if (!row) throw new Error(`Related task not found: ${id}`);
       const hierarchyEdge = parentByChild.get(id);
@@ -2138,18 +2179,40 @@ export class KanbanStore {
       || left.position - right.position
       || left.task.createdAt.localeCompare(right.task.createdAt)
       || left.task.id.localeCompare(right.task.id));
-    const validPhases = nodes.map((node) => node.phase).filter((phase) => phase >= 0);
+    const nodeLimit = 500;
+    const selectedIds = new Set<string>();
+    const select = (id: string): void => {
+      if (selectedIds.size < nodeLimit && connected.has(id)) selectedIds.add(id);
+    };
+    select(taskId);
+    select(rootTaskId);
+    let ancestorId = taskId;
+    const selectedAncestors = new Set<string>();
+    while (parentByChild.has(ancestorId) && !selectedAncestors.has(ancestorId)) {
+      selectedAncestors.add(ancestorId);
+      ancestorId = parentByChild.get(ancestorId)!.parent_id;
+      select(ancestorId);
+    }
+    for (const related of adjacency.get(taskId) ?? []) select(related);
+    for (const edge of subtasksByParent.get(rootTaskId) ?? []) select(edge.child_id);
+    for (const node of allNodes) select(node.task.id);
+    const nodes = allNodes.filter((node) => selectedIds.has(node.task.id));
+    const validPhases = allNodes.map((node) => node.phase).filter((phase) => phase >= 0);
+    const truncated = allNodes.length > nodes.length;
     return {
       focusTaskId: taskId,
       rootTaskId,
       totalPhases: validPhases.length > 0 ? Math.max(...validPhases) + 1 : 0,
+      totalConnectedNodes: allNodes.length,
+      truncated,
+      omittedNodeCount: allNodes.length - nodes.length,
       nodes,
-      hierarchy: hierarchy.map((edge) => ({
+      hierarchy: hierarchy.filter((edge) => selectedIds.has(edge.parent_id) && selectedIds.has(edge.child_id)).map((edge) => ({
         parentTaskId: edge.parent_id,
         subtaskId: edge.child_id,
         position: edge.position,
       })),
-      dependencies: dependencies.map((edge) => ({
+      dependencies: dependencies.filter((edge) => selectedIds.has(edge.parent_id) && selectedIds.has(edge.child_id)).map((edge) => ({
         prerequisiteId: edge.parent_id,
         dependentId: edge.child_id,
         satisfiedAt: edge.satisfied_at,
@@ -2885,13 +2948,13 @@ export class KanbanStore {
     return this.getTask(taskId);
   }
 
-  deferReclaim(runId: string, seconds = 120): Run {
+  deferReclaim(runId: string, seconds = 120, reason?: string): Run {
     this.write(() => {
       const run = this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow | undefined;
       if (!run || run.status !== "running") throw new Error(`Active run not found: ${runId}`);
       const expires = futureIso(Math.max(1, seconds));
       this.db.prepare("UPDATE task_runs SET claim_expires_at = ? WHERE id = ?").run(expires, runId);
-      this.appendEvent(run.task_id, "reclaim_deferred", { pid: run.pid, expires }, run.id);
+      this.appendEvent(run.task_id, "reclaim_deferred", { pid: run.pid, expires, reason: reason?.trim() || null }, run.id);
     });
     return runFromRow(this.db.prepare("SELECT * FROM task_runs WHERE id = ?").get(runId) as RunRow);
   }

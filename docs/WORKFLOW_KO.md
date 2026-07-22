@@ -156,6 +156,8 @@ MCP에서는 `kanban_graph`, `kanban_subtask_set`, `kanban_subtask_remove`, `kan
 
 다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. 전체 topology 변경은 orchestrator 또는 관리 화면에서 수행하고, worker는 자신에게 claim된 node만 구현한다.
 
+연결된 graph가 500개 node를 넘더라도 worker 시작을 실패시키지 않는다. `kanban_graph`와 Web UI는 focus task, hierarchy root, 직접 관계를 우선해 최대 500개를 보여주고 `totalConnectedNodes`, `truncated`, `omittedNodeCount`로 생략 범위를 알린다. worker context는 이 중 필요한 50개 요약만 사용한다.
+
 ![Task hierarchy와 실행 dependency를 분리해 보여주는 실제 화면](images/workflow-05-task-relationships.png)
 
 *실제 Web UI의 관계 관리 화면. 위쪽 phase 목록은 실행 순서를, Task hierarchy는 소속을, Execution dependencies는 claim을 차단하는 선행 관계를 나타낸다.*
@@ -438,7 +440,7 @@ node dist/cli.js comment <task-id> \
 node dist/cli.js promote <task-id>
 ```
 
-`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `kanban_run_terminate`로 활성 worker에 종료 신호를 보내고 run을 회수한다. 제목·본문·우선순위 설명은 실행 중에도 보완할 수 있지만 assignee, runtime, workspace, branch는 현재 실행과 어긋나지 않도록 고정된다. 필수 코드 리뷰는 별도 리뷰 카드를 만드는 것이 안전하다.
+`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `kanban_run_terminate`로 활성 worker에 종료 신호를 보낸다. 실제 PID에 신호를 보낸 경우 응답의 `pending`이 `true`이고 dispatcher가 프로세스 종료를 확인할 때까지 `Running`을 유지해 기존 worker와 대체 worker의 중복 실행을 막는다. PID가 없거나 이미 종료됐으면 즉시 run을 회수한다. 제목·본문·우선순위 설명은 실행 중에도 보완할 수 있지만 assignee, runtime, workspace, branch는 현재 실행과 어긋나지 않도록 고정된다. 필수 코드 리뷰는 별도 리뷰 카드를 만드는 것이 안전하다.
 
 ### 5.8 Done: 결과보다 검증 가능한 handoff를 남김
 
@@ -759,6 +761,8 @@ heartbeat, worker PID, claim 만료 시각과 로그를 확인한다. Web UI의 
 ```bash
 node dist/cli.js terminate <task-id> --reason "heartbeat 정지로 관리자 종료"
 ```
+
+`diagnostics`에서 `terminal_prerequisite`가 보이면 완료되지 않은 선행 task가 보관된 상태다. 요구가 더 이상 필요 없으면 dependency를 unlink하고, 여전히 필요하면 prerequisite를 다시 열어 완료한다. `stalled_prerequisite`는 선행 task가 `Blocked`, `Triage`, `Review`에서 사람의 처리를 기다린다는 뜻이다.
 
 ### worker가 말만 하고 Done이 되지 않음
 

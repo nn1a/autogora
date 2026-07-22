@@ -89,6 +89,7 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     ]);
     assert.equal(terminated.runId, terminableClaim.run.id);
     assert.equal(terminated.signaled, false);
+    assert.equal(terminated.pending, false);
     assert.equal(terminated.task.task.status, "ready");
     successfulJson<any[]>([
       "complete", terminable.task.id, "--summary", "Terminated run replaced by an administrative completion", "--db", dbPath,

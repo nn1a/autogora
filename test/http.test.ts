@@ -57,6 +57,7 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(appText, /Task hierarchy/);
     assert.match(appText, /Execution dependencies/);
     assert.match(appText, /Terminate the active run below/);
+    assert.match(appText, /Bounded graph view/);
     const styles = await fetch(`${dashboard.url}/styles.css`, { headers: sessionHeaders });
     assert.equal(styles.status, 200);
     const stylesText = await styles.text();
