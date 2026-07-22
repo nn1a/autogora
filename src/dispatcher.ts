@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { BoardManager } from "./boards.js";
 import { deliverNotifications } from "./notifications.js";
@@ -34,6 +34,10 @@ export interface RunnerCommand {
   toolApproval?: {
     directory: string;
     commandPrefix: string;
+  } | undefined;
+  policyFile?: {
+    path: string;
+    content: string;
   } | undefined;
 }
 
@@ -248,16 +252,25 @@ export function buildRunnerCommand(
   if (task.runtime === "gemini") {
     const allowWrites = options.allowWrites === true;
     const commandPrefix = `${shellQuote(process.execPath)} ${shellQuote(resolve(options.cliEntry))}`;
-    const readOnlyTools = [
-      "read_file",
-      "read_many_files",
-      "list_directory",
-      "glob",
-      "grep_search",
-      "google_web_search",
-      "web_fetch",
-      `ShellTool(${commandPrefix})`,
-    ];
+    const policyPath = join(resolve(options.logsRoot ?? tmpdir()), `gemini-${claim.run.id}.policy.toml`);
+    const policyContent = [
+      "[[rule]]",
+      'toolName = "run_shell_command"',
+      'decision = "deny"',
+      "priority = 998",
+      "",
+      "[[rule]]",
+      'toolName = "run_shell_command"',
+      `commandPrefix = ${JSON.stringify(commandPrefix)}`,
+      'decision = "allow"',
+      "priority = 999",
+      "",
+      "[[rule]]",
+      'toolName = "mcp_*"',
+      'decision = "deny"',
+      "priority = 999",
+      "",
+    ].join("\n");
     return {
       command: process.env.KANBAN_GEMINI_BIN ?? "gemini",
       cwd,
@@ -267,9 +280,10 @@ export function buildRunnerCommand(
         "--approval-mode", allowWrites ? "yolo" : "default",
         "--skip-trust",
         "-e", "none",
-        ...(!allowWrites ? ["--allowed-tools", readOnlyTools.join(",")] : []),
+        ...(!allowWrites ? ["--policy", policyPath] : []),
         "-p", prompt,
       ],
+      policyFile: allowWrites ? undefined : { path: policyPath, content: policyContent },
     };
   }
 
@@ -588,6 +602,10 @@ async function executeTurn(
   runtimeLimitMs: number | null,
 ): Promise<TurnExecution> {
   return new Promise((resolveTurn) => {
+    if (command.policyFile) {
+      mkdirSync(dirname(command.policyFile.path), { recursive: true });
+      writeFileSync(command.policyFile.path, command.policyFile.content, { encoding: "utf8", mode: 0o600 });
+    }
     const logStream = createWriteStream(logPath, { flags: "a" });
     const child = spawn(command.command, command.args, {
       cwd: command.cwd,
@@ -622,6 +640,7 @@ async function executeTurn(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       children.delete(child);
       stopApprovalBroker?.();
+      if (command.policyFile) rmSync(command.policyFile.path, { force: true });
       logStream.end();
       resolveTurn({ code, signal, spawnError, timedOut, output, sessionId: sessionIdFromOutput(output) });
     });

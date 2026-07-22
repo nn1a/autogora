@@ -40,7 +40,9 @@ for (const runtime of ["claude", "codex", "cline", "gemini"] as const) {
         assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
       } else if (runtime === "gemini") {
         assert.match(command.args.join(" "), /--approval-mode default/);
-        assert.match(command.args.join(" "), /ShellTool\(/);
+        assert.match(command.args.join(" "), /--policy/);
+        assert.match(command.policyFile?.content ?? "", /commandPrefix/);
+        assert.match(command.policyFile?.content ?? "", /toolName = "mcp_\*"/);
         assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
         assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
       } else {

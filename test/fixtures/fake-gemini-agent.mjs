@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const cliEntry = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
 const taskId = process.env.KANBAN_TASK_ID;
 const promptIndex = process.argv.indexOf("-p");
 const prompt = promptIndex >= 0 ? process.argv[promptIndex + 1] ?? "" : "";
-const allowedIndex = process.argv.indexOf("--allowed-tools");
-const allowedTools = allowedIndex >= 0 ? process.argv[allowedIndex + 1] ?? "" : "";
+const policyIndex = process.argv.indexOf("--policy");
+const policy = policyIndex >= 0 ? readFileSync(process.argv[policyIndex + 1], "utf8") : "";
 
 if (process.argv[process.argv.indexOf("--output-format") + 1] !== "stream-json") {
   throw new Error("Gemini worker must use stream-json output");
@@ -19,8 +20,8 @@ if (process.argv[process.argv.indexOf("--approval-mode") + 1] !== "default") {
 if (!process.argv.includes("--skip-trust") || !process.argv.includes("none")) {
   throw new Error("Gemini worker must isolate extensions and trust the dispatcher workspace");
 }
-if (!allowedTools.includes("ShellTool(") || allowedTools.includes("ShellTool,run_shell_command")) {
-  throw new Error("Gemini worker must narrowly allow only the scoped bridge shell prefix");
+if (!policy.includes("commandPrefix") || !policy.includes('toolName = "mcp_*"')) {
+  throw new Error("Gemini worker must narrowly allow the bridge and deny MCP tools");
 }
 if (!prompt.includes("scoped Kanban CLI bridge")) throw new Error("Gemini worker prompt is missing the CLI bridge");
 
