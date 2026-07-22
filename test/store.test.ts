@@ -214,7 +214,7 @@ test("legacy MVP databases migrate without losing tasks, runs, links, comments, 
   }
 });
 
-test("runtime schema migration adds Cline without losing modern related records", () => {
+test("runtime schema migration adds Gemini without losing modern related records", () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-runtime-migration-"));
   const dbPath = join(directory, "kanban.db");
   let taskId = "";
@@ -236,10 +236,10 @@ test("runtime schema migration adds Cline without losing modern related records"
   oldSchema.exec("PRAGMA writable_schema = ON");
   oldSchema.prepare(`
     UPDATE sqlite_master
-    SET sql = replace(sql, '''claude'', ''codex'', ''cline'', ''manual''', '''claude'', ''codex'', ''manual''')
+    SET sql = replace(sql, '''claude'', ''codex'', ''cline'', ''gemini'', ''manual''', '''claude'', ''codex'', ''cline'', ''manual''')
     WHERE type = 'table' AND name IN ('tasks', 'task_runs')
   `).run();
-  oldSchema.exec("PRAGMA writable_schema = OFF; PRAGMA user_version = 4");
+  oldSchema.exec("PRAGMA writable_schema = OFF; PRAGMA user_version = 5");
   oldSchema.close();
 
   try {
@@ -252,10 +252,10 @@ test("runtime schema migration adds Cline without losing modern related records"
       assert.ok(preserved.events.some((event) => event.kind === "completed"));
       assert.equal(migrated.listNotificationSubscriptions(taskId).length, 1);
 
-      const cline = migrated.createTask({ title: "new Cline task", assignee: "cline-worker", runtime: "cline" });
-      const claim = migrated.claimTask({ taskId: cline.task.id });
+      const gemini = migrated.createTask({ title: "new Gemini task", assignee: "gemini-worker", runtime: "gemini" });
+      const claim = migrated.claimTask({ taskId: gemini.task.id });
       assert.ok(claim);
-      assert.equal(claim.run.runtime, "cline");
+      assert.equal(claim.run.runtime, "gemini");
     } finally {
       migrated.close();
     }

@@ -12,11 +12,11 @@ export const TASK_STATUSES = [
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
-export const WORKER_RUNTIMES = ["claude", "codex", "cline"] as const;
+export const WORKER_RUNTIMES = ["claude", "codex", "cline", "gemini"] as const;
 
 export type WorkerRuntime = (typeof WORKER_RUNTIMES)[number];
 
-export const PLANNER_RUNTIMES = ["claude", "codex", "cline"] as const;
+export const PLANNER_RUNTIMES = ["claude", "codex", "cline", "gemini"] as const;
 
 export type PlannerRuntime = (typeof PLANNER_RUNTIMES)[number];
 

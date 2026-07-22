@@ -200,6 +200,29 @@ test("Cline auxiliary planner extracts and validates the final NDJSON response",
   }
 });
 
+test("Gemini auxiliary planner unwraps a deny-all headless JSON response", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-gemini-planner-"));
+  const fixture = resolve("test/fixtures/planner-gemini-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const previous = process.env.KANBAN_GEMINI_BIN;
+  process.env.KANBAN_GEMINI_BIN = fixture;
+  const store = new KanbanStore(join(directory, "kanban.db"));
+  try {
+    const task = store.createTask({ title: "rough Gemini planner input", status: "triage" });
+    const result = await specifyTriageTask(store, task.task.id, {
+      planner: createCliPlanner({ runtime: "gemini", cwd: directory, timeoutMs: 5_000 }),
+    });
+    assert.equal(result.task.status, "todo");
+    assert.equal(result.task.title, "Gemini-generated task specification");
+    assert.match(result.task.body, /Gemini CLI verification evidence/);
+  } finally {
+    store.close();
+    if (previous === undefined) delete process.env.KANBAN_GEMINI_BIN;
+    else process.env.KANBAN_GEMINI_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("profile descriptions are generated through a constrained structured planner", async () => {
   let prompt = "";
   const described = await describeProfileRoute(

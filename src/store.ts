@@ -468,12 +468,12 @@ export class KanbanStore {
       .get() as { sql: string } | undefined;
     if (existing && (!existing.sql.includes("'scheduled'") || !existing.sql.includes("idempotency_key"))) {
       this.migrateLegacySchema();
-    } else if (existing && !existing.sql.includes("'cline'")) {
+    } else if (existing && (!existing.sql.includes("'cline'") || !existing.sql.includes("'gemini'"))) {
       this.migrateRuntimeSchema();
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 5");
+    this.db.exec("PRAGMA user_version = 6");
   }
 
   private createLatestSchema(): void {
@@ -486,7 +486,7 @@ export class KanbanStore {
         title TEXT NOT NULL,
         body TEXT NOT NULL DEFAULT '',
         assignee TEXT,
-        runtime TEXT NOT NULL DEFAULT 'manual' CHECK (runtime IN ('claude', 'codex', 'cline', 'manual')),
+        runtime TEXT NOT NULL DEFAULT 'manual' CHECK (runtime IN ('claude', 'codex', 'cline', 'gemini', 'manual')),
         status TEXT NOT NULL CHECK (status IN ('triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done', 'archived')),
         priority INTEGER NOT NULL DEFAULT 0,
         workspace TEXT,
@@ -529,7 +529,7 @@ export class KanbanStore {
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         worker_id TEXT NOT NULL,
-        runtime TEXT NOT NULL CHECK (runtime IN ('claude', 'codex', 'cline', 'manual')),
+        runtime TEXT NOT NULL CHECK (runtime IN ('claude', 'codex', 'cline', 'gemini', 'manual')),
         status TEXT NOT NULL,
         claim_token TEXT NOT NULL,
         claimed_at TEXT NOT NULL,

@@ -9,7 +9,7 @@ import { BoardManager } from "../src/boards.js";
 import { buildRunnerCommand, runDispatcher } from "../src/dispatcher.js";
 import { KanbanStore } from "../src/store.js";
 
-for (const runtime of ["claude", "codex", "cline"] as const) {
+for (const runtime of ["claude", "codex", "cline", "gemini"] as const) {
   test(`builds a scoped ${runtime} runner without leaking the claim token into argv`, () => {
     const directory = mkdtempSync(join(tmpdir(), "kanban-runner-command-"));
     const store = new KanbanStore(":memory:");
@@ -36,6 +36,11 @@ for (const runtime of ["claude", "codex", "cline"] as const) {
       if (runtime === "cline") {
         assert.equal(command.env.CLINE_TOOL_APPROVAL_MODE, "desktop");
         assert.match(command.args.join(" "), /--auto-approve false/);
+        assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
+        assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
+      } else if (runtime === "gemini") {
+        assert.match(command.args.join(" "), /--approval-mode default/);
+        assert.match(command.args.join(" "), /ShellTool\(/);
         assert.equal(command.args.some((arg) => arg.includes("mcpServers")), false);
         assert.match(command.args.at(-1) ?? "", /scoped Kanban CLI bridge/);
       } else {
@@ -80,6 +85,42 @@ test("dispatcher runs a Cline worker through the scoped CLI bridge without MCP",
   } finally {
     if (previous === undefined) delete process.env.KANBAN_CLINE_BIN;
     else process.env.KANBAN_CLINE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher runs a Gemini worker through the scoped CLI bridge", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-gemini-dispatch-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/fake-gemini-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "Gemini CLI bridge e2e",
+    assignee: "gemini-worker",
+    runtime: "gemini",
+    workspace: directory,
+  });
+  store.close();
+  const previous = process.env.KANBAN_GEMINI_BIN;
+  process.env.KANBAN_GEMINI_BIN = fixture;
+  try {
+    await runDispatcher({ dbPath, cliEntry: resolve("dist/cli.js"), once: true, allowWrites: false });
+    const check = manager.openStore("default");
+    try {
+      const completed = check.getTask(task.task.id);
+      assert.equal(completed.task.status, "done");
+      assert.equal(completed.runs[0]?.runtime, "gemini");
+      assert.equal(completed.runs[0]?.summary, "fake Gemini worker completed through CLI");
+      assert.equal(completed.runs[0]?.metadata?.verification?.[0], "gemini-cli-bridge-e2e");
+      assert.match(completed.comments[0]?.body ?? "", /scoped CLI bridge/);
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_GEMINI_BIN;
+    else process.env.KANBAN_GEMINI_BIN = previous;
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -324,6 +365,54 @@ test("Cline goal mode continues through fresh CLI turns when headless resume is 
   } finally {
     if (previous === undefined) delete process.env.KANBAN_CLINE_BIN;
     else process.env.KANBAN_CLINE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Gemini goal mode resumes the stream-json session until completion", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "kanban-gemini-goal-"));
+  const dbPath = join(directory, "kanban.db");
+  const fixture = resolve("test/fixtures/goal-gemini-agent.mjs");
+  chmodSync(fixture, 0o755);
+  const manager = new BoardManager(dbPath);
+  const store = manager.openStore("default");
+  const task = store.createTask({
+    title: "finish a Gemini multi-turn goal",
+    body: "Acceptance: the resumed turn records completion.",
+    assignee: "gemini-worker",
+    runtime: "gemini",
+    workspace: directory,
+    goalMode: true,
+    goalMaxTurns: 3,
+  });
+  store.close();
+  const previous = process.env.KANBAN_GEMINI_BIN;
+  process.env.KANBAN_GEMINI_BIN = fixture;
+  const judgedTurns: number[] = [];
+  try {
+    await runDispatcher({
+      dbPath,
+      cliEntry: resolve("dist/cli.js"),
+      once: true,
+      goalJudge: async ({ turn }) => {
+        judgedTurns.push(turn);
+        return { complete: false, reason: "one gap remains", nextPrompt: "Finish the remaining gap." };
+      },
+    });
+    const check = manager.openStore("default");
+    try {
+      const completed = check.getTask(task.task.id);
+      assert.equal(completed.task.status, "done");
+      assert.equal(completed.runs[0]?.runtime, "gemini");
+      assert.deepEqual(judgedTurns, [1]);
+      assert.equal(completed.events.filter((event) => event.kind === "spawned").length, 2);
+      assert.match(completed.comments[0]?.body ?? "", /durable handoff/);
+    } finally {
+      check.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.KANBAN_GEMINI_BIN;
+    else process.env.KANBAN_GEMINI_BIN = previous;
     rmSync(directory, { recursive: true, force: true });
   }
 });

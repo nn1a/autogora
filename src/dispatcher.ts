@@ -83,10 +83,12 @@ function shellQuote(value: string): string {
 function workerPrompt(claim: ClaimedTask, cliEntry: string): string {
   const { task } = claim.task;
   const instructions = [`You are the assigned Kanban worker for ${task.id}.`];
-  if (task.runtime === "cline") {
+  if (task.runtime === "cline" || task.runtime === "gemini") {
     const bridge = `${shellQuote(process.execPath)} ${shellQuote(resolve(cliEntry))}`;
     instructions.push(
-      "MCP is unavailable in this Cline build. Use only the scoped Kanban CLI bridge for task lifecycle communication.",
+      task.runtime === "cline"
+        ? "MCP is unavailable in this Cline build. Use only the scoped Kanban CLI bridge for task lifecycle communication."
+        : "Use only the scoped Kanban CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.",
       `First run ${bridge} show "$KANBAN_TASK_ID". For long work run ${bridge} heartbeat "$KANBAN_TASK_ID" --note "progress".`,
       `Record handoffs with ${bridge} comment "$KANBAN_TASK_ID" "message".`,
       `Finish exactly once with ${bridge} complete "$KANBAN_TASK_ID" --summary "summary" or ${bridge} block "$KANBAN_TASK_ID" "reason" --kind needs_input.`,
@@ -243,6 +245,34 @@ export function buildRunnerCommand(
     };
   }
 
+  if (task.runtime === "gemini") {
+    const allowWrites = options.allowWrites === true;
+    const commandPrefix = `${shellQuote(process.execPath)} ${shellQuote(resolve(options.cliEntry))}`;
+    const readOnlyTools = [
+      "read_file",
+      "read_many_files",
+      "list_directory",
+      "glob",
+      "grep_search",
+      "google_web_search",
+      "web_fetch",
+      `ShellTool(${commandPrefix})`,
+    ];
+    return {
+      command: process.env.KANBAN_GEMINI_BIN ?? "gemini",
+      cwd,
+      env,
+      args: [
+        "--output-format", "stream-json",
+        "--approval-mode", allowWrites ? "yolo" : "default",
+        "--skip-trust",
+        "-e", "none",
+        ...(!allowWrites ? ["--allowed-tools", readOnlyTools.join(",")] : []),
+        "-p", prompt,
+      ],
+    };
+  }
+
   throw new Error(`Dispatcher cannot launch runtime: ${task.runtime}`);
 }
 
@@ -284,6 +314,15 @@ function buildGoalContinuationCommand(
     const promptIndex = initial.args.indexOf(initialPrompt);
     const args = [...initial.args];
     if (promptIndex >= 0) args[promptIndex] = `${initialPrompt}\nContinuation focus: ${prompt}`;
+    return { ...initial, args };
+  }
+  if (task.runtime === "gemini") {
+    if (!sessionId) throw new Error("Gemini goal continuation requires a session id");
+    const initialPrompt = workerPrompt(claim, options.cliEntry);
+    const promptIndex = initial.args.indexOf(initialPrompt);
+    const args = [...initial.args];
+    if (promptIndex >= 0) args[promptIndex] = prompt;
+    args.push("--resume", sessionId);
     return { ...initial, args };
   }
   throw new Error(`Goal continuation cannot launch runtime: ${task.runtime}`);

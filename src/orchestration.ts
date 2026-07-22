@@ -338,6 +338,12 @@ function clinePlannerOutput(stdout: string): unknown {
   return parseJsonObjectText(stdout);
 }
 
+function geminiPlannerOutput(stdout: string): unknown {
+  const output = JSON.parse(stdout) as Record<string, unknown>;
+  if (typeof output.response !== "string") throw new Error("Gemini planner response is missing JSON text");
+  return parseJsonObjectText(output.response);
+}
+
 export function createCliPlanner(options: {
   runtime: PlannerRuntime;
   cwd?: string | undefined;
@@ -379,6 +385,31 @@ export function createCliPlanner(options: {
           clinePrompt,
         ], cwd, timeoutMs);
         return unwrapPlannerOutput(clinePlannerOutput(output.stdout));
+      }
+      if (options.runtime === "gemini") {
+        const policyPath = join(directory, "gemini-planner-policy.toml");
+        writeFileSync(policyPath, [
+          "[[rule]]",
+          'toolName = "*"',
+          'decision = "deny"',
+          "priority = 999",
+          "",
+        ].join("\n"), "utf8");
+        const geminiPrompt = [
+          prompt,
+          "",
+          "Do not call tools. Return exactly one JSON object and no prose or Markdown.",
+          `The JSON object must conform to this schema: ${JSON.stringify(schema)}`,
+        ].join("\n");
+        const output = await runProcess(process.env.KANBAN_GEMINI_BIN ?? "gemini", [
+          "--output-format", "json",
+          "--approval-mode", "default",
+          "--policy", policyPath,
+          "--skip-trust",
+          "-e", "none",
+          "-p", geminiPrompt,
+        ], cwd, timeoutMs);
+        return unwrapPlannerOutput(geminiPlannerOutput(output.stdout));
       }
       const output = await runProcess(process.env.KANBAN_CLAUDE_BIN ?? "claude", [
         "-p", prompt,
