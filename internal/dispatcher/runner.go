@@ -119,12 +119,14 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 		"TASKCIRCUIT_RUN_ID": run.ID, "TASKCIRCUIT_CLAIM_TOKEN": claim.ClaimToken, "TASKCIRCUIT_WORKER_ID": run.WorkerID,
 		"TASKCIRCUIT_TENANT": tenant, "TASKCIRCUIT_WORKSPACE": cwd, "TASKCIRCUIT_WORKSPACES_ROOT": options.WorkspaceRoot,
 		"TASKCIRCUIT_ATTACHMENTS_ROOT": options.AttachmentsRoot, "TASKCIRCUIT_LOGS_ROOT": options.LogsRoot,
+		"TASKCIRCUIT_CLI": options.CLIPath,
 	}
 	for key, value := range map[string]string{
 		"KANBAN_DB": dbPath, "KANBAN_BOARD": task.Board, "KANBAN_TASK_ID": task.ID, "KANBAN_RUN_ID": run.ID,
 		"KANBAN_CLAIM_TOKEN": claim.ClaimToken, "KANBAN_WORKER_ID": run.WorkerID, "KANBAN_TENANT": tenant,
 		"KANBAN_WORKSPACE": cwd, "KANBAN_WORKSPACES_ROOT": options.WorkspaceRoot, "KANBAN_ATTACHMENTS_ROOT": options.AttachmentsRoot,
 		"KANBAN_LOGS_ROOT": options.LogsRoot,
+		"KANBAN_CLI_ENTRY": options.CLIPath,
 	} {
 		values[key] = value
 	}
@@ -141,6 +143,7 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 	if err != nil {
 		return RunnerCommand{}, err
 	}
+	options.CLIPath = cliPath
 	cwd, err := os.Getwd()
 	if err != nil {
 		return RunnerCommand{}, err
@@ -250,11 +253,9 @@ func BuildGoalContinuationCommand(claim model.ClaimedTask, options RunnerOptions
 		}
 		initial.Args = append(initial.Args, "--resume", sessionID)
 	case model.RuntimeCline:
-		initialPrompt := workerPrompt(claim, options.CLIPath)
-		for index, argument := range initial.Args {
-			if argument == initialPrompt {
-				initial.Args[index] = initialPrompt + "\nContinuation focus: " + prompt
-			}
+		if len(initial.Args) > 0 {
+			index := len(initial.Args) - 1
+			initial.Args[index] += "\nContinuation focus: " + prompt
 		}
 	case model.RuntimeGemini:
 		if sessionID == "" {
