@@ -373,7 +373,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.beginPrompt("block", "Block reason", "", task.ID)
 			}
 		case "p":
-			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil && (task.Status == model.TaskStatusTriage || task.Status == model.TaskStatusTodo || task.Status == model.TaskStatusScheduled || task.Status == model.TaskStatusBlocked || task.Status == model.TaskStatusReview) {
+			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil && (task.Status == model.TaskStatusTriage || task.Status == model.TaskStatusTodo || task.Status == model.TaskStatusScheduled || task.Status == model.TaskStatusReview) {
 				m.beginConfirm("promote", *task)
 			}
 		case "u":
