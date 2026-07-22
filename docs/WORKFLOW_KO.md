@@ -61,7 +61,7 @@ autogora boards create product-web \
   --switch
 ```
 
-Git 저장소를 보드의 기본 작업 디렉터리로 지정하고 작업별 경로를 생략하면 dispatcher는 격리된 worktree를 준비한다. 현재 디렉터리를 직접 수정해야 한다면 작업 생성 시 `--workspace "$PWD" --workspace-kind dir`를 명시한다.
+Git 저장소를 보드의 기본 작업 디렉터리로 지정하고 작업별 경로를 생략하면 dispatcher는 run마다 분리된 detached worktree를 준비한다. task에는 작업공간 설정만 유지하고 실제 경로와 기준 commit은 run 이력에 기록한다. 현재 디렉터리를 직접 수정해야 한다면 작업 생성 시 `--workspace "$PWD" --workspace-kind dir`를 명시한다.
 
 ### GitHub issue를 Triage로 가져오기
 

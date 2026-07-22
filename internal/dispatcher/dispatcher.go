@@ -343,8 +343,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	var goalPlanner orchestration.Planner
 	if goalMode && options.GoalJudge == nil {
 		plannerCWD := options.WorkingDirectory
-		if prepared.Task.Task.Workspace != nil {
-			plannerCWD = *prepared.Task.Task.Workspace
+		if prepared.Workspace != nil {
+			plannerCWD = prepared.Workspace.Path
 		}
 		goalPlanner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: prepared.Task.Task.Runtime, CWD: plannerCWD, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
 		if err != nil {
@@ -362,8 +362,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return
 		}
 		options.log("finish %s: %s", current.Task.ID, current.Task.Status)
-		if current.Task.Status == model.TaskStatusDone {
-			if _, err := workspaces.Cleanup(current.Task); err != nil {
+		if current.Task.Status == model.TaskStatusDone && prepared.Workspace != nil {
+			if _, err := workspaces.Cleanup(current.Task.Board, *prepared.Workspace); err != nil {
 				options.log("workspace cleanup failed %s: %v", current.Task.ID, err)
 			}
 		}

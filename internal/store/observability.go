@@ -245,6 +245,14 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 		}
 		return *pointer
 	}
+	preparedWorkspace := "(not prepared)"
+	for index := len(detail.RunWorkspaces) - 1; index >= 0; index-- {
+		workspace := detail.RunWorkspaces[index]
+		if detail.Task.CurrentRunID == nil || workspace.RunID == *detail.Task.CurrentRunID {
+			preparedWorkspace = fmt.Sprintf("%s (%s, run %s)", workspace.Path, workspace.Kind, workspace.RunID)
+			break
+		}
+	}
 	lines := []string{
 		"# Autogora task " + detail.Task.ID, "",
 		"Title: " + detail.Task.Title,
@@ -252,7 +260,8 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 		"Tenant: " + value(detail.Task.Tenant, "(none)"),
 		fmt.Sprintf("Assignee/runtime: %s / %s", value(detail.Task.Assignee, "(unassigned)"), detail.Task.Runtime),
 		"Status: " + string(detail.Task.Status),
-		fmt.Sprintf("Workspace: %s (%s)", value(detail.Task.Workspace, "(not prepared)"), detail.Task.WorkspaceKind),
+		fmt.Sprintf("Workspace configuration: %s (%s)", value(detail.Task.Workspace, "automatic"), detail.Task.WorkspaceKind),
+		"Prepared run workspace: " + preparedWorkspace,
 		"", "## Task body", truncate(orFallback(detail.Task.Body, "(empty)"), 8*1024),
 	}
 	if graph.RootTaskID != taskID {

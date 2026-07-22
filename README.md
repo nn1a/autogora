@@ -337,16 +337,18 @@ Use `boards rm <slug> --delete` only when permanent removal is intended. The
 
 ## Workspaces
 
-- `scratch` (default): isolated under the board workspace root and removed only
+- `scratch` (default): isolated per run under the board workspace root and removed only
   after successful completion and artifact capture.
 - `dir:/absolute/path`: uses and preserves an existing trusted directory.
-- `worktree`: creates and preserves a Git worktree under the board workspace
-  root. Set a board `default-workdir` to the source repository and optionally
-  pass `--branch` on task creation.
+- `worktree`: creates and preserves a detached Git worktree per run under the
+  board workspace root. Set a board `default-workdir` to the source repository.
+  `--branch` selects an existing starting ref when available and remains the
+  task's integration target; workers never move the shared branch directly.
 - `worktree:/absolute/target`: pins the worktree destination explicitly.
 
 Relative `dir:` and explicit worktree paths are rejected. Dispatcher runs record
-their resolved workspace, worker PID, and log path in attempt history.
+their resolved path, repository, base commit, worker PID, and log path without
+overwriting the task's workspace configuration.
 
 ## Attachments and artifacts
 

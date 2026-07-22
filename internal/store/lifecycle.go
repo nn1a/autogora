@@ -431,29 +431,6 @@ func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPat
 	return getRun(ctx, s.db, scope.RunID)
 }
 
-func (s *Store) BindRunWorkspace(ctx context.Context, scope RunScope, workspace string, kind model.WorkspaceKind) (model.TaskDetail, error) {
-	resolved, err := filepath.Abs(workspace)
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	taskID := ""
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		task, run, err := requireActiveRun(ctx, tx, scope)
-		if err != nil {
-			return err
-		}
-		taskID = task.ID
-		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET workspace = ?, workspace_kind = ?, updated_at = ? WHERE id = ?", resolved, kind, now(), task.ID); err != nil {
-			return err
-		}
-		return appendEvent(ctx, tx, task.ID, "workspace_prepared", map[string]any{"path": resolved, "kind": kind}, &run.ID)
-	})
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	return s.GetTask(ctx, taskID)
-}
-
 func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
 	summary := strings.TrimSpace(completion.Summary)
 	result := strings.TrimSpace(completion.Result)

@@ -123,6 +123,17 @@ type Run struct {
 	Error          *string        `json:"error"`
 }
 
+type RunWorkspace struct {
+	RunID          string        `json:"runId"`
+	TaskID         string        `json:"taskId"`
+	Path           string        `json:"path"`
+	Kind           WorkspaceKind `json:"kind"`
+	RepositoryPath *string       `json:"repositoryPath"`
+	BaseCommit     *string       `json:"baseCommit"`
+	Generated      bool          `json:"generated"`
+	PreparedAt     string        `json:"preparedAt"`
+}
+
 type Comment struct {
 	ID        int64  `json:"id"`
 	TaskID    string `json:"taskId"`
@@ -154,23 +165,25 @@ type TaskEvent struct {
 }
 
 type TaskDetail struct {
-	Task          Task         `json:"task"`
-	Parents       []Task       `json:"parents"`
-	Children      []Task       `json:"children"`
-	Prerequisites []Task       `json:"prerequisites"`
-	Dependents    []Task       `json:"dependents"`
-	ParentTask    *Task        `json:"parentTask"`
-	Subtasks      []Task       `json:"subtasks"`
-	Comments      []Comment    `json:"comments"`
-	Attachments   []Attachment `json:"attachments"`
-	Runs          []Run        `json:"runs"`
-	Events        []TaskEvent  `json:"events"`
+	Task          Task           `json:"task"`
+	Parents       []Task         `json:"parents"`
+	Children      []Task         `json:"children"`
+	Prerequisites []Task         `json:"prerequisites"`
+	Dependents    []Task         `json:"dependents"`
+	ParentTask    *Task          `json:"parentTask"`
+	Subtasks      []Task         `json:"subtasks"`
+	Comments      []Comment      `json:"comments"`
+	Attachments   []Attachment   `json:"attachments"`
+	Runs          []Run          `json:"runs"`
+	RunWorkspaces []RunWorkspace `json:"runWorkspaces"`
+	Events        []TaskEvent    `json:"events"`
 }
 
 type ClaimedTask struct {
-	Task       TaskDetail `json:"task"`
-	Run        Run        `json:"run"`
-	ClaimToken string     `json:"claimToken"`
+	Task       TaskDetail    `json:"task"`
+	Run        Run           `json:"run"`
+	ClaimToken string        `json:"claimToken"`
+	Workspace  *RunWorkspace `json:"workspace,omitempty"`
 }
 
 func ValidTaskStatus(value TaskStatus) bool {

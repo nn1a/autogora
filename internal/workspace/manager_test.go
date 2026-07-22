@@ -41,23 +41,26 @@ func TestScratchWorkspaceIsBoundAndCleanedOnlyAtTrustedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.Task.Task.WorkspaceKind != model.WorkspaceScratch || prepared.Task.Task.Workspace == nil {
-		t.Fatalf("scratch workspace not bound: %+v", prepared.Task.Task)
+	if prepared.Workspace == nil || prepared.Workspace.Kind != model.WorkspaceScratch {
+		t.Fatalf("scratch workspace not bound: %+v", prepared.Workspace)
 	}
-	if info, err := os.Stat(*prepared.Task.Task.Workspace); err != nil || !info.IsDir() {
+	if prepared.Task.Task.Workspace != nil {
+		t.Fatalf("run path overwrote task workspace intent: %+v", prepared.Task.Task)
+	}
+	if info, err := os.Stat(prepared.Workspace.Path); err != nil || !info.IsDir() {
 		t.Fatalf("scratch workspace missing: %v", err)
 	}
 	completed, err := opened.CompleteRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.CompletionInput{Summary: "done"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	removed, err := New(manager).Cleanup(completed.Task)
+	removed, err := New(manager).Cleanup(completed.Task.Board, *prepared.Workspace)
 	if err != nil || !removed {
 		t.Fatalf("cleanup: removed=%v err=%v", removed, err)
 	}
 	outside := t.TempDir()
-	completed.Task.Workspace = &outside
-	if _, err := New(manager).Cleanup(completed.Task); err == nil {
+	prepared.Workspace.Path = outside
+	if _, err := New(manager).Cleanup(completed.Task.Board, *prepared.Workspace); err == nil {
 		t.Fatal("cleanup accepted an untrusted path")
 	}
 }
@@ -125,13 +128,37 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.Task.Task.WorkspaceKind != model.WorkspaceWorktree || prepared.Task.Task.Workspace == nil {
-		t.Fatalf("worktree not bound: %+v", prepared.Task.Task)
+	if prepared.Workspace == nil || prepared.Workspace.Kind != model.WorkspaceWorktree || prepared.Workspace.BaseCommit == nil || prepared.Workspace.RepositoryPath == nil {
+		t.Fatalf("worktree not bound: %+v", prepared.Workspace)
 	}
-	if _, err := os.Stat(filepath.Join(*prepared.Task.Task.Workspace, "README.md")); err != nil {
+	if prepared.Task.Task.Workspace != nil {
+		t.Fatalf("generated path overwrote task workspace intent: %+v", prepared.Task.Task)
+	}
+	if _, err := os.Stat(filepath.Join(prepared.Workspace.Path, "README.md")); err != nil {
 		t.Fatalf("worktree content missing: %v", err)
 	}
-	if removed, err := New(manager).Cleanup(prepared.Task.Task); err != nil || removed {
+	if command := exec.Command("git", "-C", prepared.Workspace.Path, "symbolic-ref", "-q", "HEAD"); command.Run() == nil {
+		t.Fatal("worker worktree checked out a shared branch instead of a detached commit")
+	}
+	reprepared, err := New(manager).Prepare(ctx, opened, claim)
+	if err != nil || reprepared.Workspace == nil || reprepared.Workspace.Path != prepared.Workspace.Path {
+		t.Fatalf("same run did not reuse its persisted workspace: %+v err=%v", reprepared, err)
+	}
+	if _, err := opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "retry", store.FailRunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	secondClaim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || secondClaim == nil {
+		t.Fatalf("second claim: %v %v", secondClaim, err)
+	}
+	second, err := New(manager).Prepare(ctx, opened, secondClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Workspace == nil || second.Workspace.Kind != model.WorkspaceWorktree || second.Workspace.Path == prepared.Workspace.Path || second.Task.Task.Workspace != nil {
+		t.Fatalf("retry did not receive a distinct worktree while preserving task intent: %+v", second)
+	}
+	if removed, err := New(manager).Cleanup(prepared.Task.Task.Board, *prepared.Workspace); err != nil || removed {
 		t.Fatalf("worktree must be preserved: removed=%v err=%v", removed, err)
 	}
 }

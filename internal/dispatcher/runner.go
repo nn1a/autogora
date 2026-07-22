@@ -137,8 +137,10 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 	if err != nil {
 		return RunnerCommand{}, err
 	}
-	if task.Workspace != nil && strings.TrimSpace(*task.Workspace) != "" {
-		cwd, err = filepath.Abs(*task.Workspace)
+	if claim.Workspace != nil && strings.TrimSpace(claim.Workspace.Path) != "" {
+		cwd, err = filepath.Abs(claim.Workspace.Path)
+	} else if task.Workspace != nil && strings.TrimSpace(*task.Workspace) != "" && task.WorkspaceKind == model.WorkspaceDir {
+		cwd, err = filepath.Abs(strings.TrimPrefix(*task.Workspace, "dir:"))
 		if err != nil {
 			return RunnerCommand{}, err
 		}
