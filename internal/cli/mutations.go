@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/nn1a/kanban/internal/maintenance"
 	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/notifications"
 	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
 	"github.com/nn1a/kanban/internal/workspace"
@@ -419,6 +421,21 @@ func (a *App) runNotifications(ctx context.Context, command string, opts options
 		return err
 	}
 	defer opened.Close()
+	if command == "notify-deliver" {
+		limit, err := numberOption(opts.value("limit"), 25)
+		if err != nil {
+			return err
+		}
+		timeoutMS, err := numberOption(opts.value("timeout-ms"), 10_000)
+		if err != nil {
+			return err
+		}
+		results, err := notifications.Deliver(ctx, opened, notifications.Options{Limit: limit, Timeout: time.Duration(timeoutMS) * time.Millisecond})
+		if err != nil {
+			return err
+		}
+		return writeJSON(a.Stdout, results)
+	}
 	if command == "notify-list" {
 		taskID := ""
 		if len(opts.positionals) > 0 {

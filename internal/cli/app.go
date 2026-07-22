@@ -257,7 +257,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runWorkerMutation(ctx, command, opts)
 	case "complete", "block", "unblock", "promote", "archive", "delete", "schedule":
 		return a.runLifecycle(ctx, command, opts)
-	case "notify-subscribe", "notify-unsubscribe", "notify-list":
+	case "notify-subscribe", "notify-unsubscribe", "notify-list", "notify-deliver":
 		return a.runNotifications(ctx, command, opts)
 	default:
 		return fmt.Errorf("unknown or not-yet-ported command: %s", command)

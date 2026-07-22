@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nn1a/kanban/internal/maintenance"
 	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/notifications"
 	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
 	"github.com/nn1a/kanban/internal/workspace"
@@ -177,6 +179,12 @@ type garbageCollectionInput struct {
 	WorkspaceRetentionDays *int   `json:"workspace_retention_days,omitempty"`
 }
 
+type notificationDeliveryInput struct {
+	Board     string `json:"board,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
 func optionalString(value *string) store.OptionalString {
 	if value == nil {
 		return store.OptionalString{}
@@ -192,6 +200,20 @@ func optionalInt(value *int) store.OptionalInt {
 }
 
 func (s *Service) registerMutations(server *mcp.Server) {
+	addTool(server, "kanban_notify_deliver", "Deliver pending Kanban notifications", "Claim and deliver pending terminal events through registered adapters.", false, false, false, true, func(ctx context.Context, input notificationDeliveryInput) (any, error) {
+		if err := s.requireAdmin(); err != nil {
+			return nil, err
+		}
+		if input.Limit == 0 {
+			input.Limit = 25
+		}
+		if input.TimeoutMS == 0 {
+			input.TimeoutMS = 10_000
+		}
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
+			return notifications.Deliver(ctx, opened, notifications.Options{Limit: input.Limit, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond})
+		})
+	})
 	addTool(server, "kanban_gc", "Garbage collect Kanban data", "Delete expired events, worker logs, and verified terminal scratch workspaces.", false, true, true, false, func(ctx context.Context, input garbageCollectionInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
