@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func usingStore[T any](ctx context.Context, s *Server, board string, handler func(*store.Store) (T, error)) (T, error) {

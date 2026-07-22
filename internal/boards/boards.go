@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 var boardSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -155,7 +155,7 @@ func (m *Manager) DBPath(board string) (string, error) {
 		return m.defaultDBPath, nil
 	}
 	directory, _ := m.BoardDir(slug)
-	return filepath.Join(directory, "taskcircuit.db"), nil
+	return filepath.Join(directory, "autogora.db"), nil
 }
 func (m *Manager) WorkspaceRoot(board string) (string, error) {
 	slug, err := NormalizeSlug(defaultBoard(board))
@@ -458,14 +458,14 @@ func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, e
 		if slug == "" {
 			slug = regexp.MustCompile(`-\d+$`).ReplaceAllString(entry.Name(), "")
 		}
-		metadata := Metadata{Slug: slug, Name: raw.Name, Description: raw.Description, Icon: raw.Icon, Color: raw.Color, DefaultWorkdir: raw.DefaultWorkdir, CreatedAt: raw.CreatedAt, Archived: true, DBPath: filepath.Join(directory, "taskcircuit.db"), WorkspaceRoot: filepath.Join(directory, "workspaces"), AttachmentsRoot: filepath.Join(directory, "attachments"), LogsRoot: filepath.Join(directory, "logs"), Orchestration: normalizeOrchestration(raw.Orchestration)}
+		metadata := Metadata{Slug: slug, Name: raw.Name, Description: raw.Description, Icon: raw.Icon, Color: raw.Color, DefaultWorkdir: raw.DefaultWorkdir, CreatedAt: raw.CreatedAt, Archived: true, DBPath: filepath.Join(directory, "autogora.db"), WorkspaceRoot: filepath.Join(directory, "workspaces"), AttachmentsRoot: filepath.Join(directory, "attachments"), LogsRoot: filepath.Join(directory, "logs"), Orchestration: normalizeOrchestration(raw.Orchestration)}
 		result = append(result, metadata)
 	}
 	return result, nil
 }
 
 func (m *Manager) Current() string {
-	if value := strings.TrimSpace(os.Getenv("TASKCIRCUIT_BOARD")); value != "" {
+	if value := strings.TrimSpace(os.Getenv("AUTOGORA_BOARD")); value != "" {
 		if slug, err := NormalizeSlug(value); err == nil && m.Exists(slug) {
 			return slug
 		}

@@ -38,7 +38,7 @@ if find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
   exit 2
 fi
 
-temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/taskcircuit-release.XXXXXX")
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/autogora-release.XXXXXX")
 cleanup() {
   rm -r "$temporary_root"
 }
@@ -53,11 +53,11 @@ for target in $targets; do
     goos=linux
     platform_name=linux_musl
   fi
-  archive_name="taskcircuit_${version}_${platform_name}_${goarch}"
+  archive_name="autogora_${version}_${platform_name}_${goarch}"
   stage_dir="$temporary_root/$archive_name"
-  binary_name=taskcircuit
+  binary_name=autogora
   if [ "$goos" = windows ]; then
-    binary_name=taskcircuit.exe
+    binary_name=autogora.exe
   fi
 
   mkdir -p "$stage_dir"
@@ -67,7 +67,7 @@ for target in $targets; do
     -buildvcs=false \
     -ldflags "-s -w -buildid= -X main.version=$version" \
     -o "$stage_dir/$binary_name" \
-    ./cmd/taskcircuit
+    ./cmd/autogora
 
   binary_bytes=$(wc -c < "$stage_dir/$binary_name")
   if [ "$binary_bytes" -gt "$max_binary_bytes" ]; then
@@ -87,9 +87,9 @@ done
 (
   cd "$output_dir"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum taskcircuit_*.tar.gz > checksums.txt
+    sha256sum autogora_*.tar.gz > checksums.txt
   else
-    shasum -a 256 taskcircuit_*.tar.gz > checksums.txt
+    shasum -a 256 autogora_*.tar.gz > checksums.txt
   fi
 )
 

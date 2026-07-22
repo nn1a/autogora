@@ -108,9 +108,9 @@ func (b *approvalBroker) sweep() {
 				approved = approved && isScopedBridgeCommand(command, b.policy.CommandPrefix)
 			}
 		}
-		reason := "Denied by the scoped TaskCircuit read-only policy"
+		reason := "Denied by the scoped Autogora read-only policy"
 		if approved {
-			reason = "Approved by the scoped TaskCircuit read-only policy"
+			reason = "Approved by the scoped Autogora read-only policy"
 		}
 		decision, _ := json.Marshal(map[string]any{"approved": approved, "reason": reason})
 		decisionName := strings.Replace(name, ".request.", ".decision.", 1)

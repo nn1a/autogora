@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type PlannerKind string
@@ -61,7 +61,7 @@ func (w *limitedBuffer) Write(value []byte) (int, error) {
 func (w *limitedBuffer) String() string { return w.buffer.String() }
 
 func plannerBinary(getenv func(string) string, runtime model.Runtime) string {
-	name := "TASKCIRCUIT_" + strings.ToUpper(string(runtime)) + "_BIN"
+	name := "AUTOGORA_" + strings.ToUpper(string(runtime)) + "_BIN"
 	if value := strings.TrimSpace(getenv(name)); value != "" {
 		return value
 	}
@@ -192,7 +192,7 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 	}
 
 	return func(ctx context.Context, request PlannerRequest) (any, error) {
-		directory, err := os.MkdirTemp("", "taskcircuit-planner-")
+		directory, err := os.MkdirTemp("", "autogora-planner-")
 		if err != nil {
 			return nil, err
 		}

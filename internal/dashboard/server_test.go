@@ -19,7 +19,7 @@ const testToken = "test-dashboard-token-32-characters"
 
 func startTestServer(t *testing.T) *Server {
 	t.Helper()
-	server, err := Start(context.Background(), Options{DBPath: filepath.Join(t.TempDir(), "taskcircuit.db"), CLIPath: "/tmp/taskcircuit", Token: testToken})
+	server, err := Start(context.Background(), Options{DBPath: filepath.Join(t.TempDir(), "autogora.db"), CLIPath: "/tmp/autogora", Token: testToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	bootstrap.Body.Close()
-	if bootstrap.StatusCode != http.StatusFound || !strings.Contains(bootstrap.Header.Get("Set-Cookie"), "taskcircuit_session=") {
+	if bootstrap.StatusCode != http.StatusFound || !strings.Contains(bootstrap.Header.Get("Set-Cookie"), "autogora_session=") {
 		t.Fatalf("bootstrap response: %d %s", bootstrap.StatusCode, bootstrap.Header.Get("Set-Cookie"))
 	}
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/", nil)
@@ -101,7 +101,7 @@ func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 	}
 	contents, _ := io.ReadAll(html.Body)
 	html.Body.Close()
-	if html.StatusCode != http.StatusOK || !strings.Contains(string(contents), "<title>TaskCircuit</title>") || !strings.Contains(string(contents), `class="dialog-wide"`) {
+	if html.StatusCode != http.StatusOK || !strings.Contains(string(contents), "<title>Autogora</title>") || !strings.Contains(string(contents), `class="dialog-wide"`) {
 		t.Fatalf("embedded dashboard mismatch: %d %s", html.StatusCode, contents)
 	}
 }

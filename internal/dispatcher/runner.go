@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type ToolApproval struct {
@@ -47,32 +47,32 @@ func shellQuote(value string) string {
 
 func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 	task := claim.Task.Task
-	instructions := []string{fmt.Sprintf("You are the assigned TaskCircuit worker for %s.", task.ID)}
+	instructions := []string{fmt.Sprintf("You are the assigned Autogora worker for %s.", task.ID)}
 	if task.Runtime == model.RuntimeCline || task.Runtime == model.RuntimeGemini {
 		bridge := shellQuote(cliPath)
 		if task.Runtime == model.RuntimeCline {
-			instructions = append(instructions, "MCP is unavailable in this Cline build. Use only the scoped TaskCircuit CLI bridge for task lifecycle communication.")
+			instructions = append(instructions, "MCP is unavailable in this Cline build. Use only the scoped Autogora CLI bridge for task lifecycle communication.")
 		} else {
-			instructions = append(instructions, "Use only the scoped TaskCircuit CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.")
+			instructions = append(instructions, "Use only the scoped Autogora CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.")
 		}
 		instructions = append(instructions,
-			fmt.Sprintf(`First run %s show "$TASKCIRCUIT_TASK_ID". For long work run %s heartbeat "$TASKCIRCUIT_TASK_ID" --note "progress".`, bridge, bridge),
-			"Read relationshipGraph and workerContext from show. Work only on the current node; TaskCircuit has already enforced every prerequisite, and your completion will unlock listed dependents.",
-			fmt.Sprintf(`Record handoffs with %s comment "$TASKCIRCUIT_TASK_ID" "message".`, bridge),
-			fmt.Sprintf(`Finish exactly once with %s complete "$TASKCIRCUIT_TASK_ID" --summary "summary" or %s block "$TASKCIRCUIT_TASK_ID" "reason" --kind needs_input.`, bridge, bridge),
+			fmt.Sprintf(`First run %s show "$AUTOGORA_TASK_ID". For long work run %s heartbeat "$AUTOGORA_TASK_ID" --note "progress".`, bridge, bridge),
+			"Read relationshipGraph and workerContext from show. Work only on the current node; Autogora has already enforced every prerequisite, and your completion will unlock listed dependents.",
+			fmt.Sprintf(`Record handoffs with %s comment "$AUTOGORA_TASK_ID" "message".`, bridge),
+			fmt.Sprintf(`Finish exactly once with %s complete "$AUTOGORA_TASK_ID" --summary "summary" or %s block "$AUTOGORA_TASK_ID" "reason" --kind needs_input.`, bridge, bridge),
 			"The dispatcher scopes these commands to the active task and claim. Do not claim, create, reassign, unblock, or modify unrelated tasks.",
 		)
 	} else {
 		instructions = append(instructions,
-			"Call taskcircuit_show first without a task_id. Work only on that task in the current workspace.",
-			"Read relationshipGraph and workerContext from taskcircuit_show. Follow the recorded dependency phase; do not implement sibling or downstream tasks.",
-			"Use taskcircuit_heartbeat for long-running work. Record durable intermediate handoffs with taskcircuit_comment.",
+			"Call autogora_show first without a task_id. Work only on that task in the current workspace.",
+			"Read relationshipGraph and workerContext from autogora_show. Follow the recorded dependency phase; do not implement sibling or downstream tasks.",
+			"Use autogora_heartbeat for long-running work. Record durable intermediate handoffs with autogora_comment.",
 			"Do not claim, create, reassign, unblock, or modify unrelated tasks.",
 		)
 	}
 	if task.GoalMode {
 		instructions = append(instructions,
-			"This card is in goal mode. Call taskcircuit_complete only when every acceptance criterion is demonstrably satisfied, or taskcircuit_block for a real blocker.",
+			"This card is in goal mode. Call autogora_complete only when every acceptance criterion is demonstrably satisfied, or autogora_block for a real blocker.",
 		)
 		if task.Runtime == model.RuntimeCline {
 			instructions = append(instructions, "If meaningful work remains after this turn, leave the task running and end with a concise progress handoff; an independent judge may continue the goal in a fresh Cline turn.")
@@ -80,7 +80,7 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 			instructions = append(instructions, "If meaningful work remains after this turn, leave the task running and end your response with a concise progress handoff; an independent judge will continue this same session.")
 		}
 	} else {
-		instructions = append(instructions, "You must end exactly once by calling taskcircuit_complete with verification evidence, or taskcircuit_block with the concrete reason.")
+		instructions = append(instructions, "You must end exactly once by calling autogora_complete with verification evidence, or autogora_block with the concrete reason.")
 	}
 	if len(task.Skills) > 0 {
 		instructions = append(instructions, "Load and follow these task-specific skills before working: "+strings.Join(task.Skills, ", ")+".")
@@ -100,7 +100,7 @@ func workerBinary(options RunnerOptions, runtime model.Runtime) string {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	name := "TASKCIRCUIT_" + strings.ToUpper(string(runtime)) + "_BIN"
+	name := "AUTOGORA_" + strings.ToUpper(string(runtime)) + "_BIN"
 	if value := strings.TrimSpace(getenv(name)); value != "" {
 		return value
 	}
@@ -114,11 +114,11 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 		tenant = *task.Tenant
 	}
 	return map[string]string{
-		"TASKCIRCUIT_DB": dbPath, "TASKCIRCUIT_BOARD": task.Board, "TASKCIRCUIT_TASK_ID": task.ID,
-		"TASKCIRCUIT_RUN_ID": run.ID, "TASKCIRCUIT_CLAIM_TOKEN": claim.ClaimToken, "TASKCIRCUIT_WORKER_ID": run.WorkerID,
-		"TASKCIRCUIT_TENANT": tenant, "TASKCIRCUIT_WORKSPACE": cwd, "TASKCIRCUIT_WORKSPACES_ROOT": options.WorkspaceRoot,
-		"TASKCIRCUIT_ATTACHMENTS_ROOT": options.AttachmentsRoot, "TASKCIRCUIT_LOGS_ROOT": options.LogsRoot,
-		"TASKCIRCUIT_CLI": options.CLIPath,
+		"AUTOGORA_DB": dbPath, "AUTOGORA_BOARD": task.Board, "AUTOGORA_TASK_ID": task.ID,
+		"AUTOGORA_RUN_ID": run.ID, "AUTOGORA_CLAIM_TOKEN": claim.ClaimToken, "AUTOGORA_WORKER_ID": run.WorkerID,
+		"AUTOGORA_TENANT": tenant, "AUTOGORA_WORKSPACE": cwd, "AUTOGORA_WORKSPACES_ROOT": options.WorkspaceRoot,
+		"AUTOGORA_ATTACHMENTS_ROOT": options.AttachmentsRoot, "AUTOGORA_LOGS_ROOT": options.LogsRoot,
+		"AUTOGORA_CLI": options.CLIPath,
 	}
 }
 
@@ -157,13 +157,13 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 		}
 		return RunnerCommand{Command: workerBinary(options, task.Runtime), CWD: cwd, Env: env, Args: []string{
 			"exec", "--json", "--color", "never", "--skip-git-repo-check", "--sandbox", sandbox, "-C", cwd,
-			"-c", "mcp_servers.taskcircuit.command=" + string(commandJSON),
-			"-c", "mcp_servers.taskcircuit.args=" + string(argsJSON),
-			"-c", "mcp_servers.taskcircuit.required=true", prompt,
+			"-c", "mcp_servers.autogora.command=" + string(commandJSON),
+			"-c", "mcp_servers.autogora.args=" + string(argsJSON),
+			"-c", "mcp_servers.autogora.required=true", prompt,
 		}}, nil
 	case model.RuntimeClaude:
-		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"taskcircuit": map[string]any{"type": "stdio", "command": cliPath, "args": serverArgs}}})
-		lifecycle := []string{"mcp__taskcircuit__taskcircuit_show", "mcp__taskcircuit__taskcircuit_comment", "mcp__taskcircuit__taskcircuit_heartbeat", "mcp__taskcircuit__taskcircuit_complete", "mcp__taskcircuit__taskcircuit_block"}
+		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"autogora": map[string]any{"type": "stdio", "command": cliPath, "args": serverArgs}}})
+		lifecycle := []string{"mcp__autogora__autogora_show", "mcp__autogora__autogora_comment", "mcp__autogora__autogora_heartbeat", "mcp__autogora__autogora_complete", "mcp__autogora__autogora_block"}
 		builtins := []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"}
 		permission := "dontAsk"
 		if options.AllowWrites {

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func TestExecuteTurnRecordsSpawnLogAndSession(t *testing.T) {
@@ -56,13 +56,13 @@ func TestExecuteTurnEnforcesRuntimeLimit(t *testing.T) {
 
 func TestScopedApprovalBrokerAllowsOnlyLifecycleBridge(t *testing.T) {
 	directory := t.TempDir()
-	prefix := "'/tmp/taskcircuit'"
+	prefix := "'/tmp/autogora'"
 	broker := &approvalBroker{policy: ToolApproval{Directory: directory, CommandPrefix: prefix}, handled: map[string]bool{}}
 	requests := map[string]map[string]any{
 		"a.request.1.json": {"toolName": "read_file", "input": map[string]any{"path": "README.md"}},
-		"b.request.2.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " complete $TASKCIRCUIT_TASK_ID --summary ok"}},
+		"b.request.2.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " complete $AUTOGORA_TASK_ID --summary ok"}},
 		"c.request.3.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " delete t_other"}},
-		"d.request.4.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " show $TASKCIRCUIT_TASK_ID; rm -rf /tmp/x"}},
+		"d.request.4.json": {"toolName": "execute_command", "input": map[string]any{"command": prefix + " show $AUTOGORA_TASK_ID; rm -rf /tmp/x"}},
 	}
 	for name, request := range requests {
 		value, _ := json.Marshal(request)

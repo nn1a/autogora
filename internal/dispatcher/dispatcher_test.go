@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func boolValue(value bool) *bool                       { return &value }
@@ -21,7 +21,7 @@ func durationValue(value time.Duration) *time.Duration { return &value }
 
 func testManager(t *testing.T) (*boards.Manager, string) {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
+	dbPath := filepath.Join(t.TempDir(), "autogora.db")
 	manager, err := boards.NewManager(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -41,15 +41,15 @@ func executableFixture(t *testing.T, content string) string {
 	return path
 }
 
-func buildTaskCircuit(t *testing.T) string {
+func buildAutogora(t *testing.T) string {
 	t.Helper()
 	_, source, _, _ := runtime.Caller(0)
 	repository := filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
-	path := filepath.Join(t.TempDir(), "taskcircuit")
-	command := exec.Command("go", "build", "-o", path, "./cmd/taskcircuit")
+	path := filepath.Join(t.TempDir(), "autogora")
+	command := exec.Command("go", "build", "-o", path, "./cmd/autogora")
 	command.Dir = repository
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build TaskCircuit: %v\n%s", err, output)
+		t.Fatalf("build Autogora: %v\n%s", err, output)
 	}
 	return path
 }
@@ -62,9 +62,9 @@ func TestDispatcherRateLimitDoesNotConsumeRetry(t *testing.T) {
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "rate limited", Assignee: &assignee, Runtime: model.RuntimeCodex})
 	opened.Close()
 	fixture := executableFixture(t, "exit 75")
-	err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/taskcircuit", Once: true, MaxWorkers: 1,
+	err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, MaxWorkers: 1,
 		RateLimitCooldown: durationValue(0), AutoDecompose: boolValue(false), Getenv: func(name string) string {
-			if name == "TASKCIRCUIT_CODEX_BIN" {
+			if name == "AUTOGORA_CODEX_BIN" {
 				return fixture
 			}
 			return ""
@@ -114,7 +114,7 @@ func TestDispatcherAutoSpecifiesTriageWithInjectedPlanner(t *testing.T) {
 		kinds = append(kinds, request.Kind)
 		return map[string]any{"fanout": false, "rootTitle": "Audit backups", "rootBody": "Acceptance: record restore evidence.", "reason": "one specialist", "tasks": []any{}, "dependencies": []any{}}, nil
 	}
-	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/taskcircuit", Once: true, AutoDecompose: boolValue(true), DecompositionPlanner: planner}); err != nil {
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, AutoDecompose: boolValue(true), DecompositionPlanner: planner}); err != nil {
 		t.Fatal(err)
 	}
 	check, _ := manager.OpenStore(ctx, "default")
@@ -128,19 +128,19 @@ func TestDispatcherAutoSpecifiesTriageWithInjectedPlanner(t *testing.T) {
 func TestDispatcherRunsClineThroughGoCLIBridge(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
-	cliPath := buildTaskCircuit(t)
+	cliPath := buildAutogora(t)
 	opened, _ := manager.OpenStore(ctx, "default")
 	assignee := "cline-worker"
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Cline bridge", Assignee: &assignee, Runtime: model.RuntimeCline})
 	opened.Close()
 	fixture := executableFixture(t, `
-"$TASKCIRCUIT_CLI" show "$TASKCIRCUIT_TASK_ID" >/dev/null
-"$TASKCIRCUIT_CLI" heartbeat "$TASKCIRCUIT_TASK_ID" --note "running" >/dev/null
-"$TASKCIRCUIT_CLI" comment "$TASKCIRCUIT_TASK_ID" "Cline used the Go CLI bridge" --author cline >/dev/null
-"$TASKCIRCUIT_CLI" complete "$TASKCIRCUIT_TASK_ID" --summary "completed through Go CLI" --metadata '{"verification":["go-cli"]}' >/dev/null
+"$AUTOGORA_CLI" show "$AUTOGORA_TASK_ID" >/dev/null
+"$AUTOGORA_CLI" heartbeat "$AUTOGORA_TASK_ID" --note "running" >/dev/null
+"$AUTOGORA_CLI" comment "$AUTOGORA_TASK_ID" "Cline used the Go CLI bridge" --author cline >/dev/null
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "completed through Go CLI" --metadata '{"verification":["go-cli"]}' >/dev/null
 printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Once: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
-		if name == "TASKCIRCUIT_CLINE_BIN" {
+		if name == "AUTOGORA_CLINE_BIN" {
 			return fixture
 		}
 		return ""
@@ -158,23 +158,23 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 func TestDispatcherResumesGoalUntilTerminalCall(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
-	cliPath := buildTaskCircuit(t)
+	cliPath := buildAutogora(t)
 	opened, _ := manager.OpenStore(ctx, "default")
 	assignee := "worker"
 	workspacePath := t.TempDir()
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "goal", Body: "Acceptance: finish second turn", Assignee: &assignee, Runtime: model.RuntimeCodex, Workspace: &workspacePath, GoalMode: true, GoalMaxTurns: 3})
 	opened.Close()
 	fixture := executableFixture(t, `
-marker="$TASKCIRCUIT_WORKSPACE/.goal-turn"
+marker="$AUTOGORA_WORKSPACE/.goal-turn"
 if [ ! -f "$marker" ]; then
   touch "$marker"
   printf '%s\n' '{"thread_id":"session-1"}'
 else
-  "$TASKCIRCUIT_CLI" complete "$TASKCIRCUIT_TASK_ID" --summary "goal complete" --metadata '{"turns":2}' >/dev/null
+  "$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "goal complete" --metadata '{"turns":2}' >/dev/null
 fi`)
 	judged := 0
 	err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Once: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
-		if name == "TASKCIRCUIT_CODEX_BIN" {
+		if name == "AUTOGORA_CODEX_BIN" {
 			return fixture
 		}
 		return ""

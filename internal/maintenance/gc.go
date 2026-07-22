@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type Options struct {

@@ -5,13 +5,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func TestTerminateRunPersistsIntentAndReclaimsMissingProcess(t *testing.T) {
 	ctx := context.Background()
-	opened, err := store.Open(filepath.Join(t.TempDir(), "taskcircuit.db"), "default", "")
+	opened, err := store.Open(filepath.Join(t.TempDir(), "autogora.db"), "default", "")
 	if err != nil {
 		t.Fatal(err)
 	}

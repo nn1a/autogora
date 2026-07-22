@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type TaskGraphNode struct {
@@ -250,7 +250,7 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 			return err
 		}
 		metadata := map[string]any{"goal": goal}
-		blackboard := map[string]any{"type": "taskcircuit_swarm_blackboard", "goal": goal}
+		blackboard := map[string]any{"type": "autogora_swarm_blackboard", "goal": goal}
 		for key, value := range input.Blackboard {
 			metadata[key], blackboard[key] = value, value
 		}

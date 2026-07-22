@@ -10,14 +10,14 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/maintenance"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/notifications"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/runcontrol"
-	"github.com/nn1a/kanban/internal/store"
-	"github.com/nn1a/kanban/internal/workspace"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/maintenance"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/notifications"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/runcontrol"
+	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/workspace"
 )
 
 type bulkInput struct {
@@ -286,7 +286,7 @@ func (s *Service) planner(runtime model.Runtime, timeoutMS int) (orchestration.P
 }
 
 func (s *Service) registerMutations(server *mcp.Server) {
-	addTool(server, "taskcircuit_notify_deliver", "Deliver pending Kanban notifications", "Claim and deliver pending terminal events through registered adapters.", false, false, false, true, func(ctx context.Context, input notificationDeliveryInput) (any, error) {
+	addTool(server, "autogora_notify_deliver", "Deliver pending Kanban notifications", "Claim and deliver pending terminal events through registered adapters.", false, false, false, true, func(ctx context.Context, input notificationDeliveryInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -300,7 +300,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return notifications.Deliver(ctx, opened, notifications.Options{Limit: input.Limit, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond})
 		})
 	})
-	addTool(server, "taskcircuit_gc", "Garbage collect Kanban data", "Delete expired events, worker logs, and verified terminal scratch workspaces.", false, true, true, false, func(ctx context.Context, input garbageCollectionInput) (any, error) {
+	addTool(server, "autogora_gc", "Garbage collect Kanban data", "Delete expired events, worker logs, and verified terminal scratch workspaces.", false, true, true, false, func(ctx context.Context, input garbageCollectionInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -320,7 +320,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		}
 		return maintenance.Collect(ctx, s.manager, board, maintenance.Options{EventRetentionDays: events, LogRetentionDays: logs, WorkspaceRetentionDays: workspaces})
 	})
-	addTool(server, "taskcircuit_run_terminate", "Terminate a TaskCircuit worker run", "Persist termination intent, signal a live worker, and reclaim a missing process.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
+	addTool(server, "autogora_run_terminate", "Terminate an Autogora worker run", "Persist termination intent, signal a live worker, and reclaim a missing process.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -328,7 +328,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return nil, errors.New("provide exactly one of task_id or run_id")
 		}
 		if input.Reason == "" {
-			input.Reason = "Run terminated through TaskCircuit MCP"
+			input.Reason = "Run terminated through Autogora MCP"
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
 			if input.RunID != "" {
@@ -337,7 +337,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return runcontrol.TerminateTaskRun(ctx, opened, input.TaskID, input.Reason)
 		})
 	})
-	addTool(server, "taskcircuit_bulk", "Bulk mutate Kanban tasks", "Apply one mutation with per-task success and error results.", false, true, false, false, func(ctx context.Context, input bulkInput) (any, error) {
+	addTool(server, "autogora_bulk", "Bulk mutate Kanban tasks", "Apply one mutation with per-task success and error results.", false, true, false, false, func(ctx context.Context, input bulkInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -353,7 +353,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return opened.BulkMutate(ctx, input.TaskIDs, store.BulkMutation{Status: status, Assignee: assignee, Priority: input.Priority, Archive: input.Archive, Delete: input.Delete}), nil
 		})
 	})
-	addTool(server, "taskcircuit_notify_subscribe", "Subscribe to Kanban task notifications", "Subscribe a platform destination to future task events.", false, false, true, false, func(ctx context.Context, input notificationInput) (any, error) {
+	addTool(server, "autogora_notify_subscribe", "Subscribe to Kanban task notifications", "Subscribe a platform destination to future task events.", false, false, true, false, func(ctx context.Context, input notificationInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -362,7 +362,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				ThreadID: input.ThreadID, UserID: input.UserID, EventKinds: input.EventKinds, Secret: optionalStringSet(input.Secret, input.secretSet)})
 		})
 	})
-	addTool(server, "taskcircuit_notify_list", "List Kanban notification subscriptions", "List subscriptions without exposing stored secrets.", true, false, true, false, func(ctx context.Context, input notificationListInput) (any, error) {
+	addTool(server, "autogora_notify_list", "List Kanban notification subscriptions", "List subscriptions without exposing stored secrets.", true, false, true, false, func(ctx context.Context, input notificationListInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -370,7 +370,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return opened.ListNotificationSubscriptions(ctx, input.TaskID)
 		})
 	})
-	addTool(server, "taskcircuit_notify_unsubscribe", "Unsubscribe from Kanban task notifications", "Remove a task notification destination and pending deliveries.", false, true, true, false, func(ctx context.Context, input notificationInput) (any, error) {
+	addTool(server, "autogora_notify_unsubscribe", "Unsubscribe from Kanban task notifications", "Remove a task notification destination and pending deliveries.", false, true, true, false, func(ctx context.Context, input notificationInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -379,7 +379,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		})
 		return map[string]any{"taskId": input.TaskID, "unsubscribed": removed}, err
 	})
-	addTool(server, "taskcircuit_specify", "Specify a Kanban triage task", "Rewrite a rough triage card into an executable specification with explicit input or a constrained CLI planner.", false, false, false, true, func(ctx context.Context, input specifyInput) (any, error) {
+	addTool(server, "autogora_specify", "Specify a Kanban triage task", "Rewrite a rough triage card into an executable specification with explicit input or a constrained CLI planner.", false, false, false, true, func(ctx context.Context, input specifyInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -401,7 +401,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return orchestration.SpecifyTriageTask(ctx, opened, input.TaskID, planner, explicit, input.Author)
 		})
 	})
-	addTool(server, "taskcircuit_decompose", "Decompose a Kanban triage task", "Use an explicit or constrained CLI planner-generated plan to atomically create and route an acyclic child task graph.", false, false, false, true, func(ctx context.Context, input decomposeInput) (any, error) {
+	addTool(server, "autogora_decompose", "Decompose a Kanban triage task", "Use an explicit or constrained CLI planner-generated plan to atomically create and route an acyclic child task graph.", false, false, false, true, func(ctx context.Context, input decomposeInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -432,7 +432,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			})
 		})
 	})
-	addTool(server, "taskcircuit_profile_describe_auto", "Describe a Kanban routing profile", "Generate and persist a concise board routing description from prior task evidence.", false, false, false, true, func(ctx context.Context, input profileDescribeInput) (any, error) {
+	addTool(server, "autogora_profile_describe_auto", "Describe a Kanban routing profile", "Generate and persist a concise board routing description from prior task evidence.", false, false, false, true, func(ctx context.Context, input profileDescribeInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -492,7 +492,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		}
 		return described, nil
 	})
-	addTool(server, "taskcircuit_swarm", "Create a Kanban swarm", "Create a completed blackboard, parallel workers, verifier, and synthesizer.", false, false, false, false, func(ctx context.Context, input swarmInput) (any, error) {
+	addTool(server, "autogora_swarm", "Create a Kanban swarm", "Create a completed blackboard, parallel workers, verifier, and synthesizer.", false, false, false, false, func(ctx context.Context, input swarmInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -507,7 +507,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				Tenant:      input.Tenant, Workspace: input.Workspace, WorkspaceKind: input.WorkspaceKind, Blackboard: input.Blackboard})
 		})
 	})
-	addTool(server, "taskcircuit_update", "Update Kanban task", "Update task metadata or perform an administrative status transition.", false, true, true, false, func(ctx context.Context, input updateInput) (any, error) {
+	addTool(server, "autogora_update", "Update Kanban task", "Update task metadata or perform an administrative status transition.", false, true, true, false, func(ctx context.Context, input updateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -520,7 +520,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				CurrentStepKey: optionalStringSet(input.CurrentStepKey, input.currentStepKeySet), Status: input.Status})
 		})
 	})
-	addTool(server, "taskcircuit_comment", "Comment on Kanban task", "Append a durable handoff or progress note.", false, false, false, false, func(ctx context.Context, input commentInput) (any, error) {
+	addTool(server, "autogora_comment", "Comment on Kanban task", "Append a durable handoff or progress note.", false, false, false, false, func(ctx context.Context, input commentInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
@@ -532,15 +532,15 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return opened.AddComment(ctx, taskID, input.Author, input.Body)
 		})
 	})
-	addTool(server, "taskcircuit_link", "Link Kanban dependency", "Create a prerequisite-to-dependent execution edge.", false, false, true, false, s.linkHandler(true))
-	addTool(server, "taskcircuit_unlink", "Unlink Kanban dependency", "Remove an execution edge and recompute readiness.", false, true, true, false, s.linkHandler(false))
-	addTool(server, "taskcircuit_subtask_set", "Set TaskCircuit subtask parent", "Place a task under one hierarchy parent without changing dependencies.", false, false, true, false, s.subtaskHandler(true))
-	addTool(server, "taskcircuit_subtask_remove", "Remove TaskCircuit subtask parent", "Remove a hierarchy edge without changing dependencies.", false, true, true, false, s.subtaskHandler(false))
-	addTool(server, "taskcircuit_promote", "Promote Kanban task", "Move a parked task into the executable pipeline.", false, true, false, false, s.adminTaskHandler("promote"))
-	addTool(server, "taskcircuit_archive", "Archive Kanban task", "Archive a task after any active run has ended.", false, true, true, false, s.adminTaskHandler("archive"))
-	addTool(server, "taskcircuit_delete", "Delete Kanban task", "Permanently delete a task and related durable records.", false, true, false, false, s.adminTaskHandler("delete"))
-	addTool(server, "taskcircuit_unblock", "Unblock Kanban task", "Release a blocked task back to todo or ready.", false, true, false, false, s.adminTaskHandler("unblock"))
-	addTool(server, "taskcircuit_schedule", "Schedule Kanban task", "Park a task until an optional ISO-8601 time or manual promotion.", false, true, true, false, func(ctx context.Context, input scheduleInput) (any, error) {
+	addTool(server, "autogora_link", "Link Kanban dependency", "Create a prerequisite-to-dependent execution edge.", false, false, true, false, s.linkHandler(true))
+	addTool(server, "autogora_unlink", "Unlink Kanban dependency", "Remove an execution edge and recompute readiness.", false, true, true, false, s.linkHandler(false))
+	addTool(server, "autogora_subtask_set", "Set Autogora subtask parent", "Place a task under one hierarchy parent without changing dependencies.", false, false, true, false, s.subtaskHandler(true))
+	addTool(server, "autogora_subtask_remove", "Remove Autogora subtask parent", "Remove a hierarchy edge without changing dependencies.", false, true, true, false, s.subtaskHandler(false))
+	addTool(server, "autogora_promote", "Promote Kanban task", "Move a parked task into the executable pipeline.", false, true, false, false, s.adminTaskHandler("promote"))
+	addTool(server, "autogora_archive", "Archive Kanban task", "Archive a task after any active run has ended.", false, true, true, false, s.adminTaskHandler("archive"))
+	addTool(server, "autogora_delete", "Delete Kanban task", "Permanently delete a task and related durable records.", false, true, false, false, s.adminTaskHandler("delete"))
+	addTool(server, "autogora_unblock", "Unblock Kanban task", "Release a blocked task back to todo or ready.", false, true, false, false, s.adminTaskHandler("unblock"))
+	addTool(server, "autogora_schedule", "Schedule Kanban task", "Park a task until an optional ISO-8601 time or manual promotion.", false, true, true, false, func(ctx context.Context, input scheduleInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -548,7 +548,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return opened.ScheduleTask(ctx, input.TaskID, input.ScheduledAt, input.Reason)
 		})
 	})
-	addTool(server, "taskcircuit_claim", "Claim Kanban task", "Atomically claim one ready task and create a run lease.", false, false, false, false, func(ctx context.Context, input claimInput) (any, error) {
+	addTool(server, "autogora_claim", "Claim Kanban task", "Atomically claim one ready task and create a run lease.", false, false, false, false, func(ctx context.Context, input claimInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
@@ -573,10 +573,10 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return prepared, nil
 		})
 	})
-	addTool(server, "taskcircuit_attach", "Attach file to Kanban task", "Copy a local file into durable board-scoped storage.", false, false, false, false, s.attachmentHandler("file"))
-	addTool(server, "taskcircuit_attach_url", "Attach URL to Kanban task", "Add an HTTP(S) reference to a task.", false, false, false, true, s.attachmentHandler("url"))
-	addTool(server, "taskcircuit_attachments", "List Kanban attachments", "List durable files and URL references for a task.", true, false, true, false, s.attachmentHandler("list"))
-	addTool(server, "taskcircuit_attachment_remove", "Remove Kanban attachment", "Remove attachment metadata and its stored file.", false, true, false, false, func(ctx context.Context, input attachmentRemoveInput) (any, error) {
+	addTool(server, "autogora_attach", "Attach file to Kanban task", "Copy a local file into durable board-scoped storage.", false, false, false, false, s.attachmentHandler("file"))
+	addTool(server, "autogora_attach_url", "Attach URL to Kanban task", "Add an HTTP(S) reference to a task.", false, false, false, true, s.attachmentHandler("url"))
+	addTool(server, "autogora_attachments", "List Kanban attachments", "List durable files and URL references for a task.", true, false, true, false, s.attachmentHandler("list"))
+	addTool(server, "autogora_attachment_remove", "Remove Kanban attachment", "Remove attachment metadata and its stored file.", false, true, false, false, func(ctx context.Context, input attachmentRemoveInput) (any, error) {
 		taskID, err := s.scopedTaskID(input.TaskID)
 		if err != nil {
 			return nil, err
@@ -588,14 +588,14 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return map[string]any{"id": input.AttachmentID, "removed": true}, nil
 		})
 	})
-	addTool(server, "taskcircuit_heartbeat", "Heartbeat Kanban run", "Refresh the active run lease and record an optional note.", false, false, false, false, func(ctx context.Context, input heartbeatInput) (any, error) {
+	addTool(server, "autogora_heartbeat", "Heartbeat Kanban run", "Refresh the active run lease and record an optional note.", false, false, false, false, func(ctx context.Context, input heartbeatInput) (any, error) {
 		scope, err := s.scopedRun(input.RunID, input.ClaimToken)
 		if err != nil {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) { return opened.Heartbeat(ctx, scope, input.Note) })
 	})
-	addTool(server, "taskcircuit_complete", "Complete Kanban run", "Complete the active run with a summary and structured evidence.", false, true, false, false, func(ctx context.Context, input completeInput) (any, error) {
+	addTool(server, "autogora_complete", "Complete Kanban run", "Complete the active run with a summary and structured evidence.", false, true, false, false, func(ctx context.Context, input completeInput) (any, error) {
 		scope, err := s.scopedRun(input.RunID, input.ClaimToken)
 		if err != nil {
 			return nil, err
@@ -604,7 +604,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return opened.CompleteRun(ctx, scope, store.CompletionInput{Summary: input.Summary, Result: input.Result, Metadata: input.Metadata, Artifacts: input.Artifacts})
 		})
 	})
-	addTool(server, "taskcircuit_block", "Block Kanban run", "Stop an active run for input, capability, dependency, or transient reasons.", false, true, false, false, func(ctx context.Context, input blockInput) (any, error) {
+	addTool(server, "autogora_block", "Block Kanban run", "Stop an active run for input, capability, dependency, or transient reasons.", false, true, false, false, func(ctx context.Context, input blockInput) (any, error) {
 		scope, err := s.scopedRun(input.RunID, input.ClaimToken)
 		if err != nil {
 			return nil, err

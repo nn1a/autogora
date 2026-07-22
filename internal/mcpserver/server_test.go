@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 func connectTestServer(t *testing.T, server *mcp.Server) (*mcp.ClientSession, <-chan error) {
@@ -17,7 +17,7 @@ func connectTestServer(t *testing.T, server *mcp.Server) (*mcp.ClientSession, <-
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	done := make(chan error, 1)
 	go func() { done <- server.Run(context.Background(), serverTransport) }()
-	client := mcp.NewClient(&mcp.Implementation{Name: "taskcircuit-test", Version: "1.0.0"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "autogora-test", Version: "1.0.0"}, nil)
 	session, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +66,7 @@ func toolJSON(t *testing.T, session *mcp.ClientSession, name string, arguments m
 
 func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
+	dbPath := filepath.Join(t.TempDir(), "autogora.db")
 	manager, err := boards.NewManager(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -82,11 +82,11 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectedTools := []string{
-		"taskcircuit_boards_list", "taskcircuit_boards_create", "taskcircuit_boards_update", "taskcircuit_boards_switch", "taskcircuit_boards_remove",
-		"taskcircuit_create", "taskcircuit_list", "taskcircuit_show", "taskcircuit_context", "taskcircuit_graph", "taskcircuit_stats", "taskcircuit_diagnostics", "taskcircuit_events", "taskcircuit_runs", "taskcircuit_run_terminate", "taskcircuit_log", "taskcircuit_bulk", "taskcircuit_gc",
-		"taskcircuit_notify_subscribe", "taskcircuit_notify_list", "taskcircuit_notify_unsubscribe", "taskcircuit_notify_deliver",
-		"taskcircuit_specify", "taskcircuit_decompose", "taskcircuit_profile_describe_auto", "taskcircuit_swarm", "taskcircuit_update", "taskcircuit_comment", "taskcircuit_link", "taskcircuit_unlink", "taskcircuit_subtask_set", "taskcircuit_subtask_remove",
-		"taskcircuit_promote", "taskcircuit_schedule", "taskcircuit_archive", "taskcircuit_delete", "taskcircuit_claim", "taskcircuit_attach", "taskcircuit_attach_url", "taskcircuit_attachments", "taskcircuit_attachment_remove", "taskcircuit_heartbeat", "taskcircuit_complete", "taskcircuit_block", "taskcircuit_unblock",
+		"autogora_boards_list", "autogora_boards_create", "autogora_boards_update", "autogora_boards_switch", "autogora_boards_remove",
+		"autogora_create", "autogora_list", "autogora_show", "autogora_context", "autogora_graph", "autogora_stats", "autogora_diagnostics", "autogora_events", "autogora_runs", "autogora_run_terminate", "autogora_log", "autogora_bulk", "autogora_gc",
+		"autogora_notify_subscribe", "autogora_notify_list", "autogora_notify_unsubscribe", "autogora_notify_deliver",
+		"autogora_specify", "autogora_decompose", "autogora_profile_describe_auto", "autogora_swarm", "autogora_update", "autogora_comment", "autogora_link", "autogora_unlink", "autogora_subtask_set", "autogora_subtask_remove",
+		"autogora_promote", "autogora_schedule", "autogora_archive", "autogora_delete", "autogora_claim", "autogora_attach", "autogora_attach_url", "autogora_attachments", "autogora_attachment_remove", "autogora_heartbeat", "autogora_complete", "autogora_block", "autogora_unblock",
 	}
 	if len(tools.Tools) != len(expectedTools) {
 		t.Fatalf("MCP tool count = %d, want %d", len(tools.Tools), len(expectedTools))
@@ -103,8 +103,8 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 			t.Fatalf("MCP tool missing: %s", expected)
 		}
 	}
-	toolJSON(t, session, "taskcircuit_boards_update", map[string]any{"slug": "project", "default_workdir": "/tmp"}, nil)
-	toolJSON(t, session, "taskcircuit_boards_update", map[string]any{
+	toolJSON(t, session, "autogora_boards_update", map[string]any{"slug": "project", "default_workdir": "/tmp"}, nil)
+	toolJSON(t, session, "autogora_boards_update", map[string]any{
 		"slug": "project", "default_workdir": nil,
 		"orchestration": map[string]any{
 			"autoDecompose": false, "autoDecomposePerTick": 4, "autoPromoteChildren": false,
@@ -122,7 +122,7 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	var created struct {
 		Task model.Task `json:"task"`
 	}
-	toolJSON(t, session, "taskcircuit_create", map[string]any{"board": "project", "title": "MCP task", "assignee": "worker", "runtime": "codex"}, &created)
+	toolJSON(t, session, "autogora_create", map[string]any{"board": "project", "title": "MCP task", "assignee": "worker", "runtime": "codex"}, &created)
 	if created.Task.Status != model.TaskStatusReady {
 		t.Fatalf("unexpected task: %+v", created.Task)
 	}
@@ -131,7 +131,7 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 		RelationshipGraph model.RelationshipGraph `json:"relationshipGraph"`
 		WorkerContext     string                  `json:"workerContext"`
 	}
-	toolJSON(t, session, "taskcircuit_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &shown)
+	toolJSON(t, session, "autogora_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &shown)
 	if shown.RelationshipGraph.FocusTaskID != created.Task.ID || shown.WorkerContext == "" {
 		t.Fatalf("show omitted execution context: %+v", shown)
 	}
@@ -139,15 +139,15 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 		Run        model.Run `json:"run"`
 		ClaimToken string    `json:"claimToken"`
 	}
-	toolJSON(t, session, "taskcircuit_claim", map[string]any{"board": "project", "task_id": created.Task.ID}, &claimed)
+	toolJSON(t, session, "autogora_claim", map[string]any{"board": "project", "task_id": created.Task.ID}, &claimed)
 	if claimed.Run.Status != model.RunStatusRunning || claimed.ClaimToken == "" {
 		t.Fatalf("claim output mismatch: %+v", claimed)
 	}
 
 	scopedServer, scopedService := New(manager, "test")
 	scopedEnvironment := map[string]string{
-		"TASKCIRCUIT_BOARD": "project", "TASKCIRCUIT_TASK_ID": created.Task.ID,
-		"TASKCIRCUIT_RUN_ID": claimed.Run.ID, "TASKCIRCUIT_CLAIM_TOKEN": claimed.ClaimToken,
+		"AUTOGORA_BOARD": "project", "AUTOGORA_TASK_ID": created.Task.ID,
+		"AUTOGORA_RUN_ID": claimed.Run.ID, "AUTOGORA_CLAIM_TOKEN": claimed.ClaimToken,
 	}
 	scopedService.getenv = func(name string) string { return scopedEnvironment[name] }
 	scopedSession, scopedDone := connectTestServer(t, scopedServer)
@@ -155,24 +155,24 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	var scopedShow struct {
 		Task model.Task `json:"task"`
 	}
-	toolJSON(t, scopedSession, "taskcircuit_show", map[string]any{}, &scopedShow)
+	toolJSON(t, scopedSession, "autogora_show", map[string]any{}, &scopedShow)
 	if scopedShow.Task.ID != created.Task.ID || scopedShow.Task.Status != model.TaskStatusRunning {
 		t.Fatalf("scoped worker read wrong task: %+v", scopedShow.Task)
 	}
-	forbidden, err := scopedSession.CallTool(ctx, &mcp.CallToolParams{Name: "taskcircuit_list", Arguments: map[string]any{}})
+	forbidden, err := scopedSession.CallTool(ctx, &mcp.CallToolParams{Name: "autogora_list", Arguments: map[string]any{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !forbidden.IsError {
 		t.Fatal("scoped worker was allowed to list the board")
 	}
-	toolJSON(t, scopedSession, "taskcircuit_comment", map[string]any{"body": "MCP progress", "author": "worker"}, nil)
-	toolJSON(t, scopedSession, "taskcircuit_complete", map[string]any{"summary": "MCP completed", "metadata": map[string]any{"verification": []string{"mcp"}}}, nil)
+	toolJSON(t, scopedSession, "autogora_comment", map[string]any{"body": "MCP progress", "author": "worker"}, nil)
+	toolJSON(t, scopedSession, "autogora_complete", map[string]any{"summary": "MCP completed", "metadata": map[string]any{"verification": []string{"mcp"}}}, nil)
 	var completed struct {
 		Task model.Task  `json:"task"`
 		Runs []model.Run `json:"runs"`
 	}
-	toolJSON(t, session, "taskcircuit_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &completed)
+	toolJSON(t, session, "autogora_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &completed)
 	if completed.Task.Status != model.TaskStatusDone || len(completed.Runs) != 1 || completed.Runs[0].Status != model.RunStatusCompleted {
 		t.Fatalf("scoped MCP lifecycle did not complete shared task: %+v", completed)
 	}
@@ -180,7 +180,7 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 
 func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
+	dbPath := filepath.Join(t.TempDir(), "autogora.db")
 	manager, err := boards.NewManager(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -195,11 +195,11 @@ func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 	var rough struct {
 		Task model.Task `json:"task"`
 	}
-	toolJSON(t, session, "taskcircuit_create", map[string]any{"title": "rough", "status": "triage"}, &rough)
+	toolJSON(t, session, "autogora_create", map[string]any{"title": "rough", "status": "triage"}, &rough)
 	var specified struct {
 		Task model.Task `json:"task"`
 	}
-	toolJSON(t, session, "taskcircuit_specify", map[string]any{"task_id": rough.Task.ID, "title": "Precise", "body": "Acceptance: pass"}, &specified)
+	toolJSON(t, session, "autogora_specify", map[string]any{"task_id": rough.Task.ID, "title": "Precise", "body": "Acceptance: pass"}, &specified)
 	if specified.Task.Status != model.TaskStatusTodo || specified.Task.Title != "Precise" {
 		t.Fatalf("unexpected specified task: %+v", specified.Task)
 	}
@@ -207,7 +207,7 @@ func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 	var root struct {
 		Task model.Task `json:"task"`
 	}
-	toolJSON(t, session, "taskcircuit_create", map[string]any{"title": "rough graph", "status": "triage"}, &root)
+	toolJSON(t, session, "autogora_create", map[string]any{"title": "rough graph", "status": "triage"}, &root)
 	plan := map[string]any{
 		"fanout": true, "rootTitle": "Coordinate", "rootBody": "Verify output", "reason": "parallel",
 		"tasks":        []any{map[string]any{"key": "child", "title": "Implement", "body": "Deliver", "assignee": "worker", "runtime": "codex", "priority": 1, "skills": []any{}}},
@@ -219,7 +219,7 @@ func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 			ChildIDs []string `json:"childIds"`
 		} `json:"graph"`
 	}
-	toolJSON(t, session, "taskcircuit_decompose", map[string]any{"task_id": root.Task.ID, "default_profile": map[string]any{"name": "worker", "runtime": "codex"}, "plan": plan}, &decomposed)
+	toolJSON(t, session, "autogora_decompose", map[string]any{"task_id": root.Task.ID, "default_profile": map[string]any{"name": "worker", "runtime": "codex"}, "plan": plan}, &decomposed)
 	if !decomposed.Fanout || len(decomposed.Graph.ChildIDs) != 1 {
 		t.Fatalf("unexpected decomposition: %+v", decomposed)
 	}

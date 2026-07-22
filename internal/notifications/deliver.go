@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 type PayloadTask struct {
@@ -145,12 +145,12 @@ func WebhookAdapter(client *http.Client) Adapter {
 			return err
 		}
 		request.Header.Set("content-type", "application/json")
-		request.Header.Set("x-taskcircuit-delivery-id", delivery.ID)
-		request.Header.Set("x-taskcircuit-event", delivery.Event.Kind)
+		request.Header.Set("x-autogora-delivery-id", delivery.ID)
+		request.Header.Set("x-autogora-event", delivery.Event.Kind)
 		if delivery.Secret != nil {
 			digest := hmac.New(sha256.New, []byte(*delivery.Secret))
 			_, _ = digest.Write(body)
-			request.Header.Set("x-taskcircuit-signature", "sha256="+hex.EncodeToString(digest.Sum(nil)))
+			request.Header.Set("x-autogora-signature", "sha256="+hex.EncodeToString(digest.Sum(nil)))
 		}
 		response, err := client.Do(request)
 		if err != nil {

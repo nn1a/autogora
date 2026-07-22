@@ -13,15 +13,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/dispatcher"
-	"github.com/nn1a/kanban/internal/maintenance"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/notifications"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/runcontrol"
-	"github.com/nn1a/kanban/internal/store"
-	"github.com/nn1a/kanban/internal/workspace"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/dispatcher"
+	"github.com/nn1a/autogora/internal/maintenance"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/notifications"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/runcontrol"
+	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/workspace"
 )
 
 func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Request, segments []string, board, taskID string) error {
@@ -232,7 +232,7 @@ func (s *Server) handleTaskAttachments(response http.ResponseWriter, request *ht
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp("", "taskcircuit-upload-")
+	temporary, err := os.CreateTemp("", "autogora-upload-")
 	if err != nil {
 		return err
 	}

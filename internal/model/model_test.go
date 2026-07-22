@@ -9,7 +9,7 @@ func TestTaskJSONUsesExistingContractNames(t *testing.T) {
 	task := Task{
 		ID:            "task-1",
 		Board:         "default",
-		Title:         "Port TaskCircuit",
+		Title:         "Port Autogora",
 		Runtime:       RuntimeCodex,
 		Status:        TaskStatusReady,
 		WorkspaceKind: WorkspaceScratch,

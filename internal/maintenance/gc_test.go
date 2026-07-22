@@ -7,14 +7,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func TestCollectDeletesOnlyExpiredKnownScratchData(t *testing.T) {
 	ctx := context.Background()
-	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

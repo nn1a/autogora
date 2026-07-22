@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/nn1a/kanban/internal/dashboard"
+	"github.com/nn1a/autogora/internal/dashboard"
 )
 
 func (a *App) runDashboard(ctx context.Context, opts options) error {
@@ -29,7 +29,7 @@ func (a *App) runDashboard(ctx context.Context, opts options) error {
 	}
 	server, err := dashboard.Start(ctx, dashboard.Options{
 		DBPath: dbPath, CLIPath: cliPath, Host: host, Port: port, Token: opts.value("token"),
-		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[taskcircuit] %s\n", message) },
+		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})
 	if err != nil {
 		return err

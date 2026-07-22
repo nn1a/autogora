@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 type TurnExecution struct {

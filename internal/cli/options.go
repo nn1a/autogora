@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type options struct {

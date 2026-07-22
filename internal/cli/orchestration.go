@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func requirePlannerRuntime(value string) (model.Runtime, error) {

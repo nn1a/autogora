@@ -63,7 +63,7 @@ func Open(dbPath, board, attachmentsRoot string) (*Store, error) {
 func dataSourceName(path string) string {
 	var source *url.URL
 	if path == ":memory:" {
-		source = &url.URL{Scheme: "file", Opaque: "taskcircuit-" + uuid.NewString()}
+		source = &url.URL{Scheme: "file", Opaque: "autogora-" + uuid.NewString()}
 	} else {
 		source = &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	}

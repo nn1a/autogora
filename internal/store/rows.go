@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type scanner interface {

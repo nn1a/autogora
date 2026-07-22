@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func completedSubscribedTask(t *testing.T, opened *store.Store, platform, chatID, secret string) string {
@@ -50,13 +50,13 @@ func TestWebhookDeliverySignsPayloadAndRemovesTerminalSubscription(t *testing.T)
 		if err != nil {
 			t.Error(err)
 		}
-		receivedSignature = request.Header.Get("x-taskcircuit-signature")
-		deliveryID = request.Header.Get("x-taskcircuit-delivery-id")
-		eventKind = request.Header.Get("x-taskcircuit-event")
+		receivedSignature = request.Header.Get("x-autogora-signature")
+		deliveryID = request.Header.Get("x-autogora-delivery-id")
+		eventKind = request.Header.Get("x-autogora-event")
 		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	opened, err := store.Open(filepath.Join(t.TempDir(), "taskcircuit.db"), "default", "")
+	opened, err := store.Open(filepath.Join(t.TempDir(), "autogora.db"), "default", "")
 	if err != nil {
 		t.Fatal(err)
 	}

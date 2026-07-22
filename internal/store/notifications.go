@@ -9,7 +9,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 var TerminalNotificationKinds = []string{"completed", "blocked", "gave_up", "crashed", "timed_out"}

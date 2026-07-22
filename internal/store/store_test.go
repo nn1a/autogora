@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 	_ "modernc.org/sqlite"
 )
 
@@ -73,7 +73,7 @@ func TestCreateListAndReadTaskUsingExistingJSONContract(t *testing.T) {
 func TestAttachmentsAndCompletionArtifactsRemainDurable(t *testing.T) {
 	ctx := context.Background()
 	directory := t.TempDir()
-	store, err := Open(filepath.Join(directory, "taskcircuit.db"), "default", filepath.Join(directory, "attachments"))
+	store, err := Open(filepath.Join(directory, "autogora.db"), "default", filepath.Join(directory, "attachments"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestIdempotencyKeyReturnsExistingTask(t *testing.T) {
 
 func TestLegacyMVPDatabaseMigratesWithoutDataLoss(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "taskcircuit.db")
+	dbPath := filepath.Join(t.TempDir(), "autogora.db")
 	legacy, err := sql.Open("sqlite", dataSourceName(dbPath))
 	if err != nil {
 		t.Fatal(err)

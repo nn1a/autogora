@@ -7,14 +7,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func testManager(t *testing.T) (*boards.Manager, *store.Store) {
 	t.Helper()
-	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	}
 	git := func(args ...string) {
 		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
-		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=TaskCircuit", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=TaskCircuit", "GIT_COMMITTER_EMAIL=test@example.com")
+		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Autogora", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Autogora", "GIT_COMMITTER_EMAIL=test@example.com")
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, output)
 		}
@@ -100,7 +100,7 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	}
 	git("add", "README.md")
 	git("commit", "-m", "fixture")
-	manager, err := boards.NewManager(filepath.Join(directory, "taskcircuit.db"))
+	manager, err := boards.NewManager(filepath.Join(directory, "autogora.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	branch := "taskcircuit/test-worktree"
+	branch := "autogora/test-worktree"
 	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "worktree", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex, WorkspaceKind: model.WorkspaceWorktree, Branch: &branch})
 	if err != nil {
 		t.Fatal(err)

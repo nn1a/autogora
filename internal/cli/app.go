@@ -11,13 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/mcpserver"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/mcpserver"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
-const Help = `taskcircuit <command> [options]
+const Help = `autogora <command> [options]
 
 Commands:
   serve                 Run the stdio MCP server
@@ -69,7 +69,7 @@ Commands:
   dashboard             Run the authenticated local web dashboard
 
 Common options:
-  --db <path>           SQLite path (default: ./data/taskcircuit.db)
+  --db <path>           SQLite path (default: ./data/autogora.db)
   --board <slug>        Override the current board for this command
 `
 
@@ -102,14 +102,14 @@ func (a *App) workingDirectory() (string, error) {
 }
 
 func (a *App) defaultDBPath() (string, error) {
-	if value := a.env("TASKCIRCUIT_DB"); value != "" {
+	if value := a.env("AUTOGORA_DB"); value != "" {
 		return filepath.Abs(value)
 	}
 	cwd, err := a.workingDirectory()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(cwd, "data", "taskcircuit.db"), nil
+	return filepath.Join(cwd, "data", "autogora.db"), nil
 }
 
 func (a *App) managerFor(value string) (*boards.Manager, error) {
@@ -123,8 +123,8 @@ func (a *App) managerFor(value string) (*boards.Manager, error) {
 			return nil, err
 		}
 	}
-	if a.env("TASKCIRCUIT_TASK_ID") != "" {
-		if pinned := a.env("TASKCIRCUIT_DB"); pinned != "" {
+	if a.env("AUTOGORA_TASK_ID") != "" {
+		if pinned := a.env("AUTOGORA_DB"); pinned != "" {
 			resolvedPinned, _ := filepath.Abs(pinned)
 			if dbPath != resolvedPinned {
 				return nil, fmt.Errorf("this worker is scoped to database %s", resolvedPinned)
@@ -136,7 +136,7 @@ func (a *App) managerFor(value string) (*boards.Manager, error) {
 
 func (a *App) board(opts options) string {
 	requested := opts.value("board")
-	pinned := a.env("TASKCIRCUIT_BOARD")
+	pinned := a.env("AUTOGORA_BOARD")
 	if pinned != "" {
 		return pinned
 	}
@@ -144,7 +144,7 @@ func (a *App) board(opts options) string {
 }
 
 func (a *App) validateBoardScope(opts options) error {
-	pinned := a.env("TASKCIRCUIT_BOARD")
+	pinned := a.env("AUTOGORA_BOARD")
 	requested := strings.ToLower(strings.TrimSpace(opts.value("board")))
 	if pinned != "" && requested != "" && strings.ToLower(pinned) != requested {
 		return fmt.Errorf("this worker is scoped to board %s", pinned)
@@ -166,7 +166,7 @@ func (a *App) openStore(ctx context.Context, opts options) (*store.Store, *board
 }
 
 func (a *App) scopedTaskID(requested, command string) (string, error) {
-	pinned := a.env("TASKCIRCUIT_TASK_ID")
+	pinned := a.env("AUTOGORA_TASK_ID")
 	if pinned != "" && requested != "" && pinned != requested {
 		return "", fmt.Errorf("%s is scoped to task %s", command, pinned)
 	}
@@ -180,13 +180,13 @@ func (a *App) scopedTaskID(requested, command string) (string, error) {
 }
 
 func (a *App) scopedRun() (*store.RunScope, error) {
-	runID := a.env("TASKCIRCUIT_RUN_ID")
-	token := a.env("TASKCIRCUIT_CLAIM_TOKEN")
+	runID := a.env("AUTOGORA_RUN_ID")
+	token := a.env("AUTOGORA_CLAIM_TOKEN")
 	if runID == "" && token == "" {
 		return nil, nil
 	}
 	if runID == "" || token == "" {
-		return nil, errors.New("scoped worker commands require TASKCIRCUIT_RUN_ID and TASKCIRCUIT_CLAIM_TOKEN")
+		return nil, errors.New("scoped worker commands require AUTOGORA_RUN_ID and AUTOGORA_CLAIM_TOKEN")
 	}
 	return &store.RunScope{RunID: runID, ClaimToken: token}, nil
 }
@@ -220,10 +220,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	if err := a.validateBoardScope(opts); err != nil {
 		return err
 	}
-	if a.env("TASKCIRCUIT_TASK_ID") != "" {
+	if a.env("AUTOGORA_TASK_ID") != "" {
 		allowed := map[string]bool{"serve": true, "show": true, "graph": true, "context": true, "runs": true, "log": true, "heartbeat": true, "comment": true, "complete": true, "block": true}
 		if !allowed[command] {
-			return errors.New("dispatcher-scoped workers may only use TaskCircuit CLI context and lifecycle commands")
+			return errors.New("dispatcher-scoped workers may only use Autogora CLI context and lifecycle commands")
 		}
 	}
 
@@ -493,9 +493,9 @@ func (a *App) runList(ctx context.Context, opts options) error {
 		if assignee != "" {
 			return errors.New("--mine and --assignee cannot be combined")
 		}
-		assignee = a.env("TASKCIRCUIT_PROFILE", "TASKCIRCUIT_WORKER_ID")
+		assignee = a.env("AUTOGORA_PROFILE", "AUTOGORA_WORKER_ID")
 		if assignee == "" {
-			return errors.New("--mine requires TASKCIRCUIT_PROFILE or TASKCIRCUIT_WORKER_ID")
+			return errors.New("--mine requires AUTOGORA_PROFILE or AUTOGORA_WORKER_ID")
 		}
 	}
 	limit, err := numberOption(opts.value("limit"), 100)

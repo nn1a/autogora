@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 func fixturePath(t *testing.T, name string) string {
@@ -53,21 +53,21 @@ func plannerResult(t *testing.T, runtime model.Runtime, envName, fixture string)
 }
 
 func TestCodexCLIPlannerUsesStrictSchema(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCodex, "TASKCIRCUIT_CODEX_BIN", "planner-agent.sh")
+	value := plannerResult(t, model.RuntimeCodex, "AUTOGORA_CODEX_BIN", "planner-agent.sh")
 	if value["title"] != "Planner-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestClineCLIPlannerReadsFinalNDJSONResult(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCline, "TASKCIRCUIT_CLINE_BIN", "planner-cline-agent.sh")
+	value := plannerResult(t, model.RuntimeCline, "AUTOGORA_CLINE_BIN", "planner-cline-agent.sh")
 	if value["title"] != "Cline-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestGeminiCLIPlannerUsesDenyAllPolicy(t *testing.T) {
-	value := plannerResult(t, model.RuntimeGemini, "TASKCIRCUIT_GEMINI_BIN", "planner-gemini-agent.sh")
+	value := plannerResult(t, model.RuntimeGemini, "AUTOGORA_GEMINI_BIN", "planner-gemini-agent.sh")
 	if value["title"] != "Gemini-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func claimedTask(t *testing.T, runtime model.Runtime) model.ClaimedTask {
@@ -34,12 +34,12 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 	for _, runtime := range []model.Runtime{model.RuntimeClaude, model.RuntimeCodex, model.RuntimeCline, model.RuntimeGemini} {
 		t.Run(string(runtime), func(t *testing.T) {
 			claim := claimedTask(t, runtime)
-			options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "taskcircuit.db"), CLIPath: filepath.Join(t.TempDir(), "taskcircuit"), ClineApprovalDir: t.TempDir()}
+			options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "autogora.db"), CLIPath: filepath.Join(t.TempDir(), "autogora"), ClineApprovalDir: t.TempDir()}
 			command, err := BuildRunnerCommand(claim, options, "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if command.Env["TASKCIRCUIT_TASK_ID"] != claim.Task.Task.ID || command.Env["TASKCIRCUIT_CLAIM_TOKEN"] != claim.ClaimToken {
+			if command.Env["AUTOGORA_TASK_ID"] != claim.Task.Task.ID || command.Env["AUTOGORA_CLAIM_TOKEN"] != claim.ClaimToken {
 				t.Fatalf("scope missing: %#v", command.Env)
 			}
 			if strings.Contains(strings.Join(command.Args, " "), claim.ClaimToken) {
@@ -48,19 +48,19 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 			joined := strings.Join(command.Args, " ")
 			switch runtime {
 			case model.RuntimeCline:
-				if command.ToolApproval == nil || !strings.Contains(joined, "--auto-approve false") || strings.Contains(joined, "mcpServers") || !strings.Contains(joined, "scoped TaskCircuit CLI bridge") || !strings.Contains(joined, "$TASKCIRCUIT_TASK_ID") {
+				if command.ToolApproval == nil || !strings.Contains(joined, "--auto-approve false") || strings.Contains(joined, "mcpServers") || !strings.Contains(joined, "scoped Autogora CLI bridge") || !strings.Contains(joined, "$AUTOGORA_TASK_ID") {
 					t.Fatalf("invalid Cline command: %#v", command)
 				}
 			case model.RuntimeGemini:
-				if command.PolicyFile == nil || !strings.Contains(joined, "--approval-mode default") || !strings.Contains(command.PolicyFile.Content, `toolName = "mcp_*"`) || !strings.Contains(joined, "$TASKCIRCUIT_TASK_ID") {
+				if command.PolicyFile == nil || !strings.Contains(joined, "--approval-mode default") || !strings.Contains(command.PolicyFile.Content, `toolName = "mcp_*"`) || !strings.Contains(joined, "$AUTOGORA_TASK_ID") {
 					t.Fatalf("invalid Gemini command: %#v", command)
 				}
 			case model.RuntimeClaude:
-				if !strings.Contains(joined, "dontAsk") || !strings.Contains(joined, "mcp__taskcircuit__taskcircuit_complete") {
+				if !strings.Contains(joined, "dontAsk") || !strings.Contains(joined, "mcp__autogora__autogora_complete") {
 					t.Fatalf("invalid Claude command: %#v", command)
 				}
 			case model.RuntimeCodex:
-				if !strings.Contains(joined, "read-only") || !strings.Contains(joined, "mcp_servers.taskcircuit.required=true") {
+				if !strings.Contains(joined, "read-only") || !strings.Contains(joined, "mcp_servers.autogora.required=true") {
 					t.Fatalf("invalid Codex command: %#v", command)
 				}
 			}
@@ -70,7 +70,7 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 
 func TestWriteOptInAndGoalContinuations(t *testing.T) {
 	gemini := claimedTask(t, model.RuntimeGemini)
-	options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "taskcircuit"), AllowWrites: true}
+	options := RunnerOptions{DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "autogora"), AllowWrites: true}
 	command, err := BuildRunnerCommand(gemini, options, "")
 	if err != nil || command.PolicyFile != nil || !strings.Contains(strings.Join(command.Args, " "), "--approval-mode yolo") {
 		t.Fatalf("write opt-in failed: %#v, %v", command, err)

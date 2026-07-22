@@ -6,7 +6,7 @@ LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
 
 build:
 	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o bin/taskcircuit ./cmd/taskcircuit
+	CGO_ENABLED=0 $(GO) build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o bin/autogora ./cmd/autogora
 
 test:
 	$(GO) test ./...

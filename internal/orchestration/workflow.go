@@ -8,8 +8,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 type ProfileRoute struct {
@@ -180,7 +180,7 @@ func specificationPrompt(task model.TaskDetail) string {
 		body = "(empty)"
 	}
 	return strings.Join([]string{
-		"You are a TaskCircuit triage specifier.",
+		"You are an Autogora triage specifier.",
 		"Rewrite the rough idea into a precise, executable task without inventing external facts.",
 		"The body must include scope, concrete deliverables, acceptance criteria, constraints, and verification.",
 		"Return only the requested structured object.", "",
@@ -209,12 +209,12 @@ func decompositionPrompt(task model.TaskDetail, profiles []ProfileRoute) string 
 		tenant = *task.Task.Tenant
 	}
 	return strings.Join([]string{
-		"You are a TaskCircuit graph decomposer.",
+		"You are an Autogora graph decomposer.",
 		"Decide whether this triage idea benefits from independent parallel or sequential specialist tasks.",
 		"If not, set fanout=false and return an improved rootTitle/rootBody with empty tasks and dependencies.",
 		"If yes, produce a small acyclic graph. Every generated task becomes a direct subtask of the triage root.",
 		"Dependencies control execution only: dependency parent is the prerequisite and child waits for parent.",
-		"Do not add dependency edges to the root; TaskCircuit automatically makes the root wait for every terminal subtask so it can perform final coordination or verification.",
+		"Do not add dependency edges to the root; Autogora automatically makes the root wait for every terminal subtask so it can perform final coordination or verification.",
 		"Use only assignee names from the profile roster. Every task needs a complete handoff-ready body.",
 		"Return only the requested structured object.", "",
 		"Task id: " + task.Task.ID, "Title: " + task.Task.Title, "Body: " + body, "Tenant: " + tenant, "", "Profile roster:", strings.Join(roster, "\n"),
@@ -344,7 +344,7 @@ func JudgeGoalProgress(ctx context.Context, task model.TaskDetail, turn int, wor
 		workerOutput = "(empty)"
 	}
 	prompt := strings.Join([]string{
-		"You are the independent completion judge for a goal-mode TaskCircuit worker.",
+		"You are the independent completion judge for a goal-mode Autogora worker.",
 		"Compare the worker's latest output and durable task state against every acceptance criterion.",
 		"Set complete=true only when the goal is demonstrably satisfied. Otherwise give one concrete next-turn instruction.",
 		"Do not treat confidence, effort, or a promise to finish as evidence.", "Return only the requested structured object.", "",
@@ -399,7 +399,7 @@ func DescribeProfileRoute(ctx context.Context, profile ProfileRoute, evidence []
 		existing = "(none)"
 	}
 	prompt := strings.Join([]string{
-		"You describe a Claude, Codex, Cline, or Gemini TaskCircuit worker profile for a task-routing planner.",
+		"You describe a Claude, Codex, Cline, or Gemini Autogora worker profile for a task-routing planner.",
 		"Write one concise capability description grounded only in the supplied evidence.",
 		"State the work this profile should receive and any evident specialization. Do not use marketing language.",
 		"Return only the requested structured object.", "", "Profile: " + profile.Name, "Runtime: " + string(profile.Runtime),

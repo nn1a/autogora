@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nn1a/kanban/internal/dispatcher"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/dispatcher"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func (a *App) dispatcherDBPath(value string) (string, error) {
@@ -205,7 +205,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, OrchestratorProfile: orchestratorProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
 		AllowWrites: opts.flags["allow-writes"], WorkingDirectory: cwd, Getenv: a.Getenv,
-		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[taskcircuit] %s\n", message) },
+		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})
 }
 

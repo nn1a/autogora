@@ -5,13 +5,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func TestBoardsIsolateStorageAndArchiveRecoverably(t *testing.T) {
 	ctx := context.Background()
-	manager, err := NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
+	manager, err := NewManager(filepath.Join(t.TempDir(), "autogora.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,14 +77,14 @@ func TestBoardsIsolateStorageAndArchiveRecoverably(t *testing.T) {
 
 func TestBoardSlugAndEnvironmentSelection(t *testing.T) {
 	ctx := context.Background()
-	manager, err := NewManager(filepath.Join(t.TempDir(), "taskcircuit.db"))
+	manager, err := NewManager(filepath.Join(t.TempDir(), "autogora.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Create(ctx, "release_2026", Update{}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TASKCIRCUIT_BOARD", "release_2026")
+	t.Setenv("AUTOGORA_BOARD", "release_2026")
 	if manager.Current() != "release_2026" {
 		t.Fatalf("environment board = %q", manager.Current())
 	}

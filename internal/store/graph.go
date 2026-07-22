@@ -7,7 +7,7 @@ import (
 	"math"
 	"sort"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type hierarchyRow struct {

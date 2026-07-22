@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 type DiagnosticIssue struct {
@@ -246,7 +246,7 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 		return *pointer
 	}
 	lines := []string{
-		"# TaskCircuit task " + detail.Task.ID, "",
+		"# Autogora task " + detail.Task.ID, "",
 		"Title: " + detail.Task.Title,
 		"Board: " + detail.Task.Board,
 		"Tenant: " + value(detail.Task.Tenant, "(none)"),
@@ -266,7 +266,7 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	}
 	lines = append(lines, "", "## Relationship and execution order",
 		"Task hierarchy (parent/subtask) is separate from execution dependencies (prerequisite/dependent).",
-		"TaskCircuit permits a claim only after every direct prerequisite handoff is satisfied.",
+		"Autogora permits a claim only after every direct prerequisite handoff is satisfied.",
 		"Only relationship metadata is shown for other nodes; their bodies, workspaces, attachments, and unfinished results are intentionally excluded.",
 		fmt.Sprintf("Hierarchy root: %s — %s", graph.RootTaskID, root.Task.Title),
 		"Current phase: "+phase)
@@ -298,7 +298,7 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	}
 	omitted := len(graph.Nodes) - len(contextNodes) + graph.OmittedNodeCount
 	if omitted > 0 {
-		lines = append(lines, fmt.Sprintf("- … %d additional related node(s) omitted from this bounded context; use taskcircuit_graph from an orchestrator/admin session for the bounded topology view.", omitted))
+		lines = append(lines, fmt.Sprintf("- … %d additional related node(s) omitted from this bounded context; use autogora_graph from an orchestrator/admin session for the bounded topology view.", omitted))
 	}
 	if len(detail.Parents) > 0 {
 		lines = append(lines, "", "## Prerequisite handoffs")

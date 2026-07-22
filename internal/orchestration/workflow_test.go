@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func openMemoryStore(t *testing.T) *store.Store {

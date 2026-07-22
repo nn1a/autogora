@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 func satisfyOutgoingDependencies(ctx context.Context, q querier, parentID, satisfiedAt string) error {

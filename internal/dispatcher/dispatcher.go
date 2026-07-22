@@ -11,13 +11,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/nn1a/kanban/internal/boards"
-	"github.com/nn1a/kanban/internal/model"
-	"github.com/nn1a/kanban/internal/notifications"
-	"github.com/nn1a/kanban/internal/orchestration"
-	"github.com/nn1a/kanban/internal/runcontrol"
-	"github.com/nn1a/kanban/internal/store"
-	"github.com/nn1a/kanban/internal/workspace"
+	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/notifications"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/runcontrol"
+	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/workspace"
 )
 
 type GoalJudge func(context.Context, model.TaskDetail, int, string) (orchestration.GoalJudgment, error)
@@ -436,7 +436,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			options.log("reclaimed %s after deferred termination", taskID)
 			return
 		}
-		detail := fmt.Sprintf("Runner exited without a terminal TaskCircuit call (%s)", execution.ExitDescription())
+		detail := fmt.Sprintf("Runner exited without a terminal Autogora call (%s)", execution.ExitDescription())
 		if execution.SpawnError != nil {
 			detail = execution.SpawnError.Error()
 		}
@@ -595,7 +595,7 @@ func Run(ctx context.Context, options Options) error {
 				approvalDir := options.ClineApprovalDir
 				if claim.Task.Task.Runtime == model.RuntimeCline && approvalDir == "" {
 					if generatedClineApprovalDir == "" {
-						generatedClineApprovalDir, err = os.MkdirTemp("", "taskcircuit-cline-approvals-")
+						generatedClineApprovalDir, err = os.MkdirTemp("", "autogora-cline-approvals-")
 						if err != nil {
 							opened.Close()
 							return err
