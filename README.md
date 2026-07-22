@@ -27,6 +27,12 @@ with `CGO_ENABLED=0`, are statically linked, and have no glibc or musl runtime
 dependency. See the [Korean install guide](docs/INSTALL_KO.md) for Windows,
 upgrades, source builds, and data locations.
 
+Release builds trim source/VCS paths, strip debug and symbol tables, omit the
+Go build ID, enforce a 16 MiB binary-size budget, and use maximum gzip
+compression without gzip timestamp/name metadata. UPX and global inlining
+suppression are intentionally not used because their runtime and operational
+costs outweigh the small raw-binary savings for this SQLite-backed service.
+
 Claude Code, Codex, Cline, and Gemini CLI are needed only for the worker or
 planner runtimes you actually select.
 

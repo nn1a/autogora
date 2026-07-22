@@ -146,7 +146,8 @@ make verify
 Go 도구가 이미 설치되어 있다면 직접 설치할 수도 있다.
 
 ```bash
-go install github.com/nn1a/kanban/cmd/taskcircuit@latest
+go install -trimpath -ldflags='-s -w -buildid=' \
+  github.com/nn1a/kanban/cmd/taskcircuit@latest
 ```
 
 관리자가 모든 플랫폼용 릴리스 파일을 만들 때는 비어 있는 `release/` 디렉터리에서 다음 명령을 실행한다. GitHub Actions 설정은 필요하지 않다.
@@ -154,6 +155,14 @@ go install github.com/nn1a/kanban/cmd/taskcircuit@latest
 ```bash
 make release VERSION=v1.0.0
 ```
+
+릴리스 빌드는 경로와 VCS 정보를 제거하고, 디버그·심볼 테이블과 Go build ID를 제외한 뒤 gzip 헤더의 원본 이름·시간 정보 없이 최고 압축률로 아카이브를 만든다. 각 실행 파일이 기본 16MiB를 넘으면 크기 회귀로 보고 빌드를 실패시킨다. 한도를 의도적으로 변경할 때만 `MAX_BINARY_BYTES`를 명시한다.
+
+```bash
+MAX_BINARY_BYTES=18874368 make release VERSION=v1.0.0
+```
+
+UPX와 전체 inlining 비활성화는 기본 빌드에 사용하지 않는다. 작은 추가 절감보다 백신 오탐, 시작 비용, SQLite 처리 성능 저하 가능성이 더 크기 때문이다.
 
 ## 6. 업그레이드와 백업
 
