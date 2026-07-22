@@ -249,6 +249,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runSwarm(ctx, opts)
 	case "dispatch", "daemon":
 		return a.runDispatch(ctx, command, opts)
+	case "dashboard":
+		return a.runDashboard(ctx, opts)
 	case "claim":
 		return a.runClaim(ctx, opts)
 	case "terminate":
