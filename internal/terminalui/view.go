@@ -265,6 +265,19 @@ func (m *Model) View() string {
 	if m.showArchived {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  + archived")
 	}
+	filters := []string{}
+	if m.tenantFilter != "" {
+		filters = append(filters, "tenant="+m.tenantFilter)
+	}
+	if m.assigneeFilter != "" {
+		filters = append(filters, "assignee="+m.assigneeFilter)
+	}
+	if m.runtimeFilter != "" {
+		filters = append(filters, "runtime="+string(m.runtimeFilter))
+	}
+	if len(filters) > 0 {
+		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  [" + strings.Join(filters, " · ") + "]")
+	}
 	if m.loading {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  refreshing…")
 	} else if !m.updated.IsZero() {
@@ -279,7 +292,7 @@ func (m *Model) View() string {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  applying…")
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  m move  C comment  p promote  b block  c complete  ? help")
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  m move  f filters  C comment  p promote  c complete  ? help")
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -303,7 +316,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  f             tenant/assignee/runtime filters\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}

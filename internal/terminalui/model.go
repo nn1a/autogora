@@ -86,6 +86,9 @@ type Model struct {
 	search           string
 	searchDraft      string
 	showArchived     bool
+	tenantFilter     string
+	assigneeFilter   string
+	runtimeFilter    model.Runtime
 	busy             bool
 	notice           string
 	promptLabel      string
@@ -555,6 +558,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil {
 				m.menu = statusMenu(*task)
 			}
+		case "f":
+			m.menu = m.filterMenu()
 		case "n":
 			return m, m.openCreateForm()
 		case "e":
@@ -613,21 +618,14 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		selected := m.selectedID()
 		m.err, m.updated = nil, message.at
-		grouped := map[model.TaskStatus][]model.Task{}
 		m.allTasks = append([]model.Task{}, message.tasks...)
-		for _, task := range message.tasks {
-			if !taskMatchesSearch(task, m.search) {
-				continue
-			}
-			grouped[task.Status] = append(grouped[task.Status], task)
-		}
-		m.tasks = grouped
+		m.regroupTasks()
 		if m.desiredSelection != "" {
 			selected = m.desiredSelection
 			m.desiredSelection = ""
 		}
 		if selected != "" {
-			for status, items := range grouped {
+			for status, items := range m.tasks {
 				for index := range items {
 					if items[index].ID == selected {
 						m.column, m.cursors[status] = statusIndex(m.statuses(), status), index
@@ -679,6 +677,29 @@ func taskMatchesSearch(task model.Task, search string) bool {
 	}
 	encoded, _ := json.Marshal(task)
 	return strings.Contains(strings.ToLower(string(encoded)), search)
+}
+
+func (m *Model) taskVisible(task model.Task) bool {
+	if !taskMatchesSearch(task, m.search) {
+		return false
+	}
+	if m.tenantFilter != "" && pointer(task.Tenant, "") != m.tenantFilter {
+		return false
+	}
+	if m.assigneeFilter != "" && pointer(task.Assignee, "") != m.assigneeFilter {
+		return false
+	}
+	return m.runtimeFilter == "" || task.Runtime == m.runtimeFilter
+}
+
+func (m *Model) regroupTasks() {
+	grouped := map[model.TaskStatus][]model.Task{}
+	for _, task := range m.allTasks {
+		if m.taskVisible(task) {
+			grouped[task.Status] = append(grouped[task.Status], task)
+		}
+	}
+	m.tasks = grouped
 }
 
 func statusIndex(statuses []model.TaskStatus, status model.TaskStatus) int {

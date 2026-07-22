@@ -90,3 +90,28 @@ func TestActionMenuFiltersWithoutLosingItems(t *testing.T) {
 		t.Fatalf("clearing filter lost menu items: got %d want %d", len(m.menu.items), original)
 	}
 }
+
+func TestBoardFilterUsesSameTaskDataAsRelationshipPicker(t *testing.T) {
+	reviewer := "reviewer"
+	implementer := "implementer"
+	review := testTask("review", "Review", model.TaskStatusTodo)
+	review.Assignee, review.Runtime = &reviewer, model.RuntimeGemini
+	implementation := testTask("implementation", "Implement", model.TaskStatusReady)
+	implementation.Assignee, implementation.Runtime = &implementer, model.RuntimeCodex
+	m := NewModel(context.Background(), &fakeBackend{}, "default")
+	m.allTasks = []model.Task{review, implementation}
+	m.regroupTasks()
+
+	menu := m.filterMenu()
+	m.runMenuAction(menu, "filter-assignee")
+	if len(m.menu.items) != 3 {
+		t.Fatalf("unexpected assignee choices: %#v", m.menu.items)
+	}
+	m.runMenuAction(m.menu, "set-assignee:reviewer")
+	if len(m.tasks[model.TaskStatusTodo]) != 1 || len(m.tasks[model.TaskStatusReady]) != 0 {
+		t.Fatalf("filter did not narrow board: %#v", m.tasks)
+	}
+	if len(m.allTasks) != 2 {
+		t.Fatal("filter changed the shared unfiltered task data")
+	}
+}

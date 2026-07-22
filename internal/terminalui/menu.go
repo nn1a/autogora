@@ -2,6 +2,7 @@ package terminalui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -118,6 +119,44 @@ func statusMenu(task model.Task) *actionMenu {
 	return newActionMenu("Move task", task, items)
 }
 
+func (m *Model) filterMenu() *actionMenu {
+	display := func(value string) string {
+		if value == "" {
+			return "All"
+		}
+		return value
+	}
+	items := []menuItem{
+		{label: "Tenant · " + display(m.tenantFilter), action: "filter-tenant"},
+		{label: "Assignee · " + display(m.assigneeFilter), action: "filter-assignee"},
+		{label: "Runtime · " + display(string(m.runtimeFilter)), action: "filter-runtime"},
+		{label: "Clear all filters", action: "filter-clear"},
+	}
+	return newActionMenu("Board filters", model.Task{}, items)
+}
+
+func uniqueTaskValues(tasks []model.Task, value func(model.Task) string) []string {
+	seen := map[string]bool{}
+	values := []string{}
+	for _, task := range tasks {
+		item := strings.TrimSpace(value(task))
+		if item != "" && !seen[item] {
+			seen[item] = true
+			values = append(values, item)
+		}
+	}
+	sort.Strings(values)
+	return values
+}
+
+func filterValueMenu(title, prefix string, values []string) *actionMenu {
+	items := []menuItem{{label: "All", action: prefix}}
+	for _, value := range values {
+		items = append(items, menuItem{label: value, action: prefix + value})
+	}
+	return newActionMenu(title, model.Task{}, items)
+}
+
 func (m *actionMenu) applyQuery() {
 	query := strings.ToLower(strings.TrimSpace(m.query))
 	m.items = m.items[:0]
@@ -132,6 +171,23 @@ func (m *actionMenu) applyQuery() {
 func (m *Model) runMenuAction(menu *actionMenu, action string) tea.Cmd {
 	task := menu.task
 	switch action {
+	case "filter-tenant":
+		m.menu = filterValueMenu("Filter by tenant", "set-tenant:", uniqueTaskValues(m.allTasks, func(task model.Task) string { return pointer(task.Tenant, "") }))
+		return nil
+	case "filter-assignee":
+		m.menu = filterValueMenu("Filter by assignee", "set-assignee:", uniqueTaskValues(m.allTasks, func(task model.Task) string { return pointer(task.Assignee, "") }))
+		return nil
+	case "filter-runtime":
+		values := make([]string, 0, len(model.Runtimes))
+		for _, runtime := range model.Runtimes {
+			values = append(values, string(runtime))
+		}
+		m.menu = filterValueMenu("Filter by runtime", "set-runtime:", values)
+		return nil
+	case "filter-clear":
+		m.tenantFilter, m.assigneeFilter, m.runtimeFilter = "", "", ""
+		m.regroupTasks()
+		return m.loadDetail(m.selectedID())
 	case "edit":
 		return m.openEditTaskForm(task, fieldTitle)
 	case "comment":
@@ -153,6 +209,21 @@ func (m *Model) runMenuAction(menu *actionMenu, action string) tea.Cmd {
 		m.menu = m.relationshipMenu(task)
 		return nil
 	default:
+		if strings.HasPrefix(action, "set-tenant:") {
+			m.tenantFilter = strings.TrimPrefix(action, "set-tenant:")
+			m.regroupTasks()
+			return m.loadDetail(m.selectedID())
+		}
+		if strings.HasPrefix(action, "set-assignee:") {
+			m.assigneeFilter = strings.TrimPrefix(action, "set-assignee:")
+			m.regroupTasks()
+			return m.loadDetail(m.selectedID())
+		}
+		if strings.HasPrefix(action, "set-runtime:") {
+			m.runtimeFilter = model.Runtime(strings.TrimPrefix(action, "set-runtime:"))
+			m.regroupTasks()
+			return m.loadDetail(m.selectedID())
+		}
 		if strings.HasPrefix(action, "terminate:") {
 			m.confirm = &confirmState{action: "terminate", id: strings.TrimPrefix(action, "terminate:"), title: task.Title}
 			return nil
@@ -239,7 +310,11 @@ func (m *Model) renderActionMenu(width, height int) string {
 	if menu == nil {
 		return ""
 	}
-	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(menu.title), lipgloss.NewStyle().Foreground(colorMuted).Render(truncate(menu.task.Title, 58)), lipgloss.NewStyle().Foreground(colorMuted).Render(menu.task.ID), ""}
+	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(menu.title)}
+	if menu.task.ID != "" {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render(truncate(menu.task.Title, 58)), lipgloss.NewStyle().Foreground(colorMuted).Render(menu.task.ID))
+	}
+	lines = append(lines, "")
 	if menu.searching || menu.query != "" {
 		cursor := ""
 		if menu.searching {
