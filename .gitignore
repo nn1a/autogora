@@ -2,6 +2,11 @@ node_modules/
 dist/
 data/
 .kanban/
+/bin/
+/release/
+/taskcircuit
+/taskcircuit.exe
+coverage.out
 *.log
 *.db
 *.db-shm
