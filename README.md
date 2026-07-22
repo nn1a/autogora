@@ -340,6 +340,9 @@ Use `boards rm <slug> --delete` only when permanent removal is intended. The
 - `scratch` (default): isolated per run under the board workspace root and removed only
   after successful completion and artifact capture.
 - `dir:/absolute/path`: uses and preserves an existing trusted directory.
+  Writable runs take an exclusive SQLite lease on its canonical path, or on the
+  containing Git repository, until the run ends. A competing run is rescheduled
+  without consuming a retry; read-only runs remain concurrent.
 - `worktree`: creates and preserves a detached Git worktree per run under the
   board workspace root. Set a board `default-workdir` to the source repository.
   `--branch` selects an existing starting ref when available and remains the

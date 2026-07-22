@@ -15,13 +15,15 @@ import (
 )
 
 type Manager struct {
-	boards *boards.Manager
-	cwd    string
+	boards      *boards.Manager
+	cwd         string
+	allowWrites bool
 }
 
 func New(manager *boards.Manager) *Manager { return &Manager{boards: manager} }
 
 func (m *Manager) SetWorkingDirectory(path string) { m.cwd = path }
+func (m *Manager) SetAllowWrites(value bool)       { m.allowWrites = value }
 
 func expandHome(path string) (string, error) {
 	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, `~\`) {
@@ -149,6 +151,22 @@ func (m *Manager) workingDirectory() (string, error) {
 	return os.Getwd()
 }
 
+func (m *Manager) acquireWriteLease(ctx context.Context, opened *store.Store, scope store.RunScope, workspace model.RunWorkspace) error {
+	if !m.allowWrites || workspace.Kind != model.WorkspaceDir {
+		return nil
+	}
+	path := workspace.Path
+	if workspace.RepositoryPath != nil {
+		path = *workspace.RepositoryPath
+	}
+	canonical, err := canonicalPath(path)
+	if err != nil {
+		return err
+	}
+	_, err = opened.AcquireWorkspaceLease(ctx, scope, canonical)
+	return err
+}
+
 func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model.ClaimedTask) (*model.ClaimedTask, error) {
 	if claim == nil {
 		return nil, errors.New("claim cannot be nil")
@@ -166,6 +184,9 @@ func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model
 			}
 		} else if info, err := os.Stat(existing.Path); err != nil || !info.IsDir() {
 			return nil, fmt.Errorf("prepared workspace is no longer available: %s", existing.Path)
+		}
+		if err := m.acquireWriteLease(ctx, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, *existing); err != nil {
+			return nil, err
 		}
 		claim.Workspace = existing
 		return claim, nil
@@ -294,6 +315,9 @@ func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model
 		Path: path, Kind: kind, RepositoryPath: repositoryPath, BaseCommit: baseCommit, Generated: generated,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := m.acquireWriteLease(ctx, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, bound); err != nil {
 		return nil, err
 	}
 	claim.Workspace = &bound

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,6 +81,42 @@ func TestDirWorkspaceRejectsAmbiguousRelativePath(t *testing.T) {
 	}
 	if _, err := New(manager).Prepare(ctx, opened, claim); err == nil {
 		t.Fatal("relative dir workspace was accepted")
+	}
+}
+
+func TestWritableDirWorkspaceIsLeasedUntilOwningRunEnds(t *testing.T) {
+	ctx := context.Background()
+	manager, opened := testManager(t)
+	defer opened.Close()
+	directory := t.TempDir()
+	assignee := "worker"
+	first, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "first writer", Assignee: &assignee, Runtime: model.RuntimeCodex, Workspace: &directory, WorkspaceKind: model.WorkspaceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "second writer", Assignee: &assignee, Runtime: model.RuntimeCodex, Workspace: &directory, WorkspaceKind: model.WorkspaceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, _ := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: first.Task.ID})
+	secondClaim, _ := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: second.Task.ID})
+	workspaces := New(manager)
+	workspaces.SetAllowWrites(true)
+	if _, err := workspaces.Prepare(ctx, opened, firstClaim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspaces.Prepare(ctx, opened, secondClaim); !errors.Is(err, store.ErrResourceBusy) {
+		t.Fatalf("concurrent writer was not rejected: %v", err)
+	}
+	if _, err := opened.FailRun(ctx, store.RunScope{RunID: firstClaim.Run.ID, ClaimToken: firstClaim.ClaimToken}, "finished", store.FailRunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspaces.Prepare(ctx, opened, secondClaim); err != nil {
+		t.Fatalf("released workspace lease was not reusable: %v", err)
+	}
+	leases, err := opened.ListResourceLeases(ctx)
+	if err != nil || len(leases) != 1 || leases[0].RunID != secondClaim.Run.ID {
+		t.Fatalf("unexpected workspace leases: %+v err=%v", leases, err)
 	}
 }
 

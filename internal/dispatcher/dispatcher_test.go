@@ -191,6 +191,41 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	}
 }
 
+func TestWritableSharedDirectoryRunsAreSerializedWithoutRetryPenalty(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
+	opened, _ := manager.OpenStore(ctx, "default")
+	assignee := "writer"
+	directory := t.TempDir()
+	first, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "first writer", Assignee: &assignee, Runtime: model.RuntimeCline, Workspace: &directory, WorkspaceKind: model.WorkspaceDir})
+	second, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "second writer", Assignee: &assignee, Runtime: model.RuntimeCline, Workspace: &directory, WorkspaceKind: model.WorkspaceDir})
+	opened.Close()
+	fixture := executableFixture(t, `
+sleep 1
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "serialized writer completed" >/dev/null`)
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Once: true, MaxWorkers: 2, Interval: 250 * time.Millisecond,
+		AllowWrites: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+			if name == "AUTOGORA_CLINE_BIN" {
+				return fixture
+			}
+			return ""
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	check, _ := manager.OpenStore(ctx, "default")
+	defer check.Close()
+	firstDetail, _ := check.GetTask(ctx, first.Task.ID)
+	secondDetail, _ := check.GetTask(ctx, second.Task.ID)
+	done, waiting := firstDetail, secondDetail
+	if secondDetail.Task.Status == model.TaskStatusDone {
+		done, waiting = secondDetail, firstDetail
+	}
+	if done.Task.Status != model.TaskStatusDone || (waiting.Task.Status != model.TaskStatusReady && waiting.Task.Status != model.TaskStatusScheduled) || waiting.Task.FailureCount != 0 {
+		t.Fatalf("shared writers were not serialized cleanly: first=%#v second=%#v", firstDetail, secondDetail)
+	}
+}
+
 func TestDispatcherRunsClineThroughGoCLIBridge(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)

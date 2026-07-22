@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 9
+const schemaVersion = 10
 
 type Store struct {
 	db              *sql.DB
@@ -383,6 +383,20 @@ CREATE TABLE IF NOT EXISTS run_workspaces (
   prepared_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS resource_leases (
+  resource_key TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  acquired_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS release_terminal_run_resources
+AFTER UPDATE OF status ON task_runs
+WHEN NEW.status <> 'running'
+BEGIN
+  DELETE FROM resource_leases WHERE run_id = NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS task_attachments (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -441,6 +455,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(board, status, scheduled_at,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
 CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);

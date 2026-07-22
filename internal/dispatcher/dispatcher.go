@@ -300,6 +300,7 @@ func hasDeferredReclaim(detail model.TaskDetail, runID string) bool {
 func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store, claim *model.ClaimedTask, options Options, processes *ProcessSet, clineApprovalDir string) {
 	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
 	workspaces := workspace.New(manager)
+	workspaces.SetAllowWrites(options.AllowWrites)
 	if options.WorkingDirectory != "" {
 		workspaces.SetWorkingDirectory(options.WorkingDirectory)
 	}
@@ -307,7 +308,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	if err != nil {
 		durable, cancel := durableContext()
 		defer cancel()
-		_, _ = opened.FailRun(durable, scope, "Workspace preparation failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
+		failure := store.FailRunOptions{FailureLimit: options.FailureLimit}
+		if errors.Is(err, store.ErrResourceBusy) {
+			countFailure := false
+			failure = store.FailRunOptions{Outcome: model.RunStatusReclaimed, CountFailure: &countFailure, CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit}
+		}
+		_, _ = opened.FailRun(durable, scope, "Workspace preparation failed: "+err.Error(), failure)
 		options.log("workspace failure %s: %v", claim.Task.Task.ID, err)
 		return
 	}

@@ -669,7 +669,7 @@ autogora create "인증 흐름 문서 정확성 검토" \
 autogora dispatch --watch --max-workers 1 --allow-writes --board product-web
 ```
 
-공유 `dir` workspace에서는 여러 쓰기 작업을 동시에 실행하지 않는다. 분석 → 문서 → 리뷰 dependency가 세 작업의 실행 순서를 보장한다.
+공유 `dir` workspace의 쓰기 run에는 배타 lease가 걸린다. 같은 실제 경로나 Git 저장소를 쓰는 다른 run은 실패 횟수를 늘리지 않고 재예약된다. 이 예제에서는 분석 → 문서 → 리뷰 dependency가 논리적인 실행 순서도 함께 보장한다.
 
 진행 상황을 확인한다.
 
