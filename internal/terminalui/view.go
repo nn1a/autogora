@@ -280,7 +280,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  n             new triage task\n  e / s         edit title / assignee\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  n             full create form\n  e / s         edit form / agent section\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}
@@ -296,6 +296,9 @@ func (m *Model) View() string {
 				lipgloss.NewStyle().Foreground(colorMuted).Render(m.confirm.id) + "\n\n" + lipgloss.NewStyle().Foreground(colorMuted).Render("y/enter confirm · n/esc cancel"),
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, confirmation)
+	}
+	if m.form != nil {
+		content = m.renderTaskForm(m.width, contentHeight)
 	}
 	return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + content + "\n" + footer
 }

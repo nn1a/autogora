@@ -195,12 +195,13 @@ func TestDestructiveActionPinsSelectionAndRequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestPromptCreatesTriageTask(t *testing.T) {
+func TestTaskFormCreatesTriageTask(t *testing.T) {
 	backend := &fakeBackend{}
 	m := NewModel(context.Background(), backend, "default")
+	m.Update(boardContextMsg{context: taskservice.BoardContext{}})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Investigate issue")})
-	_, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, command := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	message := command()
 	m.Update(message)
 	if len(backend.actions) != 1 || backend.actions[0] != "create:Investigate issue" || m.desiredSelection != "created" {

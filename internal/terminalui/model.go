@@ -2,6 +2,7 @@ package terminalui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -90,6 +91,7 @@ type Model struct {
 	promptTaskID     string
 	confirm          *confirmState
 	desiredSelection string
+	form             *taskForm
 }
 
 func NewModel(ctx context.Context, backend Backend, board string) *Model {
@@ -196,6 +198,49 @@ func (m *Model) beginConfirm(action string, task model.Task) {
 	m.err, m.notice = nil, ""
 }
 
+func (m *Model) openCreateForm() tea.Cmd {
+	if m.boardContext == nil {
+		m.err = errors.New("board settings are still loading")
+		return nil
+	}
+	status := m.statuses()[m.column]
+	m.form = newTaskForm(m.board, m.boardContext.Profiles, status)
+	m.err, m.notice = nil, ""
+	return m.form.syncFocus()
+}
+
+func (m *Model) openEditForm(focus formField) tea.Cmd {
+	if m.boardContext == nil {
+		m.err = errors.New("board settings are still loading")
+		return nil
+	}
+	task := m.selectedTask()
+	if task == nil {
+		return nil
+	}
+	m.form = editTaskForm(m.board, m.boardContext.Profiles, *task)
+	if !m.form.locked(focus) {
+		m.form.focus = focus
+	}
+	m.err, m.notice = nil, ""
+	return m.form.syncFocus()
+}
+
+func (m *Model) submitForm(form *taskForm) tea.Cmd {
+	m.busy = true
+	return func() tea.Msg {
+		var detail model.TaskDetail
+		var err error
+		action := form.mode
+		if form.mode == "create" {
+			detail, err = m.backend.CreateTask(m.ctx, form.createInput())
+		} else {
+			detail, err = m.backend.UpdateTask(m.ctx, form.taskID, form.updateInput())
+		}
+		return mutationMsg{action: action, id: form.taskID, detail: &detail, err: err}
+	}
+}
+
 func (m *Model) mutate(action, id, value string) tea.Cmd {
 	m.busy = true
 	return func() tea.Msg {
@@ -239,7 +284,7 @@ func (m *Model) mutate(action, id, value string) tea.Cmd {
 
 func actionLabel(action string) string {
 	labels := map[string]string{
-		"create": "Task created", "title": "Title updated", "assign": "Assignee updated",
+		"create": "Task created", "edit": "Task updated", "title": "Title updated", "assign": "Assignee updated",
 		"comment": "Comment added", "promote": "Task promoted", "complete": "Task completed",
 		"block": "Task blocked", "unblock": "Task unblocked", "archive": "Task archived",
 	}
@@ -277,6 +322,30 @@ func (m *Model) handlePrompt(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if m.form != nil {
+		if key, ok := message.(tea.KeyMsg); ok {
+			if key.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			command, action := m.form.Update(key)
+			switch action {
+			case formCancel:
+				m.form = nil
+				return m, nil
+			case formSubmit:
+				form := m.form
+				m.form = nil
+				return m, m.submitForm(form)
+			default:
+				return m, command
+			}
+		}
+		switch message.(type) {
+		case tea.WindowSizeMsg, tasksLoadedMsg, detailLoadedMsg, boardContextMsg, refreshMsg, mutationMsg:
+		default:
+			return m, m.form.UpdateMessage(message)
+		}
+	}
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = message.Width, message.Height
@@ -369,15 +438,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.help = !m.help
 		case "n":
-			m.beginPrompt("create", "New task", "", "")
+			return m, m.openCreateForm()
 		case "e":
-			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil {
-				m.beginPrompt("title", "Title", task.Title, task.ID)
-			}
+			return m, m.openEditForm(fieldTitle)
 		case "s":
-			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil {
-				m.beginPrompt("assign", "Assignee (empty to clear)", pointer(task.Assignee, ""), task.ID)
-			}
+			return m, m.openEditForm(fieldProfile)
 		case "C":
 			if task := m.selectedTask(); task != nil {
 				m.beginPrompt("comment", "Comment", "", task.ID)
