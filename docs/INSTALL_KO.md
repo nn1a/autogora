@@ -1,6 +1,6 @@
 # Autogora 설치 및 업그레이드
 
-Autogora는 Web UI와 SQLite 엔진을 단일 실행 파일로 제공한다. 실행할 worker나 planner에 맞춰 Claude Code, Codex, 수정된 Cline, Gemini CLI 중 필요한 클라이언트만 설치한다. Node.js, npm, Bun, Go, 별도 데이터베이스 서버는 필요하지 않다.
+Autogora는 Web UI와 SQLite 엔진을 포함한 단일 실행 파일이다. worker나 planner로 사용할 클라이언트만 설치하면 된다. Node.js, npm, Bun, Go, 별도 데이터베이스 서버는 필요하지 않다.
 
 ## 1. 릴리스 바이너리 설치
 
@@ -17,7 +17,7 @@ Autogora는 Web UI와 SQLite 엔진을 단일 실행 파일로 제공한다. 실
 | Windows x86-64 | `autogora_<version>_windows_amd64.tar.gz` |
 | Windows ARM64 | `autogora_<version>_windows_arm64.tar.gz` |
 
-Autogora는 Linux 바이너리를 `CGO_ENABLED=0`인 정적 실행 파일로 빌드한다. glibc나 musl에 동적으로 연결하지 않으므로 별도 C 런타임 패키지가 필요 없다. Alpine에서는 `linux_musl_*` 산출물을 선택한다.
+Linux 바이너리는 `CGO_ENABLED=0`인 정적 실행 파일이다. glibc나 musl에 동적으로 연결하지 않으므로 별도 C 런타임 패키지가 필요 없다. Alpine에서는 `linux_musl_*` 산출물을 선택한다.
 
 Linux에서 체크섬을 검증하고 설치한다.
 
@@ -64,7 +64,7 @@ autogora dashboard
 
 대시보드 명령이 출력한 bootstrap URL을 브라우저에서 한 번 연다. 브라우저는 URL 토큰을 HTTP-only 세션 쿠키로 교환한 뒤 토큰 없는 URL로 이동한다. 기본 주소는 `127.0.0.1:8420`이며 Web UI 파일은 바이너리에 들어 있다.
 
-Autogora는 기본 데이터를 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장한다. 프로젝트 이름과 Git common directory의 해시를 조합해 한 clone에 연결된 worktree들은 상태를 공유하고 서로 다른 clone의 상태는 분리한다. 프로젝트의 어느 하위 디렉터리에서든 다음 명령으로 실제 경로를 확인할 수 있다. `paths`는 디렉터리나 DB를 만들지 않는다.
+기본 데이터는 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장된다. 한 clone의 worktree들은 상태를 공유하고 다른 clone은 분리된다. 프로젝트의 어느 하위 디렉터리에서든 실제 경로를 확인할 수 있으며, `paths`는 디렉터리나 DB를 만들지 않는다.
 
 ```bash
 autogora paths
@@ -102,15 +102,15 @@ autogora init --data-dir .autogora
 autogora paths
 ```
 
-Autogora는 `.autogora/.gitignore`에 `*`를 기록하여 SQLite DB와 WAL, 로그, 첨부파일, 작업 공간이 Git 상태에 나타나지 않게 한다. `.git` 내부 경로는 거부한다. 기본 위치로 돌아가려면 다음 명령을 사용한다.
+`.autogora/.gitignore`의 `*` 규칙은 SQLite DB와 WAL, 로그, 첨부파일, 작업 공간을 Git에서 제외한다. `.git` 내부에는 저장할 수 없다. 기본 위치로 돌아가려면 다음 명령을 사용한다.
 
 ```bash
 autogora init --reset-data-dir
 ```
 
-위치를 변경하면 Autogora는 기존 데이터를 이동하거나 삭제하지 않고 새 위치에 기본 보드를 초기화한다. 기존 상태를 이어서 사용하려면 실행 중인 dispatcher와 dashboard를 종료하고 전체 데이터 루트를 복사한 후 위치를 변경한다.
+위치를 바꿔도 기존 데이터는 이동하거나 삭제되지 않으며 새 위치에 기본 보드가 생성된다. 기존 상태를 이어서 사용하려면 dispatcher와 dashboard를 종료하고 전체 데이터 루트를 복사한다.
 
-저장소 디렉터리를 이동하면 절대 Git common directory가 바뀌므로 Autogora가 새 프로젝트 ID와 빈 기본 위치를 선택한다. 기존 데이터는 그대로 남는다. 이전 `autogora paths`에서 확인한 `dataRoot`를 계속 사용하려면 이동한 저장소에서 다시 연결한다.
+저장소를 이동하면 Git common directory가 바뀌어 새 프로젝트 ID와 빈 기본 위치가 선택된다. 기존 데이터는 그대로 남는다. 이전 `dataRoot`를 계속 사용하려면 이동한 저장소에서 다시 연결한다.
 
 ```bash
 autogora init --data-dir /absolute/previous/dataRoot
@@ -132,8 +132,6 @@ autogora setup --client codex
 autogora setup --client claude --client codex --dry-run
 autogora setup --client all
 ```
-
-Autogora는 기존 사용자 설정을 불필요하게 넓히지 않도록 클라이언트별 기본 범위를 선택한다.
 
 | 대상 | Skill 기본 위치 | MCP 기본 범위 |
 | --- | --- | --- |
@@ -168,7 +166,7 @@ autogora setup --client claude \
 
 안전 규칙은 다음과 같다.
 
-- Autogora는 Skill 설치 파일마다 manifest와 SHA-256을 기록한다. 사용자가 수정한 파일이나 Autogora가 관리하지 않는 같은 이름의 디렉터리는 자동으로 덮어쓰거나 지우지 않는다. 내용을 확인한 뒤에만 `--force`를 사용한다.
+- 각 Skill에는 manifest와 SHA-256이 저장된다. 수정했거나 Autogora가 관리하지 않는 파일은 자동으로 덮어쓰거나 지우지 않는다. 내용을 확인한 뒤에만 `--force`를 사용한다.
 - 같은 이름의 MCP 등록이 다른 바이너리 또는 데이터베이스를 가리키면 중단한다. 기존 등록을 확인한 뒤 교체할 때만 `--replace`를 사용한다.
 - `setup`은 Skill과 MCP 양쪽을 먼저 점검한다. 클라이언트 실행 파일 누락이나 충돌을 발견하면 아무것도 적용하지 않는다.
 - MCP 등록은 Autogora 바이너리와 데이터베이스의 절대 경로를 저장한다. 바이너리를 다른 경로로 옮기거나 데이터베이스 경로를 바꾸면 `mcp status`로 확인하고 `mcp register --replace`로 갱신한다.
@@ -220,7 +218,7 @@ autogora create "수정된 Cline CLI 브리지 검증" \
 autogora dispatch --once
 ```
 
-dispatcher는 claim한 task, run, token과 정확히 일치하는 `autogora heartbeat`, `comment`, `complete`, `block` 명령을 prompt에 넣는다. Autogora는 다른 task를 수정하는 lifecycle 명령을 거부한다. 전체 계약은 [Cline CLI 브리지 문서](../examples/cline-cli-bridge.md)에 있다.
+dispatcher는 claim한 task, run, token과 일치하는 `autogora heartbeat`, `comment`, `complete`, `block` 명령을 prompt에 넣는다. 다른 task를 수정하는 lifecycle 명령은 거부된다. 전체 계약은 [Cline CLI 브리지 문서](../examples/cline-cli-bridge.md)에 있다.
 
 Cline을 보조 planner로도 사용할 수 있다.
 
@@ -231,7 +229,7 @@ autogora decompose <triage-task-id> \
   --profile "worker:cline:범위가 지정된 작업을 구현하고 검증한다"
 ```
 
-planner는 도구를 사용하지 않고 읽기 전용 구조화 결과를 출력한다. Autogora는 Cline의 최종 NDJSON 결과가 스키마를 통과한 뒤에만 보드를 변경한다.
+planner는 도구 없이 읽기 전용 구조화 결과를 출력한다. Cline의 최종 NDJSON 결과가 스키마를 통과해야 보드에 반영된다.
 
 ## 6. 소스에서 빌드
 
@@ -270,6 +268,6 @@ MAX_BINARY_BYTES=18874368 make release VERSION=v1.0.0
 4. 기존 실행 파일만 새 바이너리로 교체한다.
 5. `autogora version`, `autogora diagnostics`를 실행하고 대시보드를 확인한다.
 
-Autogora는 데이터와 Web UI를 실행 파일과 분리한다. 새 바이너리는 데이터베이스를 열 때 필요한 스키마 마이그레이션을 수행한다. 여러 버전의 dispatcher나 dashboard가 같은 데이터베이스를 동시에 열지 않도록 관련 프로세스를 모두 종료한 뒤 교체한다.
+데이터와 Web UI는 실행 파일과 분리된다. 새 바이너리는 데이터베이스를 열 때 필요한 스키마 마이그레이션을 수행한다. 여러 버전의 dispatcher나 dashboard가 같은 데이터베이스를 동시에 열지 않도록 관련 프로세스를 모두 종료한 뒤 교체한다.
 
 문제가 있으면 기존 바이너리와 백업한 데이터 디렉터리로 함께 되돌린다. 실행 파일만 낮은 버전으로 바꾸고 새 스키마 데이터베이스를 그대로 여는 방식은 권장하지 않는다.
