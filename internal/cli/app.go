@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nn1a/kanban/internal/boards"
+	"github.com/nn1a/kanban/internal/mcpserver"
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/store"
 )
@@ -66,14 +67,15 @@ Common options:
 `
 
 type App struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Cwd    string
-	Getenv func(string) string
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Cwd     string
+	Getenv  func(string) string
+	Version string
 }
 
 func New(stdout, stderr io.Writer) *App {
-	return &App{Stdout: stdout, Stderr: stderr, Getenv: os.Getenv}
+	return &App{Stdout: stdout, Stderr: stderr, Getenv: os.Getenv, Version: "dev"}
 }
 
 func (a *App) env(names ...string) string {
@@ -219,6 +221,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 
 	switch command {
+	case "serve":
+		manager, err := a.managerFor(opts.value("db"))
+		if err != nil {
+			return err
+		}
+		return mcpserver.RunStdio(ctx, manager, a.Version)
 	case "boards":
 		return a.runBoards(ctx, opts)
 	case "init":

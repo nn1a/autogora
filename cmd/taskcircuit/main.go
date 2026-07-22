@@ -29,6 +29,7 @@ func runContext(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return 0
 	}
 	app := cli.New(stdout, stderr)
+	app.Version = version
 	if err := app.Run(ctx, args); err != nil {
 		fmt.Fprintf(stderr, "taskcircuit: %v\n", err)
 		return 1
