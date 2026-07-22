@@ -58,6 +58,14 @@ func pointer(value *string, fallback string) string {
 	return *value
 }
 
+func titleCase(value string) string {
+	if value == "" {
+		return value
+	}
+	runes := []rune(value)
+	return strings.ToUpper(string(runes[0])) + string(runes[1:])
+}
+
 func (m *Model) visibleColumns(boardWidth int) (int, int, int) {
 	statuses := m.statuses()
 	columnWidth := 24
@@ -234,9 +242,14 @@ func (m *Model) View() string {
 	}
 	if m.err != nil {
 		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("  " + truncate(m.err.Error(), max(10, m.width-30)))
+	} else if m.notice != "" {
+		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusDone)).Render("  " + m.notice)
+	}
+	if m.busy {
+		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  applying…")
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("←/→ columns  ↑/↓ cards  / search  tab detail  a archived  ? help  q quit")
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("n new  e edit  s assign  C comment  p promote  b block  c complete  x archive  ? help")
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -260,9 +273,22 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Keyboard\n\n  h/l or ←/→   move between columns\n  j/k or ↑/↓   move between cards\n  g / G         first / last card\n  /             search title and body\n  a             show or hide archived tasks\n  tab · 1/2/3   switch detail tab\n  pgup / pgdown scroll detail\n  enter         toggle details on narrow terminals\n  r             refresh now\n  ? or esc      close help\n  q             quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  n             new triage task\n  e / s         edit title / assignee\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
+	}
+	if m.inputMode != "" && m.inputMode != "search" {
+		prompt := baseBorder.Copy().BorderForeground(colorFocus).Width(min(70, m.width-4)).Padding(1, 2).Render(
+			lipgloss.NewStyle().Bold(true).Render(m.promptLabel) + "\n\n" + m.promptDraft + "█\n\n" + lipgloss.NewStyle().Foreground(colorMuted).Render("enter apply · esc cancel"),
+		)
+		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, prompt)
+	}
+	if m.confirm != nil {
+		confirmation := baseBorder.Copy().BorderForeground(statusColor(model.TaskStatusBlocked)).Width(min(68, m.width-4)).Padding(1, 2).Render(
+			lipgloss.NewStyle().Bold(true).Render(titleCase(m.confirm.action)+" task?") + "\n\n" + truncate(m.confirm.title, min(58, m.width-10)) + "\n" +
+				lipgloss.NewStyle().Foreground(colorMuted).Render(m.confirm.id) + "\n\n" + lipgloss.NewStyle().Foreground(colorMuted).Render("y/enter confirm · n/esc cancel"),
+		)
+		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, confirmation)
 	}
 	return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + content + "\n" + footer
 }

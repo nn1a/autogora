@@ -14,6 +14,7 @@ import (
 type fakeBackend struct {
 	tasks   []model.Task
 	details map[string]model.TaskDetail
+	actions []string
 }
 
 func (f *fakeBackend) ListTasks(context.Context, store.ListTaskFilter) ([]model.Task, error) {
@@ -26,6 +27,51 @@ func (f *fakeBackend) GetTask(_ context.Context, id string) (model.TaskDetail, e
 
 func (f *fakeBackend) RelationshipGraph(_ context.Context, id string) (model.RelationshipGraph, error) {
 	return model.RelationshipGraph{FocusTaskID: id, TotalConnectedNodes: 1}, nil
+}
+
+func (f *fakeBackend) CreateTask(_ context.Context, input store.CreateTaskInput) (model.TaskDetail, error) {
+	task := testTask("created", input.Title, input.Status)
+	f.actions = append(f.actions, "create:"+input.Title)
+	return model.TaskDetail{Task: task}, nil
+}
+
+func (f *fakeBackend) UpdateTask(_ context.Context, id string, input store.UpdateTaskInput) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "update:"+id)
+	task := testTask(id, "updated", model.TaskStatusTodo)
+	if input.Title != nil {
+		task.Title = *input.Title
+	}
+	return model.TaskDetail{Task: task}, nil
+}
+
+func (f *fakeBackend) PromoteTask(_ context.Context, id string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "promote:"+id)
+	return model.TaskDetail{Task: testTask(id, "promoted", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) CompleteTask(_ context.Context, id string, _ store.CompletionInput) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "complete:"+id)
+	return model.TaskDetail{Task: testTask(id, "done", model.TaskStatusDone)}, nil
+}
+
+func (f *fakeBackend) BlockTask(_ context.Context, id string, input store.BlockInput) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "block:"+id+":"+input.Reason)
+	return model.TaskDetail{Task: testTask(id, "blocked", model.TaskStatusBlocked)}, nil
+}
+
+func (f *fakeBackend) UnblockTask(_ context.Context, id string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "unblock:"+id)
+	return model.TaskDetail{Task: testTask(id, "unblocked", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) ArchiveTask(_ context.Context, id string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "archive:"+id)
+	return model.TaskDetail{Task: testTask(id, "archived", model.TaskStatusArchived)}, nil
+}
+
+func (f *fakeBackend) AddComment(_ context.Context, id, author, body string) (model.Comment, error) {
+	f.actions = append(f.actions, "comment:"+id+":"+body)
+	return model.Comment{TaskID: id, Author: author, Body: body}, nil
 }
 
 func testTask(id, title string, status model.TaskStatus) model.Task {
@@ -121,5 +167,38 @@ func TestDetailTabsRenderRelationshipsAndActivity(t *testing.T) {
 	m.detailTab = 2
 	if view := m.View(); !strings.Contains(view, "Please verify") || !strings.Contains(view, "Activity") {
 		t.Fatalf("activity detail missing:\n%s", view)
+	}
+}
+
+func TestDestructiveActionPinsSelectionAndRequiresConfirmation(t *testing.T) {
+	task := testTask("task", "Finish safely", model.TaskStatusReview)
+	backend := &fakeBackend{details: map[string]model.TaskDetail{}}
+	m := NewModel(context.Background(), backend, "default")
+	m.tasks[task.Status] = []model.Task{task}
+	m.column = statusIndex(m.statuses(), task.Status)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if m.confirm == nil || len(backend.actions) != 0 {
+		t.Fatal("completion should wait for confirmation")
+	}
+	command := m.moveColumn(-1)
+	_ = command
+	_, command = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	message := command()
+	m.Update(message)
+	if len(backend.actions) != 1 || backend.actions[0] != "complete:task" {
+		t.Fatalf("confirmation targeted the wrong task: %v", backend.actions)
+	}
+}
+
+func TestPromptCreatesTriageTask(t *testing.T) {
+	backend := &fakeBackend{}
+	m := NewModel(context.Background(), backend, "default")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Investigate issue")})
+	_, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	message := command()
+	m.Update(message)
+	if len(backend.actions) != 1 || backend.actions[0] != "create:Investigate issue" || m.desiredSelection != "created" {
+		t.Fatalf("task creation did not complete: actions=%v selection=%q", backend.actions, m.desiredSelection)
 	}
 }
