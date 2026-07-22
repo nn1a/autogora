@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -67,6 +68,77 @@ func TestCreateListAndReadTaskUsingExistingJSONContract(t *testing.T) {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
+
+func TestAttachmentsAndCompletionArtifactsRemainDurable(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	store, err := Open(filepath.Join(directory, "kanban.db"), "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	workspace := filepath.Join(directory, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(workspace, "report.md")
+	if err := os.WriteFile(artifactPath, []byte("verified report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Document", Assignee: stringValue("writer"), Runtime: model.RuntimeCodex, Workspace: &workspace, WorkspaceKind: model.WorkspaceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlAttachment, err := store.AttachURL(ctx, task.Task.ID, "https://example.com/spec", "spec")
+	if err != nil || urlAttachment.URL == nil {
+		t.Fatalf("attach URL: %+v %v", urlAttachment, err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	completed, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "documented", Artifacts: []string{"report.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Task.Status != model.TaskStatusDone || len(completed.Attachments) != 2 {
+		t.Fatalf("completion artifacts missing: %+v", completed)
+	}
+	fileAttachment := completed.Attachments[1]
+	if fileAttachment.Path == nil || !fileExistsForTest(*fileAttachment.Path) || fileAttachment.SHA256 == nil {
+		t.Fatalf("file attachment is not durable: %+v", fileAttachment)
+	}
+}
+
+func TestMissingCompletionArtifactLeavesRunActive(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store, err := Open(":memory:", "default", filepath.Join(t.TempDir(), "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Evidence", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex, Workspace: &workspace, WorkspaceKind: model.WorkspaceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "done", Artifacts: []string{"missing.txt"}}); err == nil {
+		t.Fatal("missing artifact was accepted")
+	}
+	loaded, err := store.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Task.Status != model.TaskStatusRunning || loaded.Task.CurrentRunID == nil {
+		t.Fatalf("failed completion lost active run: %+v", loaded.Task)
+	}
+}
+
+func fileExistsForTest(path string) bool { _, err := os.Stat(path); return err == nil }
 
 func TestDependencyLifecycleAndRealWorldGraphEdits(t *testing.T) {
 	ctx := context.Background()
@@ -252,6 +324,55 @@ func TestRelationshipGraphSeparatesHierarchyFromDependencies(t *testing.T) {
 	}
 	if implementationNode == nil || len(implementationNode.BlockedBy) != 1 || implementationNode.BlockedBy[0] != first.Task.ID {
 		t.Fatalf("worker-safe dependency context missing: %+v", implementationNode)
+	}
+}
+
+func TestNotificationDeliveryLeasesHideSecretsAndRemoveTerminalSubscription(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Notify", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := "delivery-secret"
+	subscription, err := store.SubscribeTask(ctx, SubscriptionInput{TaskID: task.Task.ID, Platform: "webhook", ChatID: "https://example.com/hook", Secret: OptionalString{Set: true, Value: &secret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !subscription.HasSecret {
+		t.Fatal("subscription did not record the secret presence")
+	}
+	listed, err := store.ListNotificationSubscriptions(ctx, task.Task.ID)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("list subscriptions: %+v %v", listed, err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := store.ClaimNotificationDeliveries(ctx, 25, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Secret == nil || *deliveries[0].Secret != secret || deliveries[0].Event.Kind != "completed" {
+		t.Fatalf("unexpected delivery: %+v", deliveries)
+	}
+	if err := store.ResolveNotificationDelivery(ctx, deliveries[0].ID, deliveries[0].LeaseToken, nil); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = store.ListNotificationSubscriptions(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("terminal subscription remains: %+v", listed)
 	}
 }
 

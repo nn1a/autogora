@@ -388,6 +388,24 @@ func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion Comp
 	if summary == "" {
 		return model.TaskDetail{}, errors.New("completion requires a summary or result")
 	}
+	preflight, _, err := requireActiveRun(ctx, s.db, scope)
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
+	captured, err := s.captureArtifacts(ctx, preflight, completion.Artifacts)
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
+	if len(captured) > 0 {
+		if completion.Metadata == nil {
+			completion.Metadata = map[string]any{}
+		}
+		artifacts := make([]map[string]any, 0, len(captured))
+		for _, attachment := range captured {
+			artifacts = append(artifacts, map[string]any{"id": attachment.ID, "name": attachment.Name, "path": attachment.Path})
+		}
+		completion.Metadata["artifacts"] = artifacts
+	}
 	var resultValue any
 	if result != "" {
 		resultValue = result
@@ -401,7 +419,7 @@ func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion Comp
 		metadata = string(encoded)
 	}
 	taskID := ""
-	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, run, err := requireActiveRun(ctx, tx, scope)
 		if err != nil {
 			return err
@@ -463,6 +481,22 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 	}
 	if preflight.CurrentRunID != nil {
 		return model.TaskDetail{}, errors.New("cannot complete a running task administratively; let the worker complete or terminate the active run first")
+	}
+	if preflight.Status != model.TaskStatusDone {
+		captured, err := s.captureArtifacts(ctx, preflight, completion.Artifacts)
+		if err != nil {
+			return model.TaskDetail{}, err
+		}
+		if len(captured) > 0 {
+			if completion.Metadata == nil {
+				completion.Metadata = map[string]any{}
+			}
+			artifacts := make([]map[string]any, 0, len(captured))
+			for _, attachment := range captured {
+				artifacts = append(artifacts, map[string]any{"id": attachment.ID, "name": attachment.Name, "path": attachment.Path})
+			}
+			completion.Metadata["artifacts"] = artifacts
+		}
 	}
 	summary, result := strings.TrimSpace(completion.Summary), strings.TrimSpace(completion.Result)
 	if summary == "" {
