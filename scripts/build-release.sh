@@ -6,7 +6,7 @@ cd "$project_root"
 
 version=${1:-dev}
 output_arg=${2:-release}
-targets=${TARGETS:-"linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64"}
+targets=${TARGETS:-"linux/amd64 linux/arm64 linux-musl/amd64 linux-musl/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64"}
 
 if ! printf '%s' "$version" | grep -Eq '^[A-Za-z0-9._+-]+$'; then
   echo "invalid version: $version" >&2
@@ -34,9 +34,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 for target in $targets; do
-  goos=${target%/*}
+  target_os=${target%/*}
   goarch=${target#*/}
-  archive_name="taskcircuit_${version}_${goos}_${goarch}"
+  goos=$target_os
+  platform_name=$target_os
+  if [ "$target_os" = linux-musl ]; then
+    goos=linux
+    platform_name=linux_musl
+  fi
+  archive_name="taskcircuit_${version}_${platform_name}_${goarch}"
   stage_dir="$temporary_root/$archive_name"
   binary_name=taskcircuit
   if [ "$goos" = windows ]; then
@@ -44,7 +50,7 @@ for target in $targets; do
   fi
 
   mkdir -p "$stage_dir"
-  echo "building $goos/$goarch"
+  echo "building $target_os/$goarch"
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
     -trimpath \
     -buildvcs=false \
