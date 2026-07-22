@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/store"
 )
 
 func runApp(t *testing.T, app *App, args ...string) string {
@@ -106,5 +107,48 @@ func TestScopedWorkerCannotEscapeTaskOrCommandAllowlist(t *testing.T) {
 	}
 	if _, err := app.scopedTaskID("t_other", "show"); err == nil || !strings.Contains(err.Error(), "scoped to task") {
 		t.Fatalf("scoped worker escaped task boundary: %v", err)
+	}
+}
+
+func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "kanban.db")
+	opened, err := store.Open(dbPath, "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Cline CLI bridge", Assignee: stringPointer("cline-worker"), Runtime: model.RuntimeCline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]string{
+		"KANBAN_DB": dbPath, "KANBAN_BOARD": "default", "KANBAN_TASK_ID": task.Task.ID,
+		"KANBAN_RUN_ID": claim.Run.ID, "KANBAN_CLAIM_TOKEN": claim.ClaimToken,
+	}
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Getenv = func(name string) string { return environment[name] }
+	runApp(t, app, "heartbeat", task.Task.ID, "--note", "Cline worker running")
+	runApp(t, app, "comment", task.Task.ID, "Cline communicated through the scoped CLI bridge.", "--author", "cline")
+	runApp(t, app, "complete", task.Task.ID, "--summary", "completed without MCP", "--metadata", `{"verification":["cli-bridge"]}`)
+
+	verified, err := store.Open(dbPath, "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verified.Close()
+	detail, err := verified.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusDone || len(detail.Comments) != 1 || len(detail.Runs) != 1 || detail.Runs[0].Summary == nil || *detail.Runs[0].Summary != "completed without MCP" {
+		t.Fatalf("scoped CLI lifecycle did not reach shared kernel: %+v", detail)
 	}
 }

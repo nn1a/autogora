@@ -235,6 +235,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runEvents(ctx, command, opts)
 	case "bulk":
 		return a.runBulk(ctx, opts)
+	case "swarm":
+		return a.runSwarm(ctx, opts)
+	case "edit", "assign", "reassign", "link", "unlink", "subtask-add", "subtask-rm":
+		return a.runTaskMutation(ctx, command, opts)
+	case "heartbeat", "comment", "attach", "attach-url", "attachments", "attach-rm":
+		return a.runWorkerMutation(ctx, command, opts)
+	case "complete", "block", "unblock", "promote", "archive", "delete", "schedule":
+		return a.runLifecycle(ctx, command, opts)
+	case "notify-subscribe", "notify-unsubscribe", "notify-list":
+		return a.runNotifications(ctx, command, opts)
 	default:
 		return fmt.Errorf("unknown or not-yet-ported command: %s", command)
 	}
