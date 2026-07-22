@@ -9,6 +9,7 @@ import (
 
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/kanban/internal/workspace"
 )
 
 func optionalString(opts options, name string, noneIsNil bool) store.OptionalString {
@@ -520,3 +521,40 @@ func (a *App) runSwarm(ctx context.Context, opts options) error {
 }
 
 func currentWorkerID() string { return fmt.Sprintf("cli-%d", os.Getpid()) }
+
+func (a *App) runClaim(ctx context.Context, opts options) error {
+	if len(opts.positionals) == 0 {
+		return errors.New("claim requires a task id")
+	}
+	ttl, err := numberOption(opts.value("ttl"), 900)
+	if err != nil {
+		return err
+	}
+	opened, manager, board, err := a.openStore(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer opened.Close()
+	workerID := opts.value("worker")
+	if workerID == "" {
+		workerID = currentWorkerID()
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: opts.positionals[0], Board: board, WorkerID: workerID, ClaimTTLSeconds: ttl})
+	if err != nil {
+		return err
+	}
+	if claim == nil {
+		return fmt.Errorf("task is not claimable: %s", opts.positionals[0])
+	}
+	workspaces := workspace.New(manager)
+	if a.Cwd != "" {
+		workspaces.SetWorkingDirectory(a.Cwd)
+	}
+	prepared, err := workspaces.Prepare(ctx, opened, claim)
+	if err != nil {
+		message := "Workspace preparation failed: " + err.Error()
+		_, _ = opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, message, store.FailRunOptions{})
+		return err
+	}
+	return writeJSON(a.Stdout, prepared)
+}

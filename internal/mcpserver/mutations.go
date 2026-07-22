@@ -10,6 +10,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/store"
+	"github.com/nn1a/kanban/internal/workspace"
 )
 
 type bulkInput struct {
@@ -295,8 +296,18 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			input.WorkerID = fmt.Sprintf("mcp-%d", os.Getpid())
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) {
-			return opened.ClaimTask(ctx, store.ClaimOptions{TaskID: input.TaskID, Board: board, Runtime: input.Runtime,
+			claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: input.TaskID, Board: board, Runtime: input.Runtime,
 				WorkerID: input.WorkerID, ClaimTTLSeconds: input.TTLSeconds})
+			if err != nil || claim == nil {
+				return claim, err
+			}
+			prepared, err := workspace.New(s.manager).Prepare(ctx, opened, claim)
+			if err != nil {
+				message := "Workspace preparation failed: " + err.Error()
+				_, _ = opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, message, store.FailRunOptions{})
+				return nil, err
+			}
+			return prepared, nil
 		})
 	})
 	addTool(server, "kanban_attach", "Attach file to Kanban task", "Copy a local file into durable board-scoped storage.", false, false, false, false, s.attachmentHandler("file"))
