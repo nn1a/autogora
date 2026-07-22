@@ -1,11 +1,10 @@
-# Replace /absolute/path/to/taskcircuit with this repository's absolute path.
+# Replace both absolute paths with the installed binary and project database.
 [mcp_servers.taskcircuit]
-command = "node"
+command = "/absolute/path/to/taskcircuit"
 args = [
-  "/absolute/path/to/taskcircuit/dist/cli.js",
   "serve",
   "--db",
-  "/absolute/path/to/taskcircuit/data/kanban.db",
+  "/absolute/path/to/project/data/kanban.db",
 ]
 required = true
 startup_timeout_sec = 10

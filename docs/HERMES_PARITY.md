@@ -90,7 +90,7 @@ Authoritative references:
 - [x] Atomic dashboard manual start, card progress badges, and guarded trash drop
 - [x] Board switcher/settings and specify/decompose/swarm controls
 - [x] Multi-file upload and persisted dashboard view preferences
-- [x] WebSocket event stream with reconnect/cursor support
+- [x] Server-Sent Events stream with reconnect/cursor support
 
 ## Explicit upstream boundary
 

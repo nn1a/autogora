@@ -5,7 +5,8 @@ Gemini CLI can use this project in two independent ways:
 1. Interactive sessions can register the TaskCircuit stdio MCP server:
 
    ```bash
-   gemini mcp add --scope project taskcircuit node "$PWD/dist/cli.js" serve -- \
+   TASKCIRCUIT_BIN=$(command -v taskcircuit)
+   gemini mcp add --scope project taskcircuit "$TASKCIRCUIT_BIN" serve -- \
      --db "$PWD/data/kanban.db"
    ```
 
@@ -13,17 +14,17 @@ Gemini CLI can use this project in two independent ways:
    changing user or project Gemini settings:
 
    ```bash
-   export KANBAN_GEMINI_BIN=/absolute/path/to/gemini # optional
-   node dist/cli.js create "Implement and verify the change" \
+   export TASKCIRCUIT_GEMINI_BIN=/absolute/path/to/gemini # optional
+   taskcircuit create "Implement and verify the change" \
      --assignee gemini-worker --runtime gemini --workspace "$PWD"
-   node dist/cli.js dispatch --once --allow-writes
+   taskcircuit dispatch --once --allow-writes
    ```
 
 Worker runs use `--output-format stream-json`, capture the `init.session_id`,
 and use `--resume <session-id>` for later goal turns. The worker communicates
 task state through the scoped CLI commands in its prompt. Every lifecycle call
-must match `KANBAN_DB`, `KANBAN_BOARD`, `KANBAN_TASK_ID`, `KANBAN_RUN_ID`, and
-`KANBAN_CLAIM_TOKEN` from the child environment.
+must match `TASKCIRCUIT_DB`, `TASKCIRCUIT_BOARD`, `TASKCIRCUIT_TASK_ID`,
+`TASKCIRCUIT_RUN_ID`, and `TASKCIRCUIT_CLAIM_TOKEN` from the child environment.
 
 Read-only dispatch is the default. A temporary Gemini policy denies MCP tools
 and denies `run_shell_command` except when its command begins with the exact
@@ -36,8 +37,8 @@ Gemini CLI and local configuration.
 Gemini can also specify or decompose triage work:
 
 ```bash
-node dist/cli.js specify <triage-task-id> --planner-runtime gemini
-node dist/cli.js decompose <triage-task-id> \
+taskcircuit specify <triage-task-id> --planner-runtime gemini
+taskcircuit decompose <triage-task-id> \
   --planner-runtime gemini \
   --profile "worker:gemini:implements and verifies scoped tasks"
 ```

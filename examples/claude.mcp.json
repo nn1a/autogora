@@ -2,9 +2,8 @@
   "mcpServers": {
     "taskcircuit": {
       "type": "stdio",
-      "command": "node",
+      "command": "/absolute/path/to/taskcircuit",
       "args": [
-        "${CLAUDE_PROJECT_DIR}/dist/cli.js",
         "serve",
         "--db",
         "${CLAUDE_PROJECT_DIR}/data/kanban.db"
