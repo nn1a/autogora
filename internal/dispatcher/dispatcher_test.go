@@ -54,6 +54,33 @@ func buildAutogora(t *testing.T) string {
 	return path
 }
 
+func gitRepositoryFixture(t *testing.T) string {
+	t.Helper()
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := func(args ...string) string {
+		process := exec.Command("git", append([]string{"-C", repository}, args...)...)
+		process.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.com", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.com")
+		output, err := process.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	gitInit := exec.Command("git", "init", repository)
+	if output, err := gitInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	command("add", "README.md")
+	command("commit", "-m", "base")
+	return repository
+}
+
 func TestDispatcherRateLimitDoesNotConsumeRetry(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
@@ -223,6 +250,56 @@ sleep 1
 	}
 	if done.Task.Status != model.TaskStatusDone || (waiting.Task.Status != model.TaskStatusReady && waiting.Task.Status != model.TaskStatusScheduled) || waiting.Task.FailureCount != 0 {
 		t.Fatalf("shared writers were not serialized cleanly: first=%#v second=%#v", firstDetail, secondDetail)
+	}
+}
+
+func TestDispatcherCapturesWorktreeChangesWithoutMovingUserCheckout(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	repository := gitRepositoryFixture(t)
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	cliPath := buildAutogora(t)
+	opened, _ := manager.OpenStore(ctx, "default")
+	assignee := "writer"
+	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "isolated change", Assignee: &assignee, Runtime: model.RuntimeCline})
+	opened.Close()
+	fixture := executableFixture(t, `
+printf '%s\n' 'before terminal request' > "$AUTOGORA_WORKSPACE/feature.txt"
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "change ready" >/dev/null
+printf '%s\n' 'after terminal request' >> "$AUTOGORA_WORKSPACE/feature.txt"`)
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Once: true, AllowWrites: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+		if name == "AUTOGORA_CLINE_BIN" {
+			return fixture
+		}
+		return ""
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	check, _ := manager.OpenStore(ctx, "default")
+	defer check.Close()
+	detail, _ := check.GetTask(ctx, task.Task.ID)
+	if detail.Task.Status != model.TaskStatusDone || len(detail.ChangeSets) != 1 || detail.ChangeSets[0].State != "ready" {
+		t.Fatalf("worktree completion lacks a durable change set: %#v", detail)
+	}
+	change := detail.ChangeSets[0]
+	show := exec.Command("git", "-C", repository, "show", change.HeadCommit+":feature.txt")
+	contents, err := show.Output()
+	if err != nil || string(contents) != "before terminal request\nafter terminal request\n" {
+		t.Fatalf("snapshot omitted final worker changes: %q err=%v", contents, err)
+	}
+	if _, err := os.Stat(filepath.Join(repository, "feature.txt")); !os.IsNotExist(err) {
+		t.Fatalf("worker changed the user checkout: %v", err)
+	}
+	status := exec.Command("git", "-C", repository, "status", "--porcelain")
+	if output, err := status.Output(); err != nil || len(output) != 0 {
+		t.Fatalf("snapshot dirtied the user checkout: %q err=%v", output, err)
+	}
+	ref := exec.Command("git", "-C", repository, "rev-parse", change.DurableRef)
+	refHead, err := ref.Output()
+	if err != nil || strings.TrimSpace(string(refHead)) != change.HeadCommit {
+		t.Fatalf("durable ref mismatch: %q want %s err=%v", refHead, change.HeadCommit, err)
 	}
 }
 

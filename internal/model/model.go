@@ -147,6 +147,20 @@ type TerminalRequest struct {
 	FinalizedAt *string        `json:"finalizedAt"`
 }
 
+type ChangeSet struct {
+	ID             string   `json:"id"`
+	RunID          string   `json:"runId"`
+	TaskID         string   `json:"taskId"`
+	RepositoryPath string   `json:"repositoryPath"`
+	WorktreePath   string   `json:"worktreePath"`
+	BaseCommit     string   `json:"baseCommit"`
+	HeadCommit     string   `json:"headCommit"`
+	DurableRef     string   `json:"durableRef"`
+	State          string   `json:"state"`
+	ChangedFiles   []string `json:"changedFiles"`
+	CreatedAt      string   `json:"createdAt"`
+}
+
 type Comment struct {
 	ID        int64  `json:"id"`
 	TaskID    string `json:"taskId"`
@@ -190,6 +204,7 @@ type TaskDetail struct {
 	Runs             []Run             `json:"runs"`
 	RunWorkspaces    []RunWorkspace    `json:"runWorkspaces"`
 	TerminalRequests []TerminalRequest `json:"terminalRequests"`
+	ChangeSets       []ChangeSet       `json:"changeSets"`
 	Events           []TaskEvent       `json:"events"`
 }
 

@@ -353,6 +353,12 @@ Relative `dir:` and explicit worktree paths are rejected. Dispatcher runs record
 their resolved path, repository, base commit, worker PID, and log path without
 overwriting the task's workspace configuration.
 
+After a managed worktree process exits, the dispatcher snapshots its final tree
+with a temporary Git index. It does not stage the worker index or move the user
+checkout. The snapshot is retained at `refs/autogora/runs/<run-id>` and recorded
+in task details under `changeSets` with base/head commits and changed files. A
+managed worktree cannot become Done until this durable handoff exists.
+
 ## Attachments and artifacts
 
 Files are copied into the active board's durable attachment root and limited to

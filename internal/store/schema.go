@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 11
+const schemaVersion = 12
 
 type Store struct {
 	db              *sql.DB
@@ -408,6 +408,20 @@ CREATE TABLE IF NOT EXISTS managed_runs (
   registered_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_change_sets (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  repository_path TEXT NOT NULL,
+  worktree_path TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  head_commit TEXT NOT NULL,
+  durable_ref TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('ready', 'no_change')),
+  changed_files_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS release_terminal_run_resources
 AFTER UPDATE OF status ON task_runs
 WHEN NEW.status <> 'running'
@@ -475,6 +489,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
+CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);

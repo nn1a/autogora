@@ -336,6 +336,24 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 			if open {
 				return errors.New("task prerequisites changed while completion was pending")
 			}
+			var workspaceKind string
+			workspaceErr := tx.QueryRowContext(ctx, `SELECT rw.kind FROM run_workspaces rw
+				JOIN managed_runs mr ON mr.run_id = rw.run_id WHERE rw.run_id = ?`, runID).Scan(&workspaceKind)
+			if workspaceErr != nil && !errors.Is(workspaceErr, sql.ErrNoRows) {
+				return workspaceErr
+			}
+			if model.WorkspaceKind(workspaceKind) == model.WorkspaceWorktree {
+				var state string
+				if err := tx.QueryRowContext(ctx, "SELECT state FROM task_change_sets WHERE run_id = ?", runID).Scan(&state); err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return errors.New("managed worktree completion requires a durable change set")
+					}
+					return err
+				}
+				if !validChangeSetState(state) {
+					return fmt.Errorf("change set is not ready: %s", state)
+				}
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?,
 				exit_code = ?, summary = ?, metadata_json = ? WHERE id = ?`, timestamp, timestamp, exitCode,
 				currentRequest.Summary, metadataJSON, runID); err != nil {

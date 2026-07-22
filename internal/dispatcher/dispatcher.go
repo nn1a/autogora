@@ -297,6 +297,36 @@ func hasDeferredReclaim(detail model.TaskDetail, runID string) bool {
 	return event.Kind == "reclaim_deferred" && event.RunID != nil && *event.RunID == runID
 }
 
+func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspaces *workspace.Manager, prepared *model.ClaimedTask, scope store.RunScope, exitCode int) (model.TaskDetail, error) {
+	request, err := opened.GetRunTerminalRequest(ctx, scope.RunID)
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
+	if request == nil {
+		return model.TaskDetail{}, fmt.Errorf("run has no terminal request: %s", scope.RunID)
+	}
+	if request.Kind == "complete" && prepared.Workspace != nil && prepared.Workspace.Kind == model.WorkspaceWorktree {
+		existing, err := opened.GetRunChangeSet(ctx, scope.RunID)
+		if err != nil {
+			return model.TaskDetail{}, err
+		}
+		if existing == nil {
+			snapshot, err := workspaces.CaptureChangeSet(ctx, *prepared.Workspace, prepared.Task.Task.ID, prepared.Task.Task.Title)
+			if err != nil {
+				return model.TaskDetail{}, err
+			}
+			if _, err := opened.RecordRunChangeSet(ctx, scope, store.RecordChangeSetInput{
+				RunID: scope.RunID, RepositoryPath: snapshot.RepositoryPath, WorktreePath: snapshot.WorktreePath,
+				BaseCommit: snapshot.BaseCommit, HeadCommit: snapshot.HeadCommit, DurableRef: snapshot.DurableRef,
+				State: snapshot.State, ChangedFiles: snapshot.ChangedFiles,
+			}); err != nil {
+				return model.TaskDetail{}, err
+			}
+		}
+	}
+	return opened.FinalizeRunTerminal(ctx, scope.RunID, exitCode)
+}
+
 func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store, claim *model.ClaimedTask, options Options, processes *ProcessSet, clineApprovalDir string) {
 	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
 	if err := opened.MarkRunManaged(ctx, scope); err != nil {
@@ -363,7 +393,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			durable, cancel := durableContext()
 			defer cancel()
 			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge setup failed: " + err.Error(), Kind: model.BlockKindTransient}); requestErr == nil {
-				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+				_, _ = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			}
 			return
 		}
@@ -436,7 +466,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 					return
 				}
 			} else {
-				if _, err := opened.FinalizeRunTerminal(durable, prepared.Run.ID, execution.Code); err != nil {
+				if _, err := finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, execution.Code); err != nil {
 					_, _ = opened.FailRun(durable, scope, "Terminal finalization failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
 					cancel()
 					options.log("terminal finalization failed %s: %v", taskID, err)
@@ -495,7 +525,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		if err != nil {
 			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge failed: " + err.Error(), Kind: model.BlockKindTransient}); requestErr == nil {
-				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+				_, _ = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			}
 			cancel()
 			return
@@ -503,7 +533,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		_, _ = opened.RecordGoalJudgment(durable, scope, store.GoalJudgment{Turn: turn, Complete: judgment.Complete, Reason: judgment.Reason, NextPrompt: judgment.NextPrompt})
 		if judgment.Complete {
 			if _, requestErr := opened.CompleteRun(durable, scope, store.CompletionInput{Summary: fmt.Sprintf("Goal accepted after %d turn(s): %s", turn, judgment.Reason), Metadata: map[string]any{"goalMode": true, "turns": turn, "judgeReason": judgment.Reason}}); requestErr == nil {
-				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+				_, _ = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			}
 			cancel()
 			cleanupIfDone()
@@ -511,7 +541,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		if turn >= prepared.Task.Task.GoalMaxTurns {
 			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: fmt.Sprintf("Goal turn budget exhausted after %d turns: %s", turn, judgment.Reason), Kind: model.BlockKindNeedsInput}); requestErr == nil {
-				_, _ = opened.FinalizeRunTerminal(durable, scope.RunID, 0)
+				_, _ = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			}
 			cancel()
 			return
