@@ -152,3 +152,37 @@ func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
 		t.Fatalf("scoped CLI lifecycle did not reach shared kernel: %+v", detail)
 	}
 }
+
+func TestCLIExplicitSpecificationAndDecomposition(t *testing.T) {
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "kanban.db")
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Cwd = directory
+	app.Getenv = func(string) string { return "" }
+	runApp(t, app, "init", "--db", dbPath)
+
+	createdJSON := runApp(t, app, "create", "rough", "--triage", "--db", dbPath)
+	var created struct {
+		Task model.Task `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(createdJSON), &created); err != nil {
+		t.Fatal(err)
+	}
+	specified := runApp(t, app, "specify", created.Task.ID, "--db", dbPath, "--title", "Precise task", "--body", "Acceptance: tests pass")
+	if !strings.Contains(specified, `"ok": true`) || !strings.Contains(specified, "Precise task") {
+		t.Fatalf("unexpected specify output: %s", specified)
+	}
+
+	rootJSON := runApp(t, app, "create", "rough graph", "--triage", "--db", dbPath)
+	var root struct {
+		Task model.Task `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(rootJSON), &root); err != nil {
+		t.Fatal(err)
+	}
+	plan := `{"fanout":true,"rootTitle":"Coordinate","rootBody":"Verify output","reason":"parallel","tasks":[{"key":"one","title":"Child","body":"Implement","assignee":"worker","runtime":"codex","priority":1,"skills":[]}],"dependencies":[]}`
+	decomposed := runApp(t, app, "decompose", root.Task.ID, "--db", dbPath, "--default-profile", "worker:codex", "--plan-json", plan)
+	if !strings.Contains(decomposed, `"fanout": true`) || !strings.Contains(decomposed, `"childIds"`) {
+		t.Fatalf("unexpected decompose output: %s", decomposed)
+	}
+}

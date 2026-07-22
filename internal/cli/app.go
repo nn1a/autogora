@@ -243,6 +243,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runEvents(ctx, command, opts)
 	case "bulk":
 		return a.runBulk(ctx, opts)
+	case "specify", "decompose":
+		return a.runOrchestration(ctx, command, opts)
 	case "swarm":
 		return a.runSwarm(ctx, opts)
 	case "claim":
