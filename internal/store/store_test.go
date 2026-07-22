@@ -780,3 +780,86 @@ func TestLegacyMVPDatabaseMigratesWithoutDataLoss(t *testing.T) {
 		t.Fatalf("schema version = %d, err=%v", version, err)
 	}
 }
+
+func TestRuntimeSchemaMigrationAddsGeminiWithoutLosingRelatedRecords(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "runtime.db")
+	store, err := Open(dbPath, "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, CreateTaskInput{Title: "Preserve modern data", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddComment(ctx, task.Task.ID, "human", "keep the comment"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AttachURL(ctx, task.Task.ID, "https://example.com/evidence", "evidence"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SubscribeTask(ctx, SubscriptionInput{TaskID: task.Task.ID, Platform: "webhook", ChatID: "https://example.com/hook"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %v %v", claim, err)
+	}
+	if _, err := store.CompleteRun(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, CompletionInput{Summary: "keep the completed run"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyDB, err := sql.Open("sqlite", dataSourceName(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, "PRAGMA writable_schema = ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, `UPDATE sqlite_master
+		SET sql = replace(sql, '''claude'', ''codex'', ''cline'', ''gemini'', ''manual''', '''claude'', ''codex'', ''cline'', ''manual''')
+		WHERE type = 'table' AND name IN ('tasks', 'task_runs')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, "PRAGMA writable_schema = OFF"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, "PRAGMA user_version = 5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(dbPath, "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	preserved, err := migrated.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preserved.Comments) != 1 || preserved.Comments[0].Body != "keep the comment" ||
+		len(preserved.Attachments) != 1 || preserved.Attachments[0].URL == nil ||
+		len(preserved.Runs) != 1 || preserved.Runs[0].Summary == nil || *preserved.Runs[0].Summary != "keep the completed run" ||
+		!hasEventKind(preserved.Events, "completed") {
+		t.Fatalf("runtime migration lost related records: %+v", preserved)
+	}
+	subscriptions, err := migrated.ListNotificationSubscriptions(ctx, task.Task.ID)
+	if err != nil || len(subscriptions) != 1 {
+		t.Fatalf("runtime migration lost subscription: %+v %v", subscriptions, err)
+	}
+	gemini, err := migrated.CreateTask(ctx, CreateTaskInput{Title: "New Gemini task", Assignee: stringValue("gemini-worker"), Runtime: model.RuntimeGemini})
+	if err != nil {
+		t.Fatal(err)
+	}
+	geminiClaim, err := migrated.ClaimTask(ctx, ClaimOptions{TaskID: gemini.Task.ID})
+	if err != nil || geminiClaim == nil || geminiClaim.Run.Runtime != model.RuntimeGemini {
+		t.Fatalf("Gemini task was not claimable after migration: %+v %v", geminiClaim, err)
+	}
+}
