@@ -254,8 +254,10 @@ func (m *Model) View() string {
 	}
 	header := lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("AUTOGORA") +
 		lipgloss.NewStyle().Foreground(colorText).Render("  "+boardName)
-	if m.boardContext != nil {
+	if m.boardContext != nil && m.width >= 100 {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %d profiles · planner %s", len(m.boardContext.Profiles), m.boardContext.Metadata.Orchestration.PlannerRuntime))
+	} else if m.boardContext != nil && m.width >= 70 {
+		header += lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %d profiles", len(m.boardContext.Profiles)))
 	}
 	if m.inputMode == "search" {
 		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  /" + m.searchDraft + "█")
@@ -276,11 +278,15 @@ func (m *Model) View() string {
 		filters = append(filters, "runtime="+string(m.runtimeFilter))
 	}
 	if len(filters) > 0 {
-		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  [" + strings.Join(filters, " · ") + "]")
+		label := fmt.Sprintf("%d filters", len(filters))
+		if m.width >= 100 {
+			label = strings.Join(filters, " · ")
+		}
+		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  [" + label + "]")
 	}
 	if m.loading {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  refreshing…")
-	} else if !m.updated.IsZero() {
+	} else if !m.updated.IsZero() && m.width >= 80 {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  updated " + m.updated.Format(time.Kitchen))
 	}
 	if m.err != nil {

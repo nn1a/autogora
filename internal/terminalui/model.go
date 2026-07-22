@@ -700,6 +700,9 @@ func (m *Model) regroupTasks() {
 		}
 	}
 	m.tasks = grouped
+	if m.detail != nil && m.detail.Task.ID != m.selectedID() {
+		m.detail, m.graph, m.detailScroll = nil, nil, 0
+	}
 }
 
 func statusIndex(statuses []model.TaskStatus, status model.TaskStatus) int {
