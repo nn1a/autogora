@@ -1319,9 +1319,16 @@ export class KanbanStore {
       }
       if (
         task.current_run_id &&
-        (input.assignee !== undefined || input.runtime !== undefined || input.workspace !== undefined || input.workspaceKind !== undefined)
+        ((input.assignee !== undefined && input.assignee !== task.assignee)
+          || (input.runtime !== undefined && input.runtime !== task.runtime)
+          || (input.workspace !== undefined && input.workspace !== task.workspace)
+          || (input.workspaceKind !== undefined && input.workspaceKind !== task.workspace_kind)
+          || (input.branch !== undefined && input.branch !== task.branch))
       ) {
-        throw new Error("Cannot change task ownership or workspace while a run is active");
+        throw new Error("Cannot change task ownership, workspace, or branch while a run is active; terminate the run first");
+      }
+      if (task.current_run_id && input.status !== undefined && input.status !== "running") {
+        throw new Error("Cannot change the status of a running task administratively; terminate the active run first");
       }
       const updates: string[] = [];
       const values: SQLInputValue[] = [];
@@ -1362,18 +1369,6 @@ export class KanbanStore {
       if (input.workflowTemplateId !== undefined) add("workflow_template_id", input.workflowTemplateId);
       if (input.currentStepKey !== undefined) add("current_step_key", input.currentStepKey);
       if (input.status !== undefined) add("status", input.status);
-      let reclaimedRunId: string | null = null;
-      if (task.current_run_id && input.status && input.status !== "running") {
-        const runStatus: Run["status"] = input.status === "done"
-          ? "completed"
-          : input.status === "blocked"
-            ? "blocked"
-            : "reclaimed";
-        reclaimedRunId = this.closeRunNoTransaction(task, runStatus, {
-          error: runStatus === "reclaimed" ? `Administrative status transition to ${input.status}` : null,
-        });
-        add("current_run_id", null);
-      }
       if (input.status === "done") {
         add("failure_count", 0);
         add("block_kind", null);
@@ -1387,14 +1382,11 @@ export class KanbanStore {
       this.appendEvent(taskId, "updated", input as Record<string, unknown>);
       if (input.status === "done" && task.status !== "done") {
         const completedAt = now();
-        this.appendEvent(taskId, "completed", { summary: "Completed by administrative status update", resultLength: task.result?.length ?? 0 }, reclaimedRunId);
+        this.appendEvent(taskId, "completed", { summary: "Completed by administrative status update", resultLength: task.result?.length ?? 0 });
         this.satisfyOutgoingDependenciesNoTransaction(taskId, completedAt);
       }
       if (input.status === "archived") {
         this.db.prepare("DELETE FROM notification_subscriptions WHERE task_id = ?").run(taskId);
-      }
-      if (reclaimedRunId && input.status && !["done", "blocked"].includes(input.status)) {
-        this.appendEvent(taskId, "reclaimed", { status: input.status }, reclaimedRunId);
       }
       if (input.status === undefined || ["ready", "todo", "scheduled"].includes(input.status)) {
         this.recomputeReady(taskId);
@@ -2204,11 +2196,11 @@ export class KanbanStore {
     this.write(() => {
       const task = this.requireTaskRow(taskId);
       if (task.status === "archived") return;
-      const runId = this.closeRunNoTransaction(task, "reclaimed", { error: "Task archived while running" });
+      if (task.current_run_id) throw new Error("Cannot archive a running task; terminate the active run first");
       this.db
         .prepare("UPDATE tasks SET status = 'archived', current_run_id = NULL, updated_at = ? WHERE id = ?")
         .run(now(), taskId);
-      this.appendEvent(taskId, "archived", null, runId);
+      this.appendEvent(taskId, "archived");
       this.db.prepare("DELETE FROM notification_subscriptions WHERE task_id = ?").run(taskId);
     });
     return this.getTask(taskId);
@@ -2216,7 +2208,8 @@ export class KanbanStore {
 
   deleteTask(taskId: string): { id: string; deleted: true } {
     const result = this.write(() => {
-      this.requireTaskRow(taskId);
+      const task = this.requireTaskRow(taskId);
+      if (task.current_run_id) throw new Error("Cannot delete a running task; terminate the active run first");
       const dependents = this.db
         .prepare("SELECT child_id FROM task_links WHERE parent_id = ?")
         .all(taskId) as unknown as Array<{ child_id: string }>;
@@ -2662,6 +2655,9 @@ export class KanbanStore {
     const cleanSummary = completion.summary?.trim() || completion.result?.trim() || "";
     const cleanResult = completion.result?.trim() || null;
     const preflight = this.requireTaskRow(taskId);
+    if (preflight.current_run_id) {
+      throw new Error("Cannot complete a running task administratively; let the worker complete or terminate the active run first");
+    }
     const captured = preflight.status === "done" ? [] : this.captureArtifacts(preflight, completion.artifacts);
     const metadata = captured.length > 0
       ? { ...(completion.metadata ?? {}), artifacts: captured.map((attachment) => ({ id: attachment.id, name: attachment.name, path: attachment.path })) }
@@ -2753,9 +2749,8 @@ export class KanbanStore {
       const task = this.requireTaskRow(taskId);
       if (["done", "archived"].includes(task.status)) throw new Error(`Cannot block a ${task.status} task`);
       if (task.status === "blocked") throw new Error("Task is already blocked; unblock it before blocking again");
-      const runId = task.current_run_id
-        ? this.closeRunNoTransaction(task, "blocked", { error: input.reason.trim() })
-        : this.syntheticRunNoTransaction(task, "blocked", { error: input.reason.trim() });
+      if (task.current_run_id) throw new Error("Cannot block a running task administratively; terminate the active run first");
+      const runId = this.syntheticRunNoTransaction(task, "blocked", { error: input.reason.trim() });
       this.blockNoTransaction(task, input, runId);
     });
     return this.getTask(taskId);

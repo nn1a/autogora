@@ -5,6 +5,7 @@ import { z } from "zod";
 import { BoardManager, type BoardUpdate } from "./boards.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
+import { terminateRun, terminateTaskRun } from "./run-control.js";
 import {
   createCliPlanner,
   decomposeTriageTask,
@@ -426,6 +427,29 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     },
     async ({ task_id, board }) =>
       result(usingStore(manager, board, (store) => store.getTask(scopedTaskId(task_id)).runs)),
+  );
+
+  server.registerTool(
+    "kanban_run_terminate",
+    {
+      title: "Terminate a TaskCircuit worker run",
+      description: "Signal an active worker process and atomically reclaim its run before an administrative task transition.",
+      inputSchema: z.object({
+        board: z.string().optional(),
+        task_id: z.string().optional(),
+        run_id: z.string().optional(),
+        reason: z.string().optional(),
+      }).refine(({ task_id, run_id }) => Boolean(task_id) !== Boolean(run_id), {
+        message: "Provide exactly one of task_id or run_id",
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ board, task_id, run_id, reason }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => run_id
+        ? terminateRun(store, run_id, reason ?? "Run terminated through TaskCircuit MCP")
+        : terminateTaskRun(store, task_id!, reason ?? "Run terminated through TaskCircuit MCP")));
+    },
   );
 
   server.registerTool(

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { terminateTaskRun } from "../src/run-control.js";
 import { KanbanStore } from "../src/store.js";
 
 test("dependency-gated tasks promote after a verified parent completion", () => {
@@ -499,7 +500,7 @@ test("typed dependency blocks wait in todo and repeated human blockers escalate 
   }
 });
 
-test("human lifecycle actions synthesize handoff runs and administrative moves reclaim active runs", () => {
+test("human lifecycle actions synthesize handoffs and require explicit active-run termination", () => {
   const store = new KanbanStore(":memory:");
   try {
     const manual = store.createTask({ title: "human task" });
@@ -516,6 +517,24 @@ test("human lifecycle actions synthesize handoff runs and administrative moves r
     const running = store.createTask({ title: "running", assignee: "worker", runtime: "codex" });
     const claim = store.claimTask({ taskId: running.task.id });
     assert.ok(claim);
+    assert.throws(() => store.archiveTask(running.task.id), /terminate the active run first/);
+    assert.throws(() => store.deleteTask(running.task.id), /terminate the active run first/);
+    assert.throws(() => store.completeTask(running.task.id, { summary: "unsafe" }), /terminate the active run first/);
+    assert.throws(() => store.blockTask(running.task.id, { reason: "unsafe" }), /terminate the active run first/);
+    assert.throws(() => store.updateTask(running.task.id, { status: "done" }), /terminate the active run first/);
+    assert.throws(() => store.updateTask(running.task.id, { branch: "changed-mid-run" }), /terminate the run first/);
+    const editedSnapshot = store.updateTask(running.task.id, {
+      title: "running with clarified title",
+      body: "Clarification applies to the current task record without moving its workspace.",
+      assignee: "worker",
+      runtime: "codex",
+      priority: 4,
+    });
+    assert.equal(editedSnapshot.task.status, "running");
+    assert.equal(editedSnapshot.task.priority, 4);
+    const terminated = terminateTaskRun(store, running.task.id, "Administrative edit requires a fresh run");
+    assert.equal(terminated.signaled, false);
+    assert.equal(terminated.task.task.status, "ready");
     const archived = store.archiveTask(running.task.id);
     assert.equal(archived.task.status, "archived");
     assert.equal(archived.task.currentRunId, null);

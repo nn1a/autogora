@@ -79,6 +79,21 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     assert.match(forbiddenGraph.stderr, /scoped to task/);
     successfulJson<any[]>(["complete", created.task.id, "--summary", "CLI flow complete"], scopedWorkerEnv);
 
+    const terminable = successfulJson<any>([
+      "create", "Terminable CLI task", "--db", dbPath, "--assignee", "worker", "--runtime", "codex",
+    ]);
+    const terminableClaim = successfulJson<any>(["claim", terminable.task.id, "--db", dbPath]);
+    assert.equal(terminableClaim.task.task.status, "running");
+    const terminated = successfulJson<any>([
+      "terminate", terminable.task.id, "--reason", "CLI administrative change", "--db", dbPath,
+    ]);
+    assert.equal(terminated.runId, terminableClaim.run.id);
+    assert.equal(terminated.signaled, false);
+    assert.equal(terminated.task.task.status, "ready");
+    successfulJson<any[]>([
+      "complete", terminable.task.id, "--summary", "Terminated run replaced by an administrative completion", "--db", dbPath,
+    ]);
+
     const first = successfulJson<any>(["create", "First", "--db", dbPath]);
     const second = successfulJson<any>(["create", "Second", "--db", dbPath]);
     const hierarchy = successfulJson<any>([

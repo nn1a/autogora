@@ -49,6 +49,7 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_profile_describe_auto"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_swarm"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_graph"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_run_terminate"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_subtask_set"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_subtask_remove"));
     const boards = textPayload(
@@ -199,6 +200,29 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
     ) as { task: { status: string }; runs: { status: string }[] };
     assert.equal(completed.task.status, "done");
     assert.equal(completed.runs[0]?.status, "completed");
+
+    const terminable = textPayload(
+      await client.callTool({
+        name: "kanban_create",
+        arguments: { title: "Terminable MCP task", assignee: "worker", runtime: "codex" },
+      }),
+    ) as { task: { id: string } };
+    const terminableClaim = textPayload(
+      await client.callTool({ name: "kanban_claim", arguments: { task_id: terminable.task.id } }),
+    ) as { run: { id: string } };
+    const terminated = textPayload(
+      await client.callTool({
+        name: "kanban_run_terminate",
+        arguments: { task_id: terminable.task.id, reason: "MCP administrative change" },
+      }),
+    ) as { runId: string; signaled: boolean; task: { task: { status: string } } };
+    assert.equal(terminated.runId, terminableClaim.run.id);
+    assert.equal(terminated.signaled, false);
+    assert.equal(terminated.task.task.status, "ready");
+    await client.callTool({
+      name: "kanban_update",
+      arguments: { task_id: terminable.task.id, status: "done" },
+    });
 
     const parked = textPayload(
       await client.callTool({ name: "kanban_create", arguments: { title: "parked admin task" } }),

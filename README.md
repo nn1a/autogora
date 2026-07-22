@@ -351,7 +351,7 @@ automation compatibility.
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
 - Attachments: `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_attachment_remove`
 - Observability: `kanban_context`, `kanban_stats`, `kanban_diagnostics`, `kanban_events`, `kanban_runs`, `kanban_log`
-- Administration: `kanban_bulk`, `kanban_gc`
+- Administration: `kanban_run_terminate`, `kanban_bulk`, `kanban_gc`
 - Notifications: `kanban_notify_subscribe`, `kanban_notify_list`, `kanban_notify_unsubscribe`, `kanban_notify_deliver`
 - Orchestration: `kanban_specify`, `kanban_decompose`, `kanban_profile_describe_auto`, `kanban_swarm`
 - Human recovery: `kanban_unblock`, `kanban_promote`, `kanban_schedule`, `kanban_archive`, `kanban_delete`
@@ -381,6 +381,12 @@ prerequisite handoffs, direct dependents, and a metadata-only phase map. Bodies,
 workspaces, attachments, and unfinished results from other nodes are not copied
 into worker context. The dispatcher still rechecks the dependency gate inside
 the same transaction that claims a task.
+
+Administrative completion, blocking, archiving, deletion, and ownership or
+workspace moves reject a task with an active run. Use `taskcircuit terminate
+<task-id>` or `kanban_run_terminate` first; this signals the recorded worker PID
+and atomically reclaims the run. Title, body, and priority clarifications remain
+editable during a run, while workspace and branch identity stay fixed.
 
 ## Skills
 

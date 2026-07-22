@@ -19,6 +19,7 @@ import { BoardManager, type BoardUpdate } from "./boards.js";
 import { runDispatcher } from "./dispatcher.js";
 import { garbageCollect } from "./maintenance.js";
 import { deliverNotifications } from "./notifications.js";
+import { terminateRun } from "./run-control.js";
 import {
   createCliPlanner,
   decomposeTriageTask,
@@ -220,16 +221,6 @@ function taskUpdate(body: JsonObject): UpdateTaskInput {
     goalMaxTurns: numberValue(body.goalMaxTurns),
     status: statusValue(body.status),
   };
-}
-
-function terminatePid(pid: number | null): boolean {
-  if (pid === null || pid === process.pid) return false;
-  try {
-    process.kill(pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export async function startDashboardServer(options: DashboardServerOptions): Promise<DashboardServerHandle> {
@@ -632,18 +623,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         }
         if (segments[3] === "terminate" && method === "POST") {
           const body = await readJson(request);
-          const value = await withStore(manager, board, (store) => {
-            const inspection = store.getRun(segments[2]!);
-            if (inspection.run.status !== "running") throw new Error("Run is already terminal");
-            const signaled = terminatePid(inspection.run.pid);
-            const task = store.recoverAbandonedRun(
-              inspection.run.id,
-              "reclaimed",
-              stringValue(body.reason) ?? "Run terminated from dashboard",
-              false,
-            );
-            return { signaled, task };
-          });
+          const value = await withStore(manager, board, (store) => terminateRun(
+            store,
+            segments[2]!,
+            stringValue(body.reason) ?? "Run terminated from dashboard",
+          ));
           sendJson(response, 200, value);
           return;
         }

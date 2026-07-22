@@ -21,6 +21,8 @@ Use TaskCircuit MCP to turn a goal into a small dependency graph that workers ca
 6. Use `kanban_link` only for dependencies discovered after creation (`parent_id` is the prerequisite, `child_id` is the dependent). Use `kanban_subtask_set` only for hierarchy ownership; hierarchy does not gate execution. Cycles are invalid in both relation types.
 7. Call `kanban_graph` and `kanban_show` on the created cards. Check hierarchy membership, topological phases, root readiness, and that dependency-gated subtasks remain `todo` until every prerequisite handoff is satisfied.
 
+If an administrative change must replace an active run, call `kanban_run_terminate` first. Do not move, complete, archive, or delete a running task while its worker can still modify the workspace.
+
 Do not claim or implement cards while acting as orchestrator. The dispatcher owns claims and worker launch.
 
 ## Routing guidelines

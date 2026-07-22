@@ -16,6 +16,7 @@ import {
   type ProfileRoute,
 } from "./orchestration.js";
 import { runStdioServer } from "./server.js";
+import { terminateTaskRun } from "./run-control.js";
 import { WorkspaceManager } from "./workspaces.js";
 import {
   BLOCK_KINDS,
@@ -44,6 +45,7 @@ Commands:
   context <task-id>     Print the bounded worker context
   runs <task-id>        Show attempt history
   log <task-id>         Read the latest worker log tail
+  terminate <task-id>   Signal and reclaim a task's active worker run
   stats                 Show board counts
   diagnostics           Inspect board health and active workers
   tail <task-id>        Read or follow one task's events
@@ -501,6 +503,27 @@ async function main(): Promise<void> {
         const log = store.readRunLog(taskId, numberOption(parsed.values["tail-bytes"], 64 * 1_024), parsed.values.run);
         process.stdout.write(log.text.endsWith("\n") ? log.text : `${log.text}\n`);
       }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "terminate") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { db: { type: "string" }, reason: { type: "string" } },
+    });
+    const taskId = parsed.positionals[0];
+    if (!taskId) throw new Error("terminate requires a task id");
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      process.stdout.write(`${JSON.stringify(terminateTaskRun(
+        store,
+        taskId,
+        parsed.values.reason ?? "Run terminated from TaskCircuit CLI",
+      ), null, 2)}\n`);
     } finally {
       store.close();
     }

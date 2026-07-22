@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 
+import { terminateTaskRun } from "../src/run-control.js";
 import { KanbanStore } from "../src/store.js";
 
 test("rate limits requeue without consuming retries and cooldown through scheduled", () => {
@@ -61,6 +64,31 @@ test("abandoned claims can defer for a live PID or recover with a classified out
     assert.equal(recovered.runs[0]?.status, "crashed");
     assert.equal(store.listActiveRuns().length, 0);
   } finally {
+    store.close();
+  }
+});
+
+test("explicit termination signals the recorded worker before reclaiming its run", async () => {
+  const store = new KanbanStore(":memory:");
+  let child: ChildProcess | undefined;
+  try {
+    const task = store.createTask({ title: "terminable worker", assignee: "worker", runtime: "codex" });
+    const claim = store.claimTask({ taskId: task.task.id });
+    assert.ok(claim);
+    child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(child, "spawn");
+    assert.ok(child.pid);
+    store.recordSpawn({ runId: claim.run.id, claimToken: claim.claimToken }, child.pid, "/tmp/taskcircuit-termination-test.log");
+
+    const exited = once(child, "exit");
+    const terminated = terminateTaskRun(store, task.task.id, "test termination");
+    assert.equal(terminated.signaled, true);
+    assert.equal(terminated.pid, child.pid);
+    assert.equal(terminated.task.task.status, "ready");
+    await exited;
+    assert.notEqual(child.signalCode, null);
+  } finally {
+    if (child?.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     store.close();
   }
 });

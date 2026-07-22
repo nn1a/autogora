@@ -373,9 +373,9 @@ function renderDrawer(detail) {
       ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
       ${task.status === "ready" ? '<button data-action="claim">Start manually</button>' : ""}
       ${["todo", "scheduled", "blocked", "triage", "review"].includes(task.status) ? '<button data-action="promote">Promote</button>' : ""}
-      ${task.status !== "done" && task.status !== "archived" ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
-      ${task.status !== "archived" ? '<button data-action="archive">Archive</button>' : ""}
-      <button data-action="delete" class="danger">Delete</button>
+      ${!["running", "done", "archived"].includes(task.status) ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
+      ${!["running", "archived"].includes(task.status) ? '<button data-action="archive">Archive</button>' : ""}
+      ${task.status !== "running" ? '<button data-action="delete" class="danger">Delete</button>' : '<span class="action-note">Terminate the active run below before completing, blocking, archiving, or deleting.</span>'}
     </div>
     <h3>Rendered description</h3><div class="markdown">${markdown(task.body || "(empty)")}</div>
     <h3>Execution order</h3>

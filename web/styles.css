@@ -406,6 +406,7 @@ body.drag-active .trash-drop { transform: translate(-50%, 0); opacity: 1; pointe
 .drawer-grid { display: grid; grid-template-columns: 1fr 1fr 100px; gap: 9px; }
 #save-task { width: 100%; }
 .action-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.action-note { flex: 1 1 100%; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .markdown { color: var(--text-subtle); line-height: 1.65; }
 .markdown pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); padding: 10px; border-radius: 8px; }
 .markdown a, .detail-row a { color: var(--accent); }
