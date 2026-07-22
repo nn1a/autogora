@@ -167,16 +167,24 @@ autogora tui --board product-web
 
 The full-screen TUI adapts its visible columns and detail panel to the terminal
 width. It refreshes every two seconds while preserving the selected task.
-Use the arrow keys or `h/j/k/l` to navigate, `/` to search, `tab` to switch
-between overview, relationships, and activity, and `a` to include archived
-tasks. Press `?` for the complete key map.
+Use the arrow keys or `h/j/k/l` to navigate, `/` to search, `f` to filter by
+tenant, assignee, or runtime, `tab` to switch between overview, relationships,
+and activity, and `a` to include archived tasks. Press `?` for the complete key
+map.
 
-Task creation, title and assignee edits, comments, promotion, blocking,
-unblocking, completion, and archiving use the same validated store operations
-as the CLI and dashboard. Lifecycle changes that can hide or finish work require
-confirmation, and the confirmation remains pinned to the displayed task ID if
-the board refreshes. An active worker still owns a Running task; the TUI does
-not bypass run termination or claim rules.
+The create and edit form has Task, Agent, and Execution sections. It covers the
+Web form's title, description, status, priority, assignee, runtime, tenant,
+workspace, skills, and goal-mode fields. Board profiles come from the same
+board metadata and observed task routes as the Web API; choosing one fills both
+assignee and runtime. Press `ctrl+s` to validate and save the form.
+
+Press `space` for the searchable task action palette. It includes status moves,
+Specify, Decompose, Promote, Unblock, manual claim, active-run termination,
+scheduling, completion and blocking, hierarchy and dependency edits, comments,
+file/URL attachments, archive, and delete. These actions use the same in-process
+task service as the dashboard. Destructive and planner actions remain pinned to
+the displayed task ID while the board refreshes and require confirmation. The
+TUI does not bypass active-run ownership, dependency, claim, or lifecycle rules.
 
 ## Web dashboard and HTTP API
 

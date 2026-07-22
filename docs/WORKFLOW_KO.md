@@ -87,19 +87,34 @@ autogora dispatch --once --allow-writes --board product-web
 | 키 | 동작 |
 | --- | --- |
 | 방향키, `h/j/k/l` | 컬럼과 카드 이동 |
-| `/` | 제목과 본문 검색. `Enter`로 적용하고 `Esc`로 취소 |
+| `/` | task 전체 필드 검색. `Enter`로 적용하고 `Esc`로 취소 |
+| `f` | Tenant, Assignee, Runtime 필터 |
 | `Tab`, `1`~`3` | Overview, Relations, Activity 전환 |
 | `Page Up`, `Page Down` | 긴 상세 내용 스크롤 |
 | `a` | Archived 컬럼 표시 또는 숨김 |
-| `n` | `Triage` task 생성 |
-| `e`, `s`, `C` | 제목 수정, 담당자 변경, 댓글 추가 |
+| `Space` | 선택한 task의 action palette |
+| `n` | 현재 컬럼에 task 생성 |
+| `e`, `s`, `C` | 전체 편집 폼, Agent 섹션, 댓글 추가 |
+| `m` | 상태 선택 메뉴 |
 | `p`, `u` | Promote, Unblock |
 | `b`, `c`, `x` | Block, Complete, Archive |
 | `r`, `?`, `q` | 즉시 갱신, 도움말, 종료 |
 
-`Promote`, `Unblock`, `Complete`, `Archive`는 확인창에 표시된 task ID를 기준으로 실행한다. 확인하는 동안 자동 갱신이나 선택 변경이 일어나도 다른 task에 적용되지 않는다. `Running` task의 제목, 담당자, 상태는 TUI에서 바꿀 수 없다. 먼저 Web UI나 `autogora terminate <task-id>`로 활성 run을 종료한다.
+생성·편집 폼은 세 섹션으로 구성된다.
 
-관계와 실행 기록을 확인하면서 간단한 운영 작업을 처리할 때는 TUI가 빠르다. dependency 편집, 첨부 업로드, 실행 종료, planner 실행, 여러 task 일괄 변경은 Web UI나 CLI를 사용한다.
+| 섹션 | 필드 |
+| --- | --- |
+| Task | Title, Description, Status, Priority |
+| Agent | Board profile, Assignee, Runtime, Skills |
+| Execution | Tenant, Workspace kind/path, Goal mode |
+
+`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. 선택 필드는 방향키, Goal mode는 `Space`로 변경한다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile은 Web API와 같은 board metadata 및 기존 task route에서 읽는다. Profile을 선택하면 Assignee와 Runtime이 함께 설정된다.
+
+`Space` action palette에서는 Specify, Decompose, Promote, Unblock, 수동 claim, 활성 run 종료, Schedule, Block, Complete, hierarchy와 dependency 편집, 첨부, Archive, Delete를 실행할 수 있다. 메뉴 항목이나 관계 대상이 많으면 메뉴 안에서 `/`를 눌러 검색한다.
+
+Planner action과 중요한 상태 변경은 확인창에 표시된 task ID를 기준으로 실행한다. 확인하는 동안 자동 갱신이나 선택 변경이 일어나도 다른 task에 적용되지 않는다. `Running` task에서는 Title, Description, Priority처럼 소유권과 무관한 필드만 수정할 수 있다. Assignee, Runtime, Workspace, Status를 바꾸려면 action palette에서 활성 run을 먼저 종료한다.
+
+TUI와 Web UI는 같은 task service, SQLite DB, board profile, planner 설정을 사용한다. 한 화면에서 저장한 변경은 다른 화면의 다음 갱신에 나타난다. 여러 task 일괄 변경, board 설정, swarm 생성, dispatcher 시작은 Web UI나 CLI를 사용한다.
 
 ## 3. 상태를 읽는 법
 
