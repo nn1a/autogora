@@ -49,6 +49,12 @@ func (f *taskForm) renderField(field formField, width int) string {
 	label := lipgloss.NewStyle().Bold(focused).Foreground(labelColor).Render(marker + formFieldLabel(field))
 	if locked {
 		label += lipgloss.NewStyle().Foreground(colorMuted).Render("  locked while Running")
+	} else if focused && !f.textField(field) && field != fieldBody {
+		hint := "  ↑/↓ select"
+		if field == fieldGoalMode {
+			hint = "  Space toggle"
+		}
+		label += lipgloss.NewStyle().Foreground(colorMuted).Render(hint)
 	}
 	var value string
 	if field == fieldBody {
@@ -120,7 +126,11 @@ func (m *Model) renderTaskForm(width, height int) string {
 	if f.err != nil {
 		lines = append(lines, lipgloss.NewStyle().Foreground(statusColor("blocked")).Render(f.err.Error()), "")
 	}
-	lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render("tab/shift+tab field · ctrl+←/→ section · ctrl+s save · esc cancel"))
+	helpStyle := lipgloss.NewStyle().Foreground(colorMuted)
+	lines = append(lines,
+		helpStyle.Render("↑/↓ select value · Space toggle · Tab/Shift+Tab field"),
+		helpStyle.Render("Ctrl+←/→ section · Ctrl+S save · Esc cancel"),
+	)
 	content := strings.Join(lines, "\n")
 	panel := baseBorder.Copy().BorderForeground(colorFocus).Width(panelWidth-2).Padding(1, 2).Render(content)
 	if lipgloss.Height(panel) > height {

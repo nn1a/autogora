@@ -177,6 +177,9 @@ Web form's title, description, status, priority, assignee, runtime, tenant,
 workspace, skills, and goal-mode fields. Board profiles come from the same
 board metadata and observed task routes as the Web API; choosing one fills both
 assignee and runtime. Press `ctrl+s` to validate and save the form.
+Use the up and down arrow keys to change Status, Board profile, Runtime, and
+Workspace kind; press `space` to toggle Goal mode. The form also shows these
+controls next to the focused selection field.
 
 Press `space` for the searchable task action palette. It includes status moves,
 Specify, Decompose, Promote, Unblock, manual claim, active-run termination,

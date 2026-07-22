@@ -1,6 +1,7 @@
 package terminalui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -72,5 +73,23 @@ func TestReadyFormRequiresRunnableAgent(t *testing.T) {
 	form.runtimeIndex = optionIndex(formRuntimes, "claude")
 	if err := form.validate(); err != nil {
 		t.Fatalf("valid agent route was rejected: %v", err)
+	}
+}
+
+func TestTaskFormExplainsSelectionControls(t *testing.T) {
+	form := newTaskForm("default", []orchestration.ProfileRoute{{Name: "reviewer", Runtime: model.RuntimeGemini}}, model.TaskStatusTriage)
+	form.focus = fieldProfile
+	form.syncFocus()
+	view := (&Model{form: form}).renderTaskForm(120, 32)
+	for _, text := range []string{"Board profile", "↑/↓ select", "↑/↓ select value", "Space toggle"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("form omitted selection help %q", text)
+		}
+	}
+
+	form.focus = fieldGoalMode
+	form.syncFocus()
+	if view := form.renderField(fieldGoalMode, 40); !strings.Contains(view, "Space toggle") {
+		t.Fatal("goal mode omitted its toggle hint")
 	}
 }

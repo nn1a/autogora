@@ -108,7 +108,7 @@ autogora dispatch --once --allow-writes --board product-web
 | Agent | Board profile, Assignee, Runtime, Skills |
 | Execution | Tenant, Workspace kind/path, Goal mode |
 
-`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. 선택 필드는 방향키, Goal mode는 `Space`로 변경한다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile은 Web API와 같은 board metadata 및 기존 task route에서 읽는다. Profile을 선택하면 Assignee와 Runtime이 함께 설정된다.
+`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. Status, Board profile, Runtime, Workspace kind에 포커스한 뒤 `↑/↓`로 값을 선택하고, Goal mode는 `Space`로 전환한다. 폼에도 현재 필드의 조작 키가 표시된다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile은 Web API와 같은 board metadata 및 기존 task route에서 읽는다. Profile을 선택하면 Assignee와 Runtime이 함께 설정된다.
 
 `Space` action palette에서는 Specify, Decompose, Promote, Unblock, 수동 claim, 활성 run 종료, Schedule, Block, Complete, hierarchy와 dependency 편집, 첨부, Archive, Delete를 실행할 수 있다. 메뉴 항목이나 관계 대상이 많으면 메뉴 안에서 `/`를 눌러 검색한다.
 
