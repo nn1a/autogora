@@ -82,9 +82,69 @@ autogora dashboard --db /absolute/path/to/data/autogora.db
 autogora serve --db /absolute/path/to/data/autogora.db
 ```
 
-## 3. Claude Code와 Codex에 MCP 연결
+## 3. 권장 자동 설정: Skill 설치와 MCP 등록
 
-MCP 클라이언트에는 `autogora`의 절대 경로를 등록하는 편이 안전하다.
+Autogora 바이너리에는 `autogora-worker`, `autogora-orchestrator` Skill이 포함되어 있다. 별도 저장소를 복사하거나 npm 패키지를 설치할 필요 없이, 프로젝트 디렉터리에서 다음 명령으로 Skill과 MCP를 함께 설정할 수 있다. 먼저 변경 예정 내용을 확인한 뒤 적용한다.
+
+```bash
+cd /path/to/project
+autogora setup --client codex --dry-run
+autogora setup --client codex
+```
+
+`--client`에는 `codex`, `claude`, `gemini`, `all`을 지정할 수 있고 여러 번 반복할 수도 있다.
+
+```bash
+autogora setup --client claude --client codex --dry-run
+autogora setup --client all
+```
+
+기본 범위는 기존 사용자 설정을 불필요하게 넓히지 않도록 클라이언트 특성에 맞춰 다르게 선택한다.
+
+| 대상 | Skill 기본 위치 | MCP 기본 범위 |
+| --- | --- | --- |
+| Codex | 프로젝트 `.agents/skills/` | user |
+| Claude Code | 프로젝트 `.claude/skills/` | local |
+| Gemini CLI | 프로젝트 `.agents/skills/` | project |
+
+Codex와 Gemini를 함께 선택하면 같은 `.agents/skills/` 대상은 한 번만 설치한다. 프로젝트 루트는 현재 위치에서 가장 가까운 `.git` 디렉터리를 기준으로 찾으며, `--project-dir`로 시작 위치를 명시할 수 있다.
+
+각 기능은 따로 관리할 수도 있다.
+
+```bash
+# 내장 Skill만 설치·확인·제거
+autogora skills install --client codex
+autogora skills status --client codex
+autogora skills uninstall --client codex
+
+# MCP만 등록·확인·해제
+autogora mcp register --client codex --dry-run
+autogora mcp register --client codex
+autogora mcp status --client codex
+autogora mcp unregister --client codex
+```
+
+사용자 전체에서 Skill을 공유하려면 `skills` 명령에 `--scope user`를 사용한다. 통합 설정에서는 Skill과 MCP 범위를 독립적으로 지정할 수 있다.
+
+```bash
+autogora setup --client claude \
+  --skill-scope user \
+  --mcp-scope project
+```
+
+안전 규칙은 다음과 같다.
+
+- Skill 설치 파일마다 manifest와 SHA-256을 기록한다. 사용자가 수정한 파일이나 Autogora가 관리하지 않는 같은 이름의 디렉터리는 자동으로 덮어쓰거나 지우지 않는다. 내용을 확인한 뒤에만 `--force`를 사용한다.
+- 같은 이름의 MCP 등록이 다른 바이너리 또는 데이터베이스를 가리키면 중단한다. 기존 등록을 확인한 뒤 교체할 때만 `--replace`를 사용한다.
+- `setup`은 Skill과 MCP 양쪽을 먼저 사전 점검한다. 클라이언트 실행 파일 누락이나 충돌이 발견되면 적용을 시작하지 않는다.
+- MCP 등록에는 Autogora 바이너리와 데이터베이스의 절대 경로가 저장된다. 바이너리를 다른 경로로 옮기거나 데이터베이스 경로를 바꾸면 `mcp status`로 확인하고 `mcp register --replace`로 갱신한다.
+- 명령별 옵션은 `autogora help setup`, `autogora help skills`, `autogora help mcp`에서 확인한다.
+
+현재 Codex CLI의 네이티브 등록은 user 범위를 사용한다. `setup --scope project --client codex`처럼 하나의 project 범위를 양쪽에 강제하지 말고, 기본값을 사용하거나 `--skill-scope project --mcp-scope user`로 분리한다.
+
+## 4. 수동 MCP 연결
+
+자동 설정을 사용하지 않거나 설정 파일을 직접 관리해야 할 때만 아래 절차를 사용한다. MCP 클라이언트에는 `autogora`의 절대 경로를 등록하는 편이 안전하다.
 
 ```bash
 AUTOGORA_BIN=$(command -v autogora)
@@ -95,13 +155,18 @@ claude mcp add --scope local autogora -- \
 
 codex mcp add autogora -- \
   "$AUTOGORA_BIN" serve --db "$AUTOGORA_DB"
+
+gemini mcp add --scope project autogora "$AUTOGORA_BIN" serve -- \
+  --db "$AUTOGORA_DB"
 ```
 
 설정 파일을 직접 관리한다면 [Claude 예제](../examples/claude.mcp.json)와 [Codex 예제](../examples/codex.config.toml)의 절대 경로만 설치 위치에 맞게 바꾼다.
 
-## 4. MCP가 비활성화된 Cline 연결
+## 5. MCP가 비활성화된 Cline 연결
 
 Cline 쪽 MCP 기능은 필요하지 않다. 수정된 Cline이 다음 계약을 만족하면 Autogora dispatcher가 CLI로 상태를 전달한다.
+
+`autogora setup`, `skills`, `mcp`의 client 대상에는 Cline을 넣지 않는다. Cline은 전역 MCP/Skill 설치 대신 실행마다 발급되는 task ID, run ID, claim token을 사용하는 제한된 CLI 브리지로 통신한다. 따라서 한 worker가 다른 task를 완료하거나 수정할 수 없고, MCP 기능이 막힌 수정 버전에서도 동작한다.
 
 - `--json`, `--cwd <path>`, `--auto-approve <boolean>`을 받는다.
 - 마지막 위치 인자로 worker prompt를 받는다.
@@ -133,7 +198,7 @@ autogora decompose <triage-task-id> \
 
 planner 실행은 도구를 쓰지 않는 읽기 전용 구조화 출력 단계다. Cline의 최종 NDJSON 결과가 스키마를 통과한 뒤에만 보드가 변경된다.
 
-## 5. 소스에서 빌드
+## 6. 소스에서 빌드
 
 릴리스 바이너리를 사용하는 일반 사용자에게는 Go가 필요하지 않다. 개발자만 Go 1.25 이상에서 다음 명령을 사용한다. race 검증에는 해당 플랫폼의 C 컴파일러가 추가로 필요하다.
 
@@ -164,7 +229,7 @@ MAX_BINARY_BYTES=18874368 make release VERSION=v1.0.0
 
 UPX와 전체 inlining 비활성화는 기본 빌드에 사용하지 않는다. 작은 추가 절감보다 백신 오탐, 시작 비용, SQLite 처리 성능 저하 가능성이 더 크기 때문이다.
 
-## 6. 업그레이드와 백업
+## 7. 업그레이드와 백업
 
 1. 실행 중인 `dashboard`와 `dispatch --watch` 프로세스를 정상 종료한다.
 2. `data/autogora.db`, `data/boards/`, `data/attachments/`를 백업한다.

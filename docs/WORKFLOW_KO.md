@@ -37,8 +37,12 @@ Triage ── specify ──> Todo ── promote/조건 충족 ──> Ready
 ```bash
 autogora version
 autogora init
+autogora setup --client codex --dry-run
+autogora setup --client codex
 autogora dashboard
 ```
+
+`codex` 대신 실제 사용하는 `claude` 또는 `gemini`를 지정한다. MCP가 비활성화된 수정 Cline은 `setup` 대상이 아니며, 아래의 dispatcher 기반 CLI 브리지를 사용한다. 설치 위치와 범위, 충돌 복구는 [설치 및 업그레이드 안내](INSTALL_KO.md#3-권장-자동-설정-skill-설치와-mcp-등록)를 참고한다.
 
 마지막 명령이 출력한 URL을 브라우저에서 연다. 기본 주소는 `127.0.0.1:8420`이며, URL의 일회용 토큰은 세션 쿠키로 교환된다.
 

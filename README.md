@@ -36,7 +36,28 @@ costs outweigh the small raw-binary savings for this SQLite-backed service.
 Claude Code, Codex, Cline, and Gemini CLI are needed only for the worker or
 planner runtimes you actually select.
 
-## Connect an MCP client
+## Set up an agent client
+
+Autogora embeds its worker and orchestrator Skills and can register its stdio
+MCP server through each client's native CLI. Preview both changes, then apply
+them from the project that will own the board:
+
+```bash
+autogora setup --client codex --dry-run
+autogora setup --client codex
+```
+
+Use `claude`, `gemini`, repeated `--client` options, or `--client all` as
+needed. Skills default to project scope. MCP uses each client's safe native
+default: Codex user, Claude local, and Gemini project. Inspect either half with
+`autogora skills status --client codex` or
+`autogora mcp status --client codex`. Run `autogora help setup`,
+`autogora help skills`, or `autogora help mcp` for scope and recovery options.
+
+For an MCP-disabled Cline build, skip `setup`: the dispatcher uses the scoped
+CLI bridge described below.
+
+### Manual MCP registration
 
 Resolve the installed executable once so the client receives an absolute path:
 
@@ -430,14 +451,18 @@ The portable Agent Skills are under `skills/`:
 - `autogora-worker`: execute and close one claimed task
 - `autogora-orchestrator`: create an executable dependency graph
 
-Install them into the client you use:
+Install both embedded Skills into the project (the default) and inspect them:
 
 ```bash
-cp -R skills/autogora-worker skills/autogora-orchestrator ~/.agents/skills/
-cp -R skills/autogora-worker skills/autogora-orchestrator ~/.claude/skills/
+autogora skills install --client codex
+autogora skills status --client codex
 ```
 
-Restart the client if it does not detect the new skills.
+Codex and Gemini share `.agents/skills`; Claude uses `.claude/skills`. Add
+`--scope user` for a user-wide installation. Autogora records hashes in each
+installed Skill and refuses to overwrite locally modified or unmanaged files
+unless `--force` is explicit. Restart the client if it does not detect the new
+skills.
 
 ## Safety and scope
 
