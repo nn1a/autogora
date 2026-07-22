@@ -75,7 +75,7 @@ Commands:
   schedule <id>         Park a task until a start time
   archive <id>...       Archive tasks
   delete <id>...        Permanently delete tasks
-  dispatch              Run the Claude/Codex/Cline worker dispatcher
+  dispatch              Run the Claude/Codex/Cline/Gemini worker dispatcher
   daemon --force        Run the deprecated standalone dispatcher alias
   dashboard             Run the authenticated local web dashboard
 

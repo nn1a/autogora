@@ -1,11 +1,11 @@
 # Hermes-style Kanban MCP MVP
 
-A local, durable Kanban control plane for Claude Code, Codex, and Cline. Claude and Codex use MCP; MCP-disabled Cline builds use a scoped CLI bridge. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
+A local, durable Kanban control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. It provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, and an optional CLI dispatcher.
 
 ## Requirements
 
 - Node.js 24 or newer
-- Claude Code, Codex, and/or Cline CLI only for the runtimes used by the dispatcher
+- Claude Code, Codex, Cline, and/or Gemini CLI only for the runtimes used by the dispatcher
 
 ## Set up
 
@@ -29,7 +29,14 @@ codex mcp add kanban -- \
   node "$PWD/dist/cli.js" serve --db "$PWD/data/kanban.db"
 ```
 
-The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json), [examples/codex.config.toml](examples/codex.config.toml), and the [MCP-disabled Cline CLI bridge contract](examples/cline-cli-bridge.md).
+Connect Gemini CLI for interactive MCP use:
+
+```bash
+gemini mcp add --scope project kanban node "$PWD/dist/cli.js" serve -- \
+  --db "$PWD/data/kanban.db"
+```
+
+The equivalent checked-in examples are [examples/claude.mcp.json](examples/claude.mcp.json), [examples/codex.config.toml](examples/codex.config.toml), the [MCP-disabled Cline CLI bridge contract](examples/cline-cli-bridge.md), and the [Gemini CLI runtime guide](examples/gemini-cli.md).
 
 For an MCP-disabled Cline build, no Cline MCP configuration is required. Point
 the dispatcher at the executable when it is not named `cline`:
@@ -47,6 +54,21 @@ inherits `KANBAN_TASK_ID`, `KANBAN_RUN_ID`, `KANBAN_CLAIM_TOKEN`,
 `KANBAN_BOARD`, and `KANBAN_DB`; lifecycle commands validate that scope before
 changing state. The Cline build therefore needs shell-command support, but it
 does not need an MCP client.
+
+Gemini dispatcher runs do not modify `.gemini/settings.json`. Set a custom
+binary when necessary, create a routed task, and dispatch it normally:
+
+```bash
+export KANBAN_GEMINI_BIN=/absolute/path/to/gemini
+node dist/cli.js create "Inspect the Gemini integration" \
+  --assignee gemini-worker --runtime gemini --workspace "$PWD"
+node dist/cli.js dispatch --once
+```
+
+The dispatcher uses Gemini headless `stream-json` output and a temporary,
+run-scoped policy. Read-only runs allow Gemini's normal read/search tools, deny
+MCP tools and all shell commands except the exact Kanban lifecycle bridge.
+`--allow-writes` is the explicit opt-in to Gemini `yolo` approval mode.
 
 ## Web dashboard and HTTP API
 
@@ -145,7 +167,7 @@ idempotency key on a board returns the existing non-archived task.
 Goal-mode cards run differently from ordinary one-shot work. After a worker
 turn exits without a terminal lifecycle call, an independent structured-output judge
 checks the card's title/body acceptance criteria. An incomplete card resumes
-the same Claude/Codex session with the judge's next instruction. Stock Cline's
+the same Claude/Codex/Gemini session with the judge's next instruction. Stock Cline's
 headless JSON mode does not support prompt-based `--id` resume, so Cline goals
 continue in a fresh turn using the same workspace and durable Kanban handoff.
 Acceptance completes the task; exhausting `goal_max_turns` blocks it for human
@@ -270,23 +292,25 @@ by CLI or MCP reads.
 
 `specify` turns a rough `triage` card into a scoped task with deliverables,
 acceptance criteria, constraints, and verification. `decompose` asks Claude,
-Codex, or Cline for a structured acyclic graph, validates every route, substitutes a
+Codex, Cline, or Gemini for a structured acyclic graph, validates every route, substitutes a
 configured fallback for unknown assignees, and applies all children, links, and
 root changes in one SQLite transaction. If fan-out adds no value, decomposition
 falls back to specification.
 
-Codex and Claude receive their native structured-output schema flags. Cline has
-no equivalent CLI flag, so the planner prompt includes the schema and the
-dispatcher extracts the final `run_result`/`done` text from NDJSON, parses it as
-JSON, and applies the same domain validation before any board mutation.
+Codex and Claude receive their native structured-output schema flags. Cline and
+Gemini receive the schema in the planner prompt. The dispatcher extracts Cline's
+final `run_result`/`done` NDJSON text or Gemini's headless JSON `response`, parses
+it as JSON, and applies the same domain validation before any board mutation.
+Gemini planners also receive a temporary deny-all tool policy.
 
 ```bash
 node dist/cli.js specify <triage-id> --planner-runtime codex
 node dist/cli.js specify <triage-id> --planner-runtime cline
+node dist/cli.js specify <triage-id> --planner-runtime gemini
 node dist/cli.js decompose <triage-id> \
   --profile "researcher:codex:finds primary sources" \
   --profile "writer:claude:synthesizes verified reports" \
-  --profile "reviewer:cline:checks the implementation through the CLI bridge" \
+  --profile "reviewer:gemini:checks the implementation through Gemini CLI" \
   --default-profile researcher:codex \
   --orchestrator-profile writer:claude
 ```
@@ -305,7 +329,7 @@ verifier:
 
 ```bash
 node dist/cli.js swarm "Design a multi-region failover plan" \
-  --workers researcher:codex,architect:claude,sre:cline \
+  --workers researcher:codex,architect:claude,sre:gemini \
   --verifier reviewer:claude --synthesizer writer:claude
 ```
 
@@ -346,7 +370,7 @@ Restart the client if it does not detect the new skills.
 
 ## Safety and scope
 
-- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust. In read-only Cline runs, the dispatcher approval broker permits read/search tools and only the scoped Kanban CLI lifecycle commands.
+- `--allow-writes` grants a spawned coding worker workspace edits and shell access. Use only in repositories you trust. Read-only Cline runs use the dispatcher approval broker; read-only Gemini runs use a temporary policy. Both permit only their normal read/search tools and the scoped Kanban CLI lifecycle bridge.
 - The MCP server is local stdio only; there is no multi-user isolation.
 - The optional dashboard is authenticated but remains a trusted-local-user,
   single-tenant surface; its bearer token is not a substitute for TLS on an

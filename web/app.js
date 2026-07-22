@@ -280,7 +280,7 @@ function renderDrawer(detail) {
     <label>Title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
     <div class="drawer-grid">
       <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
-      <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+      <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
       <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
     </div>
     <label>Description<textarea id="edit-body" rows="9">${escapeHtml(task.body)}</textarea></label>
@@ -382,7 +382,7 @@ async function drawerAction(taskId, action) {
 
 function parseRoute(value) {
   const [name, runtime = "codex", ...description] = value.trim().split(":");
-  if (!name || !["codex", "claude", "cline"].includes(runtime)) throw new Error(`Invalid route: ${value}`);
+  if (!name || !["codex", "claude", "cline", "gemini"].includes(runtime)) throw new Error(`Invalid route: ${value}`);
   return { name, runtime, description: description.join(":") };
 }
 

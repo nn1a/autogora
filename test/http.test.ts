@@ -38,7 +38,9 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(cookie ?? "", /kanban_session=/);
     const html = await fetch(`${dashboard.url}/`, { headers: { cookie: cookie!.split(";", 1)[0]! } });
     assert.equal(html.status, 200);
-    assert.match(await html.text(), /Kanban Control Plane/);
+    assert.match(await html.text(), /<option>gemini<\/option>/);
+    const app = await fetch(`${dashboard.url}/app.js`, { headers: { cookie: cookie!.split(";", 1)[0]! } });
+    assert.match(await app.text(), /"gemini"/);
 
     const orchestration = await request("/api/boards/default", {
       method: "PATCH",
@@ -48,17 +50,17 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
           autoDecompose: true,
           autoDecomposePerTick: 2,
           autoPromoteChildren: false,
-          plannerRuntime: "cline",
+          plannerRuntime: "gemini",
           defaultProfile: "worker",
-          profiles: [{ name: "worker", runtime: "cline", description: "general work" }],
+          profiles: [{ name: "worker", runtime: "gemini", description: "general work" }],
         },
       }),
     });
     assert.equal(orchestration.response.status, 200);
     assert.equal(orchestration.value.orchestration.autoDecompose, true);
     assert.equal(orchestration.value.orchestration.autoPromoteChildren, false);
-    assert.equal(orchestration.value.orchestration.plannerRuntime, "cline");
-    assert.equal(orchestration.value.orchestration.profiles[0]?.runtime, "cline");
+    assert.equal(orchestration.value.orchestration.plannerRuntime, "gemini");
+    assert.equal(orchestration.value.orchestration.profiles[0]?.runtime, "gemini");
     assert.equal(new BoardManager(dbPath).read("default").orchestration.profiles[0]?.name, "worker");
 
     const invalidSort = await request("/api/tasks?board=default&sort=drop-table");

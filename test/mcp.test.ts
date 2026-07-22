@@ -15,7 +15,7 @@ function textPayload(result: Awaited<ReturnType<Client["callTool"]>>): unknown {
   return JSON.parse(block.text) as unknown;
 }
 
-test("stdio MCP administration can route work across Claude, Codex, and Cline", async () => {
+test("stdio MCP administration can route work across Claude, Codex, Cline, and Gemini", async () => {
   const directory = mkdtempSync(join(tmpdir(), "kanban-mcp-"));
   const dbPath = join(directory, "kanban.db");
   new BoardManager(dbPath).create("project");
@@ -201,7 +201,7 @@ test("stdio MCP administration can route work across Claude, Codex, and Cline", 
         name: "kanban_swarm",
         arguments: {
           goal: "Exercise MCP swarm topology",
-          workers: [{ name: "researcher", runtime: "cline" }],
+          workers: [{ name: "researcher", runtime: "gemini" }],
           verifier: { name: "reviewer", runtime: "claude" },
           synthesizer: { name: "writer", runtime: "claude" },
         },
@@ -209,10 +209,10 @@ test("stdio MCP administration can route work across Claude, Codex, and Cline", 
     ) as { root: { task: { status: string } }; workerIds: string[] };
     assert.equal(swarm.root.task.status, "done");
     assert.equal(swarm.workerIds.length, 1);
-    const clineWorker = textPayload(
+    const geminiWorker = textPayload(
       await client.callTool({ name: "kanban_show", arguments: { task_id: swarm.workerIds[0] } }),
     ) as { task: { runtime: string } };
-    assert.equal(clineWorker.task.runtime, "cline");
+    assert.equal(geminiWorker.task.runtime, "gemini");
     const scheduled = textPayload(
       await client.callTool({
         name: "kanban_schedule",

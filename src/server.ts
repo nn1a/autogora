@@ -230,7 +230,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_create",
     {
       title: "Create Kanban task",
-      description: "Create a durable task, optionally assigned to a Claude, Codex, or Cline worker and gated by parent tasks.",
+      description: "Create a durable task, optionally assigned to a Claude, Codex, Cline, or Gemini worker and gated by parent tasks.",
       inputSchema: z.object({
         title: z.string().min(1),
         body: z.string().default(""),
@@ -584,7 +584,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_specify",
     {
       title: "Specify a Kanban triage task",
-      description: "Rewrite a rough triage card into an executable specification and move it to todo. Provide title/body directly or use a Claude, Codex, or Cline auxiliary planner.",
+      description: "Rewrite a rough triage card into an executable specification and move it to todo. Provide title/body directly or use a Claude, Codex, Cline, or Gemini auxiliary planner.",
       inputSchema: z.object({
         board: z.string().optional(),
         task_id: z.string(),

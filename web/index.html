@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark">K</span>
-      <div><strong>Kanban</strong><small>Claude + Codex control plane</small></div>
+      <div><strong>Kanban</strong><small>multi-runtime agent control plane</small></div>
     </div>
     <div class="board-actions">
       <label class="sr-only" for="board-select">Board</label>
@@ -64,7 +64,7 @@
       <div class="form-grid">
         <label>Status<select name="status"></select></label>
         <label>Assignee<input name="assignee" placeholder="profile name"></label>
-        <label>Runtime<select name="runtime"><option>manual</option><option>codex</option><option>claude</option><option>cline</option></select></label>
+        <label>Runtime<select name="runtime"><option>manual</option><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
         <label>Priority<input name="priority" type="number" value="0"></label>
         <label>Tenant<input name="tenant"></label>
         <label>Workspace kind<select name="workspaceKind"><option>scratch</option><option>dir</option><option>worktree</option></select></label>
@@ -101,7 +101,7 @@
       <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
       <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
       <div class="form-grid">
-        <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option><option>cline</option></select></label>
+        <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
         <label>Per tick<input name="autoDecomposePerTick" type="number" min="1" max="100" value="3"></label>
         <label>Default profile<input name="defaultProfile"></label>
         <label>Orchestrator profile<input name="orchestratorProfile"></label>
@@ -120,7 +120,7 @@
     <form id="swarm-form" method="dialog" class="dialog-form wide">
       <header><h2>Create Kanban swarm</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
       <label>Goal<textarea name="goal" rows="4" required></textarea></label>
-      <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude,reviewer:cline"></label>
+      <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude,reviewer:gemini"></label>
       <div class="form-grid">
         <label>Verifier<input name="verifier" required placeholder="reviewer:claude"></label>
         <label>Synthesizer<input name="synthesizer" required placeholder="writer:claude"></label>

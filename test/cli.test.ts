@@ -97,7 +97,7 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     assert.equal(triage.task.status, "triage");
 
     const dispatchable = successfulJson<any>([
-      "create", "Dry run candidate", "--db", dbPath, "--assignee", "worker", "--runtime", "cline",
+      "create", "Dry run candidate", "--db", dbPath, "--assignee", "worker", "--runtime", "gemini",
     ]);
     const dryRun = successfulJson<any>(["dispatch", "--db", dbPath, "--dry-run", "--max", "1"]);
     assert.equal(dryRun.dryRun, true);

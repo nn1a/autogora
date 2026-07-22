@@ -1,6 +1,6 @@
 ---
 name: kanban-orchestrator
-description: Decompose a goal into durable Kanban tasks, assignees, runtimes, workspaces, and acyclic dependencies. Use for planning or routing multi-step work across Claude, Codex, and Cline workers; do not use to implement claimed worker tasks.
+description: Decompose a goal into durable Kanban tasks, assignees, runtimes, workspaces, and acyclic dependencies. Use for planning or routing multi-step work across Claude, Codex, Cline, and Gemini workers; do not use to implement claimed worker tasks.
 ---
 
 # Kanban Orchestrator
@@ -16,7 +16,7 @@ Use Kanban MCP to turn a goal into a small dependency graph that workers can exe
 5. Create each card with:
    - an outcome-oriented title;
    - a body containing scope, constraints, acceptance criteria, and expected evidence;
-   - an explicit `assignee`, `runtime` (`claude`, `codex`, or `cline`), and workspace policy (`scratch`, `dir:<absolute-path>`, or `worktree`);
+   - an explicit `assignee`, `runtime` (`claude`, `codex`, `cline`, or `gemini`), and workspace policy (`scratch`, `dir:<absolute-path>`, or `worktree`);
    - `parents` when the task consumes another card's result.
 6. Use `kanban_link` only for dependencies discovered after creation. Cycles are invalid.
 7. Call `kanban_show` on the created cards and check that roots are `ready` and gated children are `todo`.

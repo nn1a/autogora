@@ -536,7 +536,7 @@ export async function describeProfileRoute(
     `- ${task.title}: ${task.body.slice(0, 300) || "(no body)"}; skills=${task.skills.join(", ") || "none"}`,
   ).join("\n");
   const prompt = [
-    "You describe a Claude, Codex, or Cline Kanban worker profile for a task-routing planner.",
+    "You describe a Claude, Codex, Cline, or Gemini Kanban worker profile for a task-routing planner.",
     "Write one concise capability description grounded only in the supplied evidence.",
     "State the work this profile should receive and any evident specialization. Do not use marketing language.",
     "Return only the requested structured object.",
