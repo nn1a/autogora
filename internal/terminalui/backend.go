@@ -12,4 +12,5 @@ import (
 type Backend interface {
 	ListTasks(context.Context, store.ListTaskFilter) ([]model.Task, error)
 	GetTask(context.Context, string) (model.TaskDetail, error)
+	RelationshipGraph(context.Context, string) (model.RelationshipGraph, error)
 }

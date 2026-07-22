@@ -23,34 +23,44 @@ var boardStatuses = []model.TaskStatus{
 }
 
 type tasksLoadedMsg struct {
-	tasks []model.Task
-	err   error
-	at    time.Time
+	tasks        []model.Task
+	err          error
+	at           time.Time
+	search       string
+	showArchived bool
 }
 
 type detailLoadedMsg struct {
 	id     string
 	detail model.TaskDetail
+	graph  model.RelationshipGraph
 	err    error
 }
 
 type refreshMsg time.Time
 
 type Model struct {
-	ctx      context.Context
-	backend  Backend
-	board    string
-	width    int
-	height   int
-	column   int
-	cursors  map[model.TaskStatus]int
-	tasks    map[model.TaskStatus][]model.Task
-	detail   *model.TaskDetail
-	loading  bool
-	err      error
-	updated  time.Time
-	help     bool
-	detailOn bool
+	ctx          context.Context
+	backend      Backend
+	board        string
+	width        int
+	height       int
+	column       int
+	cursors      map[model.TaskStatus]int
+	tasks        map[model.TaskStatus][]model.Task
+	detail       *model.TaskDetail
+	graph        *model.RelationshipGraph
+	loading      bool
+	err          error
+	updated      time.Time
+	help         bool
+	detailOn     bool
+	detailTab    int
+	detailScroll int
+	inputMode    string
+	search       string
+	searchDraft  string
+	showArchived bool
 }
 
 func NewModel(ctx context.Context, backend Backend, board string) *Model {
@@ -70,11 +80,12 @@ func tick() tea.Cmd {
 }
 
 func (m *Model) loadTasks() tea.Cmd {
+	search, showArchived := m.search, m.showArchived
 	return func() tea.Msg {
 		tasks, err := m.backend.ListTasks(m.ctx, store.ListTaskFilter{
-			Board: m.board, IncludeArchived: false, Sort: "priority-desc", Limit: 500,
+			Board: m.board, IncludeArchived: showArchived, Search: search, Sort: "priority-desc", Limit: 500,
 		})
-		return tasksLoadedMsg{tasks: tasks, err: err, at: time.Now()}
+		return tasksLoadedMsg{tasks: tasks, err: err, at: time.Now(), search: search, showArchived: showArchived}
 	}
 }
 
@@ -84,12 +95,25 @@ func (m *Model) loadDetail(id string) tea.Cmd {
 	}
 	return func() tea.Msg {
 		detail, err := m.backend.GetTask(m.ctx, id)
-		return detailLoadedMsg{id: id, detail: detail, err: err}
+		if err != nil {
+			return detailLoadedMsg{id: id, err: err}
+		}
+		graph, err := m.backend.RelationshipGraph(m.ctx, id)
+		return detailLoadedMsg{id: id, detail: detail, graph: graph, err: err}
 	}
 }
 
+func (m *Model) statuses() []model.TaskStatus {
+	if !m.showArchived {
+		return boardStatuses
+	}
+	return append(append([]model.TaskStatus{}, boardStatuses...), model.TaskStatusArchived)
+}
+
 func (m *Model) selectedTask() *model.Task {
-	status := boardStatuses[m.column]
+	statuses := m.statuses()
+	m.column = max(0, min(len(statuses)-1, m.column))
+	status := statuses[m.column]
 	items := m.tasks[status]
 	if len(items) == 0 {
 		return nil
@@ -110,19 +134,19 @@ func (m *Model) selectedID() string {
 }
 
 func (m *Model) moveColumn(delta int) tea.Cmd {
-	m.column = max(0, min(len(boardStatuses)-1, m.column+delta))
-	m.detail = nil
+	m.column = max(0, min(len(m.statuses())-1, m.column+delta))
+	m.detail, m.graph, m.detailScroll = nil, nil, 0
 	return m.loadDetail(m.selectedID())
 }
 
 func (m *Model) moveCard(delta int) tea.Cmd {
-	status := boardStatuses[m.column]
+	status := m.statuses()[m.column]
 	items := m.tasks[status]
 	if len(items) == 0 {
 		return nil
 	}
 	m.cursors[status] = max(0, min(len(items)-1, m.cursors[status]+delta))
-	m.detail = nil
+	m.detail, m.graph, m.detailScroll = nil, nil, 0
 	return m.loadDetail(m.selectedID())
 }
 
@@ -131,6 +155,30 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = message.Width, message.Height
 	case tea.KeyMsg:
+		if m.inputMode == "search" {
+			switch message.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.inputMode, m.searchDraft = "", m.search
+			case "enter":
+				m.inputMode, m.search = "", m.searchDraft
+				m.loading = true
+				return m, m.loadTasks()
+			case "backspace":
+				runes := []rune(m.searchDraft)
+				if len(runes) > 0 {
+					m.searchDraft = string(runes[:len(runes)-1])
+				}
+			case "ctrl+u":
+				m.searchDraft = ""
+			default:
+				if message.Type == tea.KeyRunes {
+					m.searchDraft += string(message.Runes)
+				}
+			}
+			return m, nil
+		}
 		switch message.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -143,16 +191,33 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			return m, m.moveCard(1)
 		case "g", "home":
-			status := boardStatuses[m.column]
+			status := m.statuses()[m.column]
 			m.cursors[status] = 0
 			return m, m.loadDetail(m.selectedID())
 		case "G", "end":
-			status := boardStatuses[m.column]
+			status := m.statuses()[m.column]
 			m.cursors[status] = max(0, len(m.tasks[status])-1)
 			return m, m.loadDetail(m.selectedID())
 		case "r":
 			m.loading = true
 			return m, m.loadTasks()
+		case "/":
+			m.inputMode, m.searchDraft = "search", m.search
+		case "a":
+			m.showArchived = !m.showArchived
+			if !m.showArchived && m.column >= len(boardStatuses) {
+				m.column = len(boardStatuses) - 1
+			}
+			m.loading = true
+			return m, m.loadTasks()
+		case "tab":
+			m.detailTab, m.detailScroll = (m.detailTab+1)%3, 0
+		case "1", "2", "3":
+			m.detailTab, m.detailScroll = int(message.Runes[0]-'1'), 0
+		case "pgdown", "ctrl+d":
+			m.detailScroll += max(1, m.height/3)
+		case "pgup", "ctrl+u":
+			m.detailScroll = max(0, m.detailScroll-max(1, m.height/3))
 		case "?":
 			m.help = !m.help
 		case "enter":
@@ -160,7 +225,22 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.help, m.detailOn = false, false
 		}
+	case tea.MouseMsg:
+		event := tea.MouseEvent(message)
+		switch event.Button {
+		case tea.MouseButtonWheelUp:
+			return m, m.moveCard(-1)
+		case tea.MouseButtonWheelDown:
+			return m, m.moveCard(1)
+		case tea.MouseButtonWheelLeft:
+			return m, m.moveColumn(-1)
+		case tea.MouseButtonWheelRight:
+			return m, m.moveColumn(1)
+		}
 	case tasksLoadedMsg:
+		if message.search != m.search || message.showArchived != m.showArchived {
+			break
+		}
 		m.loading = false
 		if message.err != nil {
 			m.err = message.err
@@ -177,10 +257,13 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			for status, items := range grouped {
 				for index := range items {
 					if items[index].ID == selected {
-						m.column, m.cursors[status] = statusIndex(status), index
+						m.column, m.cursors[status] = statusIndex(m.statuses(), status), index
 					}
 				}
 			}
+		}
+		if m.detail != nil && m.detail.Task.ID != m.selectedID() {
+			m.detail, m.graph, m.detailScroll = nil, nil, 0
 		}
 		return m, m.loadDetail(m.selectedID())
 	case detailLoadedMsg:
@@ -191,15 +274,15 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = message.err
 			break
 		}
-		m.detail, m.err = &message.detail, nil
+		m.detail, m.graph, m.err = &message.detail, &message.graph, nil
 	case refreshMsg:
 		return m, tea.Batch(m.loadTasks(), tick())
 	}
 	return m, nil
 }
 
-func statusIndex(status model.TaskStatus) int {
-	for index, candidate := range boardStatuses {
+func statusIndex(statuses []model.TaskStatus, status model.TaskStatus) int {
+	for index, candidate := range statuses {
 		if candidate == status {
 			return index
 		}

@@ -21,6 +21,7 @@ func statusColor(status model.TaskStatus) lipgloss.Color {
 		model.TaskStatusTriage: "213", model.TaskStatusTodo: "245", model.TaskStatusScheduled: "111",
 		model.TaskStatusReady: "81", model.TaskStatusRunning: "220", model.TaskStatusBlocked: "203",
 		model.TaskStatusReview: "141", model.TaskStatusDone: "78",
+		model.TaskStatusArchived: "239",
 	}
 	return colors[status]
 }
@@ -30,6 +31,7 @@ func statusLabel(status model.TaskStatus) string {
 		model.TaskStatusTriage: "TRIAGE", model.TaskStatusTodo: "TODO", model.TaskStatusScheduled: "SCHEDULED",
 		model.TaskStatusReady: "READY", model.TaskStatusRunning: "RUNNING", model.TaskStatusBlocked: "BLOCKED",
 		model.TaskStatusReview: "REVIEW", model.TaskStatusDone: "DONE",
+		model.TaskStatusArchived: "ARCHIVED",
 	}
 	return labels[status]
 }
@@ -57,11 +59,12 @@ func pointer(value *string, fallback string) string {
 }
 
 func (m *Model) visibleColumns(boardWidth int) (int, int, int) {
+	statuses := m.statuses()
 	columnWidth := 24
 	count := max(1, boardWidth/(columnWidth+1))
-	count = min(count, len(boardStatuses))
+	count = min(count, len(statuses))
 	start := m.column - count/2
-	start = max(0, min(len(boardStatuses)-count, start))
+	start = max(0, min(len(statuses)-count, start))
 	return start, count, max(18, boardWidth/count-1)
 }
 
@@ -102,30 +105,112 @@ func (m *Model) renderColumn(status model.TaskStatus, width, height int, focused
 	return baseBorder.Copy().BorderForeground(borderColor).Width(width-2).Height(height).Padding(0, 1).Render(strings.Join(lines, "\n"))
 }
 
+func detailTaskLine(task model.Task, width int) string {
+	return lipgloss.NewStyle().Foreground(statusColor(task.Status)).Render("• "+truncate(task.Title, max(1, width-4))) +
+		lipgloss.NewStyle().Foreground(colorMuted).Render("  "+task.ID)
+}
+
+func (m *Model) detailBody(width int) string {
+	if m.detail == nil {
+		return "Select a task"
+	}
+	task := m.detail.Task
+	lines := []string{}
+	switch m.detailTab {
+	case 1:
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Hierarchy"))
+		if m.detail.ParentTask != nil {
+			lines = append(lines, "Parent", detailTaskLine(*m.detail.ParentTask, width))
+		}
+		if len(m.detail.Subtasks) > 0 {
+			lines = append(lines, "Subtasks")
+			for _, related := range m.detail.Subtasks {
+				lines = append(lines, detailTaskLine(related, width))
+			}
+		}
+		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Render("Dependencies"))
+		if len(m.detail.Prerequisites) == 0 && len(m.detail.Dependents) == 0 {
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render("No dependency links"))
+		}
+		if len(m.detail.Prerequisites) > 0 {
+			lines = append(lines, "Blocked by")
+			for _, related := range m.detail.Prerequisites {
+				lines = append(lines, detailTaskLine(related, width))
+			}
+		}
+		if len(m.detail.Dependents) > 0 {
+			lines = append(lines, "Unlocks")
+			for _, related := range m.detail.Dependents {
+				lines = append(lines, detailTaskLine(related, width))
+			}
+		}
+		if m.graph != nil {
+			lines = append(lines, "", lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("Connected %d · phases %d", m.graph.TotalConnectedNodes, m.graph.TotalPhases)))
+		}
+	case 2:
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Activity"))
+		if len(m.detail.Runs)+len(m.detail.Comments)+len(m.detail.Events)+len(m.detail.Attachments) == 0 {
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render("No activity yet"))
+		}
+		for index := len(m.detail.Comments) - 1; index >= 0; index-- {
+			comment := m.detail.Comments[index]
+			lines = append(lines, "", lipgloss.NewStyle().Foreground(colorFocus).Render(comment.Author), lipgloss.NewStyle().Width(max(1, width-4)).Render(comment.Body))
+		}
+		for index := len(m.detail.Runs) - 1; index >= 0; index-- {
+			run := m.detail.Runs[index]
+			lines = append(lines, "", fmt.Sprintf("Run %s · %s", run.Status, run.WorkerID), lipgloss.NewStyle().Foreground(colorMuted).Render(run.ID))
+		}
+		for index := len(m.detail.Events) - 1; index >= 0 && index >= len(m.detail.Events)-10; index-- {
+			event := m.detail.Events[index]
+			lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render(event.CreatedAt+"  ")+event.Kind)
+		}
+		if len(m.detail.Attachments) > 0 {
+			lines = append(lines, "", lipgloss.NewStyle().Bold(true).Render("Attachments"))
+			for _, attachment := range m.detail.Attachments {
+				lines = append(lines, "• "+attachment.Name+lipgloss.NewStyle().Foreground(colorMuted).Render("  "+attachment.Kind))
+			}
+		}
+	default:
+		status := lipgloss.NewStyle().Bold(true).Foreground(statusColor(task.Status)).Render(statusLabel(task.Status))
+		lines = append(lines,
+			status+lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  P%d · %s · %s", task.Priority, pointer(task.Assignee, "unassigned"), task.Runtime)),
+			lipgloss.NewStyle().Foreground(colorMuted).Render(task.ID),
+		)
+		if strings.TrimSpace(task.Body) != "" {
+			lines = append(lines, "", lipgloss.NewStyle().Width(max(1, width-4)).Foreground(colorText).Render(task.Body))
+		}
+		if task.BlockReason != nil {
+			lines = append(lines, "", lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("Blocked: "+*task.BlockReason))
+		}
+		lines = append(lines, "", lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("Created %s\nUpdated %s", task.CreatedAt, task.UpdatedAt)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func clipped(value string, start, height int) string {
+	lines := strings.Split(value, "\n")
+	start = max(0, min(start, max(0, len(lines)-1)))
+	end := min(len(lines), start+max(1, height))
+	return strings.Join(lines[start:end], "\n")
+}
+
 func (m *Model) renderDetail(width, height int) string {
 	if m.detail == nil {
 		return baseBorder.Copy().Width(width-2).Height(height).Padding(0, 1).Foreground(colorMuted).Render("Select a task")
 	}
 	task := m.detail.Task
-	status := lipgloss.NewStyle().Bold(true).Foreground(statusColor(task.Status)).Render(statusLabel(task.Status))
-	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(truncate(task.Title, width-4)),
-		status + lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  P%d · %s · %s", task.Priority, pointer(task.Assignee, "unassigned"), task.Runtime)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(task.ID),
+	tabs := []string{"Overview", "Relations", "Activity"}
+	for index := range tabs {
+		style := lipgloss.NewStyle().Foreground(colorMuted)
+		if index == m.detailTab {
+			style = style.Foreground(colorFocus).Bold(true).Underline(true)
+		}
+		tabs[index] = style.Render(tabs[index])
 	}
-	if strings.TrimSpace(task.Body) != "" {
-		lines = append(lines, "", lipgloss.NewStyle().Width(max(1, width-4)).Foreground(colorText).Render(task.Body))
-	}
-	if task.BlockReason != nil {
-		lines = append(lines, "", lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("Blocked: "+*task.BlockReason))
-	}
-	relations := fmt.Sprintf("Prerequisites %d · Dependents %d · Subtasks %d", len(m.detail.Prerequisites), len(m.detail.Dependents), len(m.detail.Subtasks))
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(colorMuted).Render(relations))
-	if len(m.detail.Comments) > 0 {
-		last := m.detail.Comments[len(m.detail.Comments)-1]
-		lines = append(lines, "", lipgloss.NewStyle().Bold(true).Render("Latest comment"), lipgloss.NewStyle().Width(max(1, width-4)).Render(last.Author+": "+last.Body))
-	}
-	return baseBorder.Copy().BorderForeground(statusColor(task.Status)).Width(width-2).Height(height).Padding(0, 1).Render(strings.Join(lines, "\n"))
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(truncate(task.Title, width-4))
+	bodyHeight := max(1, height-4)
+	body := clipped(m.detailBody(width), m.detailScroll, bodyHeight)
+	return baseBorder.Copy().BorderForeground(statusColor(task.Status)).Width(width-2).Height(height).Padding(0, 1).Render(title + "\n" + strings.Join(tabs, "  ") + "\n\n" + body)
 }
 
 func (m *Model) View() string {
@@ -134,6 +219,14 @@ func (m *Model) View() string {
 	}
 	header := lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("AUTOGORA") +
 		lipgloss.NewStyle().Foreground(colorText).Render("  "+m.board)
+	if m.inputMode == "search" {
+		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  /" + m.searchDraft + "█")
+	} else if m.search != "" {
+		header += lipgloss.NewStyle().Foreground(colorFocus).Render("  /" + m.search)
+	}
+	if m.showArchived {
+		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  + archived")
+	}
 	if m.loading {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  refreshing…")
 	} else if !m.updated.IsZero() {
@@ -143,7 +236,7 @@ func (m *Model) View() string {
 		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("  " + truncate(m.err.Error(), max(10, m.width-30)))
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("←/→ columns  ↑/↓ cards  enter details  r refresh  ? help  q quit")
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("←/→ columns  ↑/↓ cards  / search  tab detail  a archived  ? help  q quit")
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -153,9 +246,10 @@ func (m *Model) View() string {
 		boardWidth -= detailWidth + 1
 	}
 	start, count, columnWidth := m.visibleColumns(boardWidth)
+	statuses := m.statuses()
 	columns := make([]string, 0, count)
 	for index := start; index < start+count; index++ {
-		columns = append(columns, m.renderColumn(boardStatuses[index], columnWidth, contentHeight, index == m.column))
+		columns = append(columns, m.renderColumn(statuses[index], columnWidth, contentHeight, index == m.column))
 	}
 	board := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
 	content := board
@@ -166,7 +260,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Keyboard\n\n  h/l or ←/→   move between columns\n  j/k or ↑/↓   move between cards\n  g / G         first / last card\n  enter         toggle details on narrow terminals\n  r             refresh now\n  ? or esc      close help\n  q             quit",
+			"Keyboard\n\n  h/l or ←/→   move between columns\n  j/k or ↑/↓   move between cards\n  g / G         first / last card\n  /             search title and body\n  a             show or hide archived tasks\n  tab · 1/2/3   switch detail tab\n  pgup / pgdown scroll detail\n  enter         toggle details on narrow terminals\n  r             refresh now\n  ? or esc      close help\n  q             quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}
