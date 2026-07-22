@@ -43,6 +43,8 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(htmlText, /<option>gemini<\/option>/);
     assert.match(htmlText, /id="theme-toggle"/);
     assert.match(htmlText, /role="dialog" aria-modal="true" aria-label="Task details"/);
+    assert.match(htmlText, /id="settings-dialog" class="dialog-wide"/);
+    assert.match(htmlText, /id="swarm-dialog" class="dialog-wide"/);
     const app = await fetch(`${dashboard.url}/app.js`, { headers: sessionHeaders });
     assert.equal(app.status, 200);
     const appText = await app.text();
@@ -56,6 +58,9 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(stylesText, /:root\[data-theme="light"\]/);
     assert.match(stylesText, /min-height: 40px/);
     assert.match(stylesText, /grid-auto-columns: calc\(100vw - 24px\)/);
+    assert.match(stylesText, /dialog\.dialog-wide \{ width: min\(720px, calc\(100vw - 32px\)\); \}/);
+    assert.match(stylesText, /overflow-x: clip/);
+    assert.doesNotMatch(stylesText, /\.dialog-form\.wide/);
 
     const orchestration = await request("/api/boards/default", {
       method: "PATCH",

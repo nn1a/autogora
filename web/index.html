@@ -92,8 +92,8 @@
     </form>
   </dialog>
 
-  <dialog id="settings-dialog">
-    <form id="settings-form" method="dialog" class="dialog-form wide">
+  <dialog id="settings-dialog" class="dialog-wide">
+    <form id="settings-form" method="dialog" class="dialog-form">
       <header><h2>Board & orchestration</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
       <div class="form-grid">
         <label>Name<input name="name"></label>
@@ -120,8 +120,8 @@
     </form>
   </dialog>
 
-  <dialog id="swarm-dialog">
-    <form id="swarm-form" method="dialog" class="dialog-form wide">
+  <dialog id="swarm-dialog" class="dialog-wide">
+    <form id="swarm-form" method="dialog" class="dialog-form">
       <header><h2>Create Kanban swarm</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
       <label>Goal<textarea name="goal" rows="4" required></textarea></label>
       <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude,reviewer:gemini"></label>
