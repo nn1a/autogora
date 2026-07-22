@@ -520,8 +520,7 @@ function parseRoute(value) {
 
 function connectEvents() {
   state.socket?.close();
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${location.host}/api/events/ws?board=${encodeURIComponent(state.board)}&since=${state.cursor}`);
+  const socket = new EventSource(`/api/events/stream?board=${encodeURIComponent(state.board)}&since=${state.cursor}`);
   state.socket = socket;
   socket.addEventListener("open", () => { $("#connection").textContent = "live"; $("#connection").classList.add("online"); });
   socket.addEventListener("message", (message) => {
@@ -529,9 +528,8 @@ function connectEvents() {
     if (payload.cursor) state.cursor = payload.cursor;
     scheduleRefresh();
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("error", () => {
     $("#connection").textContent = "offline"; $("#connection").classList.remove("online");
-    if (state.socket === socket) setTimeout(connectEvents, 1200);
   });
 }
 

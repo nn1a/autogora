@@ -1,0 +1,209 @@
+package dashboard
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/nn1a/kanban/internal/boards"
+	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/store"
+)
+
+func stringValue(value any) string {
+	result, _ := value.(string)
+	return result
+}
+
+func intValue(value any, fallback int) int {
+	switch parsed := value.(type) {
+	case float64:
+		return int(parsed)
+	case int:
+		return parsed
+	default:
+		return fallback
+	}
+}
+
+func boolValue(value any, fallback bool) bool {
+	result, ok := value.(bool)
+	if !ok {
+		return fallback
+	}
+	return result
+}
+
+func stringArray(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		if strings, ok := value.([]string); ok {
+			return append([]string{}, strings...)
+		}
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if text, ok := item.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
+func runtimeValue(value any) model.Runtime {
+	runtime := model.Runtime(stringValue(value))
+	if runtime != "" && model.ValidRuntime(runtime) {
+		return runtime
+	}
+	return ""
+}
+
+func statusValue(value any) model.TaskStatus {
+	status := model.TaskStatus(stringValue(value))
+	if status != "" && model.ValidTaskStatus(status) {
+		return status
+	}
+	return ""
+}
+
+func optionalString(body map[string]any, key string) store.OptionalString {
+	value, exists := body[key]
+	if !exists {
+		return store.OptionalString{}
+	}
+	result := store.OptionalString{Set: true}
+	if text, ok := value.(string); ok {
+		result.Value = &text
+	}
+	return result
+}
+
+func optionalInt(body map[string]any, key string) store.OptionalInt {
+	value, exists := body[key]
+	if !exists {
+		return store.OptionalInt{}
+	}
+	result := store.OptionalInt{Set: true}
+	if value != nil {
+		parsed := intValue(value, 0)
+		result.Value = &parsed
+	}
+	return result
+}
+
+func stringPointerFrom(body map[string]any, key string) *string {
+	value, exists := body[key]
+	if !exists {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	return &text
+}
+
+func intPointerFrom(body map[string]any, key string) *int {
+	value, exists := body[key]
+	if !exists || value == nil {
+		return nil
+	}
+	parsed := intValue(value, 0)
+	return &parsed
+}
+
+func boolPointerFrom(body map[string]any, key string) *bool {
+	value, exists := body[key]
+	if !exists {
+		return nil
+	}
+	parsed, ok := value.(bool)
+	if !ok {
+		return nil
+	}
+	return &parsed
+}
+
+func taskUpdate(body map[string]any) store.UpdateTaskInput {
+	input := store.UpdateTaskInput{Title: stringPointerFrom(body, "title"), Body: stringPointerFrom(body, "body"),
+		Assignee: optionalString(body, "assignee"), Tenant: optionalString(body, "tenant"), Workspace: optionalString(body, "workspace"),
+		Branch: optionalString(body, "branch"), ScheduledAt: optionalString(body, "scheduledAt"), MaxRuntimeSeconds: optionalInt(body, "maxRuntimeSeconds"),
+		GoalMode: boolPointerFrom(body, "goalMode"), GoalMaxTurns: intPointerFrom(body, "goalMaxTurns")}
+	if runtime := runtimeValue(body["runtime"]); runtime != "" {
+		input.Runtime = &runtime
+	}
+	if priority := intPointerFrom(body, "priority"); priority != nil {
+		input.Priority = priority
+	}
+	if value, exists := body["workspaceKind"]; exists {
+		kind := model.WorkspaceKind(stringValue(value))
+		input.WorkspaceKind = &kind
+	}
+	if value, exists := body["skills"]; exists {
+		skills := stringArray(value)
+		input.Skills = &skills
+	}
+	if status := statusValue(body["status"]); status != "" {
+		input.Status = &status
+	}
+	return input
+}
+
+func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
+	body, ok := value.(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	update := &boards.OrchestrationUpdate{AutoDecompose: boolPointerFrom(body, "autoDecompose"), AutoDecomposePerTick: intPointerFrom(body, "autoDecomposePerTick"), AutoPromoteChildren: boolPointerFrom(body, "autoPromoteChildren")}
+	if raw, exists := body["plannerRuntime"]; exists {
+		runtime := runtimeValue(raw)
+		if runtime == "" || runtime == model.RuntimeManual {
+			return nil, errors.New("invalid planner runtime")
+		}
+		update.PlannerRuntime = &runtime
+	}
+	update.DefaultProfile = optionalString(body, "defaultProfile")
+	update.OrchestratorProfile = optionalString(body, "orchestratorProfile")
+	if raw, exists := body["profiles"]; exists {
+		items, ok := raw.([]any)
+		if !ok {
+			return nil, errors.New("profiles must be an array")
+		}
+		profiles := make([]boards.Profile, 0, len(items))
+		for _, item := range items {
+			record, ok := item.(map[string]any)
+			if !ok {
+				return nil, errors.New("profile route must be an object")
+			}
+			name, runtime := strings.TrimSpace(stringValue(record["name"])), runtimeValue(record["runtime"])
+			if name == "" || runtime == "" || runtime == model.RuntimeManual {
+				return nil, errors.New("profile route requires name and a worker runtime")
+			}
+			profiles = append(profiles, boards.Profile{Name: name, Runtime: runtime, Description: stringValue(record["description"])})
+		}
+		update.Profiles = &profiles
+	}
+	return update, nil
+}
+
+func boardUpdate(body map[string]any) (boards.Update, error) {
+	update := boards.Update{Name: stringPointerFrom(body, "name"), Description: stringPointerFrom(body, "description"), Icon: stringPointerFrom(body, "icon"), Color: stringPointerFrom(body, "color"), DefaultWorkdir: optionalString(body, "defaultWorkdir")}
+	orchestration, err := orchestrationUpdate(body["orchestration"])
+	if err != nil {
+		return boards.Update{}, err
+	}
+	update.Orchestration = orchestration
+	return update, nil
+}
+
+func requireSort(value string) (string, error) {
+	if value == "" {
+		return "priority-desc", nil
+	}
+	valid := map[string]bool{"created": true, "created-desc": true, "priority": true, "priority-desc": true, "status": true, "assignee": true, "title": true, "updated": true}
+	if !valid[value] {
+		return "", fmt.Errorf("invalid task sort: %s", value)
+	}
+	return value, nil
+}
