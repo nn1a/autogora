@@ -19,7 +19,7 @@ Use TaskCircuit MCP to turn a goal into a small dependency graph that workers ca
    - an explicit `assignee`, `runtime` (`claude`, `codex`, `cline`, or `gemini`), and workspace policy (`scratch`, `dir:<absolute-path>`, or `worktree`);
    - `parents` when the task consumes another card's result.
 6. Use `kanban_link` only for dependencies discovered after creation (`parent_id` is the prerequisite, `child_id` is the dependent). Use `kanban_subtask_set` only for hierarchy ownership; hierarchy does not gate execution. Cycles are invalid in both relation types.
-7. Call `kanban_graph` and `kanban_show` on the created cards. Check hierarchy membership, topological phases, root readiness, and that dependency-gated subtasks remain `todo` until every prerequisite is `done`.
+7. Call `kanban_graph` and `kanban_show` on the created cards. Check hierarchy membership, topological phases, root readiness, and that dependency-gated subtasks remain `todo` until every prerequisite handoff is satisfied.
 
 Do not claim or implement cards while acting as orchestrator. The dispatcher owns claims and worker launch.
 

@@ -63,6 +63,64 @@ test("dependency cycles are rejected", () => {
   }
 });
 
+test("dependency handoffs remain stable while real-world graph edits recompute safe queue states", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const parent = store.createTask({ title: "parent", assignee: "parent-worker", runtime: "codex" });
+    const child = store.createTask({
+      title: "child",
+      assignee: "child-worker",
+      runtime: "codex",
+      parents: [parent.task.id],
+    });
+
+    store.updateTask(parent.task.id, { status: "done" });
+    assert.equal(store.getTask(child.task.id).task.status, "ready");
+    const satisfied = store.getRelationshipGraph(child.task.id).dependencies[0];
+    assert.ok(satisfied?.satisfiedAt);
+
+    store.archiveTask(parent.task.id);
+    const claim = store.claimTask({ taskId: child.task.id });
+    assert.ok(claim);
+    store.updateTask(parent.task.id, { status: "todo" });
+    assert.equal(store.getTask(child.task.id).task.status, "running");
+    store.completeRun(
+      { runId: claim.run.id, claimToken: claim.claimToken },
+      "Consumed the already-completed prerequisite handoff",
+    );
+
+    const unfinished = store.createTask({ title: "late prerequisite", assignee: "late", runtime: "codex" });
+    const running = store.createTask({ title: "active dependent", assignee: "active", runtime: "codex" });
+    const activeClaim = store.claimTask({ taskId: running.task.id });
+    assert.ok(activeClaim);
+    assert.throws(
+      () => store.linkTasks(unfinished.task.id, running.task.id),
+      /unfinished prerequisite to a running task/,
+    );
+    store.completeTask(unfinished.task.id, { summary: "Late prerequisite done" });
+    assert.equal(store.linkTasks(unfinished.task.id, running.task.id).task.status, "running");
+
+    const reopenParent = store.createTask({ title: "new requirement", assignee: "new", runtime: "codex" });
+    const completedChild = store.createTask({ title: "completed too early", assignee: "done", runtime: "codex" });
+    store.completeTask(completedChild.task.id, { summary: "Initial completion" });
+    const reopened = store.linkTasks(reopenParent.task.id, completedChild.task.id);
+    assert.equal(reopened.task.status, "todo");
+    assert.ok(reopened.events.some((event) => event.kind === "reopened_for_dependency"));
+
+    const removedParent = store.createTask({ title: "remove me", assignee: "remove", runtime: "codex" });
+    const freedChild = store.createTask({
+      title: "freed child",
+      assignee: "freed",
+      runtime: "codex",
+      parents: [removedParent.task.id],
+    });
+    store.deleteTask(removedParent.task.id);
+    assert.equal(store.getTask(freedChild.task.id).task.status, "ready");
+  } finally {
+    store.close();
+  }
+});
+
 test("task hierarchy stays separate from dependency order and claims follow graph phases", () => {
   const store = new KanbanStore(":memory:");
   try {
@@ -148,8 +206,46 @@ test("task hierarchy persists across reopen and parent deletion only detaches su
     reopened.close();
 
     const database = new DatabaseSync(dbPath);
-    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
     database.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 7 dependency links migrate to durable handoff satisfaction", () => {
+  const directory = mkdtempSync(join(tmpdir(), "taskcircuit-dependency-migration-"));
+  const dbPath = join(directory, "taskcircuit.db");
+  let parentId = "";
+  let childId = "";
+  try {
+    const store = new KanbanStore(dbPath);
+    const parent = store.createTask({ title: "Completed predecessor", assignee: "parent", runtime: "codex" });
+    const child = store.createTask({
+      title: "Waiting successor",
+      assignee: "child",
+      runtime: "codex",
+      parents: [parent.task.id],
+    });
+    parentId = parent.task.id;
+    childId = child.task.id;
+    store.completeTask(parentId, { summary: "Historical handoff" });
+    store.archiveTask(parentId);
+    store.close();
+
+    const oldDatabase = new DatabaseSync(dbPath);
+    oldDatabase.exec(`
+      DROP INDEX idx_task_links_child_state;
+      ALTER TABLE task_links DROP COLUMN satisfied_at;
+      PRAGMA user_version = 7;
+    `);
+    oldDatabase.close();
+
+    const migrated = new KanbanStore(dbPath);
+    const dependency = migrated.getRelationshipGraph(childId).dependencies.find((edge) => edge.prerequisiteId === parentId);
+    assert.ok(dependency?.satisfiedAt);
+    assert.equal(migrated.getTask(childId).task.status, "ready");
+    migrated.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

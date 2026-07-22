@@ -367,6 +367,12 @@ TaskCircuit keeps two relation types separate:
 - parent task/subtask hierarchy records which goal owns a unit of work;
 - prerequisite/dependent links form the acyclic execution DAG and gate claims.
 
+Dependency completion is stored on each edge as a durable handoff. Archiving or
+reopening a completed prerequisite does not retroactively invalidate work that
+already consumed that handoff. To require a fresh completion, unlink and relink
+the dependency. An unfinished prerequisite cannot be attached to a task that is
+already running; completed prerequisites may be attached without interrupting it.
+
 `decompose` atomically records every generated task under the triage root, applies
 the dependency DAG, and makes the root depend on all terminal subtasks. Use
 `taskcircuit graph <task-id>` or `kanban_graph` to inspect the combined topology

@@ -99,7 +99,7 @@ node dist/cli.js dispatch --once --allow-writes --board product-web
 
 - `assignee`가 지정되어 있다.
 - 런타임이 `manual`이 아니라 `claude`, `codex`, `cline`, `gemini` 중 하나다.
-- 모든 부모 작업이 `Done`이다.
+- 모든 prerequisite handoff가 완료되어 있다.
 - 예약 시간이 지났거나 예약이 없다.
 
 `Running`은 상태를 직접 수정해서 진입하지 않는다. 반드시 claim을 통해 실행 ID, lease, claim token이 함께 생성되어야 한다.
@@ -111,7 +111,9 @@ TaskCircuit은 관계를 두 종류로 분리한다.
 | 관계 | 의미 | 실행 순서에 미치는 영향 |
 | --- | --- | --- |
 | Parent task → Subtask | 어떤 목표를 위해 생성된 하위 작업인지 나타내는 소속 관계 | 직접적인 claim 차단 없음 |
-| Prerequisite → Dependent | 선행 작업 결과를 어떤 후속 작업이 소비하는지 나타내는 실행 관계 | 모든 prerequisite가 `Done`이어야 dependent가 `Ready`가 됨 |
+| Prerequisite → Dependent | 선행 작업 결과를 어떤 후속 작업이 소비하는지 나타내는 실행 관계 | 모든 prerequisite handoff가 완료되어야 dependent가 `Ready`가 됨 |
+
+Prerequisite가 한 번 완료되면 해당 dependency edge에 완료 시각이 handoff로 저장된다. 이후 선행 task를 보관하거나 다시 열어도 이미 소비된 handoff를 소급해서 무효화하지 않는다. 새 완료 결과를 반드시 기다리게 하려면 dependency를 unlink한 뒤 다시 link한다. 실행 중인 dependent에는 완료되지 않은 prerequisite를 추가할 수 없지만, 이미 완료된 prerequisite는 작업을 중단하지 않고 연결할 수 있다.
 
 Triage 카드를 `Decompose`하면 생성된 모든 작업은 원본 카드의 subtask로 기록된다. 동시에 planner가 만든 dependency DAG가 별도로 저장된다. DAG의 진입점은 병렬로 `Ready`가 될 수 있고, 후속 subtask는 선행 handoff가 완료될 때까지 `Todo`에 머문다. 모든 말단 subtask가 끝나면 원본 root task가 마지막 종합·검증 단계로 `Ready`가 된다.
 
@@ -301,7 +303,7 @@ node dist/cli.js show <root-task-id>
 node dist/cli.js list --sort status
 ```
 
-의존성은 `parent → child`, 즉 부모가 먼저 `Done`이어야 자식이 `Ready`가 된다는 뜻이다.
+의존성은 `prerequisite → dependent`, 즉 선행 handoff가 먼저 완료되어야 후속 task가 `Ready`가 된다는 뜻이다.
 
 ```bash
 node dist/cli.js link <prerequisite-id> <dependent-id>

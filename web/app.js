@@ -379,7 +379,7 @@ function renderDrawer(detail) {
     </div>
     <h3>Rendered description</h3><div class="markdown">${markdown(task.body || "(empty)")}</div>
     <h3>Execution order</h3>
-    <div class="detail-row"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>Claims are allowed only after every direct prerequisite is Done.</div></div>
+    <div class="detail-row"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>Claims are allowed only after every direct prerequisite handoff is satisfied.</div></div>
     <div class="detail-list">${graphRows}</div>
     <h3>Task hierarchy</h3>
     <small>Hierarchy records parent/subtask ownership. It does not control execution order.</small>

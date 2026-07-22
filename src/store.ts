@@ -139,6 +139,12 @@ type HierarchyRow = {
   position: number;
 };
 
+type DependencyRow = {
+  parent_id: string;
+  child_id: string;
+  satisfied_at: string | null;
+};
+
 export interface UpdateTaskInput {
   title?: string | undefined;
   body?: string | undefined;
@@ -497,7 +503,8 @@ export class KanbanStore {
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 7");
+    this.ensureDependencySatisfactionSchema();
+    this.db.exec("PRAGMA user_version = 8");
   }
 
   private createLatestSchema(): void {
@@ -537,6 +544,7 @@ export class KanbanStore {
       CREATE TABLE IF NOT EXISTS task_links (
         parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         child_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        satisfied_at TEXT,
         PRIMARY KEY (parent_id, child_id),
         CHECK (parent_id <> child_id)
       );
@@ -644,6 +652,29 @@ export class KanbanStore {
     `);
   }
 
+  private ensureDependencySatisfactionSchema(): void {
+    const columns = this.db.prepare("PRAGMA table_info(task_links)").all() as unknown as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "satisfied_at")) {
+      this.db.exec("ALTER TABLE task_links ADD COLUMN satisfied_at TEXT");
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_task_links_child_state ON task_links(child_id, satisfied_at)");
+    this.db.exec(`
+      UPDATE task_links
+      SET satisfied_at = COALESCE(
+        (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = task_links.parent_id AND e.kind = 'completed'),
+        (SELECT p.updated_at FROM tasks p WHERE p.id = task_links.parent_id)
+      )
+      WHERE satisfied_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM tasks p
+          WHERE p.id = task_links.parent_id
+            AND (p.status = 'done' OR (p.status = 'archived' AND EXISTS (
+              SELECT 1 FROM task_events e WHERE e.task_id = p.id AND e.kind = 'completed'
+            )))
+        )
+    `);
+  }
+
   private migrateRuntimeSchema(): void {
     this.db.exec("PRAGMA foreign_keys = OFF");
     this.db.exec("PRAGMA legacy_alter_table = ON");
@@ -706,7 +737,7 @@ export class KanbanStore {
           NULL, NULL, NULL, NULL, 0, failure_count, max_retries, created_at, updated_at
         FROM tasks_legacy;
 
-        INSERT INTO task_links SELECT * FROM task_links_legacy;
+        INSERT INTO task_links(parent_id, child_id) SELECT parent_id, child_id FROM task_links_legacy;
         INSERT INTO task_comments SELECT * FROM task_comments_legacy;
         INSERT INTO task_runs(
           id, task_id, worker_id, runtime, status, claim_token, claimed_at,
@@ -829,11 +860,41 @@ export class KanbanStore {
       .prepare(`
         SELECT COUNT(*) AS count
         FROM task_links l
-        JOIN tasks p ON p.id = l.parent_id
-        WHERE l.child_id = ? AND p.status <> 'done'
+        WHERE l.child_id = ? AND l.satisfied_at IS NULL
       `)
       .get(taskId) as { count: number };
     return row.count > 0;
+  }
+
+  private dependencySatisfiedAt(parentId: string): string | null {
+    const parent = this.requireTaskRow(parentId);
+    if (parent.status === "done") {
+      const event = this.db
+        .prepare("SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1")
+        .get(parentId) as { created_at: string } | undefined;
+      return event?.created_at ?? parent.updated_at;
+    }
+    if (parent.status === "archived") {
+      const event = this.db
+        .prepare("SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1")
+        .get(parentId) as { created_at: string } | undefined;
+      return event?.created_at ?? null;
+    }
+    return null;
+  }
+
+  private satisfyOutgoingDependenciesNoTransaction(parentId: string, satisfiedAt = now()): void {
+    const children = this.db
+      .prepare("SELECT child_id FROM task_links WHERE parent_id = ? AND satisfied_at IS NULL")
+      .all(parentId) as unknown as Array<{ child_id: string }>;
+    if (children.length === 0) return;
+    this.db
+      .prepare("UPDATE task_links SET satisfied_at = ? WHERE parent_id = ? AND satisfied_at IS NULL")
+      .run(satisfiedAt, parentId);
+    for (const child of children) {
+      this.appendEvent(child.child_id, "dependency_satisfied", { parentId, satisfiedAt });
+      this.recomputeReady(child.child_id);
+    }
   }
 
   private recomputeReady(taskId: string, at = now()): void {
@@ -875,8 +936,24 @@ export class KanbanStore {
     const child = this.requireTaskRow(childId);
     if (parent.board !== child.board) throw new Error("Cross-board dependencies are not allowed");
     this.assertLinkDoesNotCycle(parentId, childId);
-    this.db.prepare("INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)").run(parentId, childId);
-    this.appendEvent(childId, "linked", { parentId });
+    const satisfiedAt = this.dependencySatisfiedAt(parentId);
+    if (satisfiedAt === null && child.status === "running") {
+      throw new Error("Cannot add an unfinished prerequisite to a running task; terminate or finish the active run first");
+    }
+    const inserted = this.db
+      .prepare("INSERT OR IGNORE INTO task_links(parent_id, child_id, satisfied_at) VALUES (?, ?, ?)")
+      .run(parentId, childId, satisfiedAt);
+    if (inserted.changes === 0) return;
+    this.appendEvent(childId, "linked", { parentId, satisfiedAt });
+    if (satisfiedAt === null && child.status === "done") {
+      this.db.prepare(`
+        UPDATE tasks
+        SET status = 'todo', block_kind = NULL, block_reason = NULL,
+            block_recurrences = 0, updated_at = ?
+        WHERE id = ?
+      `).run(now(), childId);
+      this.appendEvent(childId, "reopened_for_dependency", { parentId });
+    }
     this.recomputeReady(childId);
   }
 
@@ -1308,6 +1385,11 @@ export class KanbanStore {
       values.push(now(), taskId);
       this.db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...values);
       this.appendEvent(taskId, "updated", input as Record<string, unknown>);
+      if (input.status === "done" && task.status !== "done") {
+        const completedAt = now();
+        this.appendEvent(taskId, "completed", { summary: "Completed by administrative status update", resultLength: task.result?.length ?? 0 }, reclaimedRunId);
+        this.satisfyOutgoingDependenciesNoTransaction(taskId, completedAt);
+      }
       if (input.status === "archived") {
         this.db.prepare("DELETE FROM notification_subscriptions WHERE task_id = ?").run(taskId);
       }
@@ -1437,8 +1519,8 @@ export class KanbanStore {
         SELECT t.id FROM tasks t
         WHERE t.board = ? AND t.status = 'todo' AND t.assignee IS NOT NULL AND t.runtime <> 'manual'
           AND NOT EXISTS (
-            SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id
-            WHERE l.child_id = t.id AND p.status <> 'done'
+            SELECT 1 FROM task_links l
+            WHERE l.child_id = t.id AND l.satisfied_at IS NULL
           )
       `)
       .all(board) as unknown as { id: string }[];
@@ -1795,7 +1877,7 @@ export class KanbanStore {
       "",
       "## Relationship and execution order",
       "Task hierarchy (parent/subtask) is separate from execution dependencies (prerequisite/dependent).",
-      "TaskCircuit permits a claim only after every direct prerequisite is Done.",
+      "TaskCircuit permits a claim only after every direct prerequisite handoff is satisfied.",
       "Only relationship metadata is shown for other nodes; their bodies, workspaces, attachments, and unfinished results are intentionally excluded.",
       `Hierarchy root: ${graph.rootTaskId} — ${rootTask.title}`,
       `Current phase: ${focusNode.phase >= 0 ? `${focusNode.phase + 1} of ${graph.totalPhases}` : "invalid dependency cycle"}`,
@@ -1949,12 +2031,12 @@ export class KanbanStore {
       .all(focus.board) as unknown as HierarchyRow[];
     const dependencyRows = this.db
       .prepare(`
-        SELECT l.parent_id, l.child_id
+        SELECT l.parent_id, l.child_id, l.satisfied_at
         FROM task_links l JOIN tasks p ON p.id = l.parent_id
         WHERE p.board = ?
         ORDER BY l.parent_id, l.child_id
       `)
-      .all(focus.board) as unknown as Array<{ parent_id: string; child_id: string }>;
+      .all(focus.board) as unknown as DependencyRow[];
 
     const adjacency = new Map<string, Set<string>>();
     const connect = (left: string, right: string): void => {
@@ -2012,15 +2094,17 @@ export class KanbanStore {
 
     const indegree = new Map([...connected].map((id) => [id, 0]));
     const downstream = new Map<string, string[]>();
-    const upstream = new Map<string, string[]>();
+    const openUpstream = new Map<string, string[]>();
     for (const edge of dependencies) {
       indegree.set(edge.child_id, (indegree.get(edge.child_id) ?? 0) + 1);
       const dependents = downstream.get(edge.parent_id) ?? [];
       dependents.push(edge.child_id);
       downstream.set(edge.parent_id, dependents);
-      const prerequisites = upstream.get(edge.child_id) ?? [];
-      prerequisites.push(edge.parent_id);
-      upstream.set(edge.child_id, prerequisites);
+      if (edge.satisfied_at === null) {
+        const openPrerequisites = openUpstream.get(edge.child_id) ?? [];
+        openPrerequisites.push(edge.parent_id);
+        openUpstream.set(edge.child_id, openPrerequisites);
+      }
     }
     const phases = new Map([...connected].map((id) => [id, 0]));
     const topologicalQueue = [...connected].filter((id) => indegree.get(id) === 0).sort();
@@ -2053,7 +2137,7 @@ export class KanbanStore {
         hierarchyDepth: hierarchyDepth(id),
         position: hierarchyEdge?.position ?? 0,
         phase: phases.get(id) ?? 0,
-        blockedBy: (upstream.get(id) ?? []).filter((prerequisiteId) => tasksById.get(prerequisiteId)?.status !== "done"),
+        blockedBy: openUpstream.get(id) ?? [],
         unlocks: downstream.get(id) ?? [],
       };
     }).sort((left, right) =>
@@ -2076,6 +2160,7 @@ export class KanbanStore {
       dependencies: dependencies.map((edge) => ({
         prerequisiteId: edge.parent_id,
         dependentId: edge.child_id,
+        satisfiedAt: edge.satisfied_at,
       })),
     };
   }
@@ -2132,7 +2217,11 @@ export class KanbanStore {
   deleteTask(taskId: string): { id: string; deleted: true } {
     const result = this.write(() => {
       this.requireTaskRow(taskId);
+      const dependents = this.db
+        .prepare("SELECT child_id FROM task_links WHERE parent_id = ?")
+        .all(taskId) as unknown as Array<{ child_id: string }>;
       this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
+      for (const dependent of dependents) this.recomputeReady(dependent.child_id);
       return { id: taskId, deleted: true as const };
     });
     const directory = join(this.attachmentsRoot, taskId);
@@ -2542,6 +2631,9 @@ export class KanbanStore {
     let taskId = "";
     this.write(() => {
       const { task, run } = this.requireActiveRun(scope);
+      if (this.hasOpenParents(task.id)) {
+        throw new Error("Task prerequisites changed while the run was active; terminate or requeue the run before completing");
+      }
       taskId = task.id;
       const timestamp = now();
       this.db
@@ -2561,10 +2653,7 @@ export class KanbanStore {
         { summary: cleanSummary.slice(0, 400), resultLength: cleanResult?.length ?? 0 },
         run.id,
       );
-      const children = this.db.prepare("SELECT child_id FROM task_links WHERE parent_id = ?").all(task.id) as unknown as {
-        child_id: string;
-      }[];
-      for (const child of children) this.recomputeReady(child.child_id);
+      this.satisfyOutgoingDependenciesNoTransaction(task.id, timestamp);
     });
     return this.getTask(taskId);
   }
@@ -2601,10 +2690,7 @@ export class KanbanStore {
         `)
         .run(cleanResult, now(), taskId);
       this.appendEvent(taskId, "completed", { summary: cleanSummary.slice(0, 400), resultLength: cleanResult?.length ?? 0 }, runId);
-      const children = this.db.prepare("SELECT child_id FROM task_links WHERE parent_id = ?").all(taskId) as unknown as {
-        child_id: string;
-      }[];
-      for (const child of children) this.recomputeReady(child.child_id);
+      this.satisfyOutgoingDependenciesNoTransaction(taskId);
     });
     return this.getTask(taskId);
   }
