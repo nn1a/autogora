@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -38,6 +39,7 @@ type notificationInput struct {
 	UserID     *string  `json:"user_id,omitempty"`
 	EventKinds []string `json:"event_kinds,omitempty"`
 	Secret     *string  `json:"secret,omitempty"`
+	secretSet  bool
 }
 
 type notificationListInput struct {
@@ -94,25 +96,54 @@ type swarmInput struct {
 }
 
 type updateInput struct {
-	Board              string               `json:"board,omitempty"`
-	TaskID             string               `json:"task_id"`
-	Title              *string              `json:"title,omitempty"`
-	Body               *string              `json:"body,omitempty"`
-	Tenant             *string              `json:"tenant,omitempty"`
-	Assignee           *string              `json:"assignee,omitempty"`
-	Runtime            *model.Runtime       `json:"runtime,omitempty"`
-	Priority           *int                 `json:"priority,omitempty"`
-	Workspace          *string              `json:"workspace,omitempty"`
-	WorkspaceKind      *model.WorkspaceKind `json:"workspace_kind,omitempty"`
-	Branch             *string              `json:"branch,omitempty"`
-	ScheduledAt        *string              `json:"scheduled_at,omitempty"`
-	MaxRuntimeSeconds  *int                 `json:"max_runtime_seconds,omitempty"`
-	Skills             *[]string            `json:"skills,omitempty"`
-	GoalMode           *bool                `json:"goal_mode,omitempty"`
-	GoalMaxTurns       *int                 `json:"goal_max_turns,omitempty"`
-	WorkflowTemplateID *string              `json:"workflow_template_id,omitempty"`
-	CurrentStepKey     *string              `json:"current_step_key,omitempty"`
-	Status             *model.TaskStatus    `json:"status,omitempty"`
+	Board                                           string               `json:"board,omitempty"`
+	TaskID                                          string               `json:"task_id"`
+	Title                                           *string              `json:"title,omitempty"`
+	Body                                            *string              `json:"body,omitempty"`
+	Tenant                                          *string              `json:"tenant,omitempty"`
+	Assignee                                        *string              `json:"assignee,omitempty"`
+	Runtime                                         *model.Runtime       `json:"runtime,omitempty"`
+	Priority                                        *int                 `json:"priority,omitempty"`
+	Workspace                                       *string              `json:"workspace,omitempty"`
+	WorkspaceKind                                   *model.WorkspaceKind `json:"workspace_kind,omitempty"`
+	Branch                                          *string              `json:"branch,omitempty"`
+	ScheduledAt                                     *string              `json:"scheduled_at,omitempty"`
+	MaxRuntimeSeconds                               *int                 `json:"max_runtime_seconds,omitempty"`
+	Skills                                          *[]string            `json:"skills,omitempty"`
+	GoalMode                                        *bool                `json:"goal_mode,omitempty"`
+	GoalMaxTurns                                    *int                 `json:"goal_max_turns,omitempty"`
+	WorkflowTemplateID                              *string              `json:"workflow_template_id,omitempty"`
+	CurrentStepKey                                  *string              `json:"current_step_key,omitempty"`
+	Status                                          *model.TaskStatus    `json:"status,omitempty"`
+	tenantSet, assigneeSet, workspaceSet, branchSet bool
+	scheduledAtSet, maxRuntimeSecondsSet            bool
+	workflowTemplateIDSet, currentStepKeySet        bool
+}
+
+func (input *notificationInput) UnmarshalJSON(raw []byte) error {
+	type plain notificationInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = notificationInput(value)
+	input.secretSet = presence(raw, "secret")["secret"]
+	return nil
+}
+
+func (input *updateInput) UnmarshalJSON(raw []byte) error {
+	type plain updateInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = updateInput(value)
+	found := presence(raw, "tenant", "assignee", "workspace", "branch", "scheduled_at", "max_runtime_seconds", "workflow_template_id", "current_step_key")
+	input.tenantSet, input.assigneeSet = found["tenant"], found["assignee"]
+	input.workspaceSet, input.branchSet = found["workspace"], found["branch"]
+	input.scheduledAtSet, input.maxRuntimeSecondsSet = found["scheduled_at"], found["max_runtime_seconds"]
+	input.workflowTemplateIDSet, input.currentStepKeySet = found["workflow_template_id"], found["current_step_key"]
+	return nil
 }
 
 type commentInput struct {
@@ -223,6 +254,13 @@ func optionalInt(value *int) store.OptionalInt {
 	return store.OptionalInt{Set: true, Value: value}
 }
 
+func optionalStringSet(value *string, set bool) store.OptionalString {
+	return store.OptionalString{Set: set, Value: value}
+}
+func optionalIntSet(value *int, set bool) store.OptionalInt {
+	return store.OptionalInt{Set: set, Value: value}
+}
+
 func validPlannerRuntime(runtime model.Runtime) bool {
 	return runtime == model.RuntimeClaude || runtime == model.RuntimeCodex || runtime == model.RuntimeCline || runtime == model.RuntimeGemini
 }
@@ -321,7 +359,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
 			return opened.SubscribeTask(ctx, store.SubscriptionInput{TaskID: input.TaskID, Platform: input.Platform, ChatID: input.ChatID,
-				ThreadID: input.ThreadID, UserID: input.UserID, EventKinds: input.EventKinds, Secret: optionalString(input.Secret)})
+				ThreadID: input.ThreadID, UserID: input.UserID, EventKinds: input.EventKinds, Secret: optionalStringSet(input.Secret, input.secretSet)})
 		})
 	})
 	addTool(server, "kanban_notify_list", "List Kanban notification subscriptions", "List subscriptions without exposing stored secrets.", true, false, true, false, func(ctx context.Context, input notificationListInput) (any, error) {
@@ -475,11 +513,11 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
 			return opened.UpdateTask(ctx, input.TaskID, store.UpdateTaskInput{Title: input.Title, Body: input.Body,
-				Tenant: optionalString(input.Tenant), Assignee: optionalString(input.Assignee), Runtime: input.Runtime, Priority: input.Priority,
-				Workspace: optionalString(input.Workspace), WorkspaceKind: input.WorkspaceKind, Branch: optionalString(input.Branch),
-				ScheduledAt: optionalString(input.ScheduledAt), MaxRuntimeSeconds: optionalInt(input.MaxRuntimeSeconds), Skills: input.Skills,
-				GoalMode: input.GoalMode, GoalMaxTurns: input.GoalMaxTurns, WorkflowTemplateID: optionalString(input.WorkflowTemplateID),
-				CurrentStepKey: optionalString(input.CurrentStepKey), Status: input.Status})
+				Tenant: optionalStringSet(input.Tenant, input.tenantSet), Assignee: optionalStringSet(input.Assignee, input.assigneeSet), Runtime: input.Runtime, Priority: input.Priority,
+				Workspace: optionalStringSet(input.Workspace, input.workspaceSet), WorkspaceKind: input.WorkspaceKind, Branch: optionalStringSet(input.Branch, input.branchSet),
+				ScheduledAt: optionalStringSet(input.ScheduledAt, input.scheduledAtSet), MaxRuntimeSeconds: optionalIntSet(input.MaxRuntimeSeconds, input.maxRuntimeSecondsSet), Skills: input.Skills,
+				GoalMode: input.GoalMode, GoalMaxTurns: input.GoalMaxTurns, WorkflowTemplateID: optionalStringSet(input.WorkflowTemplateID, input.workflowTemplateIDSet),
+				CurrentStepKey: optionalStringSet(input.CurrentStepKey, input.currentStepKeySet), Status: input.Status})
 		})
 	})
 	addTool(server, "kanban_comment", "Comment on Kanban task", "Append a durable handoff or progress note.", false, false, false, false, func(ctx context.Context, input commentInput) (any, error) {

@@ -81,7 +81,17 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"kanban_create", "kanban_list", "kanban_show", "kanban_context", "kanban_graph", "kanban_diagnostics", "kanban_complete", "kanban_unlink", "kanban_schedule", "kanban_notify_subscribe", "kanban_specify", "kanban_decompose", "kanban_profile_describe_auto", "kanban_swarm"} {
+	expectedTools := []string{
+		"kanban_boards_list", "kanban_boards_create", "kanban_boards_update", "kanban_boards_switch", "kanban_boards_remove",
+		"kanban_create", "kanban_list", "kanban_show", "kanban_context", "kanban_graph", "kanban_stats", "kanban_diagnostics", "kanban_events", "kanban_runs", "kanban_run_terminate", "kanban_log", "kanban_bulk", "kanban_gc",
+		"kanban_notify_subscribe", "kanban_notify_list", "kanban_notify_unsubscribe", "kanban_notify_deliver",
+		"kanban_specify", "kanban_decompose", "kanban_profile_describe_auto", "kanban_swarm", "kanban_update", "kanban_comment", "kanban_link", "kanban_unlink", "kanban_subtask_set", "kanban_subtask_remove",
+		"kanban_promote", "kanban_schedule", "kanban_archive", "kanban_delete", "kanban_claim", "kanban_attach", "kanban_attach_url", "kanban_attachments", "kanban_attachment_remove", "kanban_heartbeat", "kanban_complete", "kanban_block", "kanban_unblock",
+	}
+	if len(tools.Tools) != len(expectedTools) {
+		t.Fatalf("MCP tool count = %d, want %d", len(tools.Tools), len(expectedTools))
+	}
+	for _, expected := range expectedTools {
 		found := false
 		for _, tool := range tools.Tools {
 			if tool.Name == expected {
@@ -92,6 +102,22 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 		if !found {
 			t.Fatalf("MCP tool missing: %s", expected)
 		}
+	}
+	toolJSON(t, session, "kanban_boards_update", map[string]any{"slug": "project", "default_workdir": "/tmp"}, nil)
+	toolJSON(t, session, "kanban_boards_update", map[string]any{
+		"slug": "project", "default_workdir": nil,
+		"orchestration": map[string]any{
+			"autoDecompose": false, "autoDecomposePerTick": 4, "autoPromoteChildren": false,
+			"plannerRuntime": "gemini", "defaultProfile": "worker",
+			"profiles": []any{map[string]any{"name": "worker", "runtime": "gemini", "description": "general work"}},
+		},
+	}, nil)
+	metadata, err := manager.Read("project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.DefaultWorkdir != nil || metadata.Orchestration.AutoDecompose || metadata.Orchestration.AutoDecomposePerTick != 4 || metadata.Orchestration.PlannerRuntime != model.RuntimeGemini || len(metadata.Orchestration.Profiles) != 1 {
+		t.Fatalf("MCP board orchestration update mismatch: %+v", metadata)
 	}
 	var created struct {
 		Task model.Task `json:"task"`
@@ -196,5 +222,22 @@ func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 	toolJSON(t, session, "kanban_decompose", map[string]any{"task_id": root.Task.ID, "default_profile": map[string]any{"name": "worker", "runtime": "codex"}, "plan": plan}, &decomposed)
 	if !decomposed.Fanout || len(decomposed.Graph.ChildIDs) != 1 {
 		t.Fatalf("unexpected decomposition: %+v", decomposed)
+	}
+}
+
+func TestNullableMCPMutationInputsPreserveExplicitNull(t *testing.T) {
+	var update updateInput
+	if err := json.Unmarshal([]byte(`{"task_id":"t1","assignee":null,"tenant":null,"max_runtime_seconds":null,"workflow_template_id":null}`), &update); err != nil {
+		t.Fatal(err)
+	}
+	if !update.assigneeSet || !update.tenantSet || !update.maxRuntimeSecondsSet || !update.workflowTemplateIDSet || update.Assignee != nil || update.MaxRuntimeSeconds != nil {
+		t.Fatalf("explicit null presence was lost: %+v", update)
+	}
+	var notification notificationInput
+	if err := json.Unmarshal([]byte(`{"task_id":"t1","platform":"webhook","chat_id":"https://example.test","secret":null}`), &notification); err != nil {
+		t.Fatal(err)
+	}
+	if !notification.secretSet || notification.Secret != nil {
+		t.Fatalf("explicit notification secret clear was lost: %+v", notification)
 	}
 }

@@ -30,11 +30,17 @@ Commands:
   context <task-id>     Print the bounded worker context
   runs <task-id>        Show attempt history
   log <task-id>         Read the latest worker log tail
+  terminate <task-id>   Signal and reclaim a task's active worker run
   stats                 Show board counts
   diagnostics           Inspect board health and active workers
   tail <task-id>        Read or follow one task's events
   watch                 Read or follow the board event stream
   bulk <id>...          Apply a mutation with per-task results
+  gc                    Remove expired events, logs, and terminal scratch workspaces
+  notify-subscribe <id> Subscribe a destination to task events
+  notify-list           List notification subscriptions
+  notify-unsubscribe <id> Remove a notification destination
+  notify-deliver        Deliver pending notifications
   specify <id>          Expand a triage idea into an executable specification
   decompose <id>        Expand a triage idea into an atomic task graph
   swarm <goal>          Create a blackboard/worker/verifier/synthesizer graph
@@ -51,6 +57,7 @@ Commands:
   attach <id> <path>    Copy a durable attachment
   attach-url <id> <url> Attach an HTTP(S) reference
   attachments <id>      List task attachments
+  attach-rm <id> <aid>  Remove an attachment
   complete <id>...      Complete one or more tasks
   block <id> <reason>   Block a task with an optional typed reason
   unblock <id>...       Return blocked tasks to the work queue

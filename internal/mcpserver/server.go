@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -132,22 +133,82 @@ type boardsListInput struct {
 }
 
 type boardCreateInput struct {
-	Slug           string  `json:"slug"`
-	Name           string  `json:"name,omitempty"`
-	Description    string  `json:"description,omitempty"`
-	Icon           string  `json:"icon,omitempty"`
-	Color          string  `json:"color,omitempty"`
-	DefaultWorkdir *string `json:"default_workdir,omitempty"`
-	Switch         bool    `json:"switch,omitempty"`
+	Slug              string                   `json:"slug"`
+	Name              string                   `json:"name,omitempty"`
+	Description       string                   `json:"description,omitempty"`
+	Icon              string                   `json:"icon,omitempty"`
+	Color             string                   `json:"color,omitempty"`
+	DefaultWorkdir    *string                  `json:"default_workdir,omitempty"`
+	Orchestration     *boardOrchestrationInput `json:"orchestration,omitempty"`
+	Switch            bool                     `json:"switch,omitempty"`
+	defaultWorkdirSet bool
 }
 
 type boardUpdateInput struct {
-	Slug           string  `json:"slug"`
-	Name           *string `json:"name,omitempty"`
-	Description    *string `json:"description,omitempty"`
-	Icon           *string `json:"icon,omitempty"`
-	Color          *string `json:"color,omitempty"`
-	DefaultWorkdir *string `json:"default_workdir,omitempty"`
+	Slug              string                   `json:"slug"`
+	Name              *string                  `json:"name,omitempty"`
+	Description       *string                  `json:"description,omitempty"`
+	Icon              *string                  `json:"icon,omitempty"`
+	Color             *string                  `json:"color,omitempty"`
+	DefaultWorkdir    *string                  `json:"default_workdir,omitempty"`
+	Orchestration     *boardOrchestrationInput `json:"orchestration,omitempty"`
+	defaultWorkdirSet bool
+}
+
+type boardOrchestrationInput struct {
+	AutoDecompose          *bool           `json:"autoDecompose,omitempty"`
+	AutoDecomposePerTick   *int            `json:"autoDecomposePerTick,omitempty"`
+	AutoPromoteChildren    *bool           `json:"autoPromoteChildren,omitempty"`
+	PlannerRuntime         *model.Runtime  `json:"plannerRuntime,omitempty"`
+	DefaultProfile         *string         `json:"defaultProfile,omitempty"`
+	OrchestratorProfile    *string         `json:"orchestratorProfile,omitempty"`
+	Profiles               *[]profileRoute `json:"profiles,omitempty"`
+	defaultProfileSet      bool
+	orchestratorProfileSet bool
+}
+
+func presence(raw []byte, names ...string) map[string]bool {
+	values := map[string]json.RawMessage{}
+	_ = json.Unmarshal(raw, &values)
+	result := map[string]bool{}
+	for _, name := range names {
+		_, result[name] = values[name]
+	}
+	return result
+}
+
+func (input *boardCreateInput) UnmarshalJSON(raw []byte) error {
+	type plain boardCreateInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = boardCreateInput(value)
+	input.defaultWorkdirSet = presence(raw, "default_workdir")["default_workdir"]
+	return nil
+}
+
+func (input *boardUpdateInput) UnmarshalJSON(raw []byte) error {
+	type plain boardUpdateInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = boardUpdateInput(value)
+	input.defaultWorkdirSet = presence(raw, "default_workdir")["default_workdir"]
+	return nil
+}
+
+func (input *boardOrchestrationInput) UnmarshalJSON(raw []byte) error {
+	type plain boardOrchestrationInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = boardOrchestrationInput(value)
+	found := presence(raw, "defaultProfile", "orchestratorProfile")
+	input.defaultProfileSet, input.orchestratorProfileSet = found["defaultProfile"], found["orchestratorProfile"]
+	return nil
 }
 
 type boardSlugInput struct {
@@ -224,8 +285,13 @@ func (s *Service) registerCore(server *mcp.Server) {
 			return nil, err
 		}
 		update := boards.Update{Name: pointerIfSet(input.Name), Description: pointerIfSet(input.Description), Icon: pointerIfSet(input.Icon), Color: pointerIfSet(input.Color)}
-		if input.DefaultWorkdir != nil {
+		if input.defaultWorkdirSet {
 			update.DefaultWorkdir = store.OptionalString{Set: true, Value: input.DefaultWorkdir}
+		}
+		var err error
+		update.Orchestration, err = orchestrationBoardUpdate(input.Orchestration)
+		if err != nil {
+			return nil, err
 		}
 		metadata, err := s.manager.Create(ctx, input.Slug, update)
 		if err == nil && input.Switch {
@@ -238,8 +304,13 @@ func (s *Service) registerCore(server *mcp.Server) {
 			return nil, err
 		}
 		update := boards.Update{Name: input.Name, Description: input.Description, Icon: input.Icon, Color: input.Color}
-		if input.DefaultWorkdir != nil {
+		if input.defaultWorkdirSet {
 			update.DefaultWorkdir = store.OptionalString{Set: true, Value: input.DefaultWorkdir}
+		}
+		var err error
+		update.Orchestration, err = orchestrationBoardUpdate(input.Orchestration)
+		if err != nil {
+			return nil, err
 		}
 		return s.manager.Update(input.Slug, update)
 	})
@@ -388,6 +459,43 @@ func pointerIfSet(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.OrchestrationUpdate, error) {
+	if input == nil {
+		return nil, nil
+	}
+	if input.AutoDecomposePerTick != nil && (*input.AutoDecomposePerTick < 1 || *input.AutoDecomposePerTick > 100) {
+		return nil, errors.New("autoDecomposePerTick must be between 1 and 100")
+	}
+	if input.PlannerRuntime != nil && !validPlannerRuntime(*input.PlannerRuntime) {
+		return nil, fmt.Errorf("invalid planner runtime: %s", *input.PlannerRuntime)
+	}
+	update := &boards.OrchestrationUpdate{
+		AutoDecompose: input.AutoDecompose, AutoDecomposePerTick: input.AutoDecomposePerTick,
+		AutoPromoteChildren: input.AutoPromoteChildren, PlannerRuntime: input.PlannerRuntime,
+	}
+	if input.defaultProfileSet {
+		update.DefaultProfile = store.OptionalString{Set: true, Value: input.DefaultProfile}
+	}
+	if input.orchestratorProfileSet {
+		update.OrchestratorProfile = store.OptionalString{Set: true, Value: input.OrchestratorProfile}
+	}
+	if input.Profiles != nil {
+		if len(*input.Profiles) > 200 {
+			return nil, errors.New("profiles cannot exceed 200 entries")
+		}
+		profiles := make([]boards.Profile, 0, len(*input.Profiles))
+		for _, profile := range *input.Profiles {
+			profile.Name = strings.TrimSpace(profile.Name)
+			if profile.Name == "" || !validPlannerRuntime(profile.Runtime) {
+				return nil, errors.New("profile requires a name and worker runtime")
+			}
+			profiles = append(profiles, boards.Profile{Name: profile.Name, Runtime: profile.Runtime, Description: profile.Description})
+		}
+		update.Profiles = &profiles
+	}
+	return update, nil
 }
 
 func (s *Service) String() string { return fmt.Sprintf("TaskCircuit MCP (%s)", s.manager.Current()) }
