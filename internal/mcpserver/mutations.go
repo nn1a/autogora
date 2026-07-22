@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
 	"github.com/nn1a/kanban/internal/workspace"
 )
@@ -161,6 +162,13 @@ type blockInput struct {
 	Kind       model.BlockKind `json:"kind,omitempty"`
 }
 
+type terminateInput struct {
+	Board  string `json:"board,omitempty"`
+	TaskID string `json:"task_id,omitempty"`
+	RunID  string `json:"run_id,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
 func optionalString(value *string) store.OptionalString {
 	if value == nil {
 		return store.OptionalString{}
@@ -176,6 +184,23 @@ func optionalInt(value *int) store.OptionalInt {
 }
 
 func (s *Service) registerMutations(server *mcp.Server) {
+	addTool(server, "kanban_run_terminate", "Terminate a TaskCircuit worker run", "Persist termination intent, signal a live worker, and reclaim a missing process.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
+		if err := s.requireAdmin(); err != nil {
+			return nil, err
+		}
+		if (input.TaskID == "") == (input.RunID == "") {
+			return nil, errors.New("provide exactly one of task_id or run_id")
+		}
+		if input.Reason == "" {
+			input.Reason = "Run terminated through TaskCircuit MCP"
+		}
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
+			if input.RunID != "" {
+				return runcontrol.TerminateRun(ctx, opened, input.RunID, input.Reason)
+			}
+			return runcontrol.TerminateTaskRun(ctx, opened, input.TaskID, input.Reason)
+		})
+	})
 	addTool(server, "kanban_bulk", "Bulk mutate Kanban tasks", "Apply one mutation with per-task success and error results.", false, true, false, false, func(ctx context.Context, input bulkInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err

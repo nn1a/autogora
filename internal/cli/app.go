@@ -247,6 +247,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runSwarm(ctx, opts)
 	case "claim":
 		return a.runClaim(ctx, opts)
+	case "terminate":
+		return a.runTerminate(ctx, opts)
 	case "edit", "assign", "reassign", "link", "unlink", "subtask-add", "subtask-rm":
 		return a.runTaskMutation(ctx, command, opts)
 	case "heartbeat", "comment", "attach", "attach-url", "attachments", "attach-rm":

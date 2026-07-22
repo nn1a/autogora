@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/nn1a/kanban/internal/model"
+	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
 	"github.com/nn1a/kanban/internal/workspace"
 )
@@ -557,4 +558,24 @@ func (a *App) runClaim(ctx context.Context, opts options) error {
 		return err
 	}
 	return writeJSON(a.Stdout, prepared)
+}
+
+func (a *App) runTerminate(ctx context.Context, opts options) error {
+	if len(opts.positionals) == 0 {
+		return errors.New("terminate requires a task id")
+	}
+	opened, _, _, err := a.openStore(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer opened.Close()
+	reason := opts.value("reason")
+	if reason == "" {
+		reason = "Run terminated from TaskCircuit CLI"
+	}
+	result, err := runcontrol.TerminateTaskRun(ctx, opened, opts.positionals[0], reason)
+	if err != nil {
+		return err
+	}
+	return writeJSON(a.Stdout, result)
 }
