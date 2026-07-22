@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/nn1a/kanban/internal/maintenance"
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
@@ -574,6 +575,34 @@ func (a *App) runTerminate(ctx context.Context, opts options) error {
 		reason = "Run terminated from TaskCircuit CLI"
 	}
 	result, err := runcontrol.TerminateTaskRun(ctx, opened, opts.positionals[0], reason)
+	if err != nil {
+		return err
+	}
+	return writeJSON(a.Stdout, result)
+}
+
+func (a *App) runGarbageCollection(ctx context.Context, opts options) error {
+	manager, err := a.managerFor(opts.value("db"))
+	if err != nil {
+		return err
+	}
+	board, err := manager.Resolve(a.board(opts))
+	if err != nil {
+		return err
+	}
+	events, err := numberOption(opts.value("event-retention-days"), 30)
+	if err != nil {
+		return err
+	}
+	logs, err := numberOption(opts.value("log-retention-days"), 30)
+	if err != nil {
+		return err
+	}
+	workspaces, err := numberOption(opts.value("workspace-retention-days"), 7)
+	if err != nil {
+		return err
+	}
+	result, err := maintenance.Collect(ctx, manager, board, maintenance.Options{EventRetentionDays: events, LogRetentionDays: logs, WorkspaceRetentionDays: workspaces})
 	if err != nil {
 		return err
 	}

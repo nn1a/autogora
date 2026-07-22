@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nn1a/kanban/internal/maintenance"
 	"github.com/nn1a/kanban/internal/model"
 	"github.com/nn1a/kanban/internal/runcontrol"
 	"github.com/nn1a/kanban/internal/store"
@@ -169,6 +170,13 @@ type terminateInput struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+type garbageCollectionInput struct {
+	Board                  string `json:"board,omitempty"`
+	EventRetentionDays     *int   `json:"event_retention_days,omitempty"`
+	LogRetentionDays       *int   `json:"log_retention_days,omitempty"`
+	WorkspaceRetentionDays *int   `json:"workspace_retention_days,omitempty"`
+}
+
 func optionalString(value *string) store.OptionalString {
 	if value == nil {
 		return store.OptionalString{}
@@ -184,6 +192,26 @@ func optionalInt(value *int) store.OptionalInt {
 }
 
 func (s *Service) registerMutations(server *mcp.Server) {
+	addTool(server, "kanban_gc", "Garbage collect Kanban data", "Delete expired events, worker logs, and verified terminal scratch workspaces.", false, true, true, false, func(ctx context.Context, input garbageCollectionInput) (any, error) {
+		if err := s.requireAdmin(); err != nil {
+			return nil, err
+		}
+		board, err := s.selectedBoard(input.Board)
+		if err != nil {
+			return nil, err
+		}
+		events, logs, workspaces := 30, 30, 7
+		if input.EventRetentionDays != nil {
+			events = *input.EventRetentionDays
+		}
+		if input.LogRetentionDays != nil {
+			logs = *input.LogRetentionDays
+		}
+		if input.WorkspaceRetentionDays != nil {
+			workspaces = *input.WorkspaceRetentionDays
+		}
+		return maintenance.Collect(ctx, s.manager, board, maintenance.Options{EventRetentionDays: events, LogRetentionDays: logs, WorkspaceRetentionDays: workspaces})
+	})
 	addTool(server, "kanban_run_terminate", "Terminate a TaskCircuit worker run", "Persist termination intent, signal a live worker, and reclaim a missing process.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
