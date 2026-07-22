@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 	"github.com/nn1a/autogora/internal/taskservice"
 )
@@ -23,4 +25,17 @@ type Backend interface {
 	ArchiveTask(context.Context, string) (model.TaskDetail, error)
 	AddComment(context.Context, string, string, string) (model.Comment, error)
 	BoardContext(context.Context) (taskservice.BoardContext, error)
+	SpecifyTask(context.Context, string, *orchestration.SpecificationPlan, string) (model.TaskDetail, error)
+	DecomposeTask(context.Context, string, *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error)
+	ClaimTaskForUser(context.Context, string, int, string) (*model.ClaimedTask, error)
+	TerminateRun(context.Context, string, string) (runcontrol.Termination, error)
+	DeleteTask(context.Context, string) error
+	ScheduleTask(context.Context, string, *string, string) (model.TaskDetail, error)
+	LinkTasks(context.Context, string, string) (model.TaskDetail, error)
+	UnlinkTasks(context.Context, string, string) (model.TaskDetail, error)
+	SetSubtaskParent(context.Context, string, string, *int) (model.TaskDetail, error)
+	RemoveSubtask(context.Context, string, string) (model.TaskDetail, error)
+	AttachFile(context.Context, string, string, string) (model.Attachment, error)
+	AttachURL(context.Context, string, string, string) (model.Attachment, error)
+	RemoveAttachment(context.Context, string, string) error
 }

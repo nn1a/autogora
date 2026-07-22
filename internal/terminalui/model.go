@@ -2,6 +2,7 @@ package terminalui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -71,6 +72,7 @@ type Model struct {
 	column           int
 	cursors          map[model.TaskStatus]int
 	tasks            map[model.TaskStatus][]model.Task
+	allTasks         []model.Task
 	detail           *model.TaskDetail
 	graph            *model.RelationshipGraph
 	loading          bool
@@ -92,6 +94,7 @@ type Model struct {
 	confirm          *confirmState
 	desiredSelection string
 	form             *taskForm
+	menu             *actionMenu
 }
 
 func NewModel(ctx context.Context, backend Backend, board string) *Model {
@@ -121,7 +124,7 @@ func (m *Model) loadTasks() tea.Cmd {
 	search, showArchived := m.search, m.showArchived
 	return func() tea.Msg {
 		tasks, err := m.backend.ListTasks(m.ctx, store.ListTaskFilter{
-			Board: m.board, IncludeArchived: showArchived, Search: search, Sort: "priority-desc", Limit: 500,
+			Board: m.board, IncludeArchived: showArchived, Sort: "priority-desc", Limit: 500,
 		})
 		return tasksLoadedMsg{tasks: tasks, err: err, at: time.Now(), search: search, showArchived: showArchived}
 	}
@@ -218,7 +221,15 @@ func (m *Model) openEditForm(focus formField) tea.Cmd {
 	if task == nil {
 		return nil
 	}
-	m.form = editTaskForm(m.board, m.boardContext.Profiles, *task)
+	return m.openEditTaskForm(*task, focus)
+}
+
+func (m *Model) openEditTaskForm(task model.Task, focus formField) tea.Cmd {
+	if m.boardContext == nil {
+		m.err = errors.New("board settings are still loading")
+		return nil
+	}
+	m.form = editTaskForm(m.board, m.boardContext.Profiles, task)
 	if !m.form.locked(focus) {
 		m.form.focus = focus
 	}
@@ -268,15 +279,89 @@ func (m *Model) mutate(action, id, value string) tea.Cmd {
 		case "promote":
 			detail, err = m.backend.PromoteTask(m.ctx, id)
 		case "complete":
-			detail, err = m.backend.CompleteTask(m.ctx, id, store.CompletionInput{})
+			detail, err = m.backend.CompleteTask(m.ctx, id, store.CompletionInput{Summary: value})
 		case "block":
-			detail, err = m.backend.BlockTask(m.ctx, id, store.BlockInput{Reason: value})
+			detail, err = m.backend.BlockTask(m.ctx, id, store.BlockInput{Reason: value, Kind: model.BlockKindNeedsInput})
 		case "unblock":
 			detail, err = m.backend.UnblockTask(m.ctx, id)
 		case "archive":
 			detail, err = m.backend.ArchiveTask(m.ctx, id)
+		case "specify":
+			detail, err = m.backend.SpecifyTask(m.ctx, id, nil, "tui")
+		case "decompose":
+			result, decomposeErr := m.backend.DecomposeTask(m.ctx, id, nil)
+			detail, err = result.Task, decomposeErr
+		case "start":
+			claim, claimErr := m.backend.ClaimTaskForUser(m.ctx, id, 900, "")
+			err = claimErr
+			if claim != nil {
+				detail = claim.Task
+			}
+		case "terminate":
+			termination, terminationErr := m.backend.TerminateRun(m.ctx, id, "Terminated from TUI")
+			detail, err = termination.Task, terminationErr
+		case "delete":
+			err = m.backend.DeleteTask(m.ctx, id)
+		case "schedule":
+			detail, err = m.backend.ScheduleTask(m.ctx, id, optionalValue(value), "Scheduled from TUI")
+		case "attach-file":
+			_, err = m.backend.AttachFile(m.ctx, id, value, "")
+			if err == nil {
+				detail, err = m.backend.GetTask(m.ctx, id)
+			}
+		case "attach-url":
+			_, err = m.backend.AttachURL(m.ctx, id, value, "")
+			if err == nil {
+				detail, err = m.backend.GetTask(m.ctx, id)
+			}
 		default:
-			err = fmt.Errorf("unknown TUI action: %s", action)
+			relationID := func(prefix string) string { return strings.TrimPrefix(action, prefix) }
+			switch {
+			case strings.HasPrefix(action, "link-prerequisite:"):
+				detail, err = m.backend.LinkTasks(m.ctx, relationID("link-prerequisite:"), id)
+			case strings.HasPrefix(action, "link-dependent:"):
+				_, err = m.backend.LinkTasks(m.ctx, id, relationID("link-dependent:"))
+				if err == nil {
+					detail, err = m.backend.GetTask(m.ctx, id)
+				}
+			case strings.HasPrefix(action, "set-parent:"):
+				detail, err = m.backend.SetSubtaskParent(m.ctx, relationID("set-parent:"), id, nil)
+			case strings.HasPrefix(action, "add-subtask:"):
+				_, err = m.backend.SetSubtaskParent(m.ctx, id, relationID("add-subtask:"), nil)
+				if err == nil {
+					detail, err = m.backend.GetTask(m.ctx, id)
+				}
+			case strings.HasPrefix(action, "unlink-prerequisite:"):
+				detail, err = m.backend.UnlinkTasks(m.ctx, relationID("unlink-prerequisite:"), id)
+			case strings.HasPrefix(action, "unlink-dependent:"):
+				_, err = m.backend.UnlinkTasks(m.ctx, id, relationID("unlink-dependent:"))
+				if err == nil {
+					detail, err = m.backend.GetTask(m.ctx, id)
+				}
+			case strings.HasPrefix(action, "remove-parent:"):
+				detail, err = m.backend.RemoveSubtask(m.ctx, relationID("remove-parent:"), id)
+			case strings.HasPrefix(action, "remove-subtask:"):
+				_, err = m.backend.RemoveSubtask(m.ctx, id, relationID("remove-subtask:"))
+				if err == nil {
+					detail, err = m.backend.GetTask(m.ctx, id)
+				}
+			case strings.HasPrefix(action, "attachment-remove:"):
+				err = m.backend.RemoveAttachment(m.ctx, id, relationID("attachment-remove:"))
+				if err == nil {
+					detail, err = m.backend.GetTask(m.ctx, id)
+				}
+			default:
+				if strings.HasPrefix(action, "move:") {
+					status := model.TaskStatus(strings.TrimPrefix(action, "move:"))
+					if !model.ValidTaskStatus(status) || status == model.TaskStatusRunning {
+						err = fmt.Errorf("invalid move target: %s", status)
+					} else {
+						detail, err = m.backend.UpdateTask(m.ctx, id, store.UpdateTaskInput{Status: &status})
+					}
+					break
+				}
+				err = fmt.Errorf("unknown TUI action: %s", action)
+			}
 		}
 		return mutationMsg{action: action, id: id, detail: &detail, err: err}
 	}
@@ -286,7 +371,23 @@ func actionLabel(action string) string {
 	labels := map[string]string{
 		"create": "Task created", "edit": "Task updated", "title": "Title updated", "assign": "Assignee updated",
 		"comment": "Comment added", "promote": "Task promoted", "complete": "Task completed",
-		"block": "Task blocked", "unblock": "Task unblocked", "archive": "Task archived",
+		"block": "Task blocked", "unblock": "Task unblocked", "archive": "Task archived", "specify": "Task specified",
+		"decompose": "Task decomposed", "start": "Task claimed", "terminate": "Run termination requested", "delete": "Task deleted",
+		"schedule": "Task scheduled", "attach-file": "File attached", "attach-url": "URL attached",
+	}
+	if strings.HasPrefix(action, "move:") {
+		return "Task moved to " + strings.TrimPrefix(action, "move:")
+	}
+	for prefix, label := range map[string]string{
+		"link-prerequisite:": "Prerequisite linked", "link-dependent:": "Dependent linked",
+		"set-parent:": "Parent task set", "add-subtask:": "Subtask added",
+		"unlink-prerequisite:": "Prerequisite unlinked", "unlink-dependent:": "Dependent unlinked",
+		"remove-parent:": "Parent task removed", "remove-subtask:": "Subtask removed",
+		"attachment-remove:": "Attachment removed",
+	} {
+		if strings.HasPrefix(action, prefix) {
+			return label
+		}
 	}
 	return labels[action]
 }
@@ -299,7 +400,7 @@ func (m *Model) handlePrompt(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode, m.promptDraft, m.promptTaskID = "", "", ""
 	case "enter":
 		value := strings.TrimSpace(m.promptDraft)
-		if value == "" && m.inputMode != "assign" {
+		if value == "" && m.inputMode != "assign" && m.inputMode != "schedule" {
 			m.err = fmt.Errorf("%s cannot be empty", strings.ToLower(m.promptLabel))
 			return m, nil
 		}
@@ -344,6 +445,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.WindowSizeMsg, tasksLoadedMsg, detailLoadedMsg, boardContextMsg, refreshMsg, mutationMsg:
 		default:
 			return m, m.form.UpdateMessage(message)
+		}
+	}
+	if m.menu != nil {
+		if key, ok := message.(tea.KeyMsg); ok {
+			return m.updateMenu(key)
 		}
 	}
 	switch message := message.(type) {
@@ -437,6 +543,18 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.detailScroll = max(0, m.detailScroll-max(1, m.height/3))
 		case "?":
 			m.help = !m.help
+		case " ":
+			if task := m.selectedTask(); task != nil {
+				var detail *model.TaskDetail
+				if m.detail != nil && m.detail.Task.ID == task.ID {
+					detail = m.detail
+				}
+				m.menu = taskActionMenu(*task, detail)
+			}
+		case "m":
+			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil {
+				m.menu = statusMenu(*task)
+			}
 		case "n":
 			return m, m.openCreateForm()
 		case "e":
@@ -461,7 +579,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "c":
 			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil && task.Status != model.TaskStatusDone && task.Status != model.TaskStatusArchived {
-				m.beginConfirm("complete", *task)
+				m.beginPrompt("complete", "Completion summary", "", task.ID)
 			}
 		case "x":
 			if task := m.selectedTask(); task != nil && task.CurrentRunID == nil && task.Status != model.TaskStatusArchived {
@@ -496,7 +614,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		selected := m.selectedID()
 		m.err, m.updated = nil, message.at
 		grouped := map[model.TaskStatus][]model.Task{}
+		m.allTasks = append([]model.Task{}, message.tasks...)
 		for _, task := range message.tasks {
+			if !taskMatchesSearch(task, m.search) {
+				continue
+			}
 			grouped[task.Status] = append(grouped[task.Status], task)
 		}
 		m.tasks = grouped
@@ -548,6 +670,15 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadTasks(), m.loadBoardContext(), tick())
 	}
 	return m, nil
+}
+
+func taskMatchesSearch(task model.Task, search string) bool {
+	search = strings.ToLower(strings.TrimSpace(search))
+	if search == "" {
+		return true
+	}
+	encoded, _ := json.Marshal(task)
+	return strings.Contains(strings.ToLower(string(encoded)), search)
 }
 
 func statusIndex(statuses []model.TaskStatus, status model.TaskStatus) int {

@@ -8,6 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 	"github.com/nn1a/autogora/internal/taskservice"
 )
@@ -32,6 +34,71 @@ func (f *fakeBackend) RelationshipGraph(_ context.Context, id string) (model.Rel
 
 func (f *fakeBackend) BoardContext(context.Context) (taskservice.BoardContext, error) {
 	return taskservice.BoardContext{}, nil
+}
+
+func (f *fakeBackend) SpecifyTask(_ context.Context, id string, _ *orchestration.SpecificationPlan, _ string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "specify:"+id)
+	return model.TaskDetail{Task: testTask(id, "specified", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) DecomposeTask(_ context.Context, id string, _ *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error) {
+	f.actions = append(f.actions, "decompose:"+id)
+	return orchestration.DecompositionResult{Task: model.TaskDetail{Task: testTask(id, "decomposed", model.TaskStatusTodo)}}, nil
+}
+
+func (f *fakeBackend) ClaimTaskForUser(_ context.Context, id string, _ int, _ string) (*model.ClaimedTask, error) {
+	f.actions = append(f.actions, "start:"+id)
+	return &model.ClaimedTask{Task: model.TaskDetail{Task: testTask(id, "started", model.TaskStatusRunning)}}, nil
+}
+
+func (f *fakeBackend) TerminateRun(_ context.Context, id, _ string) (runcontrol.Termination, error) {
+	f.actions = append(f.actions, "terminate:"+id)
+	return runcontrol.Termination{Task: model.TaskDetail{Task: testTask("task", "terminated", model.TaskStatusTodo)}}, nil
+}
+
+func (f *fakeBackend) DeleteTask(_ context.Context, id string) error {
+	f.actions = append(f.actions, "delete:"+id)
+	return nil
+}
+
+func (f *fakeBackend) ScheduleTask(_ context.Context, id string, _ *string, _ string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "schedule:"+id)
+	return model.TaskDetail{Task: testTask(id, "scheduled", model.TaskStatusScheduled)}, nil
+}
+
+func (f *fakeBackend) LinkTasks(_ context.Context, parent, child string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "link:"+parent+":"+child)
+	return model.TaskDetail{Task: testTask(child, "linked", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) UnlinkTasks(_ context.Context, parent, child string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "unlink:"+parent+":"+child)
+	return model.TaskDetail{Task: testTask(child, "unlinked", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) SetSubtaskParent(_ context.Context, parent, child string, _ *int) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "subtask:"+parent+":"+child)
+	return model.TaskDetail{Task: testTask(child, "subtask", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) RemoveSubtask(_ context.Context, parent, child string) (model.TaskDetail, error) {
+	f.actions = append(f.actions, "subtask-remove:"+parent+":"+child)
+	return model.TaskDetail{Task: testTask(child, "subtask removed", model.TaskStatusTodo)}, nil
+}
+
+func (f *fakeBackend) AttachFile(_ context.Context, id, path, _ string) (model.Attachment, error) {
+	f.actions = append(f.actions, "attach-file:"+id+":"+path)
+	return model.Attachment{TaskID: id, Path: &path}, nil
+}
+
+func (f *fakeBackend) AttachURL(_ context.Context, id, url, _ string) (model.Attachment, error) {
+	f.actions = append(f.actions, "attach-url:"+id+":"+url)
+	return model.Attachment{TaskID: id, URL: &url}, nil
+}
+
+func (f *fakeBackend) RemoveAttachment(_ context.Context, id, attachment string) error {
+	f.actions = append(f.actions, "attach-remove:"+id+":"+attachment)
+	return nil
 }
 
 func (f *fakeBackend) CreateTask(_ context.Context, input store.CreateTaskInput) (model.TaskDetail, error) {
@@ -181,16 +248,16 @@ func TestDestructiveActionPinsSelectionAndRequiresConfirmation(t *testing.T) {
 	m := NewModel(context.Background(), backend, "default")
 	m.tasks[task.Status] = []model.Task{task}
 	m.column = statusIndex(m.statuses(), task.Status)
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	if m.confirm == nil || len(backend.actions) != 0 {
-		t.Fatal("completion should wait for confirmation")
+		t.Fatal("archive should wait for confirmation")
 	}
 	command := m.moveColumn(-1)
 	_ = command
 	_, command = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	message := command()
 	m.Update(message)
-	if len(backend.actions) != 1 || backend.actions[0] != "complete:task" {
+	if len(backend.actions) != 1 || backend.actions[0] != "archive:task" {
 		t.Fatalf("confirmation targeted the wrong task: %v", backend.actions)
 	}
 }

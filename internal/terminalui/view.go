@@ -66,6 +66,29 @@ func titleCase(value string) string {
 	return strings.ToUpper(string(runes[0])) + string(runes[1:])
 }
 
+func confirmationLabel(action string) string {
+	labels := map[string]string{
+		"promote": "Promote task?", "unblock": "Unblock task?", "archive": "Archive task?",
+		"delete": "Permanently delete task?", "specify": "Specify with the board planner?",
+		"decompose": "Decompose with the board planner?", "start": "Start manually and claim task?",
+		"terminate": "Terminate active run?",
+	}
+	if label := labels[action]; label != "" {
+		return label
+	}
+	for prefix, label := range map[string]string{
+		"move:": "Move task?", "link-": "Add execution relationship?", "unlink-": "Remove execution relationship?",
+		"set-parent:": "Set hierarchy parent?", "add-subtask:": "Add hierarchy subtask?",
+		"remove-parent:": "Remove hierarchy parent?", "remove-subtask:": "Remove hierarchy subtask?",
+		"attachment-remove:": "Remove attachment?",
+	} {
+		if strings.HasPrefix(action, prefix) {
+			return label
+		}
+	}
+	return titleCase(action) + " task?"
+}
+
 func (m *Model) visibleColumns(boardWidth int) (int, int, int) {
 	statuses := m.statuses()
 	columnWidth := 24
@@ -256,7 +279,7 @@ func (m *Model) View() string {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  applying…")
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("n new  e edit  s assign  C comment  p promote  b block  c complete  x archive  ? help")
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  m move  C comment  p promote  b block  c complete  ? help")
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -280,7 +303,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  n             full create form\n  e / s         edit form / agent section\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}
@@ -292,13 +315,16 @@ func (m *Model) View() string {
 	}
 	if m.confirm != nil {
 		confirmation := baseBorder.Copy().BorderForeground(statusColor(model.TaskStatusBlocked)).Width(min(68, m.width-4)).Padding(1, 2).Render(
-			lipgloss.NewStyle().Bold(true).Render(titleCase(m.confirm.action)+" task?") + "\n\n" + truncate(m.confirm.title, min(58, m.width-10)) + "\n" +
+			lipgloss.NewStyle().Bold(true).Render(confirmationLabel(m.confirm.action)) + "\n\n" + truncate(m.confirm.title, min(58, m.width-10)) + "\n" +
 				lipgloss.NewStyle().Foreground(colorMuted).Render(m.confirm.id) + "\n\n" + lipgloss.NewStyle().Foreground(colorMuted).Render("y/enter confirm · n/esc cancel"),
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, confirmation)
 	}
 	if m.form != nil {
 		content = m.renderTaskForm(m.width, contentHeight)
+	}
+	if m.menu != nil {
+		content = m.renderActionMenu(m.width, contentHeight)
 	}
 	return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + content + "\n" + footer
 }
