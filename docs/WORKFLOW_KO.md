@@ -764,6 +764,8 @@ node dist/cli.js terminate <task-id> --reason "heartbeat 정지로 관리자 종
 
 `diagnostics`에서 `terminal_prerequisite`가 보이면 완료되지 않은 선행 task가 보관된 상태다. 요구가 더 이상 필요 없으면 dependency를 unlink하고, 여전히 필요하면 prerequisite를 다시 열어 완료한다. `stalled_prerequisite`는 선행 task가 `Blocked`, `Triage`, `Review`에서 사람의 처리를 기다린다는 뜻이다.
 
+Web UI에서는 상단 `Needs attention (N)` 칩을 눌러 최대 20개의 진단 원인과 task ID를 바로 확인할 수 있다. 대형 graph drawer는 현재 task와 hierarchy root를 우선해 100개만 렌더링하며, 전체 연결 수와 생략 수는 상단 안내에 유지된다.
+
 ### worker가 말만 하고 Done이 되지 않음
 
 일반 worker는 최종 답변만 출력해서는 완료되지 않는다. `kanban_complete` 또는 dispatcher가 제공한 scoped CLI `complete` 명령을 호출해야 한다. MCP가 비활성화된 Cline과 격리된 Gemini worker는 dispatcher prompt에 포함된 정확한 CLI lifecycle bridge를 사용한다.

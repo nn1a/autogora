@@ -143,11 +143,17 @@ function renderFilters() {
   $("#assignee-filter").innerHTML = `<option value="">All assignees</option>${assignees.map((item) => `<option>${escapeHtml(item)}</option>`).join("")}`;
   $("#tenant-filter").value = tenants.includes(tenant) ? tenant : "";
   $("#assignee-filter").value = assignees.includes(assignee) ? assignee : "";
-  const healthy = state.diagnostics?.healthy !== false;
+  const diagnosticIssues = state.diagnostics?.issues || [];
+  const healthy = diagnosticIssues.length === 0;
   $("#stats").innerHTML = `
     <span class="metric"><strong>${state.stats?.total || 0}</strong><span>tasks</span></span>
     <span class="metric"><strong>${state.stats?.byStatus?.running || 0}</strong><span>running</span></span>
-    <span class="health-chip ${healthy ? "healthy" : "attention"}"><span aria-hidden="true"></span>${healthy ? "Healthy" : "Needs attention"}</span>`;
+    <button type="button" id="health-details" class="health-chip ${healthy ? "healthy" : "attention"}"><span aria-hidden="true"></span>${healthy ? "Healthy" : `Needs attention (${diagnosticIssues.length})`}</button>`;
+  $("#health-details").addEventListener("click", () => {
+    if (healthy) return;
+    alert(diagnosticIssues.slice(0, 20).map((issue) => `${issue.kind} · ${issue.taskId}\n${issue.detail}`).join("\n\n")
+      + (diagnosticIssues.length > 20 ? `\n\n… ${diagnosticIssues.length - 20} more issue(s)` : ""));
+  });
 }
 
 function cardHtml(task) {
@@ -340,14 +346,20 @@ function renderDrawer(detail) {
   const dependency = (item) => `<div class="detail-row" data-open-task="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span class="mono">${escapeHtml(item.id)} · ${escapeHtml(item.status)}</span></div>`;
   const graph = detail.relationshipGraph;
   const focusNode = graph.nodes.find((node) => node.task.id === task.id);
-  const graphRows = graph.nodes.map((node) => `<div class="detail-row" data-open-task="${escapeHtml(node.task.id)}">
+  const rootNode = graph.nodes.find((node) => node.task.id === graph.rootTaskId);
+  const graphDisplayNodes = [focusNode, rootNode, ...graph.nodes]
+    .filter(Boolean)
+    .filter((node, index, values) => values.findIndex((candidate) => candidate.task.id === node.task.id) === index)
+    .slice(0, 100);
+  const graphRows = graphDisplayNodes.map((node) => `<div class="detail-row" data-open-task="${escapeHtml(node.task.id)}">
     <strong>${node.task.id === task.id ? "Current · " : ""}${escapeHtml(node.task.title)}</strong>
     <span class="detail-status">Phase ${node.phase >= 0 ? node.phase + 1 : "?"} · ${escapeHtml(node.task.status)}</span>
     <span class="mono">${escapeHtml(node.task.id)}${node.parentTaskId ? ` · subtask of ${escapeHtml(node.parentTaskId)}` : node.task.id === graph.rootTaskId ? " · hierarchy root" : ""}</span>
     <div>Requires: ${node.blockedBy.length > 0 ? escapeHtml(node.blockedBy.join(", ")) : "all prerequisites complete or none"}</div>
   </div>`).join("");
-  const graphLimitNotice = graph.truncated
-    ? `<div class="detail-row"><strong>Bounded graph view</strong><div>Showing ${graph.nodes.length} of ${graph.totalConnectedNodes} connected tasks. ${graph.omittedNodeCount} distant nodes are omitted without blocking worker context.</div></div>`
+  const uiOmittedNodeCount = Math.max(0, graph.totalConnectedNodes - graphDisplayNodes.length);
+  const graphLimitNotice = uiOmittedNodeCount > 0
+    ? `<div class="detail-row"><strong>Bounded graph view</strong><div>Showing ${graphDisplayNodes.length} of ${graph.totalConnectedNodes} connected tasks. ${uiOmittedNodeCount} distant nodes are omitted from the drawer without blocking worker context.</div></div>`
     : "";
   const parentTask = detail.parentTask
     ? `<div class="detail-row" data-open-task="${escapeHtml(detail.parentTask.id)}"><button type="button" class="icon-button compact" data-remove-parent-task="${escapeHtml(detail.parentTask.id)}" aria-label="Remove parent task">×</button><strong>${escapeHtml(detail.parentTask.title)}</strong><span class="mono">${escapeHtml(detail.parentTask.id)}</span></div>`
