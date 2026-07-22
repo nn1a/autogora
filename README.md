@@ -88,6 +88,8 @@ TLS/reverse-proxy boundary.
 
 The dashboard includes:
 
+- responsive light/dark presentation with consistent controls and explicit
+  task status, owner, runtime, and board-health cues;
 - all lifecycle columns, search, tenant/assignee filters, archived visibility,
   and optional per-profile Running lanes;
 - create/edit drawers, safe Markdown rendering, dependencies, comments, run

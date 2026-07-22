@@ -36,11 +36,26 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.equal(bootstrap.status, 302);
     const cookie = bootstrap.headers.get("set-cookie");
     assert.match(cookie ?? "", /kanban_session=/);
-    const html = await fetch(`${dashboard.url}/`, { headers: { cookie: cookie!.split(";", 1)[0]! } });
+    const sessionHeaders = { cookie: cookie!.split(";", 1)[0]! };
+    const html = await fetch(`${dashboard.url}/`, { headers: sessionHeaders });
     assert.equal(html.status, 200);
-    assert.match(await html.text(), /<option>gemini<\/option>/);
-    const app = await fetch(`${dashboard.url}/app.js`, { headers: { cookie: cookie!.split(";", 1)[0]! } });
-    assert.match(await app.text(), /"gemini"/);
+    const htmlText = await html.text();
+    assert.match(htmlText, /<option>gemini<\/option>/);
+    assert.match(htmlText, /id="theme-toggle"/);
+    assert.match(htmlText, /role="dialog" aria-modal="true" aria-label="Task details"/);
+    const app = await fetch(`${dashboard.url}/app.js`, { headers: sessionHeaders });
+    assert.equal(app.status, 200);
+    const appText = await app.text();
+    assert.match(appText, /"gemini"/);
+    assert.match(appText, /kanban\.theme/);
+    assert.match(appText, /status-badge/);
+    assert.match(appText, /task-context/);
+    const styles = await fetch(`${dashboard.url}/styles.css`, { headers: sessionHeaders });
+    assert.equal(styles.status, 200);
+    const stylesText = await styles.text();
+    assert.match(stylesText, /:root\[data-theme="light"\]/);
+    assert.match(stylesText, /min-height: 40px/);
+    assert.match(stylesText, /grid-auto-columns: calc\(100vw - 24px\)/);
 
     const orchestration = await request("/api/boards/default", {
       method: "PATCH",
