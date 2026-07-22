@@ -32,8 +32,6 @@ Triage ── specify ──> Todo ── promote/조건 충족 ──> Ready
 
 ## 2. 최초 실행
 
-먼저 [설치 및 업그레이드 안내](INSTALL_KO.md)에 따라 단일 바이너리를 `PATH`에 설치한다. 일반 사용자는 Node.js, npm, Bun 또는 Go를 설치할 필요가 없다.
-
 ```bash
 autogora version
 autogora init
