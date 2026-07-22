@@ -19,6 +19,8 @@ import {
   type Task,
   type TaskDetail,
   type TaskEvent,
+  type TaskRelationshipGraph,
+  type TaskRelationshipTask,
   type TaskStatus,
 } from "./types.js";
 
@@ -129,6 +131,12 @@ type AttachmentRow = {
   path: string | null;
   url: string | null;
   created_at: string;
+};
+
+type HierarchyRow = {
+  parent_id: string;
+  child_id: string;
+  position: number;
 };
 
 export interface UpdateTaskInput {
@@ -256,6 +264,7 @@ export interface TaskGraphResult {
   childIds: string[];
   tasksByKey: Record<string, string>;
   leafIds: string[];
+  relationshipGraph: TaskRelationshipGraph;
 }
 
 export interface SwarmResult {
@@ -368,6 +377,21 @@ function taskFromRow(row: TaskRow): Task {
   };
 }
 
+function relationshipTaskFromRow(row: TaskRow): TaskRelationshipTask {
+  return {
+    id: row.id,
+    board: row.board,
+    tenant: row.tenant,
+    title: row.title,
+    assignee: row.assignee,
+    runtime: row.runtime,
+    status: row.status,
+    priority: row.priority,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function runFromRow(row: RunRow): Run {
   return {
     id: row.id,
@@ -473,7 +497,7 @@ export class KanbanStore {
     } else {
       this.createLatestSchema();
     }
-    this.db.exec("PRAGMA user_version = 6");
+    this.db.exec("PRAGMA user_version = 7");
   }
 
   private createLatestSchema(): void {
@@ -514,6 +538,13 @@ export class KanbanStore {
         parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         child_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         PRIMARY KEY (parent_id, child_id),
+        CHECK (parent_id <> child_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_hierarchy (
+        parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        child_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
         CHECK (parent_id <> child_id)
       );
 
@@ -603,6 +634,7 @@ export class KanbanStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
         ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
       CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
       CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
       CREATE INDEX IF NOT EXISTS idx_notification_subscriptions_task
@@ -848,6 +880,52 @@ export class KanbanStore {
     this.recomputeReady(childId);
   }
 
+  private assertHierarchyDoesNotCycle(parentTaskId: string, subtaskId: string): void {
+    if (parentTaskId === subtaskId) throw new Error("A task cannot be its own subtask");
+    const cycle = this.db
+      .prepare(`
+        WITH RECURSIVE descendants(id) AS (
+          SELECT child_id FROM task_hierarchy WHERE parent_id = ?
+          UNION
+          SELECT h.child_id FROM task_hierarchy h JOIN descendants d ON h.parent_id = d.id
+        )
+        SELECT 1 AS found FROM descendants WHERE id = ? LIMIT 1
+      `)
+      .get(subtaskId, parentTaskId) as { found: number } | undefined;
+    if (cycle) throw new Error(`Task hierarchy cycle rejected: ${parentTaskId} -> ${subtaskId}`);
+  }
+
+  private setSubtaskNoTransaction(parentTaskId: string, subtaskId: string, position?: number): void {
+    const parent = this.requireTaskRow(parentTaskId);
+    const child = this.requireTaskRow(subtaskId);
+    if (parent.board !== child.board) throw new Error("Cross-board task hierarchy is not allowed");
+    this.assertHierarchyDoesNotCycle(parentTaskId, subtaskId);
+    const existing = this.db
+      .prepare("SELECT parent_id, child_id, position FROM task_hierarchy WHERE child_id = ?")
+      .get(subtaskId) as HierarchyRow | undefined;
+    const resolvedPosition = position
+      ?? (existing?.parent_id === parentTaskId
+        ? existing.position
+        : Number((this.db
+            .prepare("SELECT COALESCE(MAX(position) + 1, 0) AS position FROM task_hierarchy WHERE parent_id = ?")
+            .get(parentTaskId) as { position: number }).position));
+    if (!Number.isInteger(resolvedPosition) || resolvedPosition < 0) {
+      throw new Error("Subtask position must be a non-negative integer");
+    }
+    if (existing?.parent_id === parentTaskId && existing.position === resolvedPosition) return;
+    this.db
+      .prepare(`
+        INSERT INTO task_hierarchy(parent_id, child_id, position) VALUES (?, ?, ?)
+        ON CONFLICT(child_id) DO UPDATE SET parent_id = excluded.parent_id, position = excluded.position
+      `)
+      .run(parentTaskId, subtaskId, resolvedPosition);
+    this.appendEvent(subtaskId, "subtask_linked", {
+      parentTaskId,
+      position: resolvedPosition,
+      previousParentTaskId: existing?.parent_id ?? null,
+    });
+  }
+
   private createTaskNoTransaction(input: CreateTaskInput): string {
     const title = input.title.trim();
     if (!title) throw new Error("Task title cannot be empty");
@@ -1022,6 +1100,9 @@ export class KanbanStore {
           status: input.autoPromoteChildren === false ? "todo" : undefined,
         });
       }
+      input.nodes.forEach((node, index) => {
+        this.setSubtaskNoTransaction(root.id, tasksByKey[node.key]!, index);
+      });
       for (const dependency of input.dependencies) {
         this.linkNoTransaction(tasksByKey[dependency.parent]!, tasksByKey[dependency.child]!);
       }
@@ -1050,6 +1131,7 @@ export class KanbanStore {
       this.appendEvent(root.id, "decomposed", {
         childIds: Object.values(tasksByKey),
         leafIds,
+        subtasks: input.nodes.map((node, position) => ({ key: node.key, taskId: tasksByKey[node.key], position })),
         dependencies: input.dependencies,
         autoPromoteChildren: input.autoPromoteChildren !== false,
       });
@@ -1059,6 +1141,7 @@ export class KanbanStore {
       childIds: input.nodes.map((node) => tasksByKey[node.key]!),
       tasksByKey,
       leafIds,
+      relationshipGraph: this.getRelationshipGraph(input.rootTaskId),
     };
   }
 
@@ -1142,6 +1225,9 @@ export class KanbanStore {
         workspace: taskWorkspace,
         workspaceKind: input.workspaceKind,
         parents: [verifierId],
+      });
+      [...workerIds, verifierId, synthesizerId].forEach((subtaskId, position) => {
+        this.setSubtaskNoTransaction(rootId, subtaskId, position);
       });
       this.appendEvent(rootId, "swarm_created", { workerIds, verifierId, synthesizerId });
     });
@@ -1657,8 +1743,33 @@ export class KanbanStore {
 
   buildWorkerContext(taskId: string): string {
     const detail = this.getTask(taskId);
+    const graph = this.getRelationshipGraph(taskId);
+    const graphTasks = new Map(graph.nodes.map((node) => [node.task.id, node.task]));
+    const focusNode = graph.nodes.find((node) => node.task.id === taskId)!;
+    const rootTask = graphTasks.get(graph.rootTaskId)!;
+    const rootTaskDetail = graph.rootTaskId === taskId ? detail.task : this.getTask(graph.rootTaskId).task;
+    const prerequisitesByTask = new Map<string, string[]>();
+    for (const dependency of graph.dependencies) {
+      const values = prerequisitesByTask.get(dependency.dependentId) ?? [];
+      values.push(dependency.prerequisiteId);
+      prerequisitesByTask.set(dependency.dependentId, values);
+    }
+    const contextPriorityIds = new Set<string>([
+      taskId,
+      graph.rootTaskId,
+      ...detail.parents.map((task) => task.id),
+      ...detail.children.map((task) => task.id),
+      ...(detail.parentTask ? [detail.parentTask.id] : []),
+      ...detail.subtasks.map((task) => task.id),
+      ...graph.hierarchy.filter((edge) => edge.parentTaskId === graph.rootTaskId).map((edge) => edge.subtaskId),
+    ]);
+    const contextGraphNodes = [
+      ...graph.nodes.filter((node) => contextPriorityIds.has(node.task.id)),
+      ...graph.nodes.filter((node) => !contextPriorityIds.has(node.task.id)),
+    ].filter((node, index, values) => values.findIndex((candidate) => candidate.task.id === node.task.id) === index)
+      .slice(0, 50);
     const lines = [
-      `# Kanban task ${detail.task.id}`,
+      `# TaskCircuit task ${detail.task.id}`,
       "",
       `Title: ${detail.task.title}`,
       `Board: ${detail.task.board}`,
@@ -1671,14 +1782,56 @@ export class KanbanStore {
       truncate(detail.task.body || "(empty)", 8 * 1_024),
     ];
 
+    if (graph.rootTaskId !== taskId) {
+      lines.push(
+        "",
+        "## Parent task goal",
+        `- ${rootTask.id} [${rootTask.status}] ${rootTask.title}`,
+        truncate(rootTaskDetail.body || "(empty)", 4 * 1_024),
+      );
+    }
+
+    lines.push(
+      "",
+      "## Relationship and execution order",
+      "Task hierarchy (parent/subtask) is separate from execution dependencies (prerequisite/dependent).",
+      "TaskCircuit permits a claim only after every direct prerequisite is Done.",
+      "Only relationship metadata is shown for other nodes; their bodies, workspaces, attachments, and unfinished results are intentionally excluded.",
+      `Hierarchy root: ${graph.rootTaskId} — ${rootTask.title}`,
+      `Current phase: ${focusNode.phase >= 0 ? `${focusNode.phase + 1} of ${graph.totalPhases}` : "invalid dependency cycle"}`,
+    );
+    for (const node of contextGraphNodes) {
+      const role = node.task.id === graph.rootTaskId
+        ? "root"
+        : node.parentTaskId
+          ? `subtask of ${node.parentTaskId}`
+          : "related task";
+      const current = node.task.id === taskId ? " ← current" : "";
+      const requires = prerequisitesByTask.get(node.task.id) ?? [];
+      lines.push(
+        `- Phase ${node.phase >= 0 ? node.phase + 1 : "?"} [${node.task.status}] ${node.task.id} (${role}) ${node.task.title}${current}`,
+        `  Requires: ${requires.length > 0 ? requires.join(", ") : "none"}; unlocks: ${node.unlocks.length > 0 ? node.unlocks.join(", ") : "none"}`,
+      );
+    }
+    if (graph.nodes.length > contextGraphNodes.length) {
+      lines.push(`- … ${graph.nodes.length - contextGraphNodes.length} additional related node(s) omitted; use kanban_graph from an orchestrator/admin session for the full topology.`);
+    }
+
     if (detail.parents.length > 0) {
-      lines.push("", "## Parent handoffs");
+      lines.push("", "## Prerequisite handoffs");
       for (const parent of detail.parents) {
         const parentDetail = this.getTask(parent.id);
         const completed = [...parentDetail.runs].reverse().find((run) => run.status === "completed");
         lines.push(`- ${parent.id} [${parent.status}] ${parent.title}`);
         if (completed?.summary) lines.push(`  Summary: ${truncate(completed.summary, 4 * 1_024)}`);
         if (completed?.metadata) lines.push(`  Metadata: ${truncate(JSON.stringify(completed.metadata), 4 * 1_024)}`);
+      }
+    }
+
+    if (detail.children.length > 0) {
+      lines.push("", "## Completion unlocks");
+      for (const dependent of detail.children) {
+        lines.push(`- ${dependent.id} [${dependent.status}] ${dependent.title}`);
       }
     }
 
@@ -1745,6 +1898,12 @@ export class KanbanStore {
     const children = this.db
       .prepare("SELECT t.* FROM tasks t JOIN task_links l ON l.child_id = t.id WHERE l.parent_id = ? ORDER BY t.created_at")
       .all(taskId) as unknown as TaskRow[];
+    const parentTask = this.db
+      .prepare("SELECT t.* FROM tasks t JOIN task_hierarchy h ON h.parent_id = t.id WHERE h.child_id = ?")
+      .get(taskId) as TaskRow | undefined;
+    const subtasks = this.db
+      .prepare("SELECT t.* FROM tasks t JOIN task_hierarchy h ON h.child_id = t.id WHERE h.parent_id = ? ORDER BY h.position, t.created_at")
+      .all(taskId) as unknown as TaskRow[];
     const comments = this.db
       .prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY id")
       .all(taskId) as unknown as CommentRow[];
@@ -1757,15 +1916,185 @@ export class KanbanStore {
     const events = this.db
       .prepare("SELECT * FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 100")
       .all(taskId) as unknown as EventRow[];
+    const prerequisites = parents.map(taskFromRow);
+    const dependents = children.map(taskFromRow);
     return {
       task,
-      parents: parents.map(taskFromRow),
-      children: children.map(taskFromRow),
+      parents: prerequisites,
+      children: dependents,
+      prerequisites,
+      dependents,
+      parentTask: parentTask ? taskFromRow(parentTask) : null,
+      subtasks: subtasks.map(taskFromRow),
       comments: comments.map(commentFromRow),
       attachments: attachments.map(attachmentFromRow),
       runs: runs.map(runFromRow),
       events: events.map(eventFromRow).reverse(),
     };
+  }
+
+  getRelationshipGraph(taskId: string): TaskRelationshipGraph {
+    const focus = this.requireTaskRow(taskId);
+    const taskRows = this.db
+      .prepare("SELECT * FROM tasks WHERE board = ? ORDER BY created_at, id")
+      .all(focus.board) as unknown as TaskRow[];
+    const tasksById = new Map(taskRows.map((task) => [task.id, task]));
+    const hierarchyRows = this.db
+      .prepare(`
+        SELECT h.parent_id, h.child_id, h.position
+        FROM task_hierarchy h JOIN tasks p ON p.id = h.parent_id
+        WHERE p.board = ?
+        ORDER BY h.parent_id, h.position, h.child_id
+      `)
+      .all(focus.board) as unknown as HierarchyRow[];
+    const dependencyRows = this.db
+      .prepare(`
+        SELECT l.parent_id, l.child_id
+        FROM task_links l JOIN tasks p ON p.id = l.parent_id
+        WHERE p.board = ?
+        ORDER BY l.parent_id, l.child_id
+      `)
+      .all(focus.board) as unknown as Array<{ parent_id: string; child_id: string }>;
+
+    const adjacency = new Map<string, Set<string>>();
+    const connect = (left: string, right: string): void => {
+      const leftEdges = adjacency.get(left) ?? new Set<string>();
+      leftEdges.add(right);
+      adjacency.set(left, leftEdges);
+      const rightEdges = adjacency.get(right) ?? new Set<string>();
+      rightEdges.add(left);
+      adjacency.set(right, rightEdges);
+    };
+    hierarchyRows.forEach((edge) => connect(edge.parent_id, edge.child_id));
+    dependencyRows.forEach((edge) => connect(edge.parent_id, edge.child_id));
+
+    const connected = new Set<string>([taskId]);
+    const queue = [taskId];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      for (const related of adjacency.get(current) ?? []) {
+        if (connected.has(related)) continue;
+        connected.add(related);
+        if (connected.size > 500) throw new Error("Task relationship graph exceeds 500 connected tasks");
+        queue.push(related);
+      }
+    }
+
+    const hierarchy = hierarchyRows.filter((edge) => connected.has(edge.parent_id) && connected.has(edge.child_id));
+    const dependencies = dependencyRows.filter((edge) => connected.has(edge.parent_id) && connected.has(edge.child_id));
+    const parentByChild = new Map(hierarchy.map((edge) => [edge.child_id, edge]));
+    const subtasksByParent = new Map<string, HierarchyRow[]>();
+    for (const edge of hierarchy) {
+      const values = subtasksByParent.get(edge.parent_id) ?? [];
+      values.push(edge);
+      subtasksByParent.set(edge.parent_id, values);
+    }
+
+    let rootTaskId = taskId;
+    const ancestorGuard = new Set<string>();
+    while (parentByChild.has(rootTaskId) && !ancestorGuard.has(rootTaskId)) {
+      ancestorGuard.add(rootTaskId);
+      rootTaskId = parentByChild.get(rootTaskId)!.parent_id;
+    }
+
+    const hierarchyDepth = (id: string): number | null => {
+      if (!parentByChild.has(id) && !subtasksByParent.has(id)) return null;
+      let depth = 0;
+      let current = id;
+      const seen = new Set<string>();
+      while (parentByChild.has(current) && !seen.has(current)) {
+        seen.add(current);
+        current = parentByChild.get(current)!.parent_id;
+        depth += 1;
+      }
+      return depth;
+    };
+
+    const indegree = new Map([...connected].map((id) => [id, 0]));
+    const downstream = new Map<string, string[]>();
+    const upstream = new Map<string, string[]>();
+    for (const edge of dependencies) {
+      indegree.set(edge.child_id, (indegree.get(edge.child_id) ?? 0) + 1);
+      const dependents = downstream.get(edge.parent_id) ?? [];
+      dependents.push(edge.child_id);
+      downstream.set(edge.parent_id, dependents);
+      const prerequisites = upstream.get(edge.child_id) ?? [];
+      prerequisites.push(edge.parent_id);
+      upstream.set(edge.child_id, prerequisites);
+    }
+    const phases = new Map([...connected].map((id) => [id, 0]));
+    const topologicalQueue = [...connected].filter((id) => indegree.get(id) === 0).sort();
+    let processed = 0;
+    while (topologicalQueue.length > 0) {
+      const current = topologicalQueue.shift()!;
+      processed += 1;
+      for (const dependent of downstream.get(current) ?? []) {
+        phases.set(dependent, Math.max(phases.get(dependent) ?? 0, (phases.get(current) ?? 0) + 1));
+        const remaining = (indegree.get(dependent) ?? 1) - 1;
+        indegree.set(dependent, remaining);
+        if (remaining === 0) {
+          topologicalQueue.push(dependent);
+          topologicalQueue.sort();
+        }
+      }
+    }
+    if (processed !== connected.size) {
+      for (const [id, remaining] of indegree) if (remaining > 0) phases.set(id, -1);
+    }
+
+    const nodes = [...connected].map((id) => {
+      const row = tasksById.get(id);
+      if (!row) throw new Error(`Related task not found: ${id}`);
+      const hierarchyEdge = parentByChild.get(id);
+      return {
+        task: relationshipTaskFromRow(row),
+        parentTaskId: hierarchyEdge?.parent_id ?? null,
+        subtaskIds: (subtasksByParent.get(id) ?? []).map((edge) => edge.child_id),
+        hierarchyDepth: hierarchyDepth(id),
+        position: hierarchyEdge?.position ?? 0,
+        phase: phases.get(id) ?? 0,
+        blockedBy: (upstream.get(id) ?? []).filter((prerequisiteId) => tasksById.get(prerequisiteId)?.status !== "done"),
+        unlocks: downstream.get(id) ?? [],
+      };
+    }).sort((left, right) =>
+      (left.phase < 0 ? Number.MAX_SAFE_INTEGER : left.phase) - (right.phase < 0 ? Number.MAX_SAFE_INTEGER : right.phase)
+      || (left.hierarchyDepth ?? Number.MAX_SAFE_INTEGER) - (right.hierarchyDepth ?? Number.MAX_SAFE_INTEGER)
+      || left.position - right.position
+      || left.task.createdAt.localeCompare(right.task.createdAt)
+      || left.task.id.localeCompare(right.task.id));
+    const validPhases = nodes.map((node) => node.phase).filter((phase) => phase >= 0);
+    return {
+      focusTaskId: taskId,
+      rootTaskId,
+      totalPhases: validPhases.length > 0 ? Math.max(...validPhases) + 1 : 0,
+      nodes,
+      hierarchy: hierarchy.map((edge) => ({
+        parentTaskId: edge.parent_id,
+        subtaskId: edge.child_id,
+        position: edge.position,
+      })),
+      dependencies: dependencies.map((edge) => ({
+        prerequisiteId: edge.parent_id,
+        dependentId: edge.child_id,
+      })),
+    };
+  }
+
+  setSubtaskParent(parentTaskId: string, subtaskId: string, position?: number): TaskDetail {
+    this.write(() => this.setSubtaskNoTransaction(parentTaskId, subtaskId, position));
+    return this.getTask(subtaskId);
+  }
+
+  removeSubtask(parentTaskId: string, subtaskId: string): TaskDetail {
+    this.write(() => {
+      this.requireTaskRow(parentTaskId);
+      this.requireTaskRow(subtaskId);
+      const deleted = this.db
+        .prepare("DELETE FROM task_hierarchy WHERE parent_id = ? AND child_id = ?")
+        .run(parentTaskId, subtaskId);
+      if (deleted.changes > 0) this.appendEvent(subtaskId, "subtask_unlinked", { parentTaskId });
+    });
+    return this.getTask(subtaskId);
   }
 
   linkTasks(parentId: string, childId: string): TaskDetail {

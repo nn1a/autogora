@@ -10,7 +10,7 @@ Use TaskCircuit MCP to turn a goal into a small dependency graph that workers ca
 ## Workflow
 
 1. Call `kanban_list` to avoid duplicating existing work.
-2. For a rough card already in `triage`, prefer `kanban_specify` for one executable task or `kanban_decompose` for an atomic routed graph. Supply the known profile roster and an explicit fallback; review the returned routes.
+2. For a rough card already in `triage`, prefer `kanban_specify` for one executable task or `kanban_decompose` for an atomic routed graph. Decomposition records every generated node as a subtask of the triage root and separately records prerequisite/dependent execution edges. Supply the known profile roster and an explicit fallback; review the returned routes.
 3. For a new swarm-shaped goal, use `kanban_swarm` to create the completed blackboard, parallel workers, verifier, and synthesizer in one operation.
 4. Otherwise split only where tasks can run independently or need an explicit handoff. Prefer a few bounded cards over many tiny cards.
 5. Create each card with:
@@ -18,8 +18,8 @@ Use TaskCircuit MCP to turn a goal into a small dependency graph that workers ca
    - a body containing scope, constraints, acceptance criteria, and expected evidence;
    - an explicit `assignee`, `runtime` (`claude`, `codex`, `cline`, or `gemini`), and workspace policy (`scratch`, `dir:<absolute-path>`, or `worktree`);
    - `parents` when the task consumes another card's result.
-6. Use `kanban_link` only for dependencies discovered after creation. Cycles are invalid.
-7. Call `kanban_show` on the created cards and check that roots are `ready` and gated children are `todo`.
+6. Use `kanban_link` only for dependencies discovered after creation (`parent_id` is the prerequisite, `child_id` is the dependent). Use `kanban_subtask_set` only for hierarchy ownership; hierarchy does not gate execution. Cycles are invalid in both relation types.
+7. Call `kanban_graph` and `kanban_show` on the created cards. Check hierarchy membership, topological phases, root readiness, and that dependency-gated subtasks remain `todo` until every prerequisite is `done`.
 
 Do not claim or implement cards while acting as orchestrator. The dispatcher owns claims and worker launch.
 

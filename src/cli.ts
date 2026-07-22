@@ -40,6 +40,7 @@ Commands:
   create <title>        Create a task from the shell
   list                  List tasks
   show <task-id>        Show task details
+  graph <task-id>       Show hierarchy, dependencies, and execution phases
   context <task-id>     Print the bounded worker context
   runs <task-id>        Show attempt history
   log <task-id>         Read the latest worker log tail
@@ -61,6 +62,8 @@ Commands:
   reassign <id>... <worker> Bulk assign or unassign tasks
   link <parent> <child> Add a dependency
   unlink <parent> <child> Remove a dependency
+  subtask-add <parent> <child> Set a task's hierarchy parent
+  subtask-rm <parent> <child> Remove a task from its hierarchy parent
   claim <task-id>       Atomically claim and prepare a ready task
   heartbeat <task-id>   Refresh the active run lease
   comment <id> <text>   Append a durable comment
@@ -240,9 +243,9 @@ async function main(): Promise<void> {
   }
   if (
     process.env.KANBAN_TASK_ID &&
-    !["serve", "show", "context", "runs", "log", "heartbeat", "comment", "complete", "block"].includes(command)
+    !["serve", "show", "graph", "context", "runs", "log", "heartbeat", "comment", "complete", "block"].includes(command)
   ) {
-    throw new Error("Dispatcher-scoped workers may only use Kanban CLI context and lifecycle commands");
+    throw new Error("Dispatcher-scoped workers may only use TaskCircuit CLI context and lifecycle commands");
   }
 
   if (command === "boards") {
@@ -467,14 +470,18 @@ async function main(): Promise<void> {
     const taskId = scopedCliTaskId(parsed.positionals[0], "show");
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      process.stdout.write(`${JSON.stringify(store.getTask(taskId), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({
+        ...store.getTask(taskId),
+        relationshipGraph: store.getRelationshipGraph(taskId),
+        workerContext: store.buildWorkerContext(taskId),
+      }, null, 2)}\n`);
     } finally {
       store.close();
     }
     return;
   }
 
-  if (["context", "runs", "log"].includes(command)) {
+  if (["graph", "context", "runs", "log"].includes(command)) {
     const parsed = parseArgs({
       args,
       allowPositionals: true,
@@ -487,7 +494,8 @@ async function main(): Promise<void> {
     const taskId = scopedCliTaskId(parsed.positionals[0], command);
     const store = openTaskStore(parsed.values.db, globalBoard);
     try {
-      if (command === "context") process.stdout.write(`${store.buildWorkerContext(taskId)}\n`);
+      if (command === "graph") process.stdout.write(`${JSON.stringify(store.getRelationshipGraph(taskId), null, 2)}\n`);
+      else if (command === "context") process.stdout.write(`${store.buildWorkerContext(taskId)}\n`);
       else if (command === "runs") process.stdout.write(`${JSON.stringify(store.getTask(taskId).runs, null, 2)}\n`);
       else {
         const log = store.readRunLog(taskId, numberOption(parsed.values["tail-bytes"], 64 * 1_024), parsed.values.run);
@@ -937,6 +945,33 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "subtask-add" || command === "subtask-rm") {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: { db: { type: "string" }, position: { type: "string" } },
+    });
+    const [parentTaskId, subtaskId] = parsed.positionals;
+    if (!parentTaskId || !subtaskId) throw new Error(`${command} requires parent task and subtask ids`);
+    const store = openTaskStore(parsed.values.db, globalBoard);
+    try {
+      const detail = command === "subtask-add"
+        ? store.setSubtaskParent(
+            parentTaskId,
+            subtaskId,
+            parsed.values.position === undefined ? undefined : numberOption(parsed.values.position, 0),
+          )
+        : store.removeSubtask(parentTaskId, subtaskId);
+      process.stdout.write(`${JSON.stringify({
+        ...detail,
+        relationshipGraph: store.getRelationshipGraph(subtaskId),
+      }, null, 2)}\n`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
   if (command === "claim") {
     const parsed = parseArgs({
       args,
@@ -1235,7 +1270,7 @@ async function main(): Promise<void> {
       plannerTimeoutMs: numberOption(parsed.values["planner-timeout-ms"], 120_000),
       allowWrites: parsed.values["allow-writes"] ?? false,
       signal: controller.signal,
-      onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),
+      onLog: (message) => process.stderr.write(`[taskcircuit] ${message}\n`),
     });
     return;
   }
@@ -1256,7 +1291,7 @@ async function main(): Promise<void> {
       host: parsed.values.host ?? "127.0.0.1",
       port: numberOption(parsed.values.port, 8420),
       token: parsed.values.token,
-      onLog: (message) => process.stderr.write(`[kanban] ${message}\n`),
+      onLog: (message) => process.stderr.write(`[taskcircuit] ${message}\n`),
     });
     process.stdout.write(`${dashboard.url}/?token=${encodeURIComponent(dashboard.token)}\n`);
     const controller = new AbortController();

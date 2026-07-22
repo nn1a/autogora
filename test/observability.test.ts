@@ -31,7 +31,8 @@ test("worker context, stats, diagnostics, event cursors, and bulk results share 
     store.addComment(child.task.id, "human", "Use the 2026 figures.");
 
     const context = store.buildWorkerContext(child.task.id);
-    assert.match(context, /Parent handoffs/);
+    assert.match(context, /Relationship and execution order/);
+    assert.match(context, /Prerequisite handoffs/);
     assert.match(context, /research handoff/);
     assert.match(context, /Use the 2026 figures/);
 

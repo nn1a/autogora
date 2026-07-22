@@ -11,9 +11,9 @@ Use the MCP tools when they are available. In an MCP-disabled Cline worker or an
 
 ## Workflow
 
-1. Call `kanban_show` without `task_id`. Read the body, parent results, comments, prior runs, and workspace constraints.
+1. Call `kanban_show` without `task_id`. Read the body, `relationshipGraph`, `workerContext`, prerequisite results, comments, prior runs, and workspace constraints. The hierarchy identifies the parent goal and sibling subtasks; dependency phases identify enforced execution order.
 2. Work only on that task under `$KANBAN_WORKSPACE`. Read task attachments from the absolute paths returned by `kanban_show`. Do not claim, create, reassign, link, unblock, or update unrelated cards.
-3. For long work, call `kanban_heartbeat` after meaningful checkpoints. Use `kanban_comment` for intermediate findings another run must retain.
+3. Work only on the current graph node. Do not implement sibling or downstream nodes; completing this node unlocks the dependents listed in the context. For long work, call `kanban_heartbeat` after meaningful checkpoints. Use `kanban_comment` for intermediate findings another run must retain.
 4. Verify the acceptance criteria. For code, run focused tests and inspect the final diff.
 5. For an ordinary card, terminate exactly once:
    - Call `kanban_complete` only when the result is usable and verified. List deliverable paths in `artifacts`; every relative path is resolved inside `$KANBAN_WORKSPACE` and must exist.

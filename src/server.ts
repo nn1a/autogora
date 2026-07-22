@@ -336,7 +336,11 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     },
     async ({ task_id, board }) => result(usingStore(manager, board, (store) => {
       const resolvedTaskId = scopedTaskId(task_id);
-      return { ...store.getTask(resolvedTaskId), workerContext: store.buildWorkerContext(resolvedTaskId) };
+      return {
+        ...store.getTask(resolvedTaskId),
+        relationshipGraph: store.getRelationshipGraph(resolvedTaskId),
+        workerContext: store.buildWorkerContext(resolvedTaskId),
+      };
     })),
   );
 
@@ -344,12 +348,24 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_context",
     {
       title: "Build Kanban worker context",
-      description: "Return the bounded task body, parent handoffs, attachments, prior attempts, and comments seen by a worker.",
+      description: "Return the bounded task body, hierarchy root, dependency phases, prerequisite handoffs, downstream tasks, attachments, prior attempts, and comments seen by a worker.",
       inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ task_id, board }) =>
       result(usingStore(manager, board, (store) => store.buildWorkerContext(scopedTaskId(task_id)))),
+  );
+
+  server.registerTool(
+    "kanban_graph",
+    {
+      title: "Show TaskCircuit relationship graph",
+      description: "Show the connected parent/subtask hierarchy and prerequisite/dependent DAG with enforced execution phases.",
+      inputSchema: z.object({ task_id: z.string().optional(), board: z.string().optional() }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ task_id, board }) =>
+      result(usingStore(manager, board, (store) => store.getRelationshipGraph(scopedTaskId(task_id)))),
   );
 
   server.registerTool(
@@ -806,7 +822,7 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_link",
     {
       title: "Link Kanban dependency",
-      description: "Create a parent-to-child dependency. Cycles and cross-board links are rejected.",
+      description: "Create an execution dependency: parent_id is the prerequisite and child_id is the dependent. Cycles and cross-board links are rejected.",
       inputSchema: z.object({ parent_id: z.string(), child_id: z.string(), board: z.string().optional() }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -820,13 +836,56 @@ export function createKanbanServer(manager: BoardManager): McpServer {
     "kanban_unlink",
     {
       title: "Unlink Kanban dependency",
-      description: "Remove a parent-to-child dependency and recompute whether the child is ready.",
+      description: "Remove a prerequisite-to-dependent execution edge and recompute whether the dependent is ready.",
       inputSchema: z.object({ parent_id: z.string(), child_id: z.string(), board: z.string().optional() }),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ parent_id, child_id, board }) => {
       requireAdminSurface();
       return result(usingStore(manager, board, (store) => store.unlinkTasks(parent_id, child_id)));
+    },
+  );
+
+  server.registerTool(
+    "kanban_subtask_set",
+    {
+      title: "Set TaskCircuit subtask parent",
+      description: "Place a task under one hierarchy parent without changing execution dependencies. Reparents an existing subtask atomically.",
+      inputSchema: z.object({
+        parent_task_id: z.string(),
+        subtask_id: z.string(),
+        position: z.number().int().min(0).optional(),
+        board: z.string().optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ parent_task_id, subtask_id, position, board }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => ({
+        detail: store.setSubtaskParent(parent_task_id, subtask_id, position),
+        graph: store.getRelationshipGraph(subtask_id),
+      })));
+    },
+  );
+
+  server.registerTool(
+    "kanban_subtask_remove",
+    {
+      title: "Remove TaskCircuit subtask parent",
+      description: "Remove a parent/subtask hierarchy edge without changing execution dependencies.",
+      inputSchema: z.object({
+        parent_task_id: z.string(),
+        subtask_id: z.string(),
+        board: z.string().optional(),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ parent_task_id, subtask_id, board }) => {
+      requireAdminSurface();
+      return result(usingStore(manager, board, (store) => ({
+        detail: store.removeSubtask(parent_task_id, subtask_id),
+        graph: store.getRelationshipGraph(subtask_id),
+      })));
     },
   );
 

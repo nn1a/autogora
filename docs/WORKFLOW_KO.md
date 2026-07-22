@@ -104,6 +104,60 @@ node dist/cli.js dispatch --once --allow-writes --board product-web
 
 `Running`은 상태를 직접 수정해서 진입하지 않는다. 반드시 claim을 통해 실행 ID, lease, claim token이 함께 생성되어야 한다.
 
+### 관계 모델과 실행 순서
+
+TaskCircuit은 관계를 두 종류로 분리한다.
+
+| 관계 | 의미 | 실행 순서에 미치는 영향 |
+| --- | --- | --- |
+| Parent task → Subtask | 어떤 목표를 위해 생성된 하위 작업인지 나타내는 소속 관계 | 직접적인 claim 차단 없음 |
+| Prerequisite → Dependent | 선행 작업 결과를 어떤 후속 작업이 소비하는지 나타내는 실행 관계 | 모든 prerequisite가 `Done`이어야 dependent가 `Ready`가 됨 |
+
+Triage 카드를 `Decompose`하면 생성된 모든 작업은 원본 카드의 subtask로 기록된다. 동시에 planner가 만든 dependency DAG가 별도로 저장된다. DAG의 진입점은 병렬로 `Ready`가 될 수 있고, 후속 subtask는 선행 handoff가 완료될 때까지 `Todo`에 머문다. 모든 말단 subtask가 끝나면 원본 root task가 마지막 종합·검증 단계로 `Ready`가 된다.
+
+예를 들어 다음 관계는 hierarchy 하나와 dependency 세 개를 가진다.
+
+```text
+Parent task: 릴리스 완료
+├─ Subtask: API 계약 검토       Phase 1
+├─ Subtask: API 구현            Phase 2
+└─ Subtask: 회귀 리뷰           Phase 3
+
+실행 dependency:
+외부 승인 → API 계약 검토 → API 구현 → 회귀 리뷰 → Parent task
+```
+
+CLI에서 관계를 확인하고 관리할 수 있다.
+
+```bash
+# 현재 작업과 연결된 hierarchy, dependency, phase 확인
+node dist/cli.js graph <task-id>
+
+# hierarchy만 설정하거나 제거한다. 실행 순서는 바뀌지 않는다.
+node dist/cli.js subtask-add <parent-task-id> <subtask-id> --position 0
+node dist/cli.js subtask-rm <parent-task-id> <subtask-id>
+
+# 실행 dependency를 추가한다. 첫 번째 ID가 prerequisite다.
+node dist/cli.js link <prerequisite-id> <dependent-id>
+node dist/cli.js unlink <prerequisite-id> <dependent-id>
+```
+
+MCP에서는 `kanban_graph`, `kanban_subtask_set`, `kanban_subtask_remove`, `kanban_link`, `kanban_unlink`를 사용한다. 기존 API의 `parents`/`children` 필드는 호환성을 위해 유지되지만 의미는 각각 `prerequisites`/`dependents`와 같다. hierarchy는 `parentTask`/`subtasks` 필드로 구분된다.
+
+모든 worker에게 전체 graph의 상세 데이터를 전달하지 않는다. 실행 worker가 받는 범위는 다음과 같다.
+
+- root 목표와 현재 subtask 본문
+- 현재 phase와 claim 순서 규칙
+- 완료된 직접 prerequisite의 summary와 metadata
+- 완료 시 열리는 직접 dependent
+- 같은 workflow node의 ID, 제목, 상태, phase 요약
+
+다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. 전체 topology 변경은 orchestrator 또는 관리 화면에서 수행하고, worker는 자신에게 claim된 node만 구현한다.
+
+![Task hierarchy와 실행 dependency를 분리해 보여주는 실제 화면](images/workflow-05-task-relationships.png)
+
+*실제 Web UI의 관계 관리 화면. 위쪽 phase 목록은 실행 순서를, Task hierarchy는 소속을, Execution dependencies는 claim을 차단하는 선행 관계를 나타낸다.*
+
 ![계획 단계의 실제 Kanban 보드](images/workflow-01-board-planning.png)
 
 *실제 Web UI의 계획 구간. 카드에서 상태, 담당자, 런타임, 우선순위와 갱신 시각을 함께 확인할 수 있다.*
@@ -250,8 +304,8 @@ node dist/cli.js list --sort status
 의존성은 `parent → child`, 즉 부모가 먼저 `Done`이어야 자식이 `Ready`가 된다는 뜻이다.
 
 ```bash
-node dist/cli.js link <parent-id> <child-id>
-node dist/cli.js unlink <parent-id> <child-id>
+node dist/cli.js link <prerequisite-id> <dependent-id>
+node dist/cli.js unlink <prerequisite-id> <dependent-id>
 ```
 
 ### 5.4 Todo: 실행 경로 확정
@@ -262,7 +316,7 @@ node dist/cli.js unlink <parent-id> <child-id>
 - 어떤 실행기를 쓰는가: `runtime`
 - 어디서 작업하는가: `workspace`, `workspace_kind`, 필요하면 `branch`
 - 무엇을 제출하는가: 완료 조건과 artifact 경로
-- 무엇이 먼저 끝나야 하는가: parent dependency
+- 무엇이 먼저 끝나야 하는가: prerequisite dependency
 
 필드를 수정한다.
 
@@ -512,7 +566,7 @@ node dist/cli.js create "인증 흐름 문서 작성" \
 DOC_ID=<문서-task-id>
 ```
 
-분석 카드가 완료되기 전에는 문서 카드가 `Todo`에 머문다. 분석이 `Done`이 되면 completion summary와 metadata가 문서 worker의 `Parent handoffs`에 포함되고 문서 카드가 자동으로 `Ready`가 된다.
+분석 카드가 완료되기 전에는 문서 카드가 `Todo`에 머문다. 분석이 `Done`이 되면 completion summary와 metadata가 문서 worker의 `Prerequisite handoffs`에 포함되고 문서 카드가 자동으로 `Ready`가 된다.
 
 ### 3단계: 문서 검토 카드
 

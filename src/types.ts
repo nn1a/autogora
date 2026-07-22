@@ -125,12 +125,51 @@ export interface TaskEvent {
 
 export interface TaskDetail {
   task: Task;
+  /** Direct execution prerequisites. Kept as `parents` for API compatibility. */
   parents: Task[];
+  /** Direct execution dependents. Kept as `children` for API compatibility. */
   children: Task[];
+  prerequisites: Task[];
+  dependents: Task[];
+  parentTask: Task | null;
+  subtasks: Task[];
   comments: Comment[];
   attachments: Attachment[];
   runs: Run[];
   events: TaskEvent[];
+}
+
+export interface TaskRelationshipTask {
+  id: string;
+  board: string;
+  tenant: string | null;
+  title: string;
+  assignee: string | null;
+  runtime: Runtime;
+  status: TaskStatus;
+  priority: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskRelationshipNode {
+  task: TaskRelationshipTask;
+  parentTaskId: string | null;
+  subtaskIds: string[];
+  hierarchyDepth: number | null;
+  position: number;
+  phase: number;
+  blockedBy: string[];
+  unlocks: string[];
+}
+
+export interface TaskRelationshipGraph {
+  focusTaskId: string;
+  rootTaskId: string;
+  totalPhases: number;
+  nodes: TaskRelationshipNode[];
+  hierarchy: Array<{ parentTaskId: string; subtaskId: string; position: number }>;
+  dependencies: Array<{ prerequisiteId: string; dependentId: string }>;
 }
 
 export interface CreateTaskInput {

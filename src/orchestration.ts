@@ -98,8 +98,8 @@ const DECOMPOSITION_SCHEMA: Record<string, unknown> = {
         type: "object",
         additionalProperties: false,
         properties: {
-          parent: { type: "string", minLength: 1 },
-          child: { type: "string", minLength: 1 },
+          parent: { type: "string", minLength: 1, description: "Task key of the prerequisite that must finish first." },
+          child: { type: "string", minLength: 1, description: "Task key of the dependent that waits for the prerequisite." },
         },
         required: ["parent", "child"],
       },
@@ -200,7 +200,7 @@ function parseGoalJudgment(value: unknown): GoalJudgment {
 
 function plannerPromptForSpecification(task: TaskDetail): string {
   return [
-    "You are a Kanban triage specifier.",
+    "You are a TaskCircuit triage specifier.",
     "Rewrite the rough idea into a precise, executable task without inventing external facts.",
     "The body must include scope, concrete deliverables, acceptance criteria, constraints, and verification.",
     "Return only the requested structured object.",
@@ -217,10 +217,12 @@ function plannerPromptForDecomposition(task: TaskDetail, profiles: ProfileRoute[
     `- ${profile.name} [${profile.runtime}]: ${profile.description?.trim() || "no description"}`,
   ).join("\n");
   return [
-    "You are a Kanban graph decomposer.",
+    "You are a TaskCircuit graph decomposer.",
     "Decide whether this triage idea benefits from independent parallel or sequential specialist tasks.",
     "If not, set fanout=false and return an improved rootTitle/rootBody with empty tasks and dependencies.",
-    "If yes, produce a small acyclic graph. Dependency parent means prerequisite; child waits for parent.",
+    "If yes, produce a small acyclic graph. Every generated task becomes a direct subtask of the triage root.",
+    "Dependencies control execution only: dependency parent is the prerequisite and child waits for parent.",
+    "Do not add dependency edges to the root; TaskCircuit automatically makes the root wait for every terminal subtask so it can perform final coordination or verification.",
     "Use only assignee names from the profile roster. Every task needs a complete handoff-ready body.",
     "Return only the requested structured object.",
     "",
@@ -510,7 +512,7 @@ export async function judgeGoalProgress(
     ? workerOutput.slice(workerOutput.length - 32 * 1_024)
     : workerOutput;
   const prompt = [
-    "You are the independent completion judge for a goal-mode Kanban worker.",
+    "You are the independent completion judge for a goal-mode TaskCircuit worker.",
     "Compare the worker's latest output and durable task state against every acceptance criterion.",
     "Set complete=true only when the goal is demonstrably satisfied. Otherwise give one concrete next-turn instruction.",
     "Do not treat confidence, effort, or a promise to finish as evidence.",
@@ -536,7 +538,7 @@ export async function describeProfileRoute(
     `- ${task.title}: ${task.body.slice(0, 300) || "(no body)"}; skills=${task.skills.join(", ") || "none"}`,
   ).join("\n");
   const prompt = [
-    "You describe a Claude, Codex, Cline, or Gemini Kanban worker profile for a task-routing planner.",
+    "You describe a Claude, Codex, Cline, or Gemini TaskCircuit worker profile for a task-routing planner.",
     "Write one concise capability description grounded only in the supplied evidence.",
     "State the work this profile should receive and any evident specialization. Do not use marketing language.",
     "Return only the requested structured object.",

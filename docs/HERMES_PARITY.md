@@ -17,7 +17,7 @@ Authoritative references:
 ### Durable board kernel
 
 - [x] SQLite WAL storage, transactional writes, dependency-cycle rejection
-- [x] Task, dependency, comment, run, and append-only event records
+- [x] Task hierarchy, execution dependency, comment, run, and append-only event records
 - [x] Statuses: `triage`, `todo`, `ready`, `running`, `blocked`, `done`, `archived`
 - [x] Atomic claim tokens, heartbeat, structured completion handoff, retry budget
 - [x] Statuses: `scheduled` and `review`
@@ -65,7 +65,7 @@ Authoritative references:
 - [x] Core MCP planning and worker lifecycle tools
 - [x] Scoped worker isolation and portable worker/orchestrator Skills
 - [x] Attachment MCP tools and attachment-aware task detail
-- [x] Bounded, preformatted worker context with parent handoffs and prior attempts
+- [x] Bounded worker context with root goal, metadata-only phase map, prerequisite handoffs, and prior attempts
 - [x] CLI verbs for boards, tasks, claim/heartbeat, runs, events, logs, stats, diagnostics, and dry-run dispatch
 - [x] Terminal event watch/tail and machine-readable output
 - [x] Notification subscriptions and leased terminal-event delivery adapters
@@ -73,7 +73,7 @@ Authoritative references:
 ### Orchestration
 
 - [x] Manual and bounded automatic triage specification
-- [x] Atomic task-graph decomposition with profile/runtime routing and fallback
+- [x] Atomic hierarchy plus dependency-graph decomposition with profile/runtime routing and fallback
 - [x] Explicit auxiliary profile-description generation from durable task evidence
 - [x] Configurable automatic promotion of unblocked decomposition children
 - [x] Kanban Swarm blackboard/worker/verifier/synthesizer topology helper
@@ -85,7 +85,7 @@ Authoritative references:
 
 - [x] Local token-authenticated HTTP API over the shared board kernel
 - [x] Kanban columns, search/filter, archived toggle, and Running profile lanes
-- [x] Create/edit drawer, dependencies, comments, runs, attachments, and events
+- [x] Create/edit drawer, hierarchy, dependency phases, comments, runs, attachments, and events
 - [x] Drag/drop and bulk status/assignee/archive/delete operations
 - [x] Atomic dashboard manual start, card progress badges, and guarded trash drop
 - [x] Board switcher/settings and specify/decompose/swarm controls

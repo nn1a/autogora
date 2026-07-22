@@ -152,8 +152,8 @@ function renderFilters() {
 
 function cardHtml(task) {
   const owner = task.assignee || "Unassigned";
-  const progress = task.status !== "done" && task.status !== "archived" && task.childrenTotal > 0
-    ? `<span class="pill" title="Completed dependencies">${task.childrenDone}/${task.childrenTotal}</span>` : "";
+  const progress = task.status !== "done" && task.status !== "archived" && task.subtasksTotal > 0
+    ? `<span class="pill" title="Completed subtasks">${task.subtasksDone}/${task.subtasksTotal}</span>` : "";
   const summary = task.body?.trim()
     ? `<div class="card-summary">${escapeHtml(task.body.trim())}</div>`
     : "";
@@ -172,7 +172,7 @@ function cardHtml(task) {
     <div class="card-foot">
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
-      ${task.commentsCount ? `<span title="Comments">💬 ${task.commentsCount}</span>` : ""}${task.linksCount ? `<span title="Dependencies">↔ ${task.linksCount}</span>` : ""}
+      ${task.commentsCount ? `<span title="Comments">💬 ${task.commentsCount}</span>` : ""}${task.relationshipsCount ? `<span title="Relationships">↔ ${task.relationshipsCount}</span>` : ""}
       <span class="updated">Updated ${relativeTime(task.updatedAt)}</span>
     </div>
   </article>`;
@@ -338,6 +338,18 @@ function renderDrawer(detail) {
   </div>`).join("");
   const events = detail.events.slice().reverse().slice(0, 30).map((event) => `<div class="detail-row"><strong>${escapeHtml(event.kind)}</strong><span class="mono">#${event.id} · ${escapeHtml(event.createdAt)}</span></div>`).join("");
   const dependency = (item) => `<div class="detail-row" data-open-task="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span class="mono">${escapeHtml(item.id)} · ${escapeHtml(item.status)}</span></div>`;
+  const graph = detail.relationshipGraph;
+  const focusNode = graph.nodes.find((node) => node.task.id === task.id);
+  const graphRows = graph.nodes.map((node) => `<div class="detail-row" data-open-task="${escapeHtml(node.task.id)}">
+    <strong>${node.task.id === task.id ? "Current · " : ""}${escapeHtml(node.task.title)}</strong>
+    <span class="detail-status">Phase ${node.phase >= 0 ? node.phase + 1 : "?"} · ${escapeHtml(node.task.status)}</span>
+    <span class="mono">${escapeHtml(node.task.id)}${node.parentTaskId ? ` · subtask of ${escapeHtml(node.parentTaskId)}` : node.task.id === graph.rootTaskId ? " · hierarchy root" : ""}</span>
+    <div>Requires: ${node.blockedBy.length > 0 ? escapeHtml(node.blockedBy.join(", ")) : "all prerequisites complete or none"}</div>
+  </div>`).join("");
+  const parentTask = detail.parentTask
+    ? `<div class="detail-row" data-open-task="${escapeHtml(detail.parentTask.id)}"><button type="button" class="icon-button compact" data-remove-parent-task="${escapeHtml(detail.parentTask.id)}" aria-label="Remove parent task">×</button><strong>${escapeHtml(detail.parentTask.title)}</strong><span class="mono">${escapeHtml(detail.parentTask.id)}</span></div>`
+    : "<small>No parent task</small>";
+  const subtasks = detail.subtasks.map((subtask) => `<div class="detail-row" data-open-task="${escapeHtml(subtask.id)}"><button type="button" class="icon-button compact" data-remove-subtask="${escapeHtml(subtask.id)}" aria-label="Remove subtask">×</button><strong>${escapeHtml(subtask.title)}</strong><span class="mono">${escapeHtml(subtask.id)} · ${escapeHtml(subtask.status)}</span></div>`).join("");
   $("#drawer-content").innerHTML = `
     <div class="drawer-title-block"><span class="eyebrow">Task</span><h1>${escapeHtml(task.title)}</h1></div>
     <div class="task-context">
@@ -366,11 +378,23 @@ function renderDrawer(detail) {
       <button data-action="delete" class="danger">Delete</button>
     </div>
     <h3>Rendered description</h3><div class="markdown">${markdown(task.body || "(empty)")}</div>
-    <h3>Dependencies</h3>
+    <h3>Execution order</h3>
+    <div class="detail-row"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>Claims are allowed only after every direct prerequisite is Done.</div></div>
+    <div class="detail-list">${graphRows}</div>
+    <h3>Task hierarchy</h3>
+    <small>Hierarchy records parent/subtask ownership. It does not control execution order.</small>
+    <div class="detail-list">${parentTask}</div>
+    <form id="set-parent-task" class="link-form"><select required><option value="">Set parent task…</option>${taskOptions(task.id)}</select><button>Set</button></form>
+    <div class="detail-list">${subtasks || '<small>No subtasks</small>'}</div>
+    <form id="add-subtask" class="link-form"><select required><option value="">Add subtask…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+    <h3>Execution dependencies</h3>
+    <small>Prerequisites must reach Done before this task can be claimed.</small>
+    <h4>Prerequisites</h4>
     <div class="detail-list">${detail.parents.map(dependency).join("") || '<small>No parents</small>'}</div>
-    <form id="add-parent" class="link-form"><select required><option value="">Add parent…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+    <form id="add-parent" class="link-form"><select required><option value="">Add prerequisite…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+    <h4>Dependents</h4>
     <div class="detail-list">${detail.children.map(dependency).join("") || '<small>No children</small>'}</div>
-    <form id="add-child" class="link-form"><select required><option value="">Add child…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+    <form id="add-child" class="link-form"><select required><option value="">Add dependent…</option>${taskOptions(task.id)}</select><button>Add</button></form>
     <h3>Comments</h3><div class="detail-list">${comments || '<small>No comments</small>'}</div>
     <form id="comment-form" class="comment-form"><input required placeholder="Add durable context…"><button>Comment</button></form>
     <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
@@ -394,6 +418,16 @@ function bindDrawer(detail) {
   });
   $$('[data-action]', $("#drawer-content")).forEach((button) => button.addEventListener("click", () => drawerAction(taskId, button.dataset.action)));
   $$('[data-open-task]', $("#drawer-content")).forEach((row) => row.addEventListener("click", () => openDrawer(row.dataset.openTask)));
+  $$('[data-remove-parent-task]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await api(boardPath(`/api/hierarchy?parentTaskId=${encodeURIComponent(button.dataset.removeParentTask)}&subtaskId=${encodeURIComponent(taskId)}`), { method: "DELETE" });
+    await openDrawer(taskId); await loadBoard();
+  }));
+  $$('[data-remove-subtask]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await api(boardPath(`/api/hierarchy?parentTaskId=${encodeURIComponent(taskId)}&subtaskId=${encodeURIComponent(button.dataset.removeSubtask)}`), { method: "DELETE" });
+    await openDrawer(taskId); await loadBoard();
+  }));
   $$('[data-terminate-run]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {
     if (!confirm("Terminate this active run and release its task?")) return;
     await api(boardPath(`/api/runs/${button.dataset.terminateRun}/terminate`), { method: "POST", body: JSON.stringify({ reason: "Terminated by dashboard user" }) });
@@ -423,6 +457,17 @@ function bindDrawer(detail) {
     await openDrawer(taskId); await loadBoard();
   });
   link("#add-parent", true); link("#add-child", false);
+  const hierarchy = (formId, selectedIsParent) => $(formId).addEventListener("submit", async (event) => {
+    event.preventDefault(); const selected = $("select", event.currentTarget).value; if (!selected) return;
+    await api(boardPath("/api/hierarchy"), {
+      method: "POST",
+      body: JSON.stringify(selectedIsParent
+        ? { parentTaskId: selected, subtaskId: taskId }
+        : { parentTaskId: taskId, subtaskId: selected }),
+    });
+    await openDrawer(taskId); await loadBoard();
+  });
+  hierarchy("#set-parent-task", true); hierarchy("#add-subtask", false);
 }
 
 async function drawerAction(taskId, action) {

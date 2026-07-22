@@ -48,6 +48,9 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_decompose"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_profile_describe_auto"));
     assert.ok(tools.tools.some((tool) => tool.name === "kanban_swarm"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_graph"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_subtask_set"));
+    assert.ok(tools.tools.some((tool) => tool.name === "kanban_subtask_remove"));
     const boards = textPayload(
       await client.callTool({ name: "kanban_boards_list", arguments: {} }),
     ) as { slug: string }[];
@@ -79,6 +82,34 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
       }),
     ) as { task: { id: string; status: string } };
     assert.equal(created.task.status, "ready");
+    const hierarchyChild = textPayload(
+      await client.callTool({
+        name: "kanban_create",
+        arguments: { title: "MCP hierarchy child", board: "project", status: "todo" },
+      }),
+    ) as { task: { id: string } };
+    const hierarchySet = textPayload(
+      await client.callTool({
+        name: "kanban_subtask_set",
+        arguments: { board: "project", parent_task_id: created.task.id, subtask_id: hierarchyChild.task.id },
+      }),
+    ) as { graph: { rootTaskId: string } };
+    assert.equal(hierarchySet.graph.rootTaskId, created.task.id);
+    const relationshipGraph = textPayload(
+      await client.callTool({
+        name: "kanban_graph",
+        arguments: { board: "project", task_id: hierarchyChild.task.id },
+      }),
+    ) as { rootTaskId: string; hierarchy: Array<{ subtaskId: string }> };
+    assert.equal(relationshipGraph.rootTaskId, created.task.id);
+    assert.equal(relationshipGraph.hierarchy[0]?.subtaskId, hierarchyChild.task.id);
+    const hierarchyRemoved = textPayload(
+      await client.callTool({
+        name: "kanban_subtask_remove",
+        arguments: { board: "project", parent_task_id: created.task.id, subtask_id: hierarchyChild.task.id },
+      }),
+    ) as { detail: { parentTask: null } };
+    assert.equal(hierarchyRemoved.detail.parentTask, null);
     const briefPath = join(directory, "brief.txt");
     writeFileSync(briefPath, "MCP attachment", "utf8");
     const attached = textPayload(
@@ -116,8 +147,8 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
     const stats = textPayload(
       await client.callTool({ name: "kanban_stats", arguments: { board: "project" } }),
     ) as { total: number; byRuntime: Record<string, number> };
-    assert.equal(stats.total, 1);
-    assert.equal(stats.byRuntime.manual, 0);
+    assert.equal(stats.total, 2);
+    assert.equal(stats.byRuntime.manual, 1);
     const events = textPayload(
       await client.callTool({ name: "kanban_events", arguments: { board: "project", task_id: created.task.id } }),
     ) as { taskId: string }[];
@@ -146,6 +177,15 @@ test("stdio MCP administration can route work across Claude, Codex, Cline, and G
     ) as { task: { id: string; status: string } };
     assert.equal(scoped.task.id, created.task.id);
     assert.equal(scoped.task.status, "running");
+    const scopedGraph = textPayload(
+      await worker.callTool({ name: "kanban_graph", arguments: {} }),
+    ) as { focusTaskId: string };
+    assert.equal(scopedGraph.focusTaskId, created.task.id);
+    const forbiddenGraph = await worker.callTool({
+      name: "kanban_graph",
+      arguments: { task_id: hierarchyChild.task.id },
+    });
+    assert.equal(forbiddenGraph.isError, true);
 
     const forbidden = await worker.callTool({ name: "kanban_list", arguments: {} });
     assert.equal(forbidden.isError, true);

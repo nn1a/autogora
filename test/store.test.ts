@@ -63,6 +63,98 @@ test("dependency cycles are rejected", () => {
   }
 });
 
+test("task hierarchy stays separate from dependency order and claims follow graph phases", () => {
+  const store = new KanbanStore(":memory:");
+  try {
+    const root = store.createTask({ title: "Coordinate release", assignee: "orchestrator", runtime: "claude" });
+    const external = store.createTask({ title: "Approve API contract", assignee: "architect", runtime: "claude" });
+    const implementation = store.createTask({ title: "Implement API", body: "PRIVATE IMPLEMENTATION BODY", assignee: "implementer", runtime: "codex" });
+    const review = store.createTask({ title: "Review API", assignee: "reviewer", runtime: "claude" });
+
+    store.setSubtaskParent(root.task.id, implementation.task.id, 0);
+    store.setSubtaskParent(root.task.id, review.task.id, 1);
+    store.setSubtaskParent(root.task.id, implementation.task.id);
+    store.linkTasks(external.task.id, implementation.task.id);
+    store.linkTasks(implementation.task.id, review.task.id);
+    store.linkTasks(review.task.id, root.task.id);
+
+    const rootDetail = store.getTask(root.task.id);
+    assert.deepEqual(rootDetail.subtasks.map((task) => task.id), [implementation.task.id, review.task.id]);
+    assert.equal(store.getRelationshipGraph(implementation.task.id).hierarchy.find((edge) => edge.subtaskId === implementation.task.id)?.position, 0);
+    const reviewDetail = store.getTask(review.task.id);
+    assert.equal(reviewDetail.parentTask?.id, root.task.id);
+    assert.deepEqual(reviewDetail.prerequisites.map((task) => task.id), [implementation.task.id]);
+    assert.deepEqual(reviewDetail.dependents.map((task) => task.id), [root.task.id]);
+
+    const graph = store.getRelationshipGraph(review.task.id);
+    assert.equal(graph.rootTaskId, root.task.id);
+    assert.equal(graph.totalPhases, 4);
+    assert.equal("body" in graph.nodes.find((node) => node.task.id === implementation.task.id)!.task, false);
+    assert.deepEqual(new Set(graph.dependencies.map((edge) => `${edge.prerequisiteId}->${edge.dependentId}`)), new Set([
+      `${external.task.id}->${implementation.task.id}`,
+      `${implementation.task.id}->${review.task.id}`,
+      `${review.task.id}->${root.task.id}`,
+    ]));
+    const phases = Object.fromEntries(graph.nodes.map((node) => [node.task.id, node.phase]));
+    assert.equal(phases[external.task.id], 0);
+    assert.equal(phases[implementation.task.id], 1);
+    assert.equal(phases[review.task.id], 2);
+    assert.equal(phases[root.task.id], 3);
+    assert.equal(store.claimTask({ taskId: implementation.task.id }), null);
+
+    store.completeTask(external.task.id, { summary: "Contract approved", metadata: { contract: "v2" } });
+    assert.equal(store.getTask(implementation.task.id).task.status, "ready");
+    store.completeTask(implementation.task.id, { summary: "API implementation complete" });
+    assert.equal(store.getTask(review.task.id).task.status, "ready");
+    const context = store.buildWorkerContext(review.task.id);
+    assert.match(context, /Parent task goal/);
+    assert.match(context, /Relationship and execution order/);
+    assert.match(context, /Current phase: 3 of 4/);
+    assert.match(context, /API implementation complete/);
+    assert.doesNotMatch(context, /PRIVATE IMPLEMENTATION BODY/);
+    assert.match(context, new RegExp(`Completion unlocks[\\s\\S]*${root.task.id}`));
+
+    assert.throws(
+      () => store.setSubtaskParent(implementation.task.id, root.task.id),
+      /hierarchy cycle/i,
+    );
+    const removed = store.removeSubtask(root.task.id, review.task.id);
+    assert.equal(removed.parentTask, null);
+    assert.deepEqual(store.getTask(root.task.id).subtasks.map((task) => task.id), [implementation.task.id]);
+  } finally {
+    store.close();
+  }
+});
+
+test("task hierarchy persists across reopen and parent deletion only detaches subtasks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "taskcircuit-hierarchy-"));
+  const dbPath = join(directory, "taskcircuit.db");
+  let rootId = "";
+  let subtaskId = "";
+  try {
+    const store = new KanbanStore(dbPath);
+    const root = store.createTask({ title: "Durable parent" });
+    const subtask = store.createTask({ title: "Durable subtask" });
+    rootId = root.task.id;
+    subtaskId = subtask.task.id;
+    store.setSubtaskParent(rootId, subtaskId, 3);
+    store.close();
+
+    const reopened = new KanbanStore(dbPath);
+    assert.equal(reopened.getTask(subtaskId).parentTask?.id, rootId);
+    assert.equal(reopened.getRelationshipGraph(subtaskId).hierarchy[0]?.position, 3);
+    reopened.deleteTask(rootId);
+    assert.equal(reopened.getTask(subtaskId).parentTask, null);
+    reopened.close();
+
+    const database = new DatabaseSync(dbPath);
+    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+    database.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("failed runs requeue until the retry budget is exhausted", () => {
   const store = new KanbanStore(":memory:");
   try {

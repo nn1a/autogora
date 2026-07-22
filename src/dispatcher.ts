@@ -94,6 +94,7 @@ function workerPrompt(claim: ClaimedTask, cliEntry: string): string {
         ? "MCP is unavailable in this Cline build. Use only the scoped TaskCircuit CLI bridge for task lifecycle communication."
         : "Use only the scoped TaskCircuit CLI bridge for task lifecycle communication; do not change Gemini user or project MCP settings.",
       `First run ${bridge} show "$KANBAN_TASK_ID". For long work run ${bridge} heartbeat "$KANBAN_TASK_ID" --note "progress".`,
+      "Read relationshipGraph and workerContext from show. Work only on the current node; TaskCircuit has already enforced every prerequisite, and your completion will unlock listed dependents.",
       `Record handoffs with ${bridge} comment "$KANBAN_TASK_ID" "message".`,
       `Finish exactly once with ${bridge} complete "$KANBAN_TASK_ID" --summary "summary" or ${bridge} block "$KANBAN_TASK_ID" "reason" --kind needs_input.`,
       "The dispatcher scopes these commands to the active task and claim. Do not claim, create, reassign, unblock, or modify unrelated tasks.",
@@ -101,6 +102,7 @@ function workerPrompt(claim: ClaimedTask, cliEntry: string): string {
   } else {
     instructions.push(
       "Call kanban_show first without a task_id. Work only on that task in the current workspace.",
+      "Read relationshipGraph and workerContext from kanban_show. Follow the recorded dependency phase; do not implement sibling or downstream tasks.",
       "Use kanban_heartbeat for long-running work. Record durable intermediate handoffs with kanban_comment.",
       "Do not claim, create, reassign, unblock, or modify unrelated tasks.",
     );

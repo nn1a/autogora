@@ -59,6 +59,14 @@ test("triage specification and decomposition use durable atomic task graphs", as
     assert.deepEqual(new Set(report.parents.map((task) => task.id)), new Set([na.task.id, eu.task.id]));
     assert.deepEqual(result.task.parents.map((task) => task.id), [report.task.id]);
     assert.equal(result.task.task.assignee, "orchestrator");
+    assert.deepEqual(new Set(result.task.subtasks.map((task) => task.id)), new Set([na.task.id, eu.task.id, report.task.id]));
+    assert.equal(na.parentTask?.id, root.task.id);
+    assert.equal(eu.parentTask?.id, root.task.id);
+    assert.equal(report.parentTask?.id, root.task.id);
+    assert.equal(result.graph.relationshipGraph.rootTaskId, root.task.id);
+    assert.equal(result.graph.relationshipGraph.totalPhases, 3);
+    assert.equal(result.graph.relationshipGraph.nodes.find((node) => node.task.id === report.task.id)?.phase, 1);
+    assert.equal(result.graph.relationshipGraph.nodes.find((node) => node.task.id === root.task.id)?.phase, 2);
 
     store.completeTask(na.task.id, { summary: "NA complete" });
     store.completeTask(eu.task.id, { summary: "EU complete" });
@@ -115,13 +123,17 @@ test("swarm topology creates a completed blackboard, parallel workers, verifier,
       const worker = store.getTask(workerId);
       assert.equal(worker.task.status, "ready");
       assert.deepEqual(worker.parents.map((task) => task.id), [swarm.root.task.id]);
+      assert.equal(worker.parentTask?.id, swarm.root.task.id);
     }
     const verifier = store.getTask(swarm.verifierId);
     assert.equal(verifier.task.status, "todo");
     assert.deepEqual(new Set(verifier.parents.map((task) => task.id)), new Set(swarm.workerIds));
+    assert.equal(verifier.parentTask?.id, swarm.root.task.id);
     const synthesizer = store.getTask(swarm.synthesizerId);
     assert.equal(synthesizer.task.status, "todo");
     assert.deepEqual(synthesizer.parents.map((task) => task.id), [swarm.verifierId]);
+    assert.equal(synthesizer.parentTask?.id, swarm.root.task.id);
+    assert.equal(store.getTask(swarm.root.task.id).subtasks.length, 5);
   } finally {
     store.close();
   }

@@ -345,6 +345,7 @@ session cookie, and default `kanban.db` filename remain unchanged for data and
 automation compatibility.
 
 - Planning: `kanban_create`, `kanban_list`, `kanban_show`, `kanban_update`, `kanban_comment`, `kanban_link`, `kanban_unlink`
+- Relationships: `kanban_graph`, `kanban_subtask_set`, `kanban_subtask_remove`
 - Boards: `kanban_boards_list`, `kanban_boards_create`, `kanban_boards_update`, `kanban_boards_switch`, `kanban_boards_remove`
 - Dispatch: `kanban_claim`
 - Worker lifecycle: `kanban_heartbeat`, `kanban_complete`, `kanban_block`
@@ -360,6 +361,20 @@ through environment variables. Their lifecycle tools can omit those identifiers,
 and the server rejects attempts to operate on another scoped board, task, or
 run. Without `--board`, the dispatcher sweeps all active boards while preserving
 the global worker limit.
+
+TaskCircuit keeps two relation types separate:
+
+- parent task/subtask hierarchy records which goal owns a unit of work;
+- prerequisite/dependent links form the acyclic execution DAG and gate claims.
+
+`decompose` atomically records every generated task under the triage root, applies
+the dependency DAG, and makes the root depend on all terminal subtasks. Use
+`taskcircuit graph <task-id>` or `kanban_graph` to inspect the combined topology
+and topological phases. A worker receives the root goal, current node, completed
+prerequisite handoffs, direct dependents, and a metadata-only phase map. Bodies,
+workspaces, attachments, and unfinished results from other nodes are not copied
+into worker context. The dispatcher still rechecks the dependency gate inside
+the same transaction that claims a task.
 
 ## Skills
 

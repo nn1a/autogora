@@ -72,10 +72,26 @@ test("CLI parity verbs share atomic claims, heartbeats, routing fields, and bulk
     const forbiddenAdmin = cli(["delete", created.task.id], scopedWorkerEnv);
     assert.equal(forbiddenAdmin.status, 1);
     assert.match(forbiddenAdmin.stderr, /context and lifecycle commands/);
+    const scopedGraph = successfulJson<any>(["graph", created.task.id], scopedWorkerEnv);
+    assert.equal(scopedGraph.focusTaskId, created.task.id);
+    const forbiddenGraph = cli(["graph", "another-task"], scopedWorkerEnv);
+    assert.equal(forbiddenGraph.status, 1);
+    assert.match(forbiddenGraph.stderr, /scoped to task/);
     successfulJson<any[]>(["complete", created.task.id, "--summary", "CLI flow complete"], scopedWorkerEnv);
 
     const first = successfulJson<any>(["create", "First", "--db", dbPath]);
     const second = successfulJson<any>(["create", "Second", "--db", dbPath]);
+    const hierarchy = successfulJson<any>([
+      "subtask-add", first.task.id, second.task.id, "--position", "0", "--db", dbPath,
+    ]);
+    assert.equal(hierarchy.parentTask.id, first.task.id);
+    const graph = successfulJson<any>(["graph", second.task.id, "--db", dbPath]);
+    assert.equal(graph.rootTaskId, first.task.id);
+    const shown = successfulJson<any>(["show", second.task.id, "--db", dbPath]);
+    assert.equal(shown.relationshipGraph.rootTaskId, first.task.id);
+    assert.match(shown.workerContext, /Relationship and execution order/);
+    const detached = successfulJson<any>(["subtask-rm", first.task.id, second.task.id, "--db", dbPath]);
+    assert.equal(detached.parentTask, null);
     const reassigned = successfulJson<any>([
       "reassign", first.task.id, second.task.id, "reviewer", "--db", dbPath,
     ]);

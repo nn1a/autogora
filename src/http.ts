@@ -337,10 +337,10 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
               const detail = store.getTask(task.id);
               return {
                 ...task,
-                childrenDone: detail.children.filter((child) => child.status === "done").length,
-                childrenTotal: detail.children.length,
+                subtasksDone: detail.subtasks.filter((subtask) => subtask.status === "done").length,
+                subtasksTotal: detail.subtasks.length,
                 commentsCount: detail.comments.length,
-                linksCount: detail.parents.length + detail.children.length,
+                relationshipsCount: detail.parents.length + detail.children.length + detail.subtasks.length + (detail.parentTask ? 1 : 0),
               };
             });
           return { board: manager.read(board), tasks, stats: store.getStats(board), diagnostics: store.diagnose(board) };
@@ -418,13 +418,33 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         return;
       }
 
+      if (segments[1] === "hierarchy" && (method === "POST" || method === "DELETE")) {
+        const body = method === "POST" ? await readJson(request) : {};
+        const parentTaskId = stringValue(body.parentTaskId) ?? url.searchParams.get("parentTaskId") ?? "";
+        const subtaskId = stringValue(body.subtaskId) ?? url.searchParams.get("subtaskId") ?? "";
+        const position = method === "POST" ? numberValue(body.position) : undefined;
+        const value = await withStore(manager, board, (store) => ({
+          detail: method === "POST"
+            ? store.setSubtaskParent(parentTaskId, subtaskId, position)
+            : store.removeSubtask(parentTaskId, subtaskId),
+          graph: store.getRelationshipGraph(subtaskId),
+        }));
+        sendJson(response, 200, value);
+        return;
+      }
+
       const taskId = segments[1] === "tasks" ? segments[2] : undefined;
       if (taskId) {
         if (segments.length === 3 && method === "GET") {
           sendJson(response, 200, await withStore(manager, board, (store) => ({
             ...store.getTask(taskId),
+            relationshipGraph: store.getRelationshipGraph(taskId),
             workerContext: store.buildWorkerContext(taskId),
           })));
+          return;
+        }
+        if (segments[3] === "graph" && method === "GET") {
+          sendJson(response, 200, await withStore(manager, board, (store) => store.getRelationshipGraph(taskId)));
           return;
         }
         if (segments.length === 3 && method === "PATCH") {

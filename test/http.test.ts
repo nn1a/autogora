@@ -54,6 +54,8 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(appText, /kanban\.theme/);
     assert.match(appText, /status-badge/);
     assert.match(appText, /task-context/);
+    assert.match(appText, /Task hierarchy/);
+    assert.match(appText, /Execution dependencies/);
     const styles = await fetch(`${dashboard.url}/styles.css`, { headers: sessionHeaders });
     assert.equal(styles.status, 200);
     const stylesText = await styles.text();
@@ -62,6 +64,7 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.match(stylesText, /grid-auto-columns: calc\(100vw - 24px\)/);
     assert.match(stylesText, /dialog\.dialog-wide \{ width: min\(720px, calc\(100vw - 32px\)\); \}/);
     assert.match(stylesText, /overflow-x: clip/);
+    assert.match(stylesText, /overflow-wrap: anywhere/);
     assert.doesNotMatch(stylesText, /\.dialog-form\.wide/);
 
     const orchestration = await request("/api/boards/default", {
@@ -154,6 +157,19 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.equal(eventMessage.type, "events");
     assert.ok(eventMessage.events.some((event: { taskId: string }) => event.taskId === streamed.value.task.id));
 
+    const hierarchy = await request("/api/hierarchy?board=default", {
+      method: "POST",
+      body: JSON.stringify({ parentTaskId: taskId, subtaskId: streamed.value.task.id, position: 0 }),
+    });
+    assert.equal(hierarchy.response.status, 200);
+    assert.equal(hierarchy.value.detail.parentTask.id, taskId);
+    assert.equal(hierarchy.value.graph.rootTaskId, taskId);
+    const graph = await request(`/api/tasks/${streamed.value.task.id}/graph?board=default`);
+    assert.equal(graph.value.hierarchy[0].subtaskId, streamed.value.task.id);
+    const parentDetail = await request(`/api/tasks/${taskId}?board=default`);
+    assert.deepEqual(parentDetail.value.subtasks.map((task: { id: string }) => task.id), [streamed.value.task.id]);
+    assert.match(parentDetail.value.workerContext, /Relationship and execution order/);
+
     const manager = new BoardManager(dbPath);
     const store = manager.openStore("default");
     const activeTask = store.createTask({ title: "active API run", assignee: "worker", runtime: "codex" });
@@ -185,6 +201,8 @@ test("authenticated HTTP API and WebSocket stream share the board kernel", async
     assert.ok(board.value.tasks.some((task: { id: string; priority: number }) => task.id === taskId && task.priority === 7));
     const taskCard = board.value.tasks.find((task: { id: string }) => task.id === taskId);
     assert.equal(taskCard.commentsCount, 1);
+    assert.equal(taskCard.subtasksTotal, 1);
+    assert.equal(taskCard.relationshipsCount, 1);
   } finally {
     socket?.close();
     if (socket && socket.readyState !== WebSocket.CLOSED) {
