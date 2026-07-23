@@ -558,19 +558,25 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 			return err
 		}
 		expectedRevision := *input.ExpectedGraphRevision
-		if incident.GraphRevision != expectedRevision {
-			return &GraphRevisionConflictError{
-				Board: incident.Board, Expected: expectedRevision, Actual: incident.GraphRevision,
-			}
-		}
-		if _, err := requireBoardGraphRevision(ctx, tx, incident.Board, expectedRevision); err != nil {
+		state, err := readBoardGraphState(ctx, tx, incident.Board)
+		if err != nil {
 			return err
+		}
+		if state.Revision != expectedRevision {
+			return &GraphRevisionConflictError{
+				Board: incident.Board, Expected: expectedRevision, Actual: state.Revision,
+			}
 		}
 
 		var updateResult sql.Result
 		updatedAt := now()
 		switch incident.Status {
 		case model.CoordinationIncidentOpen:
+			if incident.GraphRevision != expectedRevision {
+				return &GraphRevisionConflictError{
+					Board: incident.Board, Expected: expectedRevision, Actual: incident.GraphRevision,
+				}
+			}
 			if incident.ClaimToken != "" || incident.ClaimExpiresAt != nil {
 				return fmt.Errorf("open coordination incident %s has an invalid claim", id)
 			}
@@ -594,10 +600,10 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 			}
 			updateResult, err = tx.ExecContext(ctx, `
 				UPDATE coordination_incidents
-				SET claim_token = ?, claim_expires_at = ?, updated_at = ?
+				SET graph_revision = ?, claim_token = ?, claim_expires_at = ?, updated_at = ?
 				WHERE id = ? AND status = 'coordinating' AND graph_revision = ?
 					AND claim_token = ? AND claim_expires_at = ? AND claim_expires_at <= ?
-			`, token, expiresAt, updatedAt, id, expectedRevision,
+			`, expectedRevision, token, expiresAt, updatedAt, id, incident.GraphRevision,
 				incident.ClaimToken, *incident.ClaimExpiresAt, timestamp)
 		default:
 			claimedIncident = incident
@@ -625,6 +631,7 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 			return nil
 		}
 		incident.Status = model.CoordinationIncidentCoordinating
+		incident.GraphRevision = expectedRevision
 		incident.ClaimToken = token
 		incident.ClaimExpiresAt = &expiresAt
 		incident.UpdatedAt = updatedAt

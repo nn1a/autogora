@@ -264,6 +264,56 @@ func TestCoordinationIncidentClaimReclaimsAfterCrashAndRejectsStaleOwner(t *test
 	}
 }
 
+func TestCoordinationIncidentExpiredClaimRebasesToCurrentGraph(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, err := opened.CreateTask(ctx, CreateTaskInput{Title: "focus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, _, err := opened.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
+		TaskID: &task.Task.ID, Trigger: model.CoordinationTriggerGraphStalled,
+		Summary: "Graph has no runnable task", ExpectedGraphRevision: revisionPointer(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimTime := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
+	first, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: revisionPointer(0), TTL: time.Minute, Current: claimTime,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%v value=%+v err=%v", claimed, first, err)
+	}
+	parent, err := opened.CreateTask(ctx, CreateTaskInput{Title: "new prerequisite"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, parent.Task.ID, task.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	live, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: revisionPointer(1), TTL: time.Minute,
+		Current: claimTime.Add(time.Minute - time.Nanosecond),
+	})
+	if err != nil || claimed || live.ClaimToken != first.ClaimToken || live.GraphRevision != 0 {
+		t.Fatalf("live stale claim was rewritten: claimed=%v value=%+v err=%v", claimed, live, err)
+	}
+	reclaimed, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: revisionPointer(1), TTL: time.Minute,
+		Current: claimTime.Add(time.Minute),
+	})
+	if err != nil || !claimed || reclaimed.ClaimToken == first.ClaimToken ||
+		reclaimed.GraphRevision != 1 {
+		t.Fatalf("expired stale claim was not rebased: claimed=%v value=%+v err=%v", claimed, reclaimed, err)
+	}
+}
+
 func TestCoordinationIncidentClaimGuardsAndAtomicity(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/autogora.db"
