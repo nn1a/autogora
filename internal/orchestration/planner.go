@@ -46,6 +46,11 @@ type CLIPlannerOptions struct {
 
 const plannerOutputLimit = 2 * 1024 * 1024
 
+const (
+	plannerProcessTerminationGrace = time.Second
+	plannerProcessWaitDelay        = 2 * time.Second
+)
+
 type limitedBuffer struct {
 	buffer bytes.Buffer
 	limit  int
@@ -85,27 +90,101 @@ func runPlannerProcess(ctx context.Context, command string, args []string, cwd s
 	cmd := exec.CommandContext(runCtx, command, args...)
 	cmd.Dir = cwd
 	cmd.Env = os.Environ()
+	configurePlannerProcess(cmd)
+	// A coding-agent CLI may leave a descendant holding an inherited output
+	// descriptor after its leader exits. Bound that pipe wait so cleanup can
+	// terminate the owned process tree instead of blocking forever.
+	cmd.WaitDelay = plannerProcessWaitDelay
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = plannerOutputLimit, plannerOutputLimit
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		if parentErr := ctx.Err(); parentErr != nil {
-			return stdout.String(), stderr.String(), parentErr
-		}
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return stdout.String(), stderr.String(), &PlannerFailure{Kind: PlannerFailureTimeout, Err: fmt.Errorf("planner timed out after %s", timeout)}
-		}
-		message := stderr.String()
-		if len(message) > 2000 {
-			message = message[len(message)-2000:]
-		}
-		processErr := fmt.Errorf("planner failed: %w: %s", err, strings.TrimSpace(message))
-		if kind, available := ClassifyPlannerFailure(processErr); available {
-			return stdout.String(), stderr.String(), &PlannerFailure{Kind: kind, Err: processErr}
-		}
-		return stdout.String(), stderr.String(), processErr
+	if err := cmd.Start(); err != nil {
+		return stdout.String(), stderr.String(), plannerProcessError(
+			ctx,
+			runCtx,
+			timeout,
+			stderr.String(),
+			err,
+		)
+	}
+	releaseProcessTree, err := attachPlannerProcessTree(cmd)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return stdout.String(), stderr.String(), fmt.Errorf(
+			"protect planner process tree: %w",
+			err,
+		)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	canceled := false
+	select {
+	case err = <-done:
+	case <-runCtx.Done():
+		canceled = true
+		// CommandContext terminates only the leader on Unix. Terminate the
+		// process group/job here before waiting so descendants cannot keep the
+		// output pipes, agent slot, and Coordinator attempt alive.
+		releaseProcessTree()
+		err = <-done
+	}
+	// Successful CLIs can also leave background descendants. The tree remains
+	// owned until Wait finishes, then this call removes any such leftovers.
+	releaseProcessTree()
+	if canceled {
+		return stdout.String(), stderr.String(), plannerProcessError(
+			ctx,
+			runCtx,
+			timeout,
+			stderr.String(),
+			err,
+		)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) &&
+		cmd.ProcessState != nil &&
+		cmd.ProcessState.Success() {
+		// The leader completed successfully; ErrWaitDelay only reports that a
+		// descendant retained an inherited output descriptor. The tree is now
+		// terminated, so preserve the leader's successful result.
+		err = nil
+	}
+	if err != nil {
+		return stdout.String(), stderr.String(), plannerProcessError(
+			ctx,
+			runCtx,
+			timeout,
+			stderr.String(),
+			err,
+		)
 	}
 	return stdout.String(), stderr.String(), nil
+}
+
+func plannerProcessError(
+	ctx context.Context,
+	runCtx context.Context,
+	timeout time.Duration,
+	stderr string,
+	err error,
+) error {
+	if parentErr := ctx.Err(); parentErr != nil {
+		return parentErr
+	}
+	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return &PlannerFailure{Kind: PlannerFailureTimeout, Err: fmt.Errorf("planner timed out after %s", timeout)}
+	}
+	message := stderr
+	if len(message) > 2000 {
+		message = message[len(message)-2000:]
+	}
+	processErr := fmt.Errorf("planner failed: %w: %s", err, strings.TrimSpace(message))
+	if kind, available := ClassifyPlannerFailure(processErr); available {
+		return &PlannerFailure{Kind: kind, Err: processErr}
+	}
+	return processErr
 }
 
 func decodeJSONObject(text string) (any, error) {
