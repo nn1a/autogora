@@ -10,7 +10,7 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">T</span>
+      <span class="brand-mark">A</span>
       <div><strong>Autogora</strong><small>local agent work control plane</small></div>
     </div>
     <div class="board-actions">
@@ -18,6 +18,7 @@
       <select id="board-select"></select>
       <button id="new-board" class="ghost">New board</button>
       <button id="board-settings" class="ghost">Settings</button>
+      <button id="agent-settings" class="ghost">Agents</button>
       <button id="new-swarm" class="ghost">Swarm</button>
       <button id="nudge" class="primary"><span class="nudge-wide">Dispatch now</span><span class="nudge-short">Run now</span></button>
       <button id="theme-toggle" class="ghost theme-toggle" type="button" aria-label="Switch to light theme">
@@ -70,7 +71,7 @@
         <label>Board profile<select name="profile"><option value="">Custom assignment</option></select></label>
         <label>Assignee<input name="assignee" placeholder="profile name"></label>
         <label>Runtime<select name="runtime"><option>manual</option><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
-        <label>Resolved model<input name="modelPreview" value="Manual task" readonly></label>
+        <label>Current route model<input name="modelPreview" value="Manual task" readonly></label>
         <label>Priority<input name="priority" type="number" value="0"></label>
         <label>Tenant<input name="tenant"></label>
         <label>Workspace kind<select name="workspaceKind"><option>scratch</option><option>dir</option><option>worktree</option></select></label>
@@ -103,6 +104,10 @@
       </div>
       <label>Description<textarea name="description" rows="3"></textarea></label>
       <label>Default project directory<input name="defaultWorkdir"></label>
+      <section class="settings-callout">
+        <div><strong>Coding agents</strong><small>Configure installed CLIs, models, fallback order, and automatic dispatch globally.</small></div>
+        <button id="manage-agents" type="button">Manage agents</button>
+      </section>
       <hr>
       <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
       <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
@@ -126,6 +131,44 @@
         <button id="archive-board" value="cancel" class="danger">Archive board</button>
         <span class="spacer"></span>
         <button type="button" data-close-dialog class="ghost">Cancel</button><button class="primary">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="agents-dialog" class="dialog-agents">
+    <form id="agents-form" method="dialog" class="dialog-form">
+      <header><div><h2>Coding agent setup</h2><small id="agents-config-path" class="mono"></small></div><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <p class="dialog-intro">Autogora stores routing settings only. Authentication remains with each coding agent CLI. Detection checks PATH and <code>--version</code>; it never sends a prompt.</p>
+      <section class="supervisor-panel" aria-labelledby="supervisor-title">
+        <div class="section-heading">
+          <div><strong id="supervisor-title">Automatic orchestration</strong><small id="supervisor-status" aria-live="polite">Checking status…</small></div>
+          <button id="supervisor-toggle" type="button" class="ghost compact" disabled>Start</button>
+        </div>
+        <div class="agent-supervisor-grid">
+          <label class="inline"><input name="autoStart" type="checkbox"> Start with WebUI and TUI</label>
+          <label>Maximum workers<input name="maxWorkers" type="number" min="1" max="64" value="1"></label>
+          <label class="inline"><input name="allowWrites" type="checkbox"> Allow workspace changes (required for implementation)</label>
+        </div>
+      </section>
+      <section class="agent-defaults" aria-labelledby="agent-defaults-title">
+        <div><strong id="agent-defaults-title">Preferred agent order</strong><small>Comma-separated IDs. The first healthy agent runs first; later IDs provide capacity and fallback.</small></div>
+        <div class="form-grid agent-default-grid">
+          <label>Workers<input name="workerAgents" placeholder="codex, claude"></label>
+          <label>Planners<input name="plannerAgents" placeholder="codex, claude"></label>
+          <label>Judges<input name="judgeAgents" placeholder="claude, codex"></label>
+        </div>
+      </section>
+      <section class="agent-editor" aria-labelledby="agent-editor-title">
+        <div class="section-heading">
+          <div><strong id="agent-editor-title">Available coding agents</strong><small id="agent-detection-summary">No detection results yet.</small></div>
+          <div class="section-actions"><button id="detect-agents" type="button">Detect CLIs</button><button id="add-agent" type="button">Add agent</button></div>
+        </div>
+        <div id="agent-list"></div>
+      </section>
+      <footer>
+        <button id="agents-later" type="button" class="ghost">Not now</button>
+        <span class="spacer"></span>
+        <button type="button" data-close-dialog class="ghost">Cancel</button><button id="agents-submit" class="primary">Save and apply</button>
       </footer>
     </form>
   </dialog>

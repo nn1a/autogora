@@ -8,15 +8,16 @@ const COLORS = {
   running: "#36c9b0", blocked: "#ff6978", review: "#de84ff", done: "#55d38b", archived: "#667085",
 };
 
-const storedTheme = localStorage.getItem("kanban.theme");
+const storedTheme = localStorage.getItem("autogora.theme");
 let activeTheme = ["light", "dark"].includes(storedTheme)
   ? storedTheme
   : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 document.documentElement.dataset.theme = activeTheme;
 
 const state = {
-  boards: [], board: localStorage.getItem("kanban.board") || "default", metadata: null,
-  tasks: [], stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
+  boards: [], board: localStorage.getItem("autogora.board") || "default", metadata: null,
+  profiles: [], tasks: [], stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
+  agentConfig: null, agentConfigExists: false, detections: [], effectiveAgents: [], supervisor: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -33,7 +34,7 @@ function initials(value) {
 function setTheme(theme, persist = true) {
   activeTheme = theme;
   document.documentElement.dataset.theme = theme;
-  if (persist) localStorage.setItem("kanban.theme", theme);
+  if (persist) localStorage.setItem("autogora.theme", theme);
   const target = theme === "dark" ? "light" : "dark";
   const button = $("#theme-toggle");
   if (button) {
@@ -118,11 +119,20 @@ async function loadBoard() {
   const includeArchived = $("#show-archived").checked;
   const payload = await api(boardPath(`/api/board?includeArchived=${includeArchived}`));
   state.metadata = payload.board;
+  state.profiles = payload.profiles || payload.board?.orchestration?.profiles || [];
   state.tasks = payload.tasks;
   state.stats = payload.stats;
   state.diagnostics = payload.diagnostics;
   renderFilters();
   renderBoard();
+}
+
+function workerProfiles() {
+  return (state.profiles || []).filter((profile) => !profile.disabled);
+}
+
+function profileByName(name) {
+  return workerProfiles().find((profile) => profile.name === name);
 }
 
 function filteredTasks() {
@@ -295,7 +305,7 @@ function openTaskDialog(status = "todo") {
   const form = $("#task-form");
   form.reset();
   form.elements.status.value = status;
-  const profiles = (state.metadata?.orchestration?.profiles || []).filter((profile) => !profile.disabled);
+  const profiles = workerProfiles();
   form.elements.profile.innerHTML = `<option value="">Custom assignment</option>${profiles.map((profile) =>
     `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)} · ${escapeHtml(profile.model || "CLI default")}</option>`).join("")}`;
   updateTaskModelPreview();
@@ -304,7 +314,7 @@ function openTaskDialog(status = "todo") {
 
 function updateTaskModelPreview() {
   const form = $("#task-form");
-  const profile = (state.metadata?.orchestration?.profiles || []).find((item) => item.name === form.elements.profile.value);
+  const profile = profileByName(form.elements.profile.value);
   if (profile) {
     form.elements.assignee.value = profile.name;
     form.elements.runtime.value = profile.runtime;
@@ -347,14 +357,19 @@ function taskOptions(excludeId) {
 function renderDrawer(detail) {
   const task = detail.task;
   const runAgents = new Map((detail.runAgentConfigs || []).map((config) => [config.runId, config]));
-  const runRows = detail.runs.slice().reverse().map((run) => `<div class="detail-row">
-    ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger compact">Terminate</button>` : ""}
-    <strong>${escapeHtml(run.workerId)}</strong>
-    <span class="detail-status">${escapeHtml(run.status)}</span>
-    <span class="mono">${escapeHtml(run.id)} · ${relativeTime(run.claimedAt)}</span>
-    ${runAgents.has(run.id) ? `<div>${escapeHtml(runAgents.get(run.id).profile)} · ${escapeHtml(runAgents.get(run.id).runtime)} · ${escapeHtml(runAgents.get(run.id).model || "CLI default (unpinned)")}${runAgents.get(run.id).provider ? ` · ${escapeHtml(runAgents.get(run.id).provider)}` : ""}</div>` : ""}
-    ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
-  </div>`).join("");
+  const runRows = detail.runs.slice().reverse().map((run) => {
+    const config = runAgents.get(run.id);
+    const route = config ? `${config.profile} · ${config.runtime} · ${config.model || "CLI default (unpinned)"}${config.provider ? ` · ${config.provider}` : ""}` : "";
+    const provenance = config ? `${String(config.source || "unknown").replaceAll("_", " ")}${config.fallbackFrom ? ` · fallback from ${config.fallbackFrom}` : ""}` : "";
+    return `<div class="detail-row">
+      ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger compact">Terminate</button>` : ""}
+      <strong>${escapeHtml(run.workerId)}</strong>
+      <span class="detail-status">${escapeHtml(run.status)}</span>
+      <span class="mono">${escapeHtml(run.id)} · ${relativeTime(run.claimedAt)}</span>
+      ${config ? `<div>${escapeHtml(route)}</div><div class="mono">${escapeHtml(provenance)}</div>` : ""}
+      ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
+    </div>`;
+  }).join("");
   const comments = detail.comments.map((comment) => `<div class="detail-row"><strong>${escapeHtml(comment.author)}</strong>${markdown(comment.body)}<div class="mono">${escapeHtml(comment.createdAt)}</div></div>`).join("");
   const attachments = detail.attachments.map((attachment) => `<div class="detail-row">
     <button class="icon-button compact" data-remove-attachment="${escapeHtml(attachment.id)}" aria-label="Remove ${escapeHtml(attachment.name)}" title="Remove attachment">×</button>
@@ -384,6 +399,10 @@ function renderDrawer(detail) {
     ? `<div class="detail-row" data-open-task="${escapeHtml(detail.parentTask.id)}"><button type="button" class="icon-button compact" data-remove-parent-task="${escapeHtml(detail.parentTask.id)}" aria-label="Remove parent task">×</button><strong>${escapeHtml(detail.parentTask.title)}</strong><span class="mono">${escapeHtml(detail.parentTask.id)}</span></div>`
     : "<small>No parent task</small>";
   const subtasks = detail.subtasks.map((subtask) => `<div class="detail-row" data-open-task="${escapeHtml(subtask.id)}"><button type="button" class="icon-button compact" data-remove-subtask="${escapeHtml(subtask.id)}" aria-label="Remove subtask">×</button><strong>${escapeHtml(subtask.title)}</strong><span class="mono">${escapeHtml(subtask.id)} · ${escapeHtml(subtask.status)}</span></div>`).join("");
+  const selectedProfile = workerProfiles().find((profile) => profile.name === (task.assignee || "") && profile.runtime === task.runtime);
+  const drawerProfileOptions = `<option value="">Custom assignment</option>${workerProfiles().map((profile) =>
+    `<option value="${escapeHtml(profile.name)}"${selectedProfile?.name === profile.name ? " selected" : ""}>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)}</option>`).join("")}`;
+  const routeModel = selectedProfile?.model || (task.runtime === "manual" ? "Manual task" : "CLI default (unpinned)");
   $("#drawer-content").innerHTML = `
     <div class="drawer-title-block"><span class="eyebrow">Task</span><h1>${escapeHtml(task.title)}</h1></div>
     <div class="task-context">
@@ -395,9 +414,11 @@ function renderDrawer(detail) {
       <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
     </div>
     <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
-    <div class="drawer-grid">
+    <div class="drawer-grid drawer-routing-grid">
+      <label>Board profile<select id="edit-profile">${drawerProfileOptions}</select></label>
       <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
       <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+      <label>Current route model<input id="edit-model-preview" value="${escapeHtml(routeModel)}" readonly></label>
       <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
     </div>
     <label>Description<textarea id="edit-body" rows="9">${escapeHtml(task.body)}</textarea></label>
@@ -440,6 +461,19 @@ function renderDrawer(detail) {
 
 function bindDrawer(detail) {
   const taskId = detail.task.id;
+  const updateRoutePreview = () => {
+    const profile = profileByName($("#edit-profile").value);
+    if (profile) {
+      $("#edit-assignee").value = profile.name;
+      $("#edit-runtime").value = profile.runtime;
+      $("#edit-model-preview").value = profile.model || "CLI default (unpinned)";
+      return;
+    }
+    $("#edit-model-preview").value = $("#edit-runtime").value === "manual" ? "Manual task" : "CLI default (unpinned)";
+  };
+  $("#edit-profile").addEventListener("change", updateRoutePreview);
+  $("#edit-assignee").addEventListener("input", () => { $("#edit-profile").value = ""; updateRoutePreview(); });
+  $("#edit-runtime").addEventListener("change", () => { $("#edit-profile").value = ""; updateRoutePreview(); });
   $("#save-task").addEventListener("click", async () => {
     try {
       await api(boardPath(`/api/tasks/${taskId}`), { method: "PATCH", body: JSON.stringify({
@@ -578,6 +612,251 @@ function readProfileEditor() {
   });
 }
 
+function commaIDs(value) {
+  return [...new Set(String(value || "").split(",")
+    .map((item) => item.trim().toLowerCase()).filter(Boolean))];
+}
+
+function blankAgentConfig() {
+  return {
+    schemaVersion: 1,
+    supervisor: { autoStart: false, maxWorkers: 1, allowWrites: false },
+    defaults: { workerAgents: [], plannerAgents: [], judgeAgents: [] },
+    agents: [],
+  };
+}
+
+function detectionForAgent(agent) {
+  return state.detections.find((item) => item.id === agent.id)
+    || state.detections.find((item) => item.runtime === agent.runtime && item.executable === agent.command)
+    || state.detections.find((item) => item.runtime === agent.runtime);
+}
+
+function effectiveAgentFor(agent) {
+  return state.effectiveAgents.find((item) => item.name === agent.id);
+}
+
+function agentEditorRow(agent = {}) {
+  const runtime = ["codex", "claude", "cline", "gemini"].includes(agent.runtime) ? agent.runtime : "codex";
+  const runtimeOptions = ["codex", "claude", "cline", "gemini"].map((value) =>
+    `<option value="${value}"${value === runtime ? " selected" : ""}>${value}</option>`).join("");
+  const roles = new Set(agent.roles || ["worker"]);
+  const detection = detectionForAgent({ ...agent, runtime });
+  const effective = effectiveAgentFor(agent);
+  const stateName = detection?.state || "configured";
+  const stateClass = ["installed", "version_unavailable"].includes(stateName) ? stateName : "";
+  const health = effective?.health?.status && effective.health.status !== "unknown"
+    ? ` · ${effective.health.status}${effective.activeRuns ? ` · ${effective.activeRuns} active` : ""}` : "";
+  const detectionNote = detection
+    ? `${detection.version || detection.message || "No version details"}${health}`
+    : `Configured command; standard PATH detection has not matched it${health}`;
+  return `<article class="agent-row" data-original-id="${escapeHtml(agent.id || "")}">
+    <div class="agent-row-head">
+      <label class="inline agent-enabled"><input data-agent="enabled" type="checkbox"${agent.enabled ? " checked" : ""}> Enabled</label>
+      <div class="agent-row-title"><strong>${escapeHtml(agent.id || "New agent")}</strong><span class="agent-state ${stateClass}">${escapeHtml(stateName.replaceAll("_", " "))}</span></div>
+      <button type="button" class="ghost compact agent-row-remove">Remove</button>
+    </div>
+    <div class="agent-fields">
+      <label>Agent ID<input data-agent="id" value="${escapeHtml(agent.id || "")}" placeholder="codex-primary" required pattern="[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?"></label>
+      <label>Runtime<select data-agent="runtime">${runtimeOptions}</select></label>
+      <label>Command<input data-agent="command" value="${escapeHtml(agent.command || runtime)}" required></label>
+      <label>Model<input data-agent="model" value="${escapeHtml(agent.model || "")}" placeholder="CLI default (unpinned)"></label>
+    </div>
+    <div class="agent-fields secondary">
+      <label>Provider<input data-agent="provider" value="${escapeHtml(agent.provider || "")}" placeholder="optional"></label>
+      <label>Maximum concurrent<input data-agent="maxConcurrent" type="number" min="1" max="64" value="${Math.max(1, Number(agent.maxConcurrent) || 1)}"></label>
+      <label>Fallback agent IDs<input data-agent="fallbacks" value="${escapeHtml((agent.fallbacks || []).join(", "))}" placeholder="claude-backup"></label>
+    </div>
+    <div class="agent-roles"><span>Roles</span>
+      ${["worker", "planner", "judge"].map((role) => `<label class="inline"><input data-agent-role="${role}" type="checkbox"${roles.has(role) ? " checked" : ""}> ${role}</label>`).join("")}
+    </div>
+    <div class="agent-detection-note">${escapeHtml(detectionNote)}</div>
+  </article>`;
+}
+
+function renderAgentEditor(config = state.agentConfig || blankAgentConfig()) {
+  const form = $("#agents-form");
+  form.elements.autoStart.checked = Boolean(config.supervisor?.autoStart);
+  form.elements.maxWorkers.value = Math.max(1, Number(config.supervisor?.maxWorkers) || 1);
+  form.elements.allowWrites.checked = Boolean(config.supervisor?.allowWrites);
+  form.elements.workerAgents.value = (config.defaults?.workerAgents || []).join(", ");
+  form.elements.plannerAgents.value = (config.defaults?.plannerAgents || []).join(", ");
+  form.elements.judgeAgents.value = (config.defaults?.judgeAgents || []).join(", ");
+  $("#agent-list").innerHTML = (config.agents || []).map(agentEditorRow).join("")
+    || '<div class="detail-row"><strong>No coding agents configured</strong><div>Detect installed CLIs or add one manually.</div></div>';
+  const installed = state.detections.filter((item) => item.state === "installed").length;
+  const uncertain = state.detections.filter((item) => item.state === "version_unavailable").length;
+  const missing = state.detections.filter((item) => item.state === "missing").length;
+  $("#agent-detection-summary").textContent = state.detections.length
+    ? `${installed} installed, ${uncertain} need verification, ${missing} not found on PATH.`
+    : "No detection results yet.";
+}
+
+function readAgentEditor() {
+  const form = $("#agents-form");
+  const agents = $$(".agent-row", $("#agent-list")).map((row) => {
+    const field = (name) => $(`[data-agent=${name}]`, row);
+    const roles = $$('[data-agent-role]:checked', row).map((input) => input.dataset.agentRole);
+    const id = field("id").value.trim().toLowerCase();
+    if (!id) throw new Error("Every coding agent needs an ID");
+    if (!roles.length) throw new Error(`Agent ${id} needs at least one role`);
+    return {
+      id, runtime: field("runtime").value, command: field("command").value.trim(),
+      model: field("model").value.trim(), provider: field("provider").value.trim(),
+      enabled: field("enabled").checked, maxConcurrent: Number(field("maxConcurrent").value) || 1,
+      roles, fallbacks: commaIDs(field("fallbacks").value),
+    };
+  });
+  const seen = new Set();
+  for (const agent of agents) {
+    if (seen.has(agent.id)) throw new Error(`Agent ID ${agent.id} is duplicated`);
+    seen.add(agent.id);
+  }
+  return {
+    schemaVersion: 1,
+    supervisor: {
+      autoStart: form.elements.autoStart.checked,
+      maxWorkers: Number(form.elements.maxWorkers.value) || 1,
+      allowWrites: form.elements.allowWrites.checked,
+    },
+    defaults: {
+      workerAgents: commaIDs(form.elements.workerAgents.value),
+      plannerAgents: commaIDs(form.elements.plannerAgents.value),
+      judgeAgents: commaIDs(form.elements.judgeAgents.value),
+    },
+    agents,
+  };
+}
+
+function suggestedAgentConfig(config) {
+  const result = JSON.parse(JSON.stringify(config || blankAgentConfig()));
+  result.agents ||= [];
+  const added = [];
+  for (const detection of state.detections) {
+    if (detection.state === "missing") continue;
+    const alreadyConfigured = result.agents.some((agent) => agent.id === detection.id
+      || (agent.runtime === detection.runtime && detection.executable && agent.command === detection.executable));
+    if (alreadyConfigured) continue;
+    const enabled = detection.state === "installed";
+    result.agents.push({
+      id: detection.id, runtime: detection.runtime, command: detection.executable || detection.runtime,
+      model: "", provider: "", enabled, maxConcurrent: 1,
+      roles: ["worker", "planner", "judge"], fallbacks: [],
+    });
+    if (enabled) added.push(detection.id);
+  }
+  result.defaults ||= { workerAgents: [], plannerAgents: [], judgeAgents: [] };
+  for (const [key, role] of [["workerAgents", "worker"], ["plannerAgents", "planner"], ["judgeAgents", "judge"]]) {
+    if (!(result.defaults[key] || []).length) {
+      result.defaults[key] = result.agents.filter((agent) => agent.enabled && agent.roles.includes(role)).map((agent) => agent.id);
+    }
+  }
+  const eligibleWorkers = result.agents.filter((agent) => agent.enabled && agent.roles.includes("worker")).map((agent) => agent.id);
+  for (const id of added) {
+    const index = eligibleWorkers.indexOf(id);
+    const agent = result.agents.find((item) => item.id === id);
+    if (agent && agent.roles.includes("worker") && !(agent.fallbacks || []).length) {
+      agent.fallbacks = eligibleWorkers.slice(index + 1);
+    }
+  }
+  return { config: result, added };
+}
+
+async function loadAgentConfiguration() {
+  const [configuration, supervisor] = await Promise.all([api("/api/config"), api("/api/supervisor")]);
+  state.agentConfig = configuration.config;
+  state.agentConfigExists = configuration.exists;
+  state.supervisor = supervisor;
+  $("#agents-config-path").textContent = configuration.path;
+  return configuration;
+}
+
+function renderSupervisorStatus() {
+  const status = state.supervisor || {};
+  const statusElement = $("#supervisor-status");
+  const toggle = $("#supervisor-toggle");
+  if (status.running) {
+    statusElement.textContent = `Running · ${status.maxWorkers || 1} worker${status.maxWorkers === 1 ? "" : "s"} · ${status.allowWrites ? "workspace writes allowed" : "read-only workers"}`;
+    toggle.textContent = "Stop";
+  } else {
+    statusElement.textContent = status.lastError ? `Stopped · ${status.lastError}` : "Stopped";
+    toggle.textContent = "Start";
+  }
+  toggle.disabled = !state.agentConfigExists;
+}
+
+async function detectAgents(addSuggestions = true) {
+  const button = $("#detect-agents");
+  button.disabled = true;
+  button.textContent = "Detecting…";
+  try {
+    const result = await api("/api/agents/detect", { method: "POST", body: "{}" });
+    state.detections = result.agents || [];
+    if (addSuggestions) {
+      const suggested = suggestedAgentConfig(readAgentEditor());
+      renderAgentEditor(suggested.config);
+      if (suggested.added.length) toast(`Added ${suggested.added.join(", ")} as detected suggestions`);
+    } else {
+      renderAgentEditor(readAgentEditor());
+    }
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; button.textContent = "Detect CLIs"; }
+}
+
+async function openAgentSettings({ firstRun = false } = {}) {
+  if (!state.agentConfig) await loadAgentConfiguration();
+  if (firstRun) state.agentConfig.supervisor.autoStart = true;
+  renderAgentEditor(state.agentConfig);
+  renderSupervisorStatus();
+  const dialog = $("#agents-dialog");
+  if (!dialog.open) dialog.showModal();
+  try {
+    const effective = await api(boardPath("/api/agents/effective"));
+    state.effectiveAgents = effective.profiles || [];
+  } catch (error) { state.effectiveAgents = []; }
+  await detectAgents(true);
+}
+
+async function submitAgentSettings(event) {
+  event.preventDefault();
+  const button = $("#agents-submit");
+  try {
+    const config = readAgentEditor();
+    button.disabled = true; button.textContent = "Applying…";
+    const saved = await api("/api/config", { method: "PUT", body: JSON.stringify(config) });
+    state.agentConfig = saved.config; state.agentConfigExists = saved.exists;
+    state.supervisor = await api("/api/supervisor");
+    renderSupervisorStatus();
+    $("#agents-dialog").close();
+    await loadBoard();
+    toast(config.supervisor.autoStart ? "Agent settings saved; orchestration is running" : "Agent settings saved");
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; button.textContent = "Save and apply"; }
+}
+
+async function toggleSupervisor() {
+  const button = $("#supervisor-toggle");
+  if (!state.agentConfigExists) return;
+  try {
+    button.disabled = true;
+    const action = state.supervisor?.running ? "stop" : "start";
+    state.supervisor = await api(`/api/supervisor/${action}`, { method: "POST", body: "{}" });
+    renderSupervisorStatus();
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+function removeAgentReferences(id) {
+  if (!id) return;
+  const form = $("#agents-form");
+  for (const name of ["workerAgents", "plannerAgents", "judgeAgents"]) {
+    form.elements[name].value = commaIDs(form.elements[name].value).filter((value) => value !== id).join(", ");
+  }
+  $$('[data-agent=fallbacks]', $("#agent-list")).forEach((input) => {
+    input.value = commaIDs(input.value).filter((value) => value !== id).join(", ");
+  });
+}
+
 function connectEvents() {
   state.socket?.close();
   const socket = new EventSource(`/api/events/stream?board=${encodeURIComponent(state.board)}&since=${state.cursor}`);
@@ -607,19 +886,19 @@ function initializeSelects() {
   const options = mutableStatuses.map((status) => `<option value="${status}">${status}</option>`).join("");
   $("#task-form [name=status]").innerHTML = options;
   $("#bulk-status").innerHTML = `<option value="">Move to…</option>${options}`;
-  $("#show-archived").checked = localStorage.getItem("kanban.showArchived") === "true";
-  $("#lane-profile").checked = localStorage.getItem("kanban.laneByProfile") === "true";
+  $("#show-archived").checked = localStorage.getItem("autogora.showArchived") === "true";
+  $("#lane-profile").checked = localStorage.getItem("autogora.laneByProfile") === "true";
 }
 
 function bindGlobalActions() {
   $$('[data-close-dialog]').forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
   $("#board-select").addEventListener("change", async (event) => {
-    state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("kanban.board", state.board);
+    state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("autogora.board", state.board);
     await loadBoard(); connectEvents();
   });
   ["#search", "#tenant-filter", "#assignee-filter"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
-  $("#lane-profile").addEventListener("change", () => { localStorage.setItem("kanban.laneByProfile", $("#lane-profile").checked); renderBoard(); });
-  $("#show-archived").addEventListener("change", () => { localStorage.setItem("kanban.showArchived", $("#show-archived").checked); loadBoard(); });
+  $("#lane-profile").addEventListener("change", () => { localStorage.setItem("autogora.laneByProfile", $("#lane-profile").checked); renderBoard(); });
+  $("#show-archived").addEventListener("change", () => { localStorage.setItem("autogora.showArchived", $("#show-archived").checked); loadBoard(); });
   $("#drawer-close").addEventListener("click", closeDrawer); $("#scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.drawerTask) closeDrawer(); });
   $("#bulk-clear").addEventListener("click", () => { state.selected.clear(); renderBoard(); });
@@ -632,8 +911,16 @@ function bindGlobalActions() {
   $("#nudge").addEventListener("click", async () => { await api(boardPath("/api/dispatch"), { method: "POST", body: "{}" }); toast("Dispatcher pass started"); });
   $("#theme-toggle").addEventListener("click", () => setTheme(activeTheme === "dark" ? "light" : "dark"));
   $("#board-settings").addEventListener("click", openSettings);
+  $("#agent-settings").addEventListener("click", () => openAgentSettings().catch((error) => toast(error.message, true)));
+  $("#manage-agents").addEventListener("click", () => {
+    $("#settings-dialog").close();
+    openAgentSettings().catch((error) => toast(error.message, true));
+  });
   $("#task-form").addEventListener("submit", submitTask);
   $("#task-form [name=profile]").addEventListener("change", updateTaskModelPreview);
+  $("#task-form [name=assignee]").addEventListener("input", () => {
+    $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
+  });
   $("#task-form [name=runtime]").addEventListener("change", () => {
     $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
   });
@@ -647,6 +934,29 @@ function bindGlobalActions() {
   $("#profile-list").addEventListener("click", (event) => {
     if (event.target.closest(".profile-remove")) event.target.closest(".profile-row").remove();
   });
+  $("#agents-form").addEventListener("submit", submitAgentSettings);
+  $("#detect-agents").addEventListener("click", () => detectAgents(true));
+  $("#add-agent").addEventListener("click", () => {
+    const empty = $("#agent-list .detail-row"); if (empty) empty.remove();
+    $("#agent-list").insertAdjacentHTML("beforeend", agentEditorRow({ enabled: false, roles: ["worker"], maxConcurrent: 1 }));
+    $(".agent-row:last-child [data-agent=id]", $("#agent-list"))?.focus();
+  });
+  $("#agent-list").addEventListener("click", (event) => {
+    const remove = event.target.closest(".agent-row-remove");
+    if (!remove) return;
+    const row = remove.closest(".agent-row");
+    removeAgentReferences($("[data-agent=id]", row).value.trim().toLowerCase());
+    row.remove();
+    if (!$(".agent-row", $("#agent-list"))) renderAgentEditor({ ...readAgentEditor(), agents: [] });
+  });
+  $("#agent-list").addEventListener("input", (event) => {
+    if (!event.target.matches("[data-agent=id]")) return;
+    $(".agent-row-title strong", event.target.closest(".agent-row")).textContent = event.target.value.trim() || "New agent";
+  });
+  $("#agents-later").addEventListener("click", () => {
+    sessionStorage.setItem("autogora.agentSetupDeferred", "true"); $("#agents-dialog").close();
+  });
+  $("#supervisor-toggle").addEventListener("click", toggleSupervisor);
   $("#swarm-form").addEventListener("submit", submitSwarm);
   $("#archive-board").addEventListener("click", archiveBoard);
 }
@@ -671,7 +981,7 @@ async function submitBoard(event) {
       slug: data.get("slug"), name: data.get("name"), description: data.get("description"), icon: data.get("icon"),
       defaultWorkdir: data.get("defaultWorkdir") || null, switch: true,
     }) });
-    state.board = board.slug; state.cursor = 0; localStorage.setItem("kanban.board", state.board);
+    state.board = board.slug; state.cursor = 0; localStorage.setItem("autogora.board", state.board);
     $("#board-dialog").close(); await loadBoards(); await loadBoard(); connectEvents();
   } catch (error) { toast(error.message, true); }
 }
@@ -742,14 +1052,20 @@ async function archiveBoard(event) {
   if (state.board === "default" || !confirm(`Archive board ${state.board}?`)) return;
   try {
     await api(`/api/boards/${encodeURIComponent(state.board)}`, { method: "DELETE" });
-    state.board = "default"; localStorage.setItem("kanban.board", state.board); $("#settings-dialog").close();
+    state.board = "default"; localStorage.setItem("autogora.board", state.board); $("#settings-dialog").close();
     await loadBoards(); await loadBoard(); connectEvents();
   } catch (error) { toast(error.message, true); }
 }
 
 async function main() {
   setTheme(activeTheme, false); initializeSelects(); bindGlobalActions();
-  try { await loadBoards(); await loadBoard(); connectEvents(); }
+  try {
+    await loadBoards(); await loadBoard(); connectEvents();
+    const configuration = await loadAgentConfiguration();
+    if (!configuration.exists && sessionStorage.getItem("autogora.agentSetupDeferred") !== "true") {
+      await openAgentSettings({ firstRun: true });
+    }
+  }
   catch (error) { toast(error.message, true); }
 }
 
