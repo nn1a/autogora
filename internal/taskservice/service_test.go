@@ -2,6 +2,7 @@ package taskservice
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -181,6 +182,83 @@ printf '%s\n' '{"type":"run_result","text":"{\"title\":\"Global planner\",\"body
 	result, ok := value.(map[string]any)
 	if !ok || result["title"] != "Global planner" {
 		t.Fatalf("global planner result = %#v", value)
+	}
+}
+
+func TestServiceFallsBackToHealthyPlannerAndRecordsSelection(t *testing.T) {
+	isolateGlobalAgentConfig(t)
+	directory := t.TempDir()
+	primaryCommand := filepath.Join(directory, "primary.sh")
+	if err := os.WriteFile(primaryCommand, []byte("#!/bin/sh\necho 'authentication required: please log in' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupCommand := filepath.Join(directory, "backup.sh")
+	backupScript := `#!/bin/sh
+case " $* " in *" --model backup-model "*) ;; *) exit 9 ;; esac
+case " $* " in *" --provider backup-provider "*) ;; *) exit 9 ;; esac
+printf '%s\n' '{"type":"run_result","text":"{\"title\":\"Fallback planner\",\"body\":\"Durable fallback result\"}"}'
+`
+	if err := os.WriteFile(backupCommand, []byte(backupScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := agentconfig.Default()
+	config.Defaults.PlannerAgents = []string{"primary"}
+	config.Agents = []agentconfig.Agent{
+		{ID: "primary", Runtime: model.RuntimeCline, Command: primaryCommand, Model: "primary-model", Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RolePlanner}, Fallbacks: []string{"backup"}},
+		{ID: "backup", Runtime: model.RuntimeCline, Command: backupCommand, Model: "backup-model", Provider: "backup-provider", Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RolePlanner}},
+	}
+	if err := agentconfig.Save(agentconfig.Options{}, config); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Rough task", Body: "Make this precise", Status: model.TaskStatusTriage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := New(opened, manager, "default").SpecifyTask(ctx, task.Task.ID, nil, "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Title != "Fallback planner" {
+		t.Fatalf("specified task = %#v", detail.Task)
+	}
+	primaryHealth, err := opened.GetAgentHealth(ctx, "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupHealth, err := opened.GetAgentHealth(ctx, "backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primaryHealth.Status != model.AgentHealthAuthRequired || primaryHealth.CooldownUntil == nil {
+		t.Fatalf("primary health = %#v", primaryHealth)
+	}
+	if backupHealth.Status != model.AgentHealthReady {
+		t.Fatalf("backup health = %#v", backupHealth)
+	}
+	events, err := opened.ListEvents(ctx, store.EventFilter{TaskID: task.Task.ID, Kinds: []string{"orchestration_agent_selected"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("selection events = %#v", events)
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["kind"] != "specify" || payload["role"] != "planner" || payload["profile"] != "backup" || payload["model"] != "backup-model" || payload["provider"] != "backup-provider" || payload["fallbackFrom"] != "primary" {
+		t.Fatalf("selection payload = %#v", payload)
 	}
 }
 

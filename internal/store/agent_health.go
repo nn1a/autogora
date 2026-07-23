@@ -142,14 +142,22 @@ func (s *Store) ListAgentHealth(ctx context.Context) ([]model.AgentHealth, error
 // check. It intentionally does not assume that an expired cooldown is ready.
 func (s *Store) ClearExpiredAgentCooldowns(ctx context.Context, current time.Time) (int64, error) {
 	timestamp := current.UTC().Format("2006-01-02T15:04:05.000Z")
-	result, err := s.db.ExecContext(ctx, `UPDATE agent_health
-		SET status = 'unknown', cooldown_until = NULL, updated_at = ?
-		WHERE status IN ('missing', 'auth_required', 'rate_limited', 'unhealthy')
-			AND cooldown_until IS NOT NULL AND cooldown_until <= ?`, timestamp, timestamp)
+	var cleared int64
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE agent_health
+			SET status = 'unknown', cooldown_until = NULL, updated_at = ?
+			WHERE status IN ('missing', 'auth_required', 'rate_limited', 'unhealthy')
+				AND cooldown_until IS NOT NULL AND cooldown_until <= ?`, timestamp, timestamp)
+		if err != nil {
+			return err
+		}
+		cleared, err = result.RowsAffected()
+		return err
+	})
 	if err != nil {
 		return 0, fmt.Errorf("clear expired agent cooldowns: %w", err)
 	}
-	return result.RowsAffected()
+	return cleared, nil
 }
 
 // IsAgentUnavailable reports whether the latest observation should prevent a

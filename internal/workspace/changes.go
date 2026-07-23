@@ -22,42 +22,59 @@ type ChangeSnapshot struct {
 	ChangedFiles   []string
 }
 
-func (m *Manager) HasChanges(ctx context.Context, workspace model.RunWorkspace) (bool, error) {
+// ChangeInspection describes workspace state relative to the commit recorded
+// when the run workspace was prepared. HeadCommit is populated whenever a
+// worktree HEAD can be resolved, including when another part of the inspection
+// fails, so recovery messages can identify the exact work that needs review.
+type ChangeInspection struct {
+	Changed    bool
+	HeadCommit string
+}
+
+func (m *Manager) InspectChanges(ctx context.Context, workspace model.RunWorkspace) (ChangeInspection, error) {
 	if workspace.Kind == model.WorkspaceScratch {
 		entries, err := os.ReadDir(workspace.Path)
 		if err != nil {
-			return false, err
+			return ChangeInspection{}, err
 		}
-		return len(entries) > 0, nil
+		return ChangeInspection{Changed: len(entries) > 0}, nil
 	}
-	if workspace.Kind != model.WorkspaceWorktree || workspace.RepositoryPath == nil {
-		return false, nil
+	if workspace.Kind != model.WorkspaceWorktree {
+		return ChangeInspection{}, nil
+	}
+	if workspace.RepositoryPath == nil || strings.TrimSpace(*workspace.RepositoryPath) == "" {
+		return ChangeInspection{}, errors.New("prepared worktree is missing its repository")
 	}
 	if err := validateWorktree(ctx, *workspace.RepositoryPath, workspace.Path); err != nil {
-		return false, err
+		return ChangeInspection{}, err
 	}
 	output, err := gitOutputWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
 		"status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
-		return false, err
+		return ChangeInspection{}, err
 	}
-	if len(output) > 0 {
-		return true, nil
+	inspection := ChangeInspection{Changed: len(output) > 0}
+	head, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return inspection, err
 	}
+	inspection.HeadCommit = head
 	if workspace.BaseCommit == nil || strings.TrimSpace(*workspace.BaseCommit) == "" {
-		return false, errors.New("prepared worktree is missing its base commit")
+		return inspection, errors.New("prepared worktree is missing its base commit")
 	}
 	base, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
 		"rev-parse", "--verify", strings.TrimSpace(*workspace.BaseCommit)+"^{commit}")
 	if err != nil {
-		return false, err
+		return inspection, err
 	}
-	head, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
-		"rev-parse", "--verify", "HEAD^{commit}")
-	if err != nil {
-		return false, err
-	}
-	return head != base, nil
+	inspection.Changed = inspection.Changed || head != base
+	return inspection, nil
+}
+
+func (m *Manager) HasChanges(ctx context.Context, workspace model.RunWorkspace) (bool, error) {
+	inspection, err := m.InspectChanges(ctx, workspace)
+	return inspection.Changed, err
 }
 
 func gitOutputWithEnv(ctx context.Context, directory string, environment map[string]string, args ...string) ([]byte, error) {

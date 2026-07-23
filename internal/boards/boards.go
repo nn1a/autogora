@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 )
 
 var boardSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+var ErrBoardMutationInProgress = errors.New("board metadata mutation is in progress")
 
 type Profile struct {
 	Name          string        `json:"name"`
@@ -93,6 +96,55 @@ type Manager struct {
 	currentPath   string
 }
 
+func (m *Manager) withBoardMutation(
+	ctx context.Context,
+	slug string,
+	remove bool,
+	mutate func(*store.Store) error,
+) (err error) {
+	metadataLock, acquired, lockErr := acquireBoardMutationLock(m.boardMetadataLockPath(slug), true)
+	if lockErr != nil {
+		return fmt.Errorf("lock board %s metadata: %w", slug, lockErr)
+	}
+	if !acquired {
+		return fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug)
+	}
+	lifecycleLock, acquired, lifecycleErr := acquireBoardMutationLock(m.boardLifecycleLockPath(slug), remove)
+	if lifecycleErr != nil || !acquired {
+		closeErr := metadataLock.Close()
+		if lifecycleErr != nil {
+			return errors.Join(fmt.Errorf("lock board %s lifecycle: %w", slug, lifecycleErr), closeErr)
+		}
+		if remove {
+			return errors.Join(fmt.Errorf("%w: %s has open stores", store.ErrBoardBusy, slug), closeErr)
+		}
+		return errors.Join(fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug), closeErr)
+	}
+
+	var coordination *store.Store
+	if slug == "default" {
+		coordination, err = m.openStoreUnlocked(ctx, "default")
+	} else {
+		coordination, err = m.OpenCoordinationStore(ctx)
+	}
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("open coordination store for board %s: %w", slug, err),
+			lifecycleLock.Close(),
+			metadataLock.Close(),
+		)
+	}
+	defer func() {
+		err = errors.Join(err, coordination.Close(), lifecycleLock.Close(), metadataLock.Close())
+	}()
+	if slug != "default" && m.Exists(slug) {
+		if err := m.clearStaleRemovalGuards(ctx, slug, coordination); err != nil {
+			return err
+		}
+	}
+	return mutate(coordination)
+}
+
 func NewManager(defaultDBPath string) (*Manager, error) {
 	resolved, err := filepath.Abs(defaultDBPath)
 	if err != nil {
@@ -100,6 +152,18 @@ func NewManager(defaultDBPath string) (*Manager, error) {
 	}
 	home := filepath.Dir(resolved)
 	return &Manager{defaultDBPath: resolved, home: home, boardsRoot: filepath.Join(home, "boards"), currentPath: filepath.Join(home, "current")}, nil
+}
+
+func (m *Manager) boardMetadataLockPath(slug string) string {
+	return filepath.Join(m.home, ".locks", "boards", slug+".metadata.lock")
+}
+
+func (m *Manager) boardLifecycleLockPath(slug string) string {
+	return filepath.Join(m.home, ".locks", "boards", slug+".lifecycle.lock")
+}
+
+func (m *Manager) currentLockPath() string {
+	return filepath.Join(m.home, ".locks", "current.lock")
 }
 
 func NormalizeSlug(value string) (string, error) {
@@ -399,11 +463,26 @@ func (m *Manager) Create(ctx context.Context, board string, update Update) (Meta
 	if err != nil {
 		return Metadata{}, err
 	}
+	var metadata Metadata
+	err = m.withBoardMutation(ctx, slug, false, func(coordination *store.Store) error {
+		var createErr error
+		metadata, createErr = m.create(ctx, slug, update, coordination)
+		return createErr
+	})
+	return metadata, err
+}
+
+func (m *Manager) create(
+	ctx context.Context,
+	slug string,
+	update Update,
+	coordination *store.Store,
+) (Metadata, error) {
 	metadata, err := m.write(slug, update, nil)
 	if err != nil {
 		return Metadata{}, err
 	}
-	opened, err := m.OpenStore(ctx, slug)
+	opened, err := m.openStoreUnlocked(ctx, slug)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -415,6 +494,11 @@ func (m *Manager) Create(ctx context.Context, board string, update Update) (Meta
 			return Metadata{}, err
 		}
 	}
+	if slug != "default" {
+		if err := coordination.ClearBoardRemovalTombstone(ctx, slug); err != nil {
+			return Metadata{}, fmt.Errorf("clear removal tombstone for recreated board %s: %w", slug, err)
+		}
+	}
 	return metadata, nil
 }
 
@@ -423,6 +507,16 @@ func (m *Manager) Update(board string, update Update) (Metadata, error) {
 	if err != nil {
 		return Metadata{}, err
 	}
+	var metadata Metadata
+	err = m.withBoardMutation(context.Background(), slug, false, func(_ *store.Store) error {
+		var updateErr error
+		metadata, updateErr = m.update(slug, update)
+		return updateErr
+	})
+	return metadata, err
+}
+
+func (m *Manager) update(slug string, update Update) (Metadata, error) {
 	if !m.Exists(slug) {
 		return Metadata{}, fmt.Errorf("board not found: %s", slug)
 	}
@@ -436,7 +530,7 @@ func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, e
 		return nil, err
 	}
 	for _, entry := range entries {
-		if entry.IsDir() && entry.Name() != "_archived" && boardSlug.MatchString(entry.Name()) {
+		if entry.IsDir() && entry.Name() != "_archived" && boardSlug.MatchString(entry.Name()) && m.Exists(entry.Name()) {
 			slugs[entry.Name()] = true
 		}
 	}
@@ -526,17 +620,263 @@ func (m *Manager) Resolve(explicit string) (string, error) {
 }
 
 func (m *Manager) Switch(board string) (Metadata, error) {
-	slug, err := m.Resolve(board)
+	value := board
+	if strings.TrimSpace(value) == "" {
+		value = m.Current()
+	}
+	slug, err := NormalizeSlug(value)
 	if err != nil {
 		return Metadata{}, err
 	}
+	metadataLock, acquired, err := acquireBoardMutationLock(m.boardMetadataLockPath(slug), false)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("lock board %s metadata while switching: %w", slug, err)
+	}
+	if !acquired {
+		return Metadata{}, fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug)
+	}
+	defer metadataLock.Close()
+	lifecycleLock, acquired, err := acquireBoardMutationLock(m.boardLifecycleLockPath(slug), false)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("lock board %s lifecycle while switching: %w", slug, err)
+	}
+	if !acquired {
+		return Metadata{}, fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug)
+	}
+	defer lifecycleLock.Close()
+	if !m.Exists(slug) {
+		return Metadata{}, fmt.Errorf("board not found: %s", slug)
+	}
+	metadata, err := m.Read(slug)
+	if err != nil {
+		return Metadata{}, err
+	}
+	currentLock, err := m.lockCurrentSelection()
+	if err != nil {
+		return Metadata{}, err
+	}
+	defer currentLock.Close()
+	if err := m.writeCurrentSelection(slug); err != nil {
+		return Metadata{}, err
+	}
+	return metadata, nil
+}
+
+func (m *Manager) lockCurrentSelection() (*boardMutationLock, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lock, acquired, err := acquireBoardMutationLock(m.currentLockPath(), true)
+		if err != nil {
+			return nil, fmt.Errorf("lock current board selection: %w", err)
+		}
+		if acquired {
+			return lock, nil
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errors.New("current board selection is being updated")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// writeCurrentSelection atomically replaces the current-board file. The
+// caller must hold currentLockPath exclusively.
+func (m *Manager) writeCurrentSelection(slug string) error {
 	if err := os.MkdirAll(filepath.Dir(m.currentPath), 0o755); err != nil {
-		return Metadata{}, err
+		return err
 	}
-	if err := os.WriteFile(m.currentPath, []byte(slug+"\n"), 0o644); err != nil {
-		return Metadata{}, err
+	temporary, err := os.CreateTemp(filepath.Dir(m.currentPath), ".current-*")
+	if err != nil {
+		return err
 	}
-	return m.Read(slug)
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o644); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write([]byte(slug + "\n")); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, m.currentPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resetCurrentAfterRemoval preserves a newer user selection. It updates the
+// file only when it still names the board that was just removed.
+func (m *Manager) resetCurrentAfterRemoval(removed string) error {
+	currentLock, err := m.lockCurrentSelection()
+	if err != nil {
+		return err
+	}
+	defer currentLock.Close()
+	contents, err := os.ReadFile(m.currentPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(contents)) != removed {
+		return nil
+	}
+	return m.writeCurrentSelection("default")
+}
+
+func (m *Manager) hasArchived(board string) (bool, error) {
+	entries, err := os.ReadDir(filepath.Join(m.boardsRoot, "_archived"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		raw := readPersisted(filepath.Join(m.boardsRoot, "_archived", entry.Name(), "board.json"))
+		if raw.Slug == board {
+			return true, nil
+		}
+		if raw.Slug == "" && regexp.MustCompile(`-\d+$`).ReplaceAllString(entry.Name(), "") == board {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Manager) releaseRemovalGuards(ctx context.Context, board string, local, coordination store.BoardRemovalGuard) error {
+	var releaseErrors []error
+	if local.Token != "" {
+		dbPath, _ := m.DBPath(board)
+		attachments, _ := m.AttachmentsRoot(board)
+		opened, err := store.Open(dbPath, board, attachments)
+		if err != nil {
+			releaseErrors = append(releaseErrors, fmt.Errorf("open board store to release removal guard: %w", err))
+		} else {
+			released, releaseErr := opened.ReleaseBoardRemovalGuard(ctx, local)
+			closeErr := opened.Close()
+			if releaseErr != nil || closeErr != nil {
+				releaseErrors = append(releaseErrors, errors.Join(releaseErr, closeErr))
+			} else if !released {
+				releaseErrors = append(releaseErrors, errors.New("local board removal guard changed before release"))
+			}
+		}
+	}
+	if coordination.Token != "" {
+		opened, err := m.OpenCoordinationStore(ctx)
+		if err != nil {
+			releaseErrors = append(releaseErrors, fmt.Errorf("open coordination store to release removal guard: %w", err))
+		} else {
+			released, releaseErr := opened.ReleaseBoardRemovalGuard(ctx, coordination)
+			closeErr := opened.Close()
+			if releaseErr != nil || closeErr != nil {
+				releaseErrors = append(releaseErrors, errors.Join(releaseErr, closeErr))
+			} else if !released {
+				releaseErrors = append(releaseErrors, errors.New("coordination board removal guard changed before release"))
+			}
+		}
+	}
+	return errors.Join(releaseErrors...)
+}
+
+func (m *Manager) clearStaleRemovalGuards(
+	ctx context.Context,
+	slug string,
+	coordination *store.Store,
+) error {
+	opened, err := m.openStoreUnlocked(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("open board store to recover interrupted removal: %w", err)
+	}
+	localGuard, guardErr := opened.HasBoardRemovalGuard(ctx, slug)
+	if guardErr != nil {
+		_ = opened.Close()
+		return fmt.Errorf("inspect interrupted local removal for board %s: %w", slug, guardErr)
+	}
+	if localGuard {
+		liveProcesses, liveErr := countLiveTerminalProcesses(ctx, opened)
+		if liveErr != nil {
+			_ = opened.Close()
+			return fmt.Errorf("inspect terminal processes before recovering board %s: %w", slug, liveErr)
+		}
+		if liveProcesses > 0 {
+			_ = opened.Close()
+			return &store.BoardBusyError{Board: slug, LiveTerminalProcesses: liveProcesses}
+		}
+		if err := opened.ClearLocalBoardRemovalGuard(ctx, slug); err != nil {
+			_ = opened.Close()
+			return fmt.Errorf("clear interrupted local removal for board %s: %w", slug, err)
+		}
+	}
+	closeErr := opened.Close()
+	if closeErr != nil {
+		return fmt.Errorf("close recovered board %s: %w", slug, closeErr)
+	}
+	coordinationGuard, err := coordination.HasBoardRemovalGuard(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("inspect interrupted coordination removal for board %s: %w", slug, err)
+	}
+	if coordinationGuard {
+		if err := coordination.ClearBoardRemovalTombstone(ctx, slug); err != nil {
+			return fmt.Errorf("clear interrupted coordination removal for board %s: %w", slug, err)
+		}
+	}
+	return nil
+}
+
+func countLiveTerminalProcesses(ctx context.Context, opened *store.Store) (int, error) {
+	owners, err := opened.ListTerminalRunProcesses(ctx)
+	if err != nil {
+		return 0, err
+	}
+	live := 0
+	for _, owner := range owners {
+		if runcontrol.ProcessMayStillBeRunning(owner.PID, owner.ProcessIdentity) {
+			live++
+		}
+	}
+	return live, nil
+}
+
+func (m *Manager) validateRemovalGuards(
+	ctx context.Context,
+	slug string,
+	coordinationStore *store.Store,
+	localGuard store.BoardRemovalGuard,
+	coordinationGuard store.BoardRemovalGuard,
+) error {
+	coordinationActive, err := coordinationStore.HasExactBoardRemovalGuard(ctx, coordinationGuard)
+	if err != nil {
+		return fmt.Errorf("validate coordination removal guard: %w", err)
+	}
+	if !coordinationActive {
+		return fmt.Errorf("%w: coordination guard changed for %s", store.ErrBoardRemovalInProgress, slug)
+	}
+	opened, err := m.openStoreUnlocked(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("open board store to validate removal guard: %w", err)
+	}
+	localActive, validationErr := opened.HasExactBoardRemovalGuard(ctx, localGuard)
+	closeErr := opened.Close()
+	if validationErr != nil || closeErr != nil {
+		return errors.Join(validationErr, closeErr)
+	}
+	if !localActive {
+		return fmt.Errorf("%w: local guard changed for %s", store.ErrBoardRemovalInProgress, slug)
+	}
+	return nil
 }
 
 func (m *Manager) Remove(board string, hardDelete bool) (RemoveResult, error) {
@@ -547,43 +887,232 @@ func (m *Manager) Remove(board string, hardDelete bool) (RemoveResult, error) {
 	if slug == "default" {
 		return RemoveResult{}, errors.New("the default board cannot be removed")
 	}
+	var result RemoveResult
+	err = m.withBoardMutation(context.Background(), slug, true, func(coordination *store.Store) error {
+		var removeErr error
+		result, removeErr = m.remove(context.Background(), slug, hardDelete, coordination)
+		return removeErr
+	})
+	return result, err
+}
+
+func (m *Manager) cleanupTerminalGlobalLeases(
+	ctx context.Context,
+	slug string,
+	coordination *store.Store,
+) (err error) {
+	boardStore, err := m.openStoreUnlocked(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("open board store to inspect global leases: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, boardStore.Close())
+	}()
+
+	terminalRuns, err := boardStore.ListTerminalRunProcesses(ctx)
+	if err != nil {
+		return fmt.Errorf("list terminal run processes for board %s: %w", slug, err)
+	}
+	terminalByID := make(map[string]store.RunProcessOwner, len(terminalRuns))
+	for _, owner := range terminalRuns {
+		terminalByID[owner.RunID] = owner
+	}
+
+	slots, err := coordination.ListGlobalAgentSlotsForBoard(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("list global agent leases for board %s: %w", slug, err)
+	}
+	for _, slot := range slots {
+		if slot.OwnerKind != store.AgentSlotOwnerWorker || slot.RunID == nil {
+			continue
+		}
+		owner, terminal := terminalByID[*slot.RunID]
+		if !terminal || runcontrol.ProcessMayStillBeRunning(owner.PID, owner.ProcessIdentity) {
+			continue
+		}
+		if _, releaseErr := coordination.ReleaseGlobalAgentSlot(ctx, slot); releaseErr != nil {
+			return fmt.Errorf("release terminal global agent lease for run %s: %w", *slot.RunID, releaseErr)
+		}
+	}
+
+	leases, err := coordination.ListGlobalWorkspaceLeases(ctx)
+	if err != nil {
+		return fmt.Errorf("list global workspace leases for board %s: %w", slug, err)
+	}
+	for _, lease := range leases {
+		if lease.Board != slug {
+			continue
+		}
+		owner, terminal := terminalByID[lease.RunID]
+		if !terminal || runcontrol.ProcessMayStillBeRunning(owner.PID, owner.ProcessIdentity) {
+			continue
+		}
+		if _, releaseErr := coordination.ReleaseGlobalWorkspaceLease(ctx, lease); releaseErr != nil {
+			return fmt.Errorf("release terminal global workspace lease for run %s: %w", lease.RunID, releaseErr)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) remove(
+	ctx context.Context,
+	slug string,
+	hardDelete bool,
+	coordinationStore *store.Store,
+) (RemoveResult, error) {
+	if slug == "default" {
+		return RemoveResult{}, errors.New("the default board cannot be removed")
+	}
 	if !m.Exists(slug) {
+		archived, archivedErr := m.hasArchived(slug)
+		if archivedErr != nil {
+			return RemoveResult{}, fmt.Errorf("inspect archived boards: %w", archivedErr)
+		}
+		if archived {
+			return RemoveResult{}, fmt.Errorf("board is already archived: %s", slug)
+		}
 		return RemoveResult{}, fmt.Errorf("board not found: %s", slug)
 	}
 	source, _ := m.BoardDir(slug)
-	wasCurrent := m.Current() == slug
+	if err := m.cleanupTerminalGlobalLeases(ctx, slug, coordinationStore); err != nil {
+		return RemoveResult{}, fmt.Errorf("clean terminal global leases before removing board %s: %w", slug, err)
+	}
+	coordinationGuard, err := coordinationStore.AcquireBoardRemovalGuard(ctx, slug)
+	if err != nil {
+		return RemoveResult{}, fmt.Errorf("check global leases before removing board %s: %w", slug, err)
+	}
+
+	boardStore, err := m.openStoreUnlocked(ctx, slug)
+	if err != nil {
+		releaseErr := m.releaseRemovalGuards(ctx, slug, store.BoardRemovalGuard{}, coordinationGuard)
+		return RemoveResult{}, fmt.Errorf("open board store before removal: %w", errors.Join(err, releaseErr))
+	}
+	localGuard, guardErr := boardStore.AcquireBoardRemovalGuard(ctx, slug)
+	liveProcesses := 0
+	var liveErr error
+	if guardErr == nil {
+		liveProcesses, liveErr = countLiveTerminalProcesses(ctx, boardStore)
+	}
+	closeErr := boardStore.Close()
+	if guardErr != nil || liveErr != nil || closeErr != nil {
+		releaseErr := m.releaseRemovalGuards(ctx, slug, localGuard, coordinationGuard)
+		return RemoveResult{}, fmt.Errorf(
+			"check active work before removing board %s: %w",
+			slug,
+			errors.Join(guardErr, liveErr, closeErr, releaseErr),
+		)
+	}
+	if liveProcesses > 0 {
+		releaseErr := m.releaseRemovalGuards(ctx, slug, localGuard, coordinationGuard)
+		return RemoveResult{}, errors.Join(
+			&store.BoardBusyError{Board: slug, LiveTerminalProcesses: liveProcesses},
+			releaseErr,
+		)
+	}
+	rollback := func(cause error) (RemoveResult, error) {
+		releaseErr := m.releaseRemovalGuards(ctx, slug, localGuard, coordinationGuard)
+		return RemoveResult{}, errors.Join(cause, releaseErr)
+	}
+
 	if hardDelete {
-		if err := os.RemoveAll(source); err != nil {
-			return RemoveResult{}, err
+		deletingRoot := filepath.Join(m.boardsRoot, "_deleting")
+		if err := os.MkdirAll(deletingRoot, 0o755); err != nil {
+			return rollback(fmt.Errorf("prepare hard delete: %w", err))
 		}
-		if wasCurrent {
-			if _, err := m.Switch("default"); err != nil {
-				return RemoveResult{}, err
-			}
+		if err := m.validateRemovalGuards(ctx, slug, coordinationStore, localGuard, coordinationGuard); err != nil {
+			return rollback(err)
+		}
+		staged := filepath.Join(deletingRoot, fmt.Sprintf("%s-%d", slug, time.Now().UnixMilli()))
+		if err := os.Rename(source, staged); err != nil {
+			return rollback(fmt.Errorf("stage board for hard delete: %w", err))
+		}
+		_ = m.resetCurrentAfterRemoval(slug)
+		if err := os.RemoveAll(staged); err != nil {
+			return RemoveResult{}, fmt.Errorf("board was staged at %s but could not be deleted: %w", staged, err)
 		}
 		return RemoveResult{Slug: slug, Path: source}, nil
 	}
+	previous, err := m.Read(slug)
+	if err != nil {
+		return rollback(err)
+	}
 	archived := true
 	if _, err := m.write(slug, Update{}, &archived); err != nil {
-		return RemoveResult{}, err
+		return rollback(err)
 	}
 	archivedRoot := filepath.Join(m.boardsRoot, "_archived")
 	if err := os.MkdirAll(archivedRoot, 0o755); err != nil {
-		return RemoveResult{}, err
+		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
+		return rollback(errors.Join(err, restoreErr))
+	}
+	if err := m.validateRemovalGuards(ctx, slug, coordinationStore, localGuard, coordinationGuard); err != nil {
+		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
+		return rollback(errors.Join(err, restoreErr))
 	}
 	target := filepath.Join(archivedRoot, fmt.Sprintf("%s-%d", slug, time.Now().UnixMilli()))
 	if err := os.Rename(source, target); err != nil {
-		return RemoveResult{}, err
+		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
+		return rollback(errors.Join(err, restoreErr))
 	}
-	if wasCurrent {
-		if _, err := m.Switch("default"); err != nil {
-			return RemoveResult{}, err
-		}
-	}
+	_ = m.resetCurrentAfterRemoval(slug)
 	return RemoveResult{Slug: slug, Archived: true, Path: target}, nil
 }
 
 func (m *Manager) OpenStore(ctx context.Context, board string) (*store.Store, error) {
+	slug := board
+	if strings.TrimSpace(slug) == "" {
+		slug = m.Current()
+	}
+	normalized, err := NormalizeSlug(slug)
+	if err != nil {
+		return nil, err
+	}
+	metadataLock, acquired, lockErr := acquireBoardMutationLock(m.boardMetadataLockPath(normalized), false)
+	if lockErr != nil {
+		return nil, fmt.Errorf("lock board %s metadata while opening its store: %w", normalized, lockErr)
+	}
+	if !acquired {
+		return nil, fmt.Errorf("%w: %s", ErrBoardMutationInProgress, normalized)
+	}
+	lifecycleLock, acquired, lifecycleErr := acquireBoardMutationLock(m.boardLifecycleLockPath(normalized), false)
+	if lifecycleErr != nil || !acquired {
+		closeErr := metadataLock.Close()
+		if lifecycleErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("lock board %s lifecycle while opening its store: %w", normalized, lifecycleErr),
+				closeErr,
+			)
+		}
+		return nil, errors.Join(fmt.Errorf("%w: %s", ErrBoardMutationInProgress, normalized), closeErr)
+	}
+	opened, openErr := m.openStoreUnlocked(ctx, normalized)
+	if openErr != nil {
+		return nil, errors.Join(openErr, lifecycleLock.Close(), metadataLock.Close())
+	}
+	opened.SetCloseHook(lifecycleLock.Close)
+	if normalized != "default" {
+		coordination, coordinationErr := m.OpenCoordinationStore(ctx)
+		if coordinationErr != nil {
+			return nil, errors.Join(coordinationErr, opened.Close(), metadataLock.Close())
+		}
+		recoveryErr := m.clearStaleRemovalGuards(ctx, normalized, coordination)
+		closeErr := coordination.Close()
+		if errors.Is(recoveryErr, store.ErrBoardBusy) {
+			// Keep the durable guard and return a read-capable Store so the
+			// operator can inspect the orphaned process before retrying.
+			recoveryErr = nil
+		}
+		if recoveryErr != nil || closeErr != nil {
+			return nil, errors.Join(recoveryErr, closeErr, opened.Close(), metadataLock.Close())
+		}
+	}
+	if err := metadataLock.Close(); err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	return opened, nil
+}
+
+func (m *Manager) openStoreUnlocked(ctx context.Context, board string) (*store.Store, error) {
 	slug := board
 	if strings.TrimSpace(slug) == "" {
 		slug = m.Current()
@@ -598,4 +1127,11 @@ func (m *Manager) OpenStore(ctx context.Context, board string) (*store.Store, er
 	dbPath, _ := m.DBPath(normalized)
 	attachments, _ := m.AttachmentsRoot(normalized)
 	return store.Open(dbPath, normalized, attachments)
+}
+
+// OpenCoordinationStore opens the default database shared by every board.
+// Cross-board resources must be coordinated here rather than in a board-local
+// task database.
+func (m *Manager) OpenCoordinationStore(ctx context.Context) (*store.Store, error) {
+	return m.OpenStore(ctx, "default")
 }

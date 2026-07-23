@@ -60,14 +60,25 @@ func (l *supervisorLease) renew(ctx context.Context, cancelDispatcher context.Ca
 			return
 		case current := <-ticker.C:
 			if _, err := l.store.RenewServiceLease(ctx, dispatcherLeaseName, l.owner, dispatcherLeaseTTL, current); err != nil {
+				err = supervisorLeaseRenewalError(ctx, err)
+				if err == nil {
+					return
+				}
 				l.mu.Lock()
-				l.err = fmt.Errorf("dispatcher supervisor lease lost: %w", err)
+				l.err = err
 				l.mu.Unlock()
 				cancelDispatcher()
 				return
 			}
 		}
 	}
+}
+
+func supervisorLeaseRenewalError(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() != nil {
+		return nil
+	}
+	return fmt.Errorf("dispatcher supervisor lease lost: %w", err)
 }
 
 func (l *supervisorLease) Err() error {

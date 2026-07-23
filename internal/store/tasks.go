@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -86,6 +87,15 @@ type ListTaskFilter struct {
 	Search             string
 	Sort               string
 	Limit              int
+	After              *TaskListCursor
+}
+
+// TaskListCursor continues the default priority-descending task order without
+// relying on an offset that can shift while tasks are being updated.
+type TaskListCursor struct {
+	Priority  int
+	CreatedAt string
+	ID        string
 }
 
 type EventFilter struct {
@@ -111,7 +121,28 @@ type querier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func now() string { return time.Now().UTC().Format("2006-01-02T15:04:05.000Z") }
+var timestampState = struct {
+	sync.Mutex
+	clock func() time.Time
+	last  time.Time
+}{
+	clock: time.Now,
+}
+
+// now returns a process-monotonic RFC3339 timestamp. Task updated_at values are
+// optimistic-concurrency tokens, so consecutive writes must not collapse onto
+// the same millisecond even when the wall clock has coarse resolution.
+func now() string {
+	timestampState.Lock()
+	defer timestampState.Unlock()
+
+	current := timestampState.clock().UTC()
+	if !current.After(timestampState.last) {
+		current = timestampState.last.Add(time.Nanosecond)
+	}
+	timestampState.last = current
+	return current.Format(time.RFC3339Nano)
+}
 
 func newID(prefix string) string {
 	return prefix + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
@@ -167,6 +198,18 @@ func resolveWorkspaceKind(workspace *string, explicit model.WorkspaceKind) model
 }
 
 func (s *Store) withWrite(ctx context.Context, fn func(*sql.Tx) error) error {
+	return s.withWriteUnchecked(ctx, func(tx *sql.Tx) error {
+		if err := ensureBoardNotRemoving(ctx, tx, s.board, boardRemovalScopeLocal); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
+// withWriteUnchecked exists only for installing, releasing, or clearing board
+// removal barriers. All ordinary store mutations must use withWrite so an
+// already-open Store cannot modify a board after removal begins.
+func (s *Store) withWriteUnchecked(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -184,6 +227,13 @@ func requireTask(ctx context.Context, q querier, taskID string) (model.Task, err
 		return model.Task{}, fmt.Errorf("task not found: %s", taskID)
 	}
 	return task, err
+}
+
+func requireExpectedTaskVersion(task model.Task, expectedUpdatedAt *string) error {
+	if expectedUpdatedAt != nil && strings.TrimSpace(*expectedUpdatedAt) != task.UpdatedAt {
+		return fmt.Errorf("task update conflict: %s changed at %s; refresh before saving", task.ID, task.UpdatedAt)
+	}
+	return nil
 }
 
 func appendEvent(ctx context.Context, q querier, taskID, kind string, payload any, runID *string) error {
@@ -573,15 +623,25 @@ func (s *Store) ListTasks(ctx context.Context, filter ListTaskFilter) ([]model.T
 		values = append(values, "%"+search+"%", "%"+search+"%")
 	}
 	orders := map[string]string{
-		"created": "created_at ASC", "created-desc": "created_at DESC",
-		"priority": "priority ASC, created_at ASC", "priority-desc": "priority DESC, created_at ASC",
-		"status":   "status ASC, priority DESC, created_at ASC",
-		"assignee": "assignee ASC, priority DESC, created_at ASC",
-		"title":    "title COLLATE NOCASE ASC", "updated": "updated_at DESC",
+		"created": "created_at ASC, id ASC", "created-desc": "created_at DESC, id DESC",
+		"priority": "priority ASC, created_at ASC, id ASC", "priority-desc": "priority DESC, created_at ASC, id ASC",
+		"status":   "status ASC, priority DESC, created_at ASC, id ASC",
+		"assignee": "assignee ASC, priority DESC, created_at ASC, id ASC",
+		"title":    "title COLLATE NOCASE ASC, id ASC", "updated": "updated_at DESC, id DESC",
 	}
 	order := orders[filter.Sort]
 	if order == "" {
 		order = orders["priority-desc"]
+	}
+	if filter.After != nil {
+		if filter.Sort != "" && filter.Sort != "priority-desc" {
+			return nil, errors.New("task cursor requires priority-desc sort")
+		}
+		if strings.TrimSpace(filter.After.CreatedAt) == "" || strings.TrimSpace(filter.After.ID) == "" {
+			return nil, errors.New("task cursor requires createdAt and id")
+		}
+		clauses = append(clauses, `(priority < ? OR (priority = ? AND (created_at > ? OR (created_at = ? AND id > ?))))`)
+		values = append(values, filter.After.Priority, filter.After.Priority, filter.After.CreatedAt, filter.After.CreatedAt, filter.After.ID)
 	}
 	limit := filter.Limit
 	if limit == 0 {

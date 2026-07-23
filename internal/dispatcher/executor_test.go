@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,38 @@ func TestExecuteTurnRecordsSpawnLogAndSession(t *testing.T) {
 	contents, _ := os.ReadFile(logPath)
 	if !strings.Contains(string(contents), "session-1") {
 		t.Fatalf("log was not written: %s", contents)
+	}
+}
+
+func TestExecuteTurnDoesNotStartAfterDeferredReclaim(t *testing.T) {
+	ctx := context.Background()
+	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "cancel before spawn", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	if _, err := opened.DeferReclaim(ctx, claim.Run.ID, 30, "operator request"); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "started")
+	result := ExecuteTurn(ctx, RunnerCommand{
+		Command: "/bin/sh", Args: []string{"-c", "touch \"$1\"", "sh", marker}, CWD: t.TempDir(),
+	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, NewProcessSet(),
+		filepath.Join(t.TempDir(), "run.log"), nil)
+	if !errors.Is(result.SpawnError, store.ErrRunTerminationPending) {
+		t.Fatalf("spawn error = %v, want ErrRunTerminationPending", result.SpawnError)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker command started despite reclaim request: %v", err)
 	}
 }
 

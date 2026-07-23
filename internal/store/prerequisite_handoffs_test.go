@@ -86,11 +86,8 @@ func TestPrerequisiteHandoffsPinTheSatisfyingRunAndChangeSet(t *testing.T) {
 		}
 	}
 
-	// The normal respawn guard intentionally blocks an immediate duplicate run.
-	// Age the completed run so this test can exercise a deliberate re-completion.
-	if _, err := store.db.ExecContext(ctx, "UPDATE task_runs SET ended_at = ? WHERE id = ?", "2000-01-01T00:00:00.000Z", firstRunID); err != nil {
-		t.Fatal(err)
-	}
+	// An explicit Ready transition records deliberate rerun intent, so the
+	// recent-success guard does not impose an arbitrary one-hour delay.
 	ready := model.TaskStatusReady
 	if _, err := store.UpdateTask(ctx, parent.Task.ID, UpdateTaskInput{Status: &ready}); err != nil {
 		t.Fatal(err)

@@ -25,6 +25,7 @@ const (
 )
 
 type PlannerRequest struct {
+	TaskID string
 	Kind   PlannerKind
 	Prompt string
 	Schema map[string]any
@@ -87,14 +88,21 @@ func runPlannerProcess(ctx context.Context, command string, args []string, cwd s
 	stdout.limit, stderr.limit = plannerOutputLimit, plannerOutputLimit
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
+		if parentErr := ctx.Err(); parentErr != nil {
+			return stdout.String(), stderr.String(), parentErr
+		}
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return stdout.String(), stderr.String(), fmt.Errorf("planner timed out after %s", timeout)
+			return stdout.String(), stderr.String(), &PlannerFailure{Kind: PlannerFailureTimeout, Err: fmt.Errorf("planner timed out after %s", timeout)}
 		}
 		message := stderr.String()
 		if len(message) > 2000 {
 			message = message[len(message)-2000:]
 		}
-		return stdout.String(), stderr.String(), fmt.Errorf("planner failed: %w: %s", err, strings.TrimSpace(message))
+		processErr := fmt.Errorf("planner failed: %w: %s", err, strings.TrimSpace(message))
+		if kind, available := ClassifyPlannerFailure(processErr); available {
+			return stdout.String(), stderr.String(), &PlannerFailure{Kind: kind, Err: processErr}
+		}
+		return stdout.String(), stderr.String(), processErr
 	}
 	return stdout.String(), stderr.String(), nil
 }
@@ -187,6 +195,13 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 	resolved, err := filepath.Abs(cwd)
 	if err != nil {
 		return nil, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("inspect planner working directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("planner working directory is not a directory: %s", resolved)
 	}
 	timeout := options.Timeout
 	if timeout == 0 {

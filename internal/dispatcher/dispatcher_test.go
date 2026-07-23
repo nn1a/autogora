@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -13,10 +14,14 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/processidentity"
+	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/workspace"
 )
 
 func boolValue(value bool) *bool                       { return &value }
@@ -110,6 +115,77 @@ func TestDispatcherRateLimitDoesNotConsumeRetry(t *testing.T) {
 	}
 }
 
+func TestDispatcherHonorsGlobalAgentCapacityAcrossBoards(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	if _, err := manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	alpha, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alpha.Close()
+	assignee := "shared"
+	ownerTask, err := alpha.CreateTask(ctx, store.CreateTaskInput{Title: "capacity owner", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := alpha.ClaimTask(ctx, store.ClaimOptions{TaskID: ownerTask.Task.ID})
+	if err != nil || owner == nil {
+		t.Fatalf("claim capacity owner: %+v, %v", owner, err)
+	}
+	lease, acquired, err := agentcoord.New(manager).AcquireWorker(ctx, assignee, 1, "alpha", owner.Run.ID)
+	if err != nil || !acquired {
+		t.Fatalf("acquire capacity owner: %+v, acquired=%v, err=%v", lease, acquired, err)
+	}
+
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "wait for shared capacity", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if closeErr := opened.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{WorkerAgents: []string{assignee}},
+		Agents: []agentconfig.Agent{{
+			ID: assignee, Runtime: model.RuntimeCodex, Command: "/missing-must-not-run",
+			Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleWorker},
+		}},
+	}
+	if err := Run(ctx, Options{
+		DBPath: dbPath, CLIPath: "/tmp/autogora", Board: "default", Once: true, MaxWorkers: 1,
+		AgentConfig: &config, AutoDecompose: boolValue(false), Getenv: func(string) string { return "" },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusScheduled || detail.Task.ScheduledAt == nil || detail.Task.FailureCount != 0 || len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusReclaimed {
+		t.Fatalf("capacity-full task state = %#v", detail)
+	}
+	if len(detail.RunAgentConfigs) != 0 {
+		t.Fatalf("capacity-full run unexpectedly pinned or spawned an agent: %#v", detail.RunAgentConfigs)
+	}
+	if _, err := alpha.FailRun(ctx, store.RunScope{RunID: owner.Run.ID, ClaimToken: owner.ClaimToken}, "test complete", store.FailRunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecoveryRequeuesRecordedDeadWorker(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)
@@ -130,6 +206,292 @@ func TestRecoveryRequeuesRecordedDeadWorker(t *testing.T) {
 	detail, _ := opened.GetTask(ctx, task.Task.ID)
 	if detail.Task.Status != model.TaskStatusReady || detail.Task.FailureCount != 1 || detail.Runs[0].Status != model.RunStatusCrashed {
 		t.Fatalf("dead worker was not recovered: %#v", detail)
+	}
+}
+
+func TestRecoveryEscalatesDeferredTerminationWithoutDuplicateGraceEvents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows process API force-terminates on the first signal")
+	}
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "stubborn stale worker", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	process := exec.Command("sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() {
+		_ = process.Wait()
+		close(finished)
+	}()
+	defer func() {
+		_ = process.Process.Kill()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	processIdentity, err := processidentity.Capture(process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.RecordSpawnWithIdentity(ctx, scope, process.Process.Pid, filepath.Join(t.TempDir(), "stubborn.log"), processIdentity); err != nil {
+		t.Fatal(err)
+	}
+	zero := time.Duration(0)
+	options := Options{StaleTimeout: 0, HeartbeatMaxStale: 0, CrashGrace: &zero, TerminationGrace: time.Second}
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
+	events, err := opened.ListEvents(ctx, store.EventFilter{TaskID: task.Task.ID, Kinds: []string{"reclaim_deferred"}})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("grace period emitted duplicate events: %d, %v", len(events), err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("force termination did not stop the stale worker")
+	}
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusReady || detail.Task.CurrentRunID != nil || detail.Task.FailureCount != 0 ||
+		len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusReclaimed {
+		t.Fatalf("stale worker was not reclaimed after escalation: %#v", detail)
+	}
+	events, err = opened.ListEvents(ctx, store.EventFilter{TaskID: task.Task.ID, Kinds: []string{"reclaim_deferred"}})
+	if err != nil || len(events) != 2 {
+		t.Fatalf("escalation events = %d, %v", len(events), err)
+	}
+}
+
+func TestRecoveryBlocksStaleRunsWithUnreviewedWorktreeChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{name: "dirty", mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "partial.txt"), []byte("unfinished\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "committed", mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "committed.txt"), []byte("committed before recovery\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"add", "committed.txt"}, {"-c", "user.name=Autogora", "-c", "user.email=autogora@localhost", "commit", "-m", "worker checkpoint"}} {
+				command := exec.Command("git", append([]string{"-C", path}, args...)...)
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, output)
+				}
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			manager, dbPath := testManager(t)
+			repository := gitRepositoryFixture(t)
+			if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			assignee := "worker"
+			task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "recover partial work", Assignee: &assignee, Runtime: model.RuntimeCodex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := workspace.New(manager).Prepare(ctx, opened, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if prepared.Workspace == nil || prepared.Workspace.Kind != model.WorkspaceWorktree {
+				t.Fatalf("expected prepared worktree: %#v", prepared.Workspace)
+			}
+			test.mutate(t, prepared.Workspace.Path)
+			headOutput, err := exec.Command("git", "-C", prepared.Workspace.Path, "rev-parse", "HEAD").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			head := strings.TrimSpace(string(headOutput))
+
+			database, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			staleAt := time.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339Nano)
+			if _, err := database.ExecContext(ctx, `UPDATE task_runs SET claimed_at = ?, heartbeat_at = ?, claim_expires_at = ? WHERE id = ?`,
+				staleAt, staleAt, staleAt, claim.Run.ID); err != nil {
+				database.Close()
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			options := Options{}
+			options.normalize()
+			if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+				t.Fatal(err)
+			}
+			detail, err := opened.GetTask(ctx, task.Task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || detail.Task.BlockKind == nil ||
+				*detail.Task.BlockKind != model.BlockKindNeedsInput || detail.Task.BlockReason == nil {
+				t.Fatalf("stale partial run was not blocked for review: %#v", detail)
+			}
+			reason := *detail.Task.BlockReason
+			if !strings.Contains(reason, prepared.Workspace.Path) || !strings.Contains(reason, head) ||
+				!strings.Contains(reason, "partial changes remain") || !strings.Contains(reason, "before unblocking") {
+				t.Fatalf("block reason is not actionable: %q", reason)
+			}
+			var recovered *model.Run
+			for index := range detail.Runs {
+				if detail.Runs[index].ID == claim.Run.ID {
+					recovered = &detail.Runs[index]
+					break
+				}
+			}
+			if recovered == nil || recovered.Status != model.RunStatusReclaimed || recovered.Error == nil || !strings.Contains(*recovered.Error, prepared.Workspace.Path) {
+				t.Fatalf("original stale run lacks preservation evidence: %#v", detail.Runs)
+			}
+		})
+	}
+}
+
+func TestAdministrativeTerminationPreservesManagedRunChanges(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "preserve administrative stop", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	if err := opened.MarkRunManaged(ctx, scope); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := workspace.New(manager).Prepare(ctx, opened, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Workspace == nil {
+		t.Fatal("managed run did not prepare a workspace")
+	}
+	if err := os.WriteFile(filepath.Join(prepared.Workspace.Path, "partial.txt"), []byte("unfinished\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	termination, err := runcontrol.TerminateTaskRun(ctx, opened, task.Task.ID, "stopped for an administrative edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !termination.Pending || termination.Signaled || termination.Task.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("termination released managed run too early: %+v", termination)
+	}
+
+	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.BlockKind == nil || *detail.Task.BlockKind != model.BlockKindNeedsInput ||
+		detail.Task.BlockReason == nil || !strings.Contains(*detail.Task.BlockReason, "partial changes remain") {
+		t.Fatalf("administrative recovery did not preserve partial work: %+v", detail.Task)
+	}
+	if len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusReclaimed {
+		t.Fatalf("unexpected terminal run after protected recovery: %+v", detail.Runs)
+	}
+}
+
+func TestReadOnlyManagedDirRunReclaimsWithoutFalsePartialWorkBlock(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	shared := t.TempDir()
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &shared}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "reader"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "read-only analysis", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	if err := opened.MarkRunManagedWithPolicy(ctx, scope, false); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := workspace.New(manager).Prepare(ctx, opened, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Workspace == nil || prepared.Workspace.Kind != model.WorkspaceDir {
+		t.Fatalf("expected shared dir workspace: %+v", prepared.Workspace)
+	}
+
+	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusReady || detail.Task.CurrentRunID != nil || len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusReclaimed {
+		t.Fatalf("read-only run was not safely reclaimed: %+v", detail)
 	}
 }
 
@@ -163,6 +525,545 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	detail, _ := check.GetTask(ctx, task.Task.ID)
 	if detail.Task.Status != model.TaskStatusDone || detail.Task.Assignee == nil || *detail.Task.Assignee != "operator" || !strings.Contains(detail.Task.Body, "Acceptance") || len(kinds) != 1 || kinds[0] != orchestration.PlannerDecompose {
 		t.Fatalf("unexpected auto specification: %#v, kinds=%v", detail, kinds)
+	}
+}
+
+func TestAutoDecomposeSkipsGitHubImportsWithoutStarvingLocalTriage(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported := make([]string, 0, 1025)
+	for index := 1; index <= 1025; index++ {
+		key := fmt.Sprintf("github-issue:owner/repository:%d", index)
+		task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+			Title: fmt.Sprintf("Imported issue %d", index), Status: model.TaskStatusTriage, Priority: 100, IdempotencyKey: &key,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		imported = append(imported, task.Task.ID)
+	}
+	deepAssignee := "deep-worker"
+	local, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Local rough idea", Status: model.TaskStatusTriage, Priority: 0,
+		Assignee: &deepAssignee, Runtime: model.RuntimeClaude,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plannerCalls := 0
+	plannerPrompt := ""
+	planner := func(_ context.Context, request orchestration.PlannerRequest) (any, error) {
+		plannerCalls++
+		plannerPrompt = request.Prompt
+		return map[string]any{"fanout": false, "rootTitle": "Implement local idea", "rootBody": "Acceptance: local task is specified.", "reason": "one worker", "tasks": []any{}, "dependencies": []any{}}, nil
+	}
+	logs := []string{}
+	profile := orchestration.ProfileRoute{Name: "operator", Runtime: model.RuntimeCodex}
+	options := Options{AutoDecompose: boolValue(true), AutoDecomposePerTick: 1, DecompositionPlanner: planner, DefaultProfile: &profile,
+		OnLog: func(message string) { logs = append(logs, message) }}
+	diagnostics := &autoDecomposeDiagnostics{}
+	decomposeBoardTriage(ctx, manager, []string{"default"}, options, diagnostics)
+	if plannerCalls != 0 {
+		t.Fatalf("bounded first scan unexpectedly reached the local task: plannerCalls=%d", plannerCalls)
+	}
+	decomposeBoardTriage(ctx, manager, []string{"default"}, options, diagnostics)
+
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	for _, taskID := range imported {
+		detail, err := check.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.Task.Status != model.TaskStatusTriage {
+			t.Fatalf("imported task was auto-decomposed: %#v", detail.Task)
+		}
+	}
+	localDetail, err := check.GetTask(ctx, local.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localDetail.Task.Status == model.TaskStatusTriage || plannerCalls != 1 {
+		t.Fatalf("local task was starved or planner saw imports: local=%#v plannerCalls=%d", localDetail.Task, plannerCalls)
+	}
+	if !strings.Contains(plannerPrompt, deepAssignee) {
+		t.Fatalf("task beyond the bounded route snapshot lost its explicit profile: %s", plannerPrompt)
+	}
+	skipLogs := 0
+	for _, message := range logs {
+		if strings.Contains(message, "auto-decompose skipped imported GitHub task") {
+			skipLogs++
+		}
+	}
+	if skipLogs != len(imported) {
+		t.Fatalf("skip diagnostics were repeated or missing: logs=%v", logs)
+	}
+}
+
+func TestAutoDecomposeRotatesBoardsBetweenPlanningPasses(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	if _, err := manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	defaultStore, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultTasks := make(map[string]bool)
+	for index := 0; index < 2; index++ {
+		task, createErr := defaultStore.CreateTask(ctx, store.CreateTaskInput{
+			Title: fmt.Sprintf("Default idea %d", index+1), Status: model.TaskStatusTriage,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		defaultTasks[task.Task.ID] = true
+	}
+	if err := defaultStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	alphaStore, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaTask, err := alphaStore.CreateTask(ctx, store.CreateTaskInput{Title: "Alpha idea", Status: model.TaskStatusTriage})
+	if closeErr := alphaStore.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+
+	plannerCalls := []string{}
+	planner := func(_ context.Context, request orchestration.PlannerRequest) (any, error) {
+		plannerCalls = append(plannerCalls, request.TaskID)
+		return map[string]any{
+			"fanout": false, "rootTitle": "Specified idea", "rootBody": "Acceptance: the idea is executable.",
+			"reason": "one worker", "tasks": []any{}, "dependencies": []any{},
+		}, nil
+	}
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	options := Options{
+		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
+		DecompositionPlanner: planner, DefaultProfile: &profile,
+	}
+	diagnostics := &autoDecomposeDiagnostics{}
+	decomposeBoardTriage(ctx, manager, []string{"default", "alpha"}, options, diagnostics)
+	decomposeBoardTriage(ctx, manager, []string{"default", "alpha"}, options, diagnostics)
+
+	if len(plannerCalls) != 2 || !defaultTasks[plannerCalls[0]] || plannerCalls[1] != alphaTask.Task.ID {
+		t.Fatalf("planning order = %v, want default then alpha %s", plannerCalls, alphaTask.Task.ID)
+	}
+}
+
+func TestAutoDecomposeBackoffCandidateDoesNotConsumePlanningQuota(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cooling, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Cooling planner task", Status: model.TaskStatusTriage, Priority: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionable, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Actionable planner task", Status: model.TaskStatusTriage, Priority: 0,
+	})
+	if closeErr := opened.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	plannerCalls := []string{}
+	planner := func(_ context.Context, request orchestration.PlannerRequest) (any, error) {
+		plannerCalls = append(plannerCalls, request.TaskID)
+		return map[string]any{
+			"fanout": false, "rootTitle": "Specified task", "rootBody": "Acceptance: execute it.",
+			"reason": "one worker", "tasks": []any{}, "dependencies": []any{},
+		}, nil
+	}
+	diagnostics := &autoDecomposeDiagnostics{}
+	diagnostics.recordAutoDecomposeFailure("default", cooling.Task.ID)
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	decomposeBoardTriage(ctx, manager, []string{"default"}, Options{
+		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
+		DecompositionPlanner: planner, DefaultProfile: &profile,
+	}, diagnostics)
+	if len(plannerCalls) != 1 || plannerCalls[0] != actionable.Task.ID {
+		t.Fatalf("planner calls = %v, want only actionable task %s", plannerCalls, actionable.Task.ID)
+	}
+}
+
+func TestBlockingAutoDecomposeDoesNotBlockRecoveryOrReadyClaims(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager, dbPath := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Slow planning idea", Status: model.TaskStatusTriage}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	stale, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Recover while planning", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleClaim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: stale.Task.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Start while planning", Assignee: &assignee, Runtime: model.RuntimeCodex, Priority: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleAt := time.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := database.ExecContext(ctx, `UPDATE task_runs SET claimed_at = ?, heartbeat_at = ?, claim_expires_at = ? WHERE id = ?`,
+		staleAt, staleAt, staleAt, staleClaim.Run.ID); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "worker-started")
+	t.Setenv("AUTOGORA_TEST_WORKER_MARKER", marker)
+	worker := executableFixture(t, `
+touch "$AUTOGORA_TEST_WORKER_MARKER"
+while :; do sleep 1; done`)
+	plannerStarted := make(chan struct{})
+	planner := func(plannerCtx context.Context, _ orchestration.PlannerRequest) (any, error) {
+		close(plannerStarted)
+		<-plannerCtx.Done()
+		return nil, plannerCtx.Err()
+	}
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Board: "default", Interval: 250 * time.Millisecond,
+			MaxWorkers: 1, AutoDecompose: boolValue(true), AutoDecomposePerTick: 1, DecompositionPlanner: planner, DefaultProfile: &profile,
+			Getenv: func(name string) string {
+				if name == "AUTOGORA_CODEX_BIN" {
+					return worker
+				}
+				return ""
+			}})
+	}()
+	select {
+	case <-plannerStarted:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("planner did not start")
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		workerStarted := false
+		if _, err := os.Stat(marker); err == nil {
+			workerStarted = true
+		}
+		check, openErr := manager.OpenStore(context.Background(), "default")
+		if openErr != nil {
+			cancel()
+			t.Fatal(openErr)
+		}
+		staleDetail, staleErr := check.GetTask(context.Background(), stale.Task.ID)
+		readyDetail, readyErr := check.GetTask(context.Background(), ready.Task.ID)
+		check.Close()
+		if staleErr != nil || readyErr != nil {
+			cancel()
+			t.Fatalf("inspect concurrent progress: stale=%v ready=%v", staleErr, readyErr)
+		}
+		if workerStarted && staleDetail.Task.Status != model.TaskStatusRunning && len(staleDetail.Runs) == 1 &&
+			staleDetail.Runs[0].Status == model.RunStatusReclaimed && readyDetail.Task.Status == model.TaskStatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("planner blocked lifecycle progress: workerStarted=%v stale=%#v ready=%#v", workerStarted, staleDetail, readyDetail)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatcher did not stop after planner context cancellation")
+	}
+}
+
+func TestDispatcherRotatesWorkerClaimsAcrossBoards(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager, dbPath := testManager(t)
+	if _, err := manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "shared-worker"
+	defaultStore, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultIDs := make([]string, 0, 2)
+	for index := 0; index < 2; index++ {
+		task, createErr := defaultStore.CreateTask(ctx, store.CreateTaskInput{
+			Title: fmt.Sprintf("Default work %d", index+1), Assignee: &assignee, Runtime: model.RuntimeCline,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		defaultIDs = append(defaultIDs, task.Task.ID)
+	}
+	if err := defaultStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	alphaStore, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaTask, err := alphaStore.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Alpha work", Assignee: &assignee, Runtime: model.RuntimeCline,
+	})
+	if closeErr := alphaStore.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+
+	orderPath := filepath.Join(t.TempDir(), "board-order")
+	t.Setenv("AUTOGORA_TEST_BOARD_ORDER", orderPath)
+	fixture := executableFixture(t, `
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "fair claim completed" >/dev/null
+printf '%s\n' "$AUTOGORA_BOARD" >> "$AUTOGORA_TEST_BOARD_ORDER"
+printf '%s\n' '{"type":"run_result","text":"done"}'`)
+	cliPath := buildAutogora(t)
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- Run(ctx, Options{
+			DBPath: dbPath, CLIPath: cliPath, Interval: 250 * time.Millisecond,
+			MaxWorkers: 1, AutoDecompose: boolValue(false),
+			Getenv: func(name string) string {
+				if name == "AUTOGORA_CLINE_BIN" {
+					return fixture
+				}
+				return os.Getenv(name)
+			},
+		})
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	var order []string
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(orderPath)
+		if readErr == nil {
+			order = strings.Fields(string(data))
+		}
+		if len(order) >= 3 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if len(order) < 3 {
+		cancel()
+		t.Fatalf("worker claim order did not complete: %v", order)
+	}
+	if order[0] != "default" || order[1] != "alpha" || order[2] != "default" {
+		cancel()
+		t.Fatalf("worker claim order = %v, want [default alpha default]", order[:3])
+	}
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatcher did not stop")
+	}
+
+	defaultCheck, err := manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, taskID := range defaultIDs {
+		detail, getErr := defaultCheck.GetTask(context.Background(), taskID)
+		if getErr != nil || detail.Task.Status != model.TaskStatusDone {
+			defaultCheck.Close()
+			t.Fatalf("default task %s was not completed: status=%s err=%v", taskID, detail.Task.Status, getErr)
+		}
+	}
+	if err := defaultCheck.Close(); err != nil {
+		t.Fatal(err)
+	}
+	alphaCheck, err := manager.OpenStore(context.Background(), "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alphaCheck.Close()
+	alphaDetail, err := alphaCheck.GetTask(context.Background(), alphaTask.Task.ID)
+	if err != nil || alphaDetail.Task.Status != model.TaskStatusDone {
+		t.Fatalf("alpha task was not completed: status=%s err=%v", alphaDetail.Task.Status, err)
+	}
+}
+
+func TestDispatcherShutdownDoesNotWaitForeverForPlannerIgnoringContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manager, dbPath := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Planner ignores cancellation", Status: model.TaskStatusTriage}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plannerStarted := make(chan struct{})
+	plannerReleased := make(chan struct{})
+	plannerExited := make(chan struct{})
+	planner := func(context.Context, orchestration.PlannerRequest) (any, error) {
+		close(plannerStarted)
+		<-plannerReleased
+		close(plannerExited)
+		return nil, errors.New("planner released by test")
+	}
+	logs := make(chan string, 10)
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- Run(ctx, Options{
+			DBPath: dbPath, CLIPath: "/tmp/autogora", Interval: 250 * time.Millisecond,
+			AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
+			DecompositionPlanner: planner, DefaultProfile: &profile,
+			PlanningShutdownGrace: 50 * time.Millisecond,
+			OnLog: func(message string) {
+				select {
+				case logs <- message:
+				default:
+				}
+			},
+		})
+	}()
+	select {
+	case <-plannerStarted:
+	case <-time.After(3 * time.Second):
+		cancel()
+		close(plannerReleased)
+		t.Fatal("planner did not start")
+	}
+
+	startedShutdown := time.Now()
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			close(plannerReleased)
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(plannerReleased)
+		t.Fatal("dispatcher remained blocked on planner cancellation")
+	}
+	if elapsed := time.Since(startedShutdown); elapsed > 750*time.Millisecond {
+		close(plannerReleased)
+		t.Fatalf("dispatcher shutdown took %s", elapsed)
+	}
+	foundShutdownLog := false
+	for {
+		select {
+		case message := <-logs:
+			if strings.Contains(message, "planner did not stop within") {
+				foundShutdownLog = true
+			}
+		default:
+			goto logsDrained
+		}
+	}
+logsDrained:
+	if !foundShutdownLog {
+		close(plannerReleased)
+		t.Fatal("dispatcher did not report the bounded planner shutdown")
+	}
+	close(plannerReleased)
+	select {
+	case <-plannerExited:
+	case <-time.After(time.Second):
+		t.Fatal("planner goroutine did not unwind after release")
+	}
+}
+
+func TestAutoDecomposeFailureUsesBackoffAcrossTicks(t *testing.T) {
+	manager, dbPath := testManager(t)
+	opened, err := manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := opened.CreateTask(context.Background(), store.CreateTaskInput{Title: "Planner keeps failing", Status: model.TaskStatusTriage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plannerCalls := 0
+	planner := func(context.Context, orchestration.PlannerRequest) (any, error) {
+		plannerCalls++
+		return nil, errors.New("planner unavailable")
+	}
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+	defer cancel()
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Board: "default", Interval: 250 * time.Millisecond,
+		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1, DecompositionPlanner: planner, DefaultProfile: &profile}); err != nil {
+		t.Fatal(err)
+	}
+	if plannerCalls != 1 {
+		t.Fatalf("planner calls during five-second backoff = %d, want 1", plannerCalls)
+	}
+	check, err := manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(context.Background(), task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failureEvents := 0
+	for _, event := range detail.Events {
+		if event.Kind == "auto_decompose_failed" {
+			failureEvents++
+			payload := string(event.Payload)
+			if !strings.Contains(payload, `"attempt":1`) || !strings.Contains(payload, `"retryAt"`) {
+				t.Fatalf("failure event lacks retry boundary: %s", payload)
+			}
+		}
+	}
+	if failureEvents != 1 || detail.Task.Status != model.TaskStatusTriage {
+		t.Fatalf("unexpected planner failure state: events=%d detail=%#v", failureEvents, detail)
 	}
 }
 
@@ -218,6 +1119,46 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	secondDetail, _ := check.GetTask(ctx, second.Task.ID)
 	if firstDetail.Task.Status != model.TaskStatusReady || secondDetail.Task.Status != model.TaskStatusDone {
 		t.Fatalf("target dispatch changed the wrong task: first=%s second=%s", firstDetail.Task.Status, secondDetail.Task.Status)
+	}
+}
+
+func TestDispatcherFinalizesBlockRequestAfterNonzeroExit(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "block then exit", Assignee: &assignee, Runtime: model.RuntimeCline})
+	if closeErr := opened.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	fixture := executableFixture(t, `
+"$AUTOGORA_CLI" block "$AUTOGORA_TASK_ID" "human approval required" --kind needs_input >/dev/null
+exit 75`)
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Board: "default", Once: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+		if name == "AUTOGORA_CLINE_BIN" {
+			return fixture
+		}
+		return ""
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.BlockReason == nil || *detail.Task.BlockReason != "human approval required" ||
+		len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked || detail.Runs[0].ExitCode == nil || *detail.Runs[0].ExitCode != 75 ||
+		len(detail.TerminalRequests) != 1 || detail.TerminalRequests[0].FinalizedAt == nil {
+		t.Fatalf("nonzero block was not finalized: %#v", detail)
 	}
 }
 

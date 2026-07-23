@@ -420,7 +420,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		}
 		return maintenance.Collect(ctx, s.manager, board, maintenance.Options{EventRetentionDays: events, LogRetentionDays: logs, WorkspaceRetentionDays: workspaces})
 	})
-	addTool(server, "autogora_run_terminate", "Terminate an Autogora worker run", "Persist termination intent, signal a live worker, and reclaim a missing process.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
+	addTool(server, "autogora_run_terminate", "Terminate an Autogora worker run", "Persist termination intent, signal only the verified worker process, and let the dispatcher preserve partial work before reclaiming a managed run.", false, true, false, false, func(ctx context.Context, input terminateInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}

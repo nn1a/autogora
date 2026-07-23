@@ -11,6 +11,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 )
 
@@ -163,8 +164,56 @@ func (m *Manager) acquireWriteLease(ctx context.Context, opened *store.Store, sc
 	if err != nil {
 		return err
 	}
-	_, err = opened.AcquireWorkspaceLease(ctx, scope, canonical)
-	return err
+	if _, err := opened.AcquireWorkspaceLease(ctx, scope, canonical); err != nil {
+		return err
+	}
+	coordination, err := m.boards.OpenCoordinationStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer coordination.Close()
+	lease, acquired, err := coordination.AcquireGlobalWorkspaceLease(ctx, opened.Board(), scope.RunID, canonical)
+	if err != nil {
+		return err
+	}
+	if acquired {
+		return nil
+	}
+	owner, err := m.boards.OpenStore(ctx, lease.Board)
+	if err != nil {
+		return &store.ResourceBusyError{Path: canonical, OwnerBoard: lease.Board, OwnerRunID: lease.RunID}
+	}
+	terminal, statusErr := owner.IsRunTerminal(ctx, lease.RunID)
+	processMayStillRun := true
+	if statusErr == nil && terminal {
+		inspection, inspectErr := owner.GetRun(ctx, lease.RunID)
+		var identity *string
+		var identityErr error
+		if inspectErr == nil {
+			identity, identityErr = owner.GetRunProcessIdentity(ctx, lease.RunID)
+		}
+		if inspectErr != nil || identityErr != nil {
+			statusErr = errors.Join(inspectErr, identityErr)
+		} else {
+			processMayStillRun = runcontrol.ProcessMayStillBeRunning(inspection.Run.PID, identity)
+		}
+	}
+	closeErr := owner.Close()
+	if statusErr != nil || closeErr != nil || !terminal || processMayStillRun {
+		return &store.ResourceBusyError{Path: canonical, OwnerBoard: lease.Board, OwnerRunID: lease.RunID}
+	}
+	_, err = coordination.ReleaseGlobalWorkspaceLease(ctx, lease)
+	if err != nil {
+		return err
+	}
+	lease, acquired, err = coordination.AcquireGlobalWorkspaceLease(ctx, opened.Board(), scope.RunID, canonical)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return &store.ResourceBusyError{Path: canonical, OwnerBoard: lease.Board, OwnerRunID: lease.RunID}
+	}
+	return nil
 }
 
 func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model.ClaimedTask) (*model.ClaimedTask, error) {

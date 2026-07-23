@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nn1a/autogora/internal/processidentity"
 	"github.com/nn1a/autogora/internal/store"
 )
 
@@ -150,12 +151,33 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	tail := &tailBuffer{limit: 128 * 1024}
 	writer := io.MultiWriter(logFile, tail)
 	child.Stdout, child.Stderr = writer, writer
+	deferred, err := opened.GetDeferredReclaim(ctx, scope.RunID)
+	if err != nil {
+		return TurnExecution{Code: -1, SpawnError: fmt.Errorf("check pending run termination: %w", err)}
+	}
+	if deferred != nil {
+		return TurnExecution{Code: -1, SpawnError: fmt.Errorf("%w: %s", store.ErrRunTerminationPending, scope.RunID)}
+	}
 	if err := child.Start(); err != nil {
 		return TurnExecution{Code: -1, SpawnError: err}
 	}
+	releaseProcessTree, err := attachProcessTree(child)
+	if err != nil {
+		_ = child.Process.Kill()
+		_, _ = child.Process.Wait()
+		return TurnExecution{Code: -1, SpawnError: fmt.Errorf("protect worker process tree: %w", err), Output: tail.String()}
+	}
+	defer releaseProcessTree()
 	processes.add(child)
 	defer processes.remove(child)
-	if _, err := opened.RecordSpawn(ctx, scope, child.Process.Pid, logPath); err != nil {
+	processIdentity, err := processidentity.Capture(child.Process.Pid)
+	if err != nil {
+		done := make(chan error, 1)
+		go func() { done <- child.Wait() }()
+		_ = stopAndWait(child, done)
+		return TurnExecution{Code: -1, SpawnError: fmt.Errorf("capture worker process identity: %w", err), Output: tail.String()}
+	}
+	if _, err := opened.RecordSpawnWithIdentity(ctx, scope, child.Process.Pid, logPath, processIdentity); err != nil {
 		done := make(chan error, 1)
 		go func() { done <- child.Wait() }()
 		_ = stopAndWait(child, done)

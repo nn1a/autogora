@@ -1,16 +1,9 @@
-//go:build !windows
+//go:build !linux && !darwin && !windows
 
 package runcontrol
 
-import "syscall"
-
-func signalProcessTree(pid int) bool {
-	processGroup, err := syscall.Getpgid(pid)
-	if err != nil {
-		return false
-	}
-	if processGroup == pid {
-		return syscall.Kill(-processGroup, syscall.SIGTERM) == nil
-	}
-	return syscall.Kill(pid, syscall.SIGTERM) == nil
+// Platforms without a kernel process handle must not signal a persisted PID.
+// Checking identity and then signaling by PID would leave a reuse race.
+func signalVerifiedProcess(_ int, _ *string, _ bool) bool {
+	return false
 }

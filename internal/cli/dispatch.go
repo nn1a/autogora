@@ -169,8 +169,8 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		profileFallback = plannerRuntime
 	}
 	plannerTimeoutMS, err := numberOption(opts.value("planner-timeout-ms"), 120_000)
-	if err != nil {
-		return err
+	if err != nil || plannerTimeoutMS < 1_000 || plannerTimeoutMS > 600_000 {
+		return errors.New("--planner-timeout-ms must be between 1000 and 600000")
 	}
 	var profiles []orchestration.ProfileRoute
 	for _, raw := range opts.many("profile") {

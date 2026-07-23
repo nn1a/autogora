@@ -19,9 +19,14 @@ import (
 
 const blockRecurrenceLimit = 2
 
+const claimCandidatePageSize = 50
+
+var ErrRunTerminationPending = errors.New("run termination is pending")
+
 type ClaimOptions struct {
 	TaskID                   string
 	Board                    string
+	ExpectedUpdatedAt        *string
 	Runtime                  model.Runtime
 	WorkerID                 string
 	ExcludeManual            bool
@@ -38,15 +43,17 @@ type RunScope struct {
 }
 
 type CompletionInput struct {
-	Summary   string
-	Result    string
-	Metadata  map[string]any
-	Artifacts []string
+	Summary           string
+	Result            string
+	Metadata          map[string]any
+	Artifacts         []string
+	ExpectedUpdatedAt *string
 }
 
 type BlockInput struct {
-	Reason string
-	Kind   model.BlockKind
+	Reason            string
+	Kind              model.BlockKind
+	ExpectedUpdatedAt *string
 }
 
 type FailRunOptions struct {
@@ -63,9 +70,21 @@ type GoalJudgment struct {
 	NextPrompt string
 }
 
+// DeferredReclaim is the durable termination intent for a managed run. The
+// dispatcher keeps the run active until the worker actually exits, then uses
+// this outcome instead of relying on whichever task event happened last.
+type DeferredReclaim struct {
+	RunID        string          `json:"runId"`
+	ExpiresAt    string          `json:"expiresAt"`
+	Reason       string          `json:"reason"`
+	Outcome      model.RunStatus `json:"outcome"`
+	CountFailure bool            `json:"countFailure"`
+}
+
 type ActiveRun struct {
-	Task model.Task `json:"task"`
-	Run  model.Run  `json:"run"`
+	Task        model.Task            `json:"task"`
+	Run         model.Run             `json:"run"`
+	AgentConfig *model.RunAgentConfig `json:"agentConfig,omitempty"`
 }
 
 type RunInspection = ActiveRun
@@ -126,25 +145,43 @@ var guardedRunError = regexp.MustCompile(`(?i)(?:429|rate.?limit|quota|unauthori
 
 func respawnGuardReason(ctx context.Context, q querier, taskID string) (string, error) {
 	oneHourAgo := time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	var runID, endedAt string
 	var status string
 	var runError sql.NullString
-	err := q.QueryRowContext(ctx, "SELECT status, error FROM task_runs WHERE task_id = ? AND ended_at >= ? ORDER BY ended_at DESC LIMIT 1", taskID, oneHourAgo).Scan(&status, &runError)
+	err := q.QueryRowContext(ctx, "SELECT id, status, error, ended_at FROM task_runs WHERE task_id = ? AND ended_at >= ? ORDER BY ended_at DESC, id DESC LIMIT 1", taskID, oneHourAgo).Scan(&runID, &status, &runError, &endedAt)
 	if err != nil && err != sql.ErrNoRows {
 		return "", err
 	}
 	if status == string(model.RunStatusCompleted) {
+		// A recent success prevents accidental duplicate spawning, but an
+		// explicit lifecycle edit after that success is a deliberate rerun.
+		// Comments and attachments are intentionally not sufficient.
+		var completedEventID sql.NullInt64
+		if err := q.QueryRowContext(ctx, `SELECT MAX(id) FROM task_events
+			WHERE task_id = ? AND run_id = ? AND kind = 'completed'`, taskID, runID).Scan(&completedEventID); err != nil {
+			return "", err
+		}
+		clauses := `task_id = ? AND kind IN ('updated', 'reopened_for_dependency', 'specified', 'unblocked', 'promote_requested', 'scheduled', 'schedule_due')`
+		values := []any{taskID}
+		if completedEventID.Valid {
+			clauses += " AND id > ?"
+			values = append(values, completedEventID.Int64)
+		} else {
+			clauses += " AND created_at >= ?"
+			values = append(values, endedAt)
+		}
+		var explicitlyRequeued int
+		err := q.QueryRowContext(ctx, "SELECT 1 FROM task_events WHERE "+clauses+" ORDER BY id DESC LIMIT 1", values...).Scan(&explicitlyRequeued)
+		if err == nil {
+			return "", nil
+		}
+		if err != sql.ErrNoRows {
+			return "", err
+		}
 		return "recent_success", nil
 	}
 	if runError.Valid && guardedRunError.MatchString(runError.String) {
 		return "blocker_auth", nil
-	}
-	var found int
-	err = q.QueryRowContext(ctx, "SELECT 1 FROM task_comments WHERE task_id = ? AND body LIKE '%github.com/%/pull/%' ORDER BY id DESC LIMIT 1", taskID).Scan(&found)
-	if err == nil {
-		return "active_pr", nil
-	}
-	if err != sql.ErrNoRows {
-		return "", err
 	}
 	return "", nil
 }
@@ -171,6 +208,21 @@ func (s *Store) ClaimTask(ctx context.Context, input ClaimOptions) (*model.Claim
 		board := input.Board
 		if board == "" {
 			board = s.board
+		}
+		if err := ensureBoardNotRemoving(ctx, tx, board, boardRemovalScopeLocal); err != nil {
+			return err
+		}
+		if input.ExpectedUpdatedAt != nil {
+			if strings.TrimSpace(input.TaskID) == "" {
+				return errors.New("expectedUpdatedAt requires a targeted task claim")
+			}
+			target, err := requireTask(ctx, tx, input.TaskID)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(*input.ExpectedUpdatedAt) != target.UpdatedAt {
+				return fmt.Errorf("task update conflict: %s changed at %s; refresh before dispatching", target.ID, target.UpdatedAt)
+			}
 		}
 		if input.MaxInProgress > 0 {
 			var running int
@@ -211,84 +263,112 @@ func (s *Store) ClaimTask(ctx context.Context, input ClaimOptions) (*model.Claim
 			}
 			clauses = append(clauses, "(assignee IS NULL OR assignee NOT IN ("+strings.Join(placeholders, ",")+"))")
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE "+strings.Join(clauses, " AND ")+" ORDER BY priority DESC, created_at ASC LIMIT 50", values...)
-		if err != nil {
-			return err
-		}
-		candidates := []model.Task{}
-		for rows.Next() {
-			candidate, err := scanTask(rows)
+		var selected *model.Task
+		var cursor *model.Task
+		for selected == nil {
+			pageClauses := append([]string(nil), clauses...)
+			pageValues := append([]any(nil), values...)
+			if cursor != nil {
+				pageClauses = append(pageClauses, `(priority < ? OR (priority = ? AND (created_at > ? OR (created_at = ? AND id > ?))))`)
+				pageValues = append(pageValues, cursor.Priority, cursor.Priority, cursor.CreatedAt, cursor.CreatedAt, cursor.ID)
+			}
+			pageValues = append(pageValues, claimCandidatePageSize)
+			rows, err := tx.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE "+strings.Join(pageClauses, " AND ")+" ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?", pageValues...)
 			if err != nil {
+				return err
+			}
+			candidates := make([]model.Task, 0, claimCandidatePageSize)
+			for rows.Next() {
+				candidate, err := scanTask(rows)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				candidates = append(candidates, candidate)
+			}
+			if err := rows.Err(); err != nil {
 				rows.Close()
 				return err
 			}
-			candidates = append(candidates, candidate)
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		var selected *model.Task
-		for index := range candidates {
-			candidate := &candidates[index]
-			open, err := hasOpenParents(ctx, tx, candidate.ID)
-			if err != nil {
+			if err := rows.Close(); err != nil {
 				return err
 			}
-			if open {
-				if _, err := tx.ExecContext(ctx, "UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?", now(), candidate.ID); err != nil {
+			if len(candidates) == 0 {
+				break
+			}
+			last := candidates[len(candidates)-1]
+			cursor = &last
+			for index := range candidates {
+				candidate := &candidates[index]
+				open, err := hasOpenParents(ctx, tx, candidate.ID)
+				if err != nil {
 					return err
 				}
-				continue
-			}
-			assigneeLimit := input.MaxInProgressPerAssignee
-			if candidate.Assignee != nil {
-				if configured := input.MaxInProgressByAssignee[*candidate.Assignee]; configured > 0 && (assigneeLimit <= 0 || configured < assigneeLimit) {
-					assigneeLimit = configured
-				}
-			}
-			if assigneeLimit > 0 && candidate.Assignee != nil {
-				var running int
-				if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE board = ? AND status = 'running' AND assignee = ?", board, *candidate.Assignee).Scan(&running); err != nil {
-					return err
-				}
-				if running >= max(1, assigneeLimit) {
+				if open {
+					if _, err := tx.ExecContext(ctx, "UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?", now(), candidate.ID); err != nil {
+						return err
+					}
 					continue
 				}
-			}
-			guard, err := respawnGuardReason(ctx, tx, candidate.ID)
-			if err != nil {
-				return err
-			}
-			if guard != "" {
-				if err := appendRespawnGuard(ctx, tx, candidate.ID, guard); err != nil {
+				assigneeLimit := input.MaxInProgressPerAssignee
+				if candidate.Assignee != nil {
+					if configured := input.MaxInProgressByAssignee[*candidate.Assignee]; configured > 0 && (assigneeLimit <= 0 || configured < assigneeLimit) {
+						assigneeLimit = configured
+					}
+				}
+				if assigneeLimit > 0 && candidate.Assignee != nil {
+					var running int
+					if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE board = ? AND status = 'running' AND assignee = ?", board, *candidate.Assignee).Scan(&running); err != nil {
+						return err
+					}
+					if running >= max(1, assigneeLimit) {
+						continue
+					}
+				}
+				guard, err := respawnGuardReason(ctx, tx, candidate.ID)
+				if err != nil {
 					return err
 				}
-				continue
+				if guard != "" {
+					if err := appendRespawnGuard(ctx, tx, candidate.ID, guard); err != nil {
+						return err
+					}
+					continue
+				}
+				selected = candidate
+				break
 			}
-			selected = candidate
-			break
+			if len(candidates) < claimCandidatePageSize {
+				break
+			}
 		}
 		if selected == nil {
 			return nil
 		}
 		runID, taskID = newID("r"), selected.ID
-		token, err = claimToken()
+		generatedToken, err := claimToken()
 		if err != nil {
 			return err
 		}
+		token = generatedToken
 		timestamp := now()
 		ttl := input.ClaimTTLSeconds
 		if ttl <= 0 {
 			ttl = 15 * 60
 		}
 		expires := futureISO(max(1, ttl))
-		result, err := tx.ExecContext(ctx, "UPDATE tasks SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ? AND status = 'ready' AND current_run_id IS NULL", runID, timestamp, selected.ID)
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'running', current_run_id = ?, updated_at = ?
+			WHERE id = ? AND status = 'ready' AND current_run_id IS NULL AND updated_at = ?`,
+			runID, timestamp, selected.ID, selected.UpdatedAt)
 		if err != nil {
 			return err
 		}
 		changed, _ := result.RowsAffected()
 		if changed != 1 {
 			taskID = ""
+			if input.ExpectedUpdatedAt != nil {
+				return fmt.Errorf("task update conflict: %s changed before dispatch claim; refresh before dispatching", selected.ID)
+			}
 			return nil
 		}
 		workerID := input.WorkerID
@@ -325,14 +405,14 @@ func (s *Store) Heartbeat(ctx context.Context, scope RunScope, note string) (mod
 		if err != nil {
 			return err
 		}
-		expiresAt, heartbeatAt := time.Now(), time.Now()
+		expiresAt := time.Now()
 		oldExpiry, expiryErr := time.Parse(time.RFC3339Nano, run.ClaimExpiresAt)
 		oldHeartbeat, heartbeatErr := time.Parse(time.RFC3339Nano, run.HeartbeatAt)
 		ttl := 15 * time.Minute
 		if expiryErr == nil && heartbeatErr == nil && oldExpiry.Sub(oldHeartbeat) > time.Second {
 			ttl = oldExpiry.Sub(oldHeartbeat)
 		}
-		timestamp := heartbeatAt.UTC().Format("2006-01-02T15:04:05.000Z")
+		timestamp := now()
 		expires := expiresAt.Add(ttl).UTC().Format("2006-01-02T15:04:05.000Z")
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET heartbeat_at = ?, claim_expires_at = ? WHERE id = ?", timestamp, expires, run.ID); err != nil {
 			return err
@@ -436,10 +516,18 @@ func (s *Store) PauseGoalRun(ctx context.Context, scope RunScope, turn int) (mod
 }
 
 func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPath string) (model.Run, error) {
+	return s.RecordSpawnWithIdentity(ctx, scope, pid, logPath, "")
+}
+
+// RecordSpawnWithIdentity persists the OS process-start identity alongside the
+// PID. Recovery must compare both before sending a signal because PIDs can be
+// reused after the original worker exits.
+func (s *Store) RecordSpawnWithIdentity(ctx context.Context, scope RunScope, pid int, logPath, processIdentity string) (model.Run, error) {
 	resolved, err := filepath.Abs(logPath)
 	if err != nil {
 		return model.Run{}, err
 	}
+	processIdentity = strings.TrimSpace(processIdentity)
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, run, err := requireActiveRun(ctx, tx, scope)
 		if err != nil {
@@ -448,15 +536,56 @@ func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPat
 		if err := ensureNoTerminalRequest(ctx, tx, run.ID); err != nil {
 			return err
 		}
+		var reclaimCount int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM run_reclaim_requests WHERE run_id = ?", run.ID,
+		).Scan(&reclaimCount); err != nil {
+			return err
+		}
+		if reclaimCount > 0 {
+			return fmt.Errorf("%w: %s", ErrRunTerminationPending, run.ID)
+		}
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET pid = ?, log_path = ? WHERE id = ?", pid, resolved, run.ID); err != nil {
 			return err
 		}
-		return appendEvent(ctx, tx, task.ID, "spawned", map[string]any{"pid": pid, "logPath": resolved}, &run.ID)
+		if processIdentity == "" {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM run_process_identities WHERE run_id = ?", run.ID); err != nil {
+				return err
+			}
+		} else if _, err := tx.ExecContext(ctx, `INSERT INTO run_process_identities(run_id, process_identity, recorded_at)
+			VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET
+				process_identity = excluded.process_identity,
+				recorded_at = excluded.recorded_at`, run.ID, processIdentity, now()); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, task.ID, "spawned", map[string]any{
+			"pid": pid, "logPath": resolved, "processIdentity": normalizedPointer(&processIdentity),
+		}, &run.ID)
 	})
 	if err != nil {
 		return model.Run{}, err
 	}
 	return getRun(ctx, s.db, scope.RunID)
+}
+
+// GetRunProcessIdentity returns the identity recorded by the latest spawn for
+// a run. The coordination row is not subject to task-event garbage collection.
+func (s *Store) GetRunProcessIdentity(ctx context.Context, runID string) (*string, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, errors.New("run ID is required")
+	}
+	var processIdentity string
+	err := s.db.QueryRowContext(ctx,
+		"SELECT process_identity FROM run_process_identities WHERE run_id = ?", runID,
+	).Scan(&processIdentity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return normalizedPointer(&processIdentity), nil
 }
 
 func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
@@ -498,6 +627,9 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
+	if err := requireExpectedTaskVersion(preflight, completion.ExpectedUpdatedAt); err != nil {
+		return model.TaskDetail{}, err
+	}
 	if preflight.CurrentRunID != nil {
 		return model.TaskDetail{}, errors.New("cannot complete a running task administratively; let the worker complete or terminate the active run first")
 	}
@@ -530,6 +662,9 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 		if err != nil {
 			return err
 		}
+		if err := requireExpectedTaskVersion(task, completion.ExpectedUpdatedAt); err != nil {
+			return err
+		}
 		if task.Status == model.TaskStatusArchived {
 			return errors.New("cannot complete an archived task")
 		}
@@ -546,7 +681,7 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 		}
 		timestamp := now()
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'done', current_run_id = NULL, result = ?, failure_count = 0,
-		block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ? WHERE id = ?`, resultValue, timestamp, taskID); err != nil {
+		scheduled_at = NULL, block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ? WHERE id = ?`, resultValue, timestamp, taskID); err != nil {
 			return err
 		}
 		if err := appendEvent(ctx, tx, taskID, "completed", map[string]any{"summary": truncate(summary, 400), "resultLength": len(result)}, runID); err != nil {
@@ -574,7 +709,7 @@ func blockTaskRecord(ctx context.Context, q querier, task model.Task, input Bloc
 		kind = input.Kind
 	}
 	if input.Kind == model.BlockKindDependency {
-		if _, err := q.ExecContext(ctx, "UPDATE tasks SET status = 'todo', current_run_id = NULL, block_kind = ?, block_reason = ?, updated_at = ? WHERE id = ?", kind, reason, timestamp, task.ID); err != nil {
+		if _, err := q.ExecContext(ctx, "UPDATE tasks SET status = 'todo', current_run_id = NULL, scheduled_at = NULL, block_kind = ?, block_reason = ?, updated_at = ? WHERE id = ?", kind, reason, timestamp, task.ID); err != nil {
 			return err
 		}
 		return appendEvent(ctx, q, task.ID, "dependency_wait", map[string]any{"reason": reason, "kind": input.Kind}, runID)
@@ -589,7 +724,7 @@ func blockTaskRecord(ctx context.Context, q querier, task model.Task, input Bloc
 	if loop {
 		status, event = model.TaskStatusTriage, "block_loop_detected"
 	}
-	if _, err := q.ExecContext(ctx, `UPDATE tasks SET status = ?, current_run_id = NULL, block_kind = ?, block_reason = ?,
+	if _, err := q.ExecContext(ctx, `UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_at = NULL, block_kind = ?, block_reason = ?,
 		block_recurrences = ?, updated_at = ? WHERE id = ?`, status, kind, reason, recurrences, timestamp, task.ID); err != nil {
 		return err
 	}
@@ -608,6 +743,9 @@ func (s *Store) BlockTask(ctx context.Context, taskID string, input BlockInput) 
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.Status == model.TaskStatusDone || task.Status == model.TaskStatusArchived {
@@ -667,6 +805,14 @@ func finishUnsuccessful(ctx context.Context, q querier, task model.Task, run mod
 		}
 	}
 	timestamp := now()
+	requestResult, err := q.ExecContext(ctx, "DELETE FROM run_terminal_requests WHERE run_id = ? AND finalized_at IS NULL", run.ID)
+	if err != nil {
+		return err
+	}
+	discardedRequest, err := requestResult.RowsAffected()
+	if err != nil {
+		return err
+	}
 	if _, err := q.ExecContext(ctx, "UPDATE task_runs SET status = ?, ended_at = ?, heartbeat_at = ?, error = ? WHERE id = ?", outcome, timestamp, timestamp, runError, run.ID); err != nil {
 		return err
 	}
@@ -674,7 +820,7 @@ func finishUnsuccessful(ctx context.Context, q querier, task model.Task, run mod
 		block_reason = CASE WHEN ? THEN ? ELSE block_reason END, updated_at = ? WHERE id = ?`, next, failures, scheduledAt, exhausted, runError, timestamp, task.ID); err != nil {
 		return err
 	}
-	payload := map[string]any{"error": runError, "failures": failures, "effectiveLimit": limit, "outcome": outcome, "countFailure": countFailure, "scheduledAt": scheduledAt}
+	payload := map[string]any{"error": runError, "failures": failures, "effectiveLimit": limit, "outcome": outcome, "countFailure": countFailure, "scheduledAt": scheduledAt, "discardedTerminalRequest": discardedRequest > 0}
 	event := string(outcome)
 	if outcome == model.RunStatusFailed {
 		if exhausted {
@@ -731,9 +877,21 @@ func (s *Store) RecoverAbandonedRun(ctx context.Context, runID string, outcome m
 	return s.GetTask(ctx, taskID)
 }
 
-func (s *Store) DeferReclaim(ctx context.Context, runID string, seconds int, reason string) (model.Run, error) {
+func (s *Store) deferRunRecovery(ctx context.Context, runID string, seconds int, reason string, outcome model.RunStatus, countFailure bool) (model.Run, error) {
 	if seconds <= 0 {
 		seconds = 120
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Run termination requested"
+	}
+	if outcome == "" {
+		outcome = model.RunStatusReclaimed
+	}
+	switch outcome {
+	case model.RunStatusReclaimed, model.RunStatusTimedOut:
+	default:
+		return model.Run{}, fmt.Errorf("unsupported deferred run outcome: %s", outcome)
 	}
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		run, err := getRun(ctx, tx, runID)
@@ -744,10 +902,25 @@ func (s *Store) DeferReclaim(ctx context.Context, runID string, seconds int, rea
 			return fmt.Errorf("active run not found: %s", runID)
 		}
 		expires := futureISO(max(1, seconds))
+		requestedAt := now()
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET claim_expires_at = ? WHERE id = ?", expires, runID); err != nil {
 			return err
 		}
-		return appendEvent(ctx, tx, run.TaskID, "reclaim_deferred", map[string]any{"pid": run.PID, "expires": expires, "reason": normalizedPointer(&reason)}, &run.ID)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO run_reclaim_requests(
+				run_id, expires_at, reason, outcome, count_failure, requested_at
+			) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET
+				expires_at = excluded.expires_at,
+				reason = excluded.reason,
+				outcome = excluded.outcome,
+				count_failure = excluded.count_failure,
+				requested_at = excluded.requested_at`,
+			run.ID, expires, reason, outcome, countFailure, requestedAt); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, run.TaskID, "reclaim_deferred", map[string]any{
+			"pid": run.PID, "expires": expires, "reason": reason,
+			"outcome": outcome, "countFailure": countFailure,
+		}, &run.ID)
 	})
 	if err != nil {
 		return model.Run{}, err
@@ -755,10 +928,59 @@ func (s *Store) DeferReclaim(ctx context.Context, runID string, seconds int, rea
 	return getRun(ctx, s.db, runID)
 }
 
+func (s *Store) DeferReclaim(ctx context.Context, runID string, seconds int, reason string) (model.Run, error) {
+	return s.deferRunRecovery(ctx, runID, seconds, reason, model.RunStatusReclaimed, false)
+}
+
+func (s *Store) DeferTimedOutRun(ctx context.Context, runID string, seconds int, reason string) (model.Run, error) {
+	return s.deferRunRecovery(ctx, runID, seconds, reason, model.RunStatusTimedOut, true)
+}
+
+// GetDeferredReclaim reads coordination state directly by run ID. It is not
+// subject to task-event retention.
+func (s *Store) GetDeferredReclaim(ctx context.Context, runID string) (*DeferredReclaim, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, errors.New("run ID is required")
+	}
+	var value DeferredReclaim
+	var countFailure bool
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, expires_at, reason, outcome, count_failure
+		FROM run_reclaim_requests WHERE run_id = ?`, runID).Scan(
+		&value.RunID, &value.ExpiresAt, &value.Reason, &value.Outcome, &countFailure,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := time.Parse(time.RFC3339Nano, value.ExpiresAt); err != nil {
+		return nil, fmt.Errorf("invalid deferred reclaim expiry for run %s: %w", runID, err)
+	}
+	if value.Outcome == "" {
+		value.Outcome = model.RunStatusReclaimed
+	}
+	if strings.TrimSpace(value.Reason) == "" {
+		value.Reason = "Run termination requested"
+	}
+	value.CountFailure = countFailure
+	return &value, nil
+}
+
 func (s *Store) UnblockTask(ctx context.Context, taskID string) (model.TaskDetail, error) {
+	return s.UnblockTaskWithVersion(ctx, taskID, nil)
+}
+
+// UnblockTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use UnblockTask.
+func (s *Store) UnblockTaskWithVersion(ctx context.Context, taskID string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.Status != model.TaskStatusBlocked {
@@ -807,7 +1029,11 @@ func (s *Store) ListActiveRuns(ctx context.Context, board string) ([]ActiveRun, 
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, ActiveRun{Task: task, Run: run})
+		config, err := s.GetRunAgentConfig(ctx, value.runID)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ActiveRun{Task: task, Run: run, AgentConfig: config})
 	}
 	return result, rows.Err()
 }

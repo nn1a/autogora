@@ -230,6 +230,22 @@ func TestDispatchLeavesBoardOrchestrationSettingsUnsetWithoutOverrides(t *testin
 	}
 }
 
+func TestDispatchRejectsPlannerTimeoutOutsideSupportedRange(t *testing.T) {
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Getenv = func(string) string { return "" }
+	app.DispatchRunner = func(context.Context, dispatcher.Options) error {
+		t.Fatal("dispatcher ran with an invalid planner timeout")
+		return nil
+	}
+
+	for _, value := range []string{"999", "600001"} {
+		err := app.Run(context.Background(), []string{"dispatch", "--once", "--planner-timeout-ms", value})
+		if err == nil || !strings.Contains(err.Error(), "between 1000 and 600000") {
+			t.Fatalf("planner timeout %s error = %v", value, err)
+		}
+	}
+}
+
 func TestBooleanFalseOptionRemainsExplicit(t *testing.T) {
 	opts, err := parseOptions([]string{"--auto-decompose=false"})
 	if err != nil {

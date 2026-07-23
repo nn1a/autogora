@@ -3,23 +3,28 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 16
+const schemaVersion = 17
 
 type Store struct {
 	db              *sql.DB
 	dbPath          string
 	board           string
 	attachmentsRoot string
+	closeOnce       sync.Once
+	closeHook       func() error
+	closeErr        error
 }
 
 func Open(dbPath, board, attachmentsRoot string) (*Store, error) {
@@ -81,7 +86,22 @@ func dataSourceName(path string) string {
 	return source.String()
 }
 
-func (s *Store) Close() error            { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		dbErr := s.db.Close()
+		var hookErr error
+		if s.closeHook != nil {
+			hookErr = s.closeHook()
+		}
+		s.closeErr = errors.Join(dbErr, hookErr)
+	})
+	return s.closeErr
+}
+
+// SetCloseHook lets the board manager hold an operating-system shared lock for
+// the Store lifetime. It must be called before the Store is returned to users.
+func (s *Store) SetCloseHook(hook func() error) { s.closeHook = hook }
+
 func (s *Store) DBPath() string          { return s.dbPath }
 func (s *Store) Board() string           { return s.board }
 func (s *Store) AttachmentsRoot() string { return s.attachmentsRoot }
@@ -462,6 +482,47 @@ CREATE TABLE IF NOT EXISTS resource_leases (
   acquired_at TEXT NOT NULL
 );
 
+-- Cross-board coordination lives in the default board database. Run IDs belong
+-- to separate board databases, so this table intentionally has no foreign keys.
+CREATE TABLE IF NOT EXISTS global_workspace_leases (
+  resource_key TEXT PRIMARY KEY,
+  board TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  lease_token TEXT NOT NULL,
+  acquired_at TEXT NOT NULL
+);
+
+-- Agent slots coordinate concurrency across every board. Run IDs belong to
+-- board-local databases, so this table intentionally has no foreign keys.
+CREATE TABLE IF NOT EXISTS global_agent_slots (
+  agent_id TEXT NOT NULL,
+  slot INTEGER NOT NULL CHECK (slot >= 1),
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('worker', 'planner', 'judge')),
+  board TEXT NOT NULL,
+  run_id TEXT,
+  owner_id TEXT NOT NULL UNIQUE,
+  lease_token TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT,
+  PRIMARY KEY (agent_id, slot),
+  CHECK (
+    (owner_kind = 'worker' AND run_id IS NOT NULL AND expires_at IS NULL) OR
+    (owner_kind IN ('planner', 'judge') AND expires_at IS NOT NULL)
+  )
+);
+
+-- Board removal uses barriers in both the board-local database and the default
+-- coordination database. The coordination row remains as a tombstone until a
+-- new board with the same slug has been fully initialized.
+CREATE TABLE IF NOT EXISTS board_removal_guards (
+  board TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope IN ('local', 'coordination')),
+  token TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  PRIMARY KEY (board, scope)
+);
+
 CREATE TABLE IF NOT EXISTS run_terminal_requests (
   run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK (kind IN ('complete', 'block')),
@@ -478,6 +539,32 @@ CREATE TABLE IF NOT EXISTS run_terminal_requests (
 CREATE TABLE IF NOT EXISTS managed_runs (
   run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
   registered_at TEXT NOT NULL
+);
+
+-- Process safety state must outlive task-event retention. A PID is never
+-- trusted without the exact process-start identity captured for that spawn.
+CREATE TABLE IF NOT EXISTS run_process_identities (
+  run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+  process_identity TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+
+-- A missing row means that the write policy predates durable policy tracking.
+CREATE TABLE IF NOT EXISTS managed_run_policies (
+  run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+  allow_writes INTEGER NOT NULL CHECK (allow_writes IN (0, 1)),
+  recorded_at TEXT NOT NULL
+);
+
+-- Administrative termination is coordination state, not merely an audit
+-- event. Spawn registration and supervisor recovery both consult this row.
+CREATE TABLE IF NOT EXISTS run_reclaim_requests (
+  run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('reclaimed', 'timed_out')),
+  count_failure INTEGER NOT NULL CHECK (count_failure IN (0, 1)),
+  requested_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_change_sets (
@@ -563,6 +650,8 @@ CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_
 CREATE INDEX IF NOT EXISTS idx_agent_health_due ON agent_health(status, cooldown_until);
 CREATE INDEX IF NOT EXISTS idx_service_leases_expiry ON service_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
+CREATE INDEX IF NOT EXISTS idx_global_workspace_leases_owner ON global_workspace_leases(board, run_id);
+CREATE INDEX IF NOT EXISTS idx_global_agent_slots_expiry ON global_agent_slots(owner_kind, expires_at);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);

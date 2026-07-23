@@ -28,6 +28,7 @@ type TaskGraphDependency struct {
 
 type TaskGraphInput struct {
 	RootTaskID           string
+	ExpectedUpdatedAt    *string
 	RootTitle            string
 	RootBody             string
 	OrchestratorAssignee string
@@ -113,6 +114,9 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		root, err := requireTask(ctx, tx, input.RootTaskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(root, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
 		if root.Status != model.TaskStatusTriage {

@@ -86,6 +86,16 @@ func TestCLIPlannerRejectsManualRuntime(t *testing.T) {
 	}
 }
 
+func TestCLIPlannerRejectsMissingWorkingDirectoryBeforeAgentHealthClassification(t *testing.T) {
+	_, err := CreateCLIPlanner(CLIPlannerOptions{Runtime: model.RuntimeCodex, CWD: filepath.Join(t.TempDir(), "missing")})
+	if err == nil {
+		t.Fatal("expected a missing planner working directory to be rejected")
+	}
+	if _, retry := ClassifyPlannerFailure(err); retry {
+		t.Fatalf("working directory error was classified as an agent failure: %v", err)
+	}
+}
+
 func TestCLIPlannerUsesRegisteredCommand(t *testing.T) {
 	planner, err := CreateCLIPlanner(CLIPlannerOptions{
 		Runtime: model.RuntimeCodex, Command: fixturePath(t, "planner-agent.sh"), Model: "gpt-test",

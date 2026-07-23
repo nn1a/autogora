@@ -218,6 +218,12 @@ func (s *Store) UnlinkTasks(ctx context.Context, parentID, childID string) (mode
 }
 
 func (s *Store) SpecifyTask(ctx context.Context, taskID, title, body, author string) (model.TaskDetail, error) {
+	return s.SpecifyTaskWithVersion(ctx, taskID, title, body, author, nil)
+}
+
+// SpecifyTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use SpecifyTask.
+func (s *Store) SpecifyTaskWithVersion(ctx context.Context, taskID, title, body, author string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	title, body = strings.TrimSpace(title), strings.TrimSpace(body)
 	if title == "" {
 		return model.TaskDetail{}, errors.New("specified task title cannot be empty")
@@ -228,6 +234,9 @@ func (s *Store) SpecifyTask(ctx context.Context, taskID, title, body, author str
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.Status != model.TaskStatusTriage {
@@ -249,9 +258,18 @@ func (s *Store) SpecifyTask(ctx context.Context, taskID, title, body, author str
 }
 
 func (s *Store) ArchiveTask(ctx context.Context, taskID string) (model.TaskDetail, error) {
+	return s.ArchiveTaskWithVersion(ctx, taskID, nil)
+}
+
+// ArchiveTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use ArchiveTask.
+func (s *Store) ArchiveTaskWithVersion(ctx context.Context, taskID string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.Status == model.TaskStatusArchived {
@@ -260,7 +278,7 @@ func (s *Store) ArchiveTask(ctx context.Context, taskID string) (model.TaskDetai
 		if task.CurrentRunID != nil {
 			return errors.New("cannot archive a running task; terminate the active run first")
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET status = 'archived', current_run_id = NULL, updated_at = ? WHERE id = ?", now(), taskID); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE tasks SET status = 'archived', current_run_id = NULL, scheduled_at = NULL, updated_at = ? WHERE id = ?", now(), taskID); err != nil {
 			return err
 		}
 		if err := appendEvent(ctx, tx, taskID, "archived", nil, nil); err != nil {
@@ -276,9 +294,18 @@ func (s *Store) ArchiveTask(ctx context.Context, taskID string) (model.TaskDetai
 }
 
 func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
+	return s.DeleteTaskWithVersion(ctx, taskID, nil)
+}
+
+// DeleteTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use DeleteTask.
+func (s *Store) DeleteTaskWithVersion(ctx context.Context, taskID string, expectedUpdatedAt *string) error {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.CurrentRunID != nil {
@@ -322,9 +349,18 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 }
 
 func (s *Store) PromoteTask(ctx context.Context, taskID string) (model.TaskDetail, error) {
+	return s.PromoteTaskWithVersion(ctx, taskID, nil)
+}
+
+// PromoteTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use PromoteTask.
+func (s *Store) PromoteTaskWithVersion(ctx context.Context, taskID string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if !slices.Contains([]model.TaskStatus{model.TaskStatusTodo, model.TaskStatusScheduled, model.TaskStatusBlocked, model.TaskStatusTriage, model.TaskStatusReview}, task.Status) {
@@ -348,6 +384,12 @@ func (s *Store) PromoteTask(ctx context.Context, taskID string) (model.TaskDetai
 }
 
 func (s *Store) ScheduleTask(ctx context.Context, taskID string, scheduledAt *string, reason string) (model.TaskDetail, error) {
+	return s.ScheduleTaskWithVersion(ctx, taskID, scheduledAt, reason, nil)
+}
+
+// ScheduleTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
+// is set. Non-interactive callers can continue to use ScheduleTask.
+func (s *Store) ScheduleTaskWithVersion(ctx context.Context, taskID string, scheduledAt *string, reason string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	normalized, err := normalizeISO(scheduledAt, "scheduledAt")
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -355,6 +397,9 @@ func (s *Store) ScheduleTask(ctx context.Context, taskID string, scheduledAt *st
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
+			return err
+		}
+		if err := requireExpectedTaskVersion(task, expectedUpdatedAt); err != nil {
 			return err
 		}
 		if task.CurrentRunID != nil {
@@ -428,14 +473,37 @@ func (s *Store) GarbageCollectEvents(ctx context.Context, retentionDays int) (in
 	return count, err
 }
 
+func requestsRunningExecutionUpdate(input UpdateTaskInput) bool {
+	return input.Title != nil ||
+		input.Body != nil ||
+		input.Assignee.Set ||
+		input.Tenant.Set ||
+		input.Runtime != nil ||
+		input.Workspace.Set ||
+		input.WorkspaceKind != nil ||
+		input.Branch.Set ||
+		input.ScheduledAt.Set ||
+		input.MaxRuntimeSeconds.Set ||
+		input.MaxRetries != nil ||
+		input.Skills != nil ||
+		input.GoalMode != nil ||
+		input.GoalMaxTurns != nil ||
+		input.WorkflowTemplateID.Set ||
+		input.CurrentStepKey.Set ||
+		input.Status != nil
+}
+
 func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskInput) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
 			return err
 		}
-		if input.ExpectedUpdatedAt != nil && strings.TrimSpace(*input.ExpectedUpdatedAt) != task.UpdatedAt {
-			return fmt.Errorf("task update conflict: %s changed at %s; refresh before saving", taskID, task.UpdatedAt)
+		if err := requireExpectedTaskVersion(task, input.ExpectedUpdatedAt); err != nil {
+			return err
+		}
+		if task.Status == model.TaskStatusRunning && requestsRunningExecutionUpdate(input) {
+			return errors.New("cannot change task execution settings while running; terminate the active run first (only priority may be changed)")
 		}
 		if input.Status != nil && *input.Status == model.TaskStatusRunning && task.Status != model.TaskStatusRunning {
 			return errors.New("tasks enter running only through an atomic claim")

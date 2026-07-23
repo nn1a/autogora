@@ -102,6 +102,17 @@ func ensureNoTerminalRequest(ctx context.Context, q querier, runID string) error
 }
 
 func (s *Store) MarkRunManaged(ctx context.Context, scope RunScope) error {
+	return s.markRunManaged(ctx, scope, nil)
+}
+
+// MarkRunManagedWithPolicy records whether the dispatcher granted workspace
+// writes. Recovery uses the persisted policy after a supervisor restart so a
+// known read-only run does not get blocked merely because it used a shared dir.
+func (s *Store) MarkRunManagedWithPolicy(ctx context.Context, scope RunScope, allowWrites bool) error {
+	return s.markRunManaged(ctx, scope, &allowWrites)
+}
+
+func (s *Store) markRunManaged(ctx context.Context, scope RunScope, allowWrites *bool) error {
 	return s.withWrite(ctx, func(tx *sql.Tx) error {
 		task, run, err := requireActiveRun(ctx, tx, scope)
 		if err != nil {
@@ -110,7 +121,17 @@ func (s *Store) MarkRunManaged(ctx context.Context, scope RunScope) error {
 		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO managed_runs(run_id, registered_at) VALUES (?, ?)", run.ID, now()); err != nil {
 			return err
 		}
-		return appendEvent(ctx, tx, task.ID, "run_managed", nil, &run.ID)
+		var payload map[string]any
+		if allowWrites != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO managed_run_policies(run_id, allow_writes, recorded_at)
+				VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET
+					allow_writes = excluded.allow_writes,
+					recorded_at = excluded.recorded_at`, run.ID, *allowWrites, now()); err != nil {
+				return err
+			}
+			payload = map[string]any{"allowWrites": *allowWrites}
+		}
+		return appendEvent(ctx, tx, task.ID, "run_managed", payload, &run.ID)
 	})
 }
 
@@ -123,6 +144,26 @@ func (s *Store) IsRunManaged(ctx context.Context, runID string) (bool, error) {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// GetManagedRunWritePolicy returns nil for runs created before the policy was
+// persisted. Recovery treats that unknown state conservatively.
+func (s *Store) GetManagedRunWritePolicy(ctx context.Context, runID string) (*bool, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, errors.New("run id cannot be empty")
+	}
+	var allowWrites bool
+	err := s.db.QueryRowContext(ctx,
+		"SELECT allow_writes FROM managed_run_policies WHERE run_id = ?", runID,
+	).Scan(&allowWrites)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &allowWrites, nil
 }
 
 func (s *Store) requestRunCompletion(ctx context.Context, scope RunScope, completion CompletionInput, deferFinalization bool) (model.TaskDetail, error) {
@@ -370,7 +411,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'done', current_run_id = NULL, result = ?, failure_count = 0,
-				block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ? WHERE id = ?`, currentRequest.Result, timestamp, currentTask.ID); err != nil {
+				scheduled_at = NULL, block_kind = NULL, block_reason = NULL, block_recurrences = 0, updated_at = ? WHERE id = ?`, currentRequest.Result, timestamp, currentTask.ID); err != nil {
 				return err
 			}
 			summary := ""

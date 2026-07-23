@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
@@ -77,23 +76,14 @@ func (s *Service) ProfileRoutes(ctx context.Context, metadata boards.Metadata) (
 }
 
 func (s *Service) planner(metadata boards.Metadata) (orchestration.Planner, error) {
-	runtime := metadata.Orchestration.PlannerRuntime
-	modelName, provider, command := metadata.Orchestration.PlannerModel, metadata.Orchestration.PlannerProvider, ""
-	config, err := agentconfig.Load(agentconfig.Options{})
-	if err != nil {
-		return nil, fmt.Errorf("load global agent configuration: %w", err)
-	}
-	if modelName == "" && provider == "" {
-		if agent, found := firstGlobalAgent(config, config.Defaults.PlannerAgents, agentconfig.RolePlanner); found {
-			runtime, modelName, provider, command = agent.Runtime, agent.Model, agent.Provider, agent.Command
-		}
-	}
-	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{
-		Runtime: runtime, Command: command, Model: modelName, Provider: provider, Timeout: 120 * time.Second,
-	})
+	return s.plannerForRole(metadata, agentconfig.RolePlanner)
 }
 
 func (s *Service) SpecifyTask(ctx context.Context, taskID string, explicit *orchestration.SpecificationPlan, author string) (model.TaskDetail, error) {
+	return s.SpecifyTaskWithVersion(ctx, taskID, explicit, author, nil)
+}
+
+func (s *Service) SpecifyTaskWithVersion(ctx context.Context, taskID string, explicit *orchestration.SpecificationPlan, author string, expectedUpdatedAt *string) (model.TaskDetail, error) {
 	metadata, err := s.manager.Read(s.board)
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -102,7 +92,7 @@ func (s *Service) SpecifyTask(ctx context.Context, taskID string, explicit *orch
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
-	return orchestration.SpecifyTriageTask(ctx, s.Store, taskID, planner, explicit, author)
+	return orchestration.SpecifyTriageTaskWithVersion(ctx, s.Store, taskID, planner, explicit, author, expectedUpdatedAt)
 }
 
 func profileRoutes(values []boards.Profile) []orchestration.ProfileRoute {
@@ -207,6 +197,10 @@ func concurrencyLimit(global, board int) int {
 }
 
 func (s *Service) DecomposeTask(ctx context.Context, taskID string, plan *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error) {
+	return s.DecomposeTaskWithVersion(ctx, taskID, plan, nil)
+}
+
+func (s *Service) DecomposeTaskWithVersion(ctx context.Context, taskID string, plan *orchestration.DecompositionPlan, expectedUpdatedAt *string) (orchestration.DecompositionResult, error) {
 	metadata, err := s.manager.Read(s.board)
 	if err != nil {
 		return orchestration.DecompositionResult{}, err
@@ -234,6 +228,7 @@ func (s *Service) DecomposeTask(ctx context.Context, taskID string, plan *orches
 	return orchestration.DecomposeTriageTask(ctx, s.Store, taskID, orchestration.DecomposeOptions{
 		Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &orchestrator,
 		AutoPromoteChildren: &metadata.Orchestration.AutoPromoteChildren, Planner: planner, Plan: plan,
+		ExpectedUpdatedAt: expectedUpdatedAt,
 	})
 }
 
