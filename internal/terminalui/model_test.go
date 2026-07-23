@@ -444,7 +444,8 @@ func TestEmptyBoardExplainsFirstWorkflowAndGitHubImport(t *testing.T) {
 	for _, value := range []string{
 		"Start your first workflow",
 		"Configure agents",
-		"autogora agents detect --save",
+		"Press A → Presets → Ctrl+P → Ctrl+S",
+		"Detect installed CLIs",
 		"Choose a workspace",
 		"Execution",
 		"Import or create work",

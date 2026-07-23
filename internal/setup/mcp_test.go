@@ -3,6 +3,7 @@ package setup
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -19,6 +20,22 @@ type fakeRunner struct {
 	missing map[string]bool
 	run     func(file string, args []string) (CommandOutput, error)
 	calls   []runnerCall
+}
+
+func TestExecRunnerBoundsEachOutputStreamWhileProcessRuns(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("shell fixture is Unix-only")
+	}
+	output, err := (ExecRunner{}).RunBounded(
+		context.Background(), t.TempDir(), "sh", 17, 23,
+		"-c", "printf '1234567890123456789012345'; printf 'abcdefghijklmnopqrstuvwxyz' >&2",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Stdout) != 17 || len(output.Stderr) != 23 {
+		t.Fatalf("bounded output lengths = stdout:%d stderr:%d", len(output.Stdout), len(output.Stderr))
+	}
 }
 
 func (runner *fakeRunner) LookPath(file string) (string, error) {

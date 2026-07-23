@@ -145,8 +145,8 @@ func (m *Model) renderEmptyBoard(width, height int) string {
 		lipgloss.NewStyle().Foreground(colorMuted).Render("Complete these once, then bring work into Triage."),
 		"",
 		lipgloss.NewStyle().Bold(true).Render("1  Configure agents"),
-		"   " + truncate("autogora agents detect --save", lineWidth-3),
-		lipgloss.NewStyle().Foreground(colorMuted).Render("   Review defaults and supervisor policy in another terminal."),
+		"   " + truncate("Press A → Presets → Ctrl+P → Ctrl+S", lineWidth-3),
+		lipgloss.NewStyle().Foreground(colorMuted).Render("   Detect installed CLIs, choose role defaults, and review Supervisor policy."),
 		"",
 		lipgloss.NewStyle().Bold(true).Render("2  Choose a workspace"),
 		lipgloss.NewStyle().Foreground(colorMuted).Render("   Press n → Execution → Workspace, or use the board default."),
@@ -159,7 +159,7 @@ func (m *Model) renderEmptyBoard(width, height int) string {
 		lines = []string{
 			lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Start your first workflow"), "",
 			"1  Agents",
-			truncate("autogora agents detect --save", lineWidth),
+			truncate("A → Presets → Ctrl+P → Ctrl+S", lineWidth),
 			"2  Workspace",
 			truncate("n → Execution → Workspace", lineWidth),
 			"3  Import or create",
@@ -171,7 +171,7 @@ func (m *Model) renderEmptyBoard(width, height int) string {
 	if height < 13 {
 		lines = []string{
 			lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Empty board"),
-			truncate("1 Agents: autogora agents detect --save", lineWidth),
+			truncate("1 Agents: A → Presets → Ctrl+P", lineWidth),
 			truncate("2 Workspace: n → Execution", lineWidth),
 			truncate("3 Import: autogora github import", lineWidth),
 			truncate("n create · r refresh · ? help", lineWidth),
@@ -362,7 +362,17 @@ func (m *Model) View() string {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  " + busyLabel)
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  O board settings  m move  f filters  C comment  ? help")
+	footerText := "space actions  n new  e edit  A agents  O board settings  m move  f filters  ? help"
+	if m.width < 100 {
+		footerText = "space actions · n new · A agents · O board · ? help"
+	}
+	if m.width < 60 {
+		footerText = "A agents · O board · ? help"
+	}
+	if m.width < 30 {
+		footerText = "A agents · ? help"
+	}
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(footerText)
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -388,7 +398,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  f             tenant/assignee/runtime filters\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  O             board orchestration settings\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  f             tenant/assignee/runtime filters\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  A             global agents and Supervisor\n  O             board orchestration settings\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}
@@ -413,6 +423,12 @@ func (m *Model) View() string {
 	}
 	if m.settings != nil {
 		content = m.renderBoardSettings(m.width, contentHeight)
+	}
+	if m.globalLoading {
+		content = m.renderGlobalAgentsLoading(m.width, contentHeight)
+	}
+	if m.globalAgents != nil {
+		content = m.renderGlobalAgents(m.width, contentHeight)
 	}
 	return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + content + "\n" + footer
 }

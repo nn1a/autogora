@@ -220,10 +220,23 @@ func (c *Controller) Stop(ctx context.Context) error {
 }
 
 func (c *Controller) Apply(ctx context.Context, parent context.Context, config agentconfig.Config) error {
+	return c.Reconcile(ctx, parent, config, config.Supervisor.AutoStart)
+}
+
+// Reconcile applies a new dispatcher snapshot while preserving an explicit
+// process-level desired state supplied by the caller. AutoStart is a policy
+// for future UI sessions and does not implicitly override current manual
+// start/stop intent.
+func (c *Controller) Reconcile(
+	ctx context.Context,
+	parent context.Context,
+	config agentconfig.Config,
+	desired bool,
+) error {
 	if err := c.Stop(ctx); err != nil {
 		return err
 	}
-	if config.Supervisor.AutoStart {
+	if desired {
 		c.Start(parent, config)
 	}
 	return nil

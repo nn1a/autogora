@@ -167,7 +167,91 @@ func TestAgentPresetAPIPreviewsDetectedConfigurationWithoutSaving(t *testing.T) 
 	}
 }
 
+func TestAgentConfigAPIUsesRevisionCASAndPreservesSupervisorIntent(t *testing.T) {
+	server := startTestServer(t)
+	response, value := apiRequest(t, server, http.MethodGet, "/api/config", nil)
+	initial := mapValue(t, value)
+	revision, _ := initial["revision"].(string)
+	if response.StatusCode != http.StatusOK || revision != string(agentconfig.MissingRevision) {
+		t.Fatalf("unexpected initial config snapshot: %d %#v", response.StatusCode, initial)
+	}
+	config := mapValue(t, initial["config"])
+	supervisorConfig := mapValue(t, config["supervisor"])
+	supervisorConfig["autoStart"] = true
+	supervisorConfig["maxWorkers"] = float64(2)
+	supervisorConfig["allowWrites"] = false
+
+	missing, missingValue := apiRequest(t, server, http.MethodPut, "/api/config", config)
+	if missing.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(mapValue(t, missingValue)["error"].(string), "If-Match") {
+		t.Fatalf("missing revision was accepted: %d %#v", missing.StatusCode, missingValue)
+	}
+
+	savedResponse, savedValue := apiRequestWithHeaders(
+		t, server, http.MethodPut, "/api/config", config,
+		map[string]string{"If-Match": revision},
+	)
+	saved := mapValue(t, savedValue)
+	savedRevision, _ := saved["revision"].(string)
+	if savedResponse.StatusCode != http.StatusOK || savedRevision == "" || savedRevision == revision {
+		t.Fatalf("config CAS did not return a new revision: %d %#v", savedResponse.StatusCode, saved)
+	}
+	if status := server.supervisor.Status(); status.Desired {
+		t.Fatalf("ordinary Web save changed stopped Supervisor intent: %#v", status)
+	}
+
+	staleConfig := mapValue(t, saved["config"])
+	mapValue(t, staleConfig["supervisor"])["maxWorkers"] = float64(9)
+	staleResponse, staleValue := apiRequestWithHeaders(
+		t, server, http.MethodPut, "/api/config", staleConfig,
+		map[string]string{"If-Match": revision},
+	)
+	if staleResponse.StatusCode != http.StatusConflict ||
+		!strings.Contains(strings.ToLower(mapValue(t, staleValue)["error"].(string)), "revision conflict") {
+		t.Fatalf("stale Web config overwrite was not rejected: %d %#v", staleResponse.StatusCode, staleValue)
+	}
+	loaded, err := agentconfig.Load(agentconfig.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Supervisor.MaxWorkers != 2 {
+		t.Fatalf("stale Web save overwrote current config: %#v", loaded.Supervisor)
+	}
+}
+
+func putAgentConfig(
+	t *testing.T,
+	server *Server,
+	config any,
+	startSupervisor bool,
+) (*http.Response, any) {
+	t.Helper()
+	response, value := apiRequest(t, server, http.MethodGet, "/api/config", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("load config revision: %d %#v", response.StatusCode, value)
+	}
+	revision, _ := mapValue(t, value)["revision"].(string)
+	headers := map[string]string{"If-Match": revision}
+	if startSupervisor {
+		headers["X-Autogora-Supervisor-Desired"] = "start"
+	}
+	return apiRequestWithHeaders(
+		t, server, http.MethodPut, "/api/config", config, headers,
+	)
+}
+
 func apiRequest(t *testing.T, server *Server, method, path string, body any) (*http.Response, any) {
+	t.Helper()
+	return apiRequestWithHeaders(t, server, method, path, body, nil)
+}
+
+func apiRequestWithHeaders(
+	t *testing.T,
+	server *Server,
+	method, path string,
+	body any,
+	headers map[string]string,
+) (*http.Response, any) {
 	t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -184,6 +268,9 @@ func apiRequest(t *testing.T, server *Server, method, path string, body any) (*h
 	request.Header.Set("Authorization", "Bearer "+testToken)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -383,7 +470,7 @@ func TestGlobalAgentConfigAPIStartsEmptyAndPersistsValidatedConfig(t *testing.T)
 				"maxConcurrent": 1, "roles": []string{"worker", "planner"}},
 		},
 	}
-	response, savedValue := apiRequest(t, server, http.MethodPut, "/api/config", config)
+	response, savedValue := putAgentConfig(t, server, config, true)
 	saved := mapValue(t, savedValue)
 	if response.StatusCode != http.StatusOK || saved["exists"] != true || saved["path"] != initial["path"] {
 		t.Fatalf("config save failed: %d %#v", response.StatusCode, saved)
@@ -411,7 +498,7 @@ func TestGlobalAgentConfigAPIStartsEmptyAndPersistsValidatedConfig(t *testing.T)
 			"roles": []string{"worker"}, "apiKey": "must-not-be-accepted",
 		}},
 	}
-	rejected, rejectedValue := apiRequest(t, server, http.MethodPut, "/api/config", invalid)
+	rejected, rejectedValue := putAgentConfig(t, server, invalid, false)
 	if rejected.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, rejectedValue)["error"].(string), "unknown field") {
 		t.Fatalf("unknown config field was accepted: %d %#v", rejected.StatusCode, rejectedValue)
 	}
@@ -421,7 +508,7 @@ func TestGlobalAgentConfigAPIStartsEmptyAndPersistsValidatedConfig(t *testing.T)
 		"defaults":      map[string]any{"workerAgents": []string{"unknown"}, "plannerAgents": []string{}, "judgeAgents": []string{}},
 		"agents":        []any{},
 	}
-	rejected, rejectedValue = apiRequest(t, server, http.MethodPut, "/api/config", invalidPolicy)
+	rejected, rejectedValue = putAgentConfig(t, server, invalidPolicy, false)
 	if rejected.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, rejectedValue)["error"].(string), "unknown agent") {
 		t.Fatalf("invalid config references were accepted: %d %#v", rejected.StatusCode, rejectedValue)
 	}
@@ -446,7 +533,7 @@ func TestEffectiveAgentsIncludeBoardProfilesHealthAndActiveRuns(t *testing.T) {
 				"maxConcurrent": 1, "roles": []string{"planner"}},
 		},
 	}
-	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+	if response, value := putAgentConfig(t, server, config, false); response.StatusCode != http.StatusOK {
 		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
 	}
 	if response, value := apiRequest(t, server, http.MethodPatch, "/api/boards/default", map[string]any{
@@ -532,7 +619,7 @@ func TestEffectiveAgentsUseSharedHealthForGlobalProfiles(t *testing.T) {
 			"enabled": true, "maxConcurrent": 1, "roles": []string{"worker"},
 		}},
 	}
-	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+	if response, value := putAgentConfig(t, server, config, false); response.StatusCode != http.StatusOK {
 		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
 	}
 	ctx := context.Background()
@@ -587,7 +674,7 @@ func TestBoardSnapshotKeepsMetadataProfilesSeparateFromEffectiveProfiles(t *test
 			"maxConcurrent": 1, "roles": []string{"worker"},
 		}},
 	}
-	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+	if response, value := putAgentConfig(t, server, config, false); response.StatusCode != http.StatusOK {
 		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
 	}
 	if response, value := apiRequest(t, server, http.MethodPatch, "/api/boards/default", map[string]any{
@@ -796,7 +883,7 @@ func TestTargetedDispatchRejectsStrandedRoutesAndAcceptsRunnableTask(t *testing.
 		"agents": []any{map[string]any{"id": "worker", "runtime": "cline", "command": "/missing/cline", "enabled": true,
 			"maxConcurrent": 1, "roles": []string{"worker"}}},
 	}
-	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+	if response, value := putAgentConfig(t, server, config, false); response.StatusCode != http.StatusOK {
 		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
 	}
 	_, stranded := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{

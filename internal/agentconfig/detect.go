@@ -11,7 +11,10 @@ import (
 	"github.com/nn1a/autogora/internal/model"
 )
 
-const DefaultDetectionTimeout = 3 * time.Second
+const (
+	DefaultDetectionTimeout = 3 * time.Second
+	MaxDetectionOutputBytes = 16 * 1024
+)
 
 type VersionRunner func(context.Context, string) (stdout string, stderr string, err error)
 
@@ -50,7 +53,8 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 
 func defaultVersionRunner(ctx context.Context, executable string) (string, string, error) {
 	command := exec.CommandContext(ctx, executable, "--version")
-	stdout, stderr := boundedBuffer{limit: 16 * 1024}, boundedBuffer{limit: 16 * 1024}
+	stdout := boundedBuffer{limit: MaxDetectionOutputBytes}
+	stderr := boundedBuffer{limit: MaxDetectionOutputBytes}
 	command.Stdout, command.Stderr = &stdout, &stderr
 	err := command.Run()
 	return stdout.value.String(), stderr.value.String(), err

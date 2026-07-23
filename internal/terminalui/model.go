@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
@@ -59,6 +60,28 @@ type boardSettingsSavedMsg struct {
 	err     error
 }
 
+type globalAgentsLoadedMsg struct {
+	context    GlobalAgentsContext
+	generation uint64
+	err        error
+}
+
+type globalAgentsSavedMsg struct {
+	context GlobalAgentsContext
+	err     error
+}
+
+type globalAgentsDetectedMsg struct {
+	detections []agentconfig.Detection
+	err        error
+}
+
+type globalSupervisorMsg struct {
+	action  string
+	context GlobalAgentsContext
+	err     error
+}
+
 type mutationMsg struct {
 	action string
 	id     string
@@ -75,6 +98,7 @@ type confirmState struct {
 type Model struct {
 	ctx              context.Context
 	backend          Backend
+	globalBackend    GlobalAgentsBackend
 	board            string
 	boardContext     *taskservice.BoardContext
 	boardContextGen  uint64
@@ -114,12 +138,24 @@ type Model struct {
 	desiredSelection string
 	form             *taskForm
 	settings         *boardSettingsForm
+	globalAgents     *globalAgentsForm
+	globalLoading    bool
+	globalAgentsGen  uint64
 	menu             *actionMenu
 }
 
 func NewModel(ctx context.Context, backend Backend, board string) *Model {
+	return NewModelWithGlobalAgents(ctx, backend, nil, board)
+}
+
+func NewModelWithGlobalAgents(
+	ctx context.Context,
+	backend Backend,
+	globalBackend GlobalAgentsBackend,
+	board string,
+) *Model {
 	return &Model{
-		ctx: ctx, backend: backend, board: board,
+		ctx: ctx, backend: backend, globalBackend: globalBackend, board: board,
 		width: 100, height: 30, cursors: map[model.TaskStatus]int{},
 		tasks: map[model.TaskStatus][]model.Task{}, loading: true,
 	}
@@ -289,6 +325,78 @@ func (m *Model) openBoardSettings() tea.Cmd {
 	m.settings = newBoardSettingsForm(*m.boardContext)
 	m.clearMutationStatus()
 	return m.settings.syncFocus()
+}
+
+func (m *Model) openGlobalAgents() tea.Cmd {
+	if m.busy {
+		return nil
+	}
+	if m.globalBackend == nil {
+		m.err = errors.New("global agent settings are unavailable in this TUI")
+		return nil
+	}
+	m.globalAgentsGen++
+	generation := m.globalAgentsGen
+	m.globalLoading = true
+	m.clearMutationStatus()
+	return func() tea.Msg {
+		value, err := m.globalBackend.LoadGlobalAgents(m.ctx)
+		return globalAgentsLoadedMsg{context: value, generation: generation, err: err}
+	}
+}
+
+func (m *Model) saveGlobalAgents(form *globalAgentsForm) tea.Cmd {
+	config, err := form.buildConfig()
+	if err != nil {
+		form.err = err
+		return nil
+	}
+	form.saving = true
+	return func() tea.Msg {
+		value, err := m.globalBackend.SaveGlobalAgents(m.ctx, form.revision, config)
+		return globalAgentsSavedMsg{context: value, err: err}
+	}
+}
+
+func (m *Model) detectGlobalAgentPreset(form *globalAgentsForm) tea.Cmd {
+	config, err := form.buildConfig()
+	if err != nil {
+		form.err = err
+		return nil
+	}
+	if _, err := form.selectedPreset(); err != nil {
+		form.err = err
+		return nil
+	}
+	form.detecting = true
+	form.err, form.notice = nil, ""
+	return func() tea.Msg {
+		detections, err := m.globalBackend.DetectGlobalAgents(m.ctx, config)
+		return globalAgentsDetectedMsg{detections: detections, err: err}
+	}
+}
+
+func (m *Model) startGlobalSupervisor(form *globalAgentsForm) tea.Cmd {
+	config, err := form.buildConfig()
+	if err != nil {
+		form.err = err
+		return nil
+	}
+	form.lifecycle = "start"
+	form.err, form.notice = nil, ""
+	return func() tea.Msg {
+		value, err := m.globalBackend.StartSupervisor(m.ctx, form.revision, config)
+		return globalSupervisorMsg{action: "start", context: value, err: err}
+	}
+}
+
+func (m *Model) stopGlobalSupervisor(form *globalAgentsForm) tea.Cmd {
+	form.lifecycle = "stop"
+	form.err, form.notice = nil, ""
+	return func() tea.Msg {
+		value, err := m.globalBackend.StopSupervisor(m.ctx)
+		return globalSupervisorMsg{action: "stop", context: value, err: err}
+	}
 }
 
 func (m *Model) saveBoardSettings(form *boardSettingsForm) tea.Cmd {
@@ -530,6 +638,81 @@ func (m *Model) handlePrompt(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if m.globalLoading {
+		if key, ok := message.(tea.KeyMsg); ok {
+			switch key.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.globalAgentsGen++
+				m.globalLoading = false
+				return m, nil
+			}
+			return m, nil
+		}
+	}
+	if m.globalAgents != nil {
+		if key, ok := message.(tea.KeyMsg); ok {
+			if key.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			if key.String() == "?" {
+				m.globalAgents.help = !m.globalAgents.help
+				return m, nil
+			}
+			if m.globalAgents.help {
+				switch key.String() {
+				case "esc", "enter":
+					m.globalAgents.help = false
+				}
+				return m, nil
+			}
+			if m.globalAgents.saving || m.globalAgents.detecting || m.globalAgents.lifecycle != "" {
+				return m, nil
+			}
+			switch key.String() {
+			case "ctrl+p":
+				if m.globalAgents.tab == globalAgentsPresets {
+					return m, m.detectGlobalAgentPreset(m.globalAgents)
+				}
+			case "ctrl+r":
+				if m.globalAgents.tab == globalAgentsSupervisor {
+					return m, m.startGlobalSupervisor(m.globalAgents)
+				}
+			case "ctrl+t":
+				if m.globalAgents.tab == globalAgentsSupervisor {
+					return m, m.stopGlobalSupervisor(m.globalAgents)
+				}
+			}
+			command, action := m.globalAgents.Update(key)
+			switch action {
+			case formCancel:
+				m.globalAgents = nil
+				return m, nil
+			case formSubmit:
+				return m, m.saveGlobalAgents(m.globalAgents)
+			default:
+				return m, command
+			}
+		}
+		if mouse, ok := message.(tea.MouseMsg); ok {
+			event := tea.MouseEvent(mouse)
+			switch event.Button {
+			case tea.MouseButtonWheelUp:
+				m.globalAgents.scroll = max(0, m.globalAgents.scroll-3)
+			case tea.MouseButtonWheelDown:
+				m.globalAgents.scroll += 3
+			}
+			return m, nil
+		}
+		switch message.(type) {
+		case tea.WindowSizeMsg, tasksLoadedMsg, detailLoadedMsg, boardContextMsg,
+			boardSettingsSavedMsg, globalAgentsLoadedMsg, globalAgentsSavedMsg,
+			globalAgentsDetectedMsg, globalSupervisorMsg, refreshMsg, mutationMsg:
+		default:
+			return m, m.globalAgents.UpdateMessage(message)
+		}
+	}
 	if m.settings != nil {
 		if key, ok := message.(tea.KeyMsg); ok {
 			if key.String() == "ctrl+c" {
@@ -698,6 +881,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.menu = m.filterMenu()
 		case "O":
 			return m, m.openBoardSettings()
+		case "A":
+			return m, m.openGlobalAgents()
 		case "n":
 			return m, m.openCreateForm()
 		case "e":
@@ -815,6 +1000,99 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = fmt.Sprintf("Board settings saved; %d active run(s) keep pinned settings", activeRuns)
 		}
 		m.noticeUntil = time.Now().Add(noticeDuration)
+	case globalAgentsLoadedMsg:
+		if message.generation != m.globalAgentsGen {
+			break
+		}
+		m.globalLoading = false
+		if message.err != nil {
+			m.err = message.err
+			break
+		}
+		if message.context.ActiveRuns == 0 && m.boardContext != nil {
+			message.context.ActiveRuns = m.boardContext.ActiveRuns
+		}
+		m.globalAgents = newGlobalAgentsForm(message.context)
+		m.err = nil
+		return m, m.globalAgents.syncFocus()
+	case globalAgentsDetectedMsg:
+		if m.globalAgents == nil {
+			break
+		}
+		m.globalAgents.detecting = false
+		if message.err != nil {
+			m.globalAgents.err = message.err
+			break
+		}
+		if err := m.globalAgents.applyPreset(message.detections); err != nil {
+			m.globalAgents.err = err
+			break
+		}
+		return m, m.globalAgents.syncFocus()
+	case globalAgentsSavedMsg:
+		if m.globalAgents == nil {
+			break
+		}
+		m.globalAgents.saving = false
+		if message.err != nil {
+			if message.context.Revision != "" {
+				m.globalAgents.path = message.context.Path
+				m.globalAgents.exists = message.context.Exists
+				m.globalAgents.revision = message.context.Revision
+				m.globalAgents.status = message.context.Supervisor
+				m.globalAgents.replaceConfig(message.context.Config)
+			}
+			if errors.Is(message.err, agentconfig.ErrRevisionConflict) {
+				m.globalAgents.err = errors.New(
+					"Global agent settings changed in another process. Cancel and reopen this form to reload before saving",
+				)
+			} else {
+				m.globalAgents.err = message.err
+			}
+			break
+		}
+		activeRuns := message.context.ActiveRuns
+		m.globalAgents = nil
+		m.err, m.notice = nil, "Global agent settings saved and applied"
+		if activeRuns > 0 {
+			m.notice = fmt.Sprintf(
+				"Global settings saved; %d active run(s) keep pinned agents", activeRuns,
+			)
+		}
+		m.noticeUntil = time.Now().Add(noticeDuration)
+		m.boardContextGen++
+		return m, m.loadBoardContext()
+	case globalSupervisorMsg:
+		if m.globalAgents == nil {
+			break
+		}
+		m.globalAgents.lifecycle = ""
+		if message.err != nil {
+			if message.context.Revision != "" {
+				m.globalAgents.path = message.context.Path
+				m.globalAgents.exists = message.context.Exists
+				m.globalAgents.revision = message.context.Revision
+				m.globalAgents.status = message.context.Supervisor
+				m.globalAgents.replaceConfig(message.context.Config)
+			}
+			if errors.Is(message.err, agentconfig.ErrRevisionConflict) {
+				m.globalAgents.err = errors.New(
+					"Global agent settings changed in another process. Cancel and reopen this form to reload before starting",
+				)
+			} else {
+				m.globalAgents.err = message.err
+			}
+			break
+		}
+		m.globalAgents.path = message.context.Path
+		m.globalAgents.exists = message.context.Exists
+		m.globalAgents.revision = message.context.Revision
+		m.globalAgents.status = message.context.Supervisor
+		m.globalAgents.replaceConfig(message.context.Config)
+		m.globalAgents.notice = "Supervisor stopped"
+		if message.action == "start" {
+			m.globalAgents.notice = "Settings saved; Supervisor start requested"
+		}
 	case mutationMsg:
 		m.busy, m.busyAction = false, ""
 		if message.err != nil {
@@ -831,6 +1109,9 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		if m.notice != "" && !m.noticeUntil.IsZero() && !time.Time(message).Before(m.noticeUntil) {
 			m.notice, m.noticeUntil = "", time.Time{}
+		}
+		if m.globalAgents != nil && m.globalBackend != nil {
+			m.globalAgents.status = m.globalBackend.SupervisorStatus()
 		}
 		return m, tea.Batch(m.loadTasks(), m.loadBoardContext(), tick())
 	}

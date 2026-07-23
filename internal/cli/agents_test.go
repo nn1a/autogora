@@ -86,8 +86,9 @@ func TestAgentsCLIManagesRegistryDefaultsAndSupervisor(t *testing.T) {
 }
 
 type agentDetectionRunner struct {
-	paths map[string]string
-	calls [][]string
+	paths  map[string]string
+	calls  [][]string
+	limits [][2]int
 }
 
 func (runner *agentDetectionRunner) LookPath(file string) (string, error) {
@@ -99,7 +100,18 @@ func (runner *agentDetectionRunner) LookPath(file string) (string, error) {
 }
 
 func (runner *agentDetectionRunner) Run(_ context.Context, _ string, file string, args ...string) (setupcfg.CommandOutput, error) {
+	return setupcfg.CommandOutput{}, errors.New("unbounded Run must not be used for agent detection")
+}
+
+func (runner *agentDetectionRunner) RunBounded(
+	_ context.Context,
+	_ string,
+	file string,
+	stdoutLimit, stderrLimit int,
+	args ...string,
+) (setupcfg.CommandOutput, error) {
 	runner.calls = append(runner.calls, append([]string{file}, args...))
+	runner.limits = append(runner.limits, [2]int{stdoutLimit, stderrLimit})
 	if strings.HasSuffix(file, "cline") {
 		return setupcfg.CommandOutput{Stderr: "cline test version\n"}, errors.New("test version exit")
 	}
@@ -126,6 +138,11 @@ func TestAgentsDetectUsesVersionOnlyAndPreservesExistingSettings(t *testing.T) {
 	for _, call := range runner.calls {
 		if len(call) != 2 || call[1] != "--version" {
 			t.Fatalf("detection made unsafe call: %#v", call)
+		}
+	}
+	for _, limits := range runner.limits {
+		if limits != [2]int{agentconfig.MaxDetectionOutputBytes, agentconfig.MaxDetectionOutputBytes} {
+			t.Fatalf("detection output was not bounded while running: %#v", runner.limits)
 		}
 	}
 
@@ -224,6 +241,30 @@ func TestAgentsCLIRejectsUnsafeOrInvalidConfiguration(t *testing.T) {
 		if err := app.Run(context.Background(), args); err == nil {
 			t.Fatalf("expected %v to fail", args)
 		}
+	}
+}
+
+func TestAgentsCLISaveRejectsAStaleLoadedRevision(t *testing.T) {
+	app, configOptions := newAgentConfigTestApp(t)
+	opened, err := app.loadAgentConfigSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	external := agentconfig.Default()
+	external.Supervisor.MaxWorkers = 8
+	if err := agentconfig.Save(configOptions, external); err != nil {
+		t.Fatal(err)
+	}
+	stale := opened.Config
+	stale.Supervisor.MaxWorkers = 3
+	err = app.saveAgentConfig(opened.Revision, stale)
+	if !errors.Is(err, agentconfig.ErrRevisionConflict) ||
+		!strings.Contains(err.Error(), "rerun the command") {
+		t.Fatalf("stale CLI save error = %v", err)
+	}
+	loaded, err := agentconfig.Load(configOptions)
+	if err != nil || loaded.Supervisor.MaxWorkers != 8 {
+		t.Fatalf("stale CLI save overwrote external change: %#v err=%v", loaded, err)
 	}
 }
 

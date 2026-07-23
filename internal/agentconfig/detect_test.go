@@ -3,6 +3,7 @@ package agentconfig
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,5 +66,20 @@ func TestDetectSupportedAgentsBoundsVersionTimeout(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDetectionBuffersBoundEachOutputStream(t *testing.T) {
+	for _, name := range []string{"stdout", "stderr"} {
+		t.Run(name, func(t *testing.T) {
+			buffer := boundedBuffer{limit: MaxDetectionOutputBytes}
+			value := []byte(strings.Repeat("x", MaxDetectionOutputBytes+4096))
+			written, err := buffer.Write(value)
+			if err != nil || written != len(value) ||
+				buffer.value.Len() != MaxDetectionOutputBytes {
+				t.Fatalf("bounded buffer wrote=%d stored=%d err=%v",
+					written, buffer.value.Len(), err)
+			}
+		})
 	}
 }

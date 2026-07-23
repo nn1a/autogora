@@ -25,6 +25,19 @@ type CommandRunner interface {
 	Run(ctx context.Context, directory, file string, args ...string) (CommandOutput, error)
 }
 
+// BoundedCommandRunner is used for probes of external tools whose output is
+// not trusted. Implementations must enforce both limits while the child is
+// running rather than collecting unbounded output and truncating afterward.
+type BoundedCommandRunner interface {
+	CommandRunner
+	RunBounded(
+		ctx context.Context,
+		directory, file string,
+		stdoutLimit, stderrLimit int,
+		args ...string,
+	) (CommandOutput, error)
+}
+
 type ExecRunner struct{}
 
 func (ExecRunner) LookPath(file string) (string, error) { return exec.LookPath(file) }
@@ -36,6 +49,38 @@ func (ExecRunner) Run(ctx context.Context, directory, file string, args ...strin
 	command.Stdout, command.Stderr = &stdout, &stderr
 	err := command.Run()
 	return CommandOutput{Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
+type boundedCommandBuffer struct {
+	value bytes.Buffer
+	limit int
+}
+
+func (b *boundedCommandBuffer) Write(value []byte) (int, error) {
+	received := len(value)
+	if b.limit > b.value.Len() {
+		remaining := b.limit - b.value.Len()
+		if remaining > len(value) {
+			remaining = len(value)
+		}
+		_, _ = b.value.Write(value[:remaining])
+	}
+	return received, nil
+}
+
+func (ExecRunner) RunBounded(
+	ctx context.Context,
+	directory, file string,
+	stdoutLimit, stderrLimit int,
+	args ...string,
+) (CommandOutput, error) {
+	command := exec.CommandContext(ctx, file, args...)
+	command.Dir = directory
+	stdout := boundedCommandBuffer{limit: max(0, stdoutLimit)}
+	stderr := boundedCommandBuffer{limit: max(0, stderrLimit)}
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err := command.Run()
+	return CommandOutput{Stdout: stdout.value.String(), Stderr: stderr.value.String()}, err
 }
 
 type MCPOptions struct {

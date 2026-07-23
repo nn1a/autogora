@@ -72,6 +72,32 @@ func TestDashboardPreviewsAgentPresetsWithCoordinatorDefaults(t *testing.T) {
 	}
 }
 
+func TestDashboardAgentConfigEditsUseRevisionCASAndReload(t *testing.T) {
+	html, err := Files.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	javascript, err := Files.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{`id="agents-reload"`, `id="agents-submit"`} {
+		if !strings.Contains(string(html), marker) {
+			t.Fatalf("agent config conflict control %q is missing", marker)
+		}
+	}
+	for _, marker := range []string{
+		`agentConfigRevision`,
+		`"if-match": state.agentConfigRevision`,
+		`reloadAgentSettings`,
+		`changed in another UI`,
+	} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("agent config CAS behavior %q is missing", marker)
+		}
+	}
+}
+
 func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 	javascript, err := Files.ReadFile("app.js")
 	if err != nil {

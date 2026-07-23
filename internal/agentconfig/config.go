@@ -2,6 +2,7 @@ package agentconfig
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,35 @@ type Options struct {
 	Getenv        func(string) string
 	GOOS          string
 	HomeDirectory string
+}
+
+type Revision string
+
+const MissingRevision Revision = "missing"
+
+var ErrRevisionConflict = errors.New("agent configuration revision conflict")
+
+type RevisionConflictError struct {
+	Expected Revision
+	Actual   Revision
+}
+
+func (e *RevisionConflictError) Error() string {
+	return fmt.Sprintf(
+		"%s: expected %s, found %s",
+		ErrRevisionConflict, e.Expected, e.Actual,
+	)
+}
+
+func (e *RevisionConflictError) Unwrap() error {
+	return ErrRevisionConflict
+}
+
+type Snapshot struct {
+	Path     string
+	Exists   bool
+	Revision Revision
+	Config   Config
 }
 
 type Config struct {
@@ -141,17 +171,34 @@ func Path(options Options) (string, error) {
 }
 
 func Load(options Options) (Config, error) {
+	snapshot, err := LoadSnapshot(options)
+	return snapshot.Config, err
+}
+
+func LoadSnapshot(options Options) (Snapshot, error) {
 	path, err := Path(options)
 	if err != nil {
-		return Config{}, err
+		return Snapshot{}, err
 	}
 	contents, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Default(), nil
+		return Snapshot{
+			Path: path, Exists: false, Revision: MissingRevision, Config: Default(),
+		}, nil
 	}
 	if err != nil {
-		return Config{}, fmt.Errorf("read agent configuration %s: %w", path, err)
+		return Snapshot{}, fmt.Errorf("read agent configuration %s: %w", path, err)
 	}
+	config, err := decodeConfig(path, contents)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{
+		Path: path, Exists: true, Revision: contentsRevision(contents), Config: config,
+	}, nil
+}
+
+func decodeConfig(path string, contents []byte) (Config, error) {
 	var config Config
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.DisallowUnknownFields()
@@ -172,6 +219,11 @@ func Load(options Options) (Config, error) {
 	return config, nil
 }
 
+func contentsRevision(contents []byte) Revision {
+	digest := sha256.Sum256(contents)
+	return Revision(fmt.Sprintf("sha256:%x", digest[:]))
+}
+
 func Exists(options Options) (bool, error) {
 	path, err := Path(options)
 	if err != nil {
@@ -188,23 +240,66 @@ func Exists(options Options) (bool, error) {
 }
 
 func Save(options Options, config Config) error {
+	_, err := saveConfig(options, nil, config)
+	return err
+}
+
+func CompareAndSwap(
+	options Options,
+	expected Revision,
+	config Config,
+) (Snapshot, error) {
+	if expected == "" {
+		return Snapshot{}, errors.New("agent configuration CAS requires an expected revision")
+	}
+	return saveConfig(options, &expected, config)
+}
+
+func saveConfig(
+	options Options,
+	expected *Revision,
+	config Config,
+) (snapshot Snapshot, err error) {
 	path, err := Path(options)
 	if err != nil {
-		return err
+		return Snapshot{}, err
 	}
 	config = Normalize(config)
 	if err := Validate(config); err != nil {
-		return fmt.Errorf("validate agent configuration: %w", err)
+		return Snapshot{}, fmt.Errorf("validate agent configuration: %w", err)
 	}
 	contents, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode agent configuration: %w", err)
+		return Snapshot{}, fmt.Errorf("encode agent configuration: %w", err)
 	}
 	contents = append(contents, '\n')
-	if err := writeAtomic(path, contents); err != nil {
-		return fmt.Errorf("save agent configuration %s: %w", path, err)
+	lock, err := acquireConfigLock(path + ".lock")
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("lock agent configuration %s: %w", path, err)
 	}
-	return nil
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("unlock agent configuration %s: %w", path, closeErr))
+		}
+	}()
+	if expected != nil {
+		current, readErr := os.ReadFile(path)
+		actual := MissingRevision
+		if readErr == nil {
+			actual = contentsRevision(current)
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return Snapshot{}, fmt.Errorf("read agent configuration %s: %w", path, readErr)
+		}
+		if actual != *expected {
+			return Snapshot{}, &RevisionConflictError{Expected: *expected, Actual: actual}
+		}
+	}
+	if err := writeAtomic(path, contents); err != nil {
+		return Snapshot{}, fmt.Errorf("save agent configuration %s: %w", path, err)
+	}
+	return Snapshot{
+		Path: path, Exists: true, Revision: contentsRevision(contents), Config: config,
+	}, nil
 }
 
 func Normalize(config Config) Config {

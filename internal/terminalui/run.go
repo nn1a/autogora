@@ -9,9 +9,10 @@ import (
 )
 
 type Options struct {
-	Board  string
-	Input  io.Reader
-	Output io.Writer
+	Board        string
+	Input        io.Reader
+	Output       io.Writer
+	GlobalAgents GlobalAgentsBackend
 }
 
 func Run(ctx context.Context, backend Backend, options Options) error {
@@ -23,7 +24,7 @@ func Run(ctx context.Context, backend Backend, options Options) error {
 		output = os.Stdout
 	}
 	program := tea.NewProgram(
-		NewModel(ctx, backend, options.Board),
+		NewModelWithGlobalAgents(ctx, backend, options.GlobalAgents, options.Board),
 		tea.WithContext(ctx),
 		tea.WithInput(input),
 		tea.WithOutput(output),

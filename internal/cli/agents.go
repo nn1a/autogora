@@ -57,6 +57,7 @@ other credentials in it. Detection never sends a prompt or makes a paid API call
 type agentConfigReport struct {
 	Path       string                 `json:"path"`
 	Exists     bool                   `json:"exists"`
+	Revision   agentconfig.Revision   `json:"revision"`
 	Supervisor agentconfig.Supervisor `json:"supervisor"`
 	Defaults   agentconfig.Defaults   `json:"defaults"`
 	Agents     []agentconfig.Agent    `json:"agents"`
@@ -193,38 +194,54 @@ func (a *App) agentConfigOptions() agentconfig.Options {
 }
 
 func (a *App) loadAgentConfig() (string, bool, agentconfig.Config, error) {
-	options := a.agentConfigOptions()
-	path, err := agentconfig.Path(options)
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return "", false, agentconfig.Config{}, err
 	}
-	exists, err := agentconfig.Exists(options)
-	if err != nil {
-		return "", false, agentconfig.Config{}, err
-	}
-	config, err := agentconfig.Load(options)
-	if err != nil {
-		return "", false, agentconfig.Config{}, err
-	}
-	return path, exists, config, nil
+	return snapshot.Path, snapshot.Exists, snapshot.Config, nil
+}
+
+func (a *App) loadAgentConfigSnapshot() (agentconfig.Snapshot, error) {
+	return agentconfig.LoadSnapshot(a.agentConfigOptions())
 }
 
 func (a *App) writeAgentConfigReport() error {
-	path, exists, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	return a.writeAgentConfigSnapshot(snapshot)
+}
+
+func (a *App) writeAgentConfigSnapshot(snapshot agentconfig.Snapshot) error {
 	return writeJSON(a.Stdout, agentConfigReport{
-		Path: path, Exists: exists, Supervisor: config.Supervisor,
-		Defaults: config.Defaults, Agents: config.Agents,
+		Path: snapshot.Path, Exists: snapshot.Exists, Revision: snapshot.Revision,
+		Supervisor: snapshot.Config.Supervisor,
+		Defaults:   snapshot.Config.Defaults, Agents: snapshot.Config.Agents,
 	})
 }
 
-func (a *App) saveAgentConfig(config agentconfig.Config) error {
-	if err := agentconfig.Save(a.agentConfigOptions(), config); err != nil {
-		return err
+func agentConfigSaveError(err error) error {
+	if errors.Is(err, agentconfig.ErrRevisionConflict) {
+		return fmt.Errorf(
+			"global agent configuration changed while this command was running; rerun the command: %w",
+			err,
+		)
 	}
-	return a.writeAgentConfigReport()
+	return err
+}
+
+func (a *App) saveAgentConfig(
+	expected agentconfig.Revision,
+	config agentconfig.Config,
+) error {
+	snapshot, err := agentconfig.CompareAndSwap(
+		a.agentConfigOptions(), expected, config,
+	)
+	if err != nil {
+		return agentConfigSaveError(err)
+	}
+	return a.writeAgentConfigSnapshot(snapshot)
 }
 
 func (a *App) setAgent(opts options, values []string) error {
@@ -238,10 +255,11 @@ func (a *App) setAgent(opts options, values []string) error {
 	if err != nil {
 		return err
 	}
-	_, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	config := snapshot.Config
 	id := strings.TrimSpace(values[0])
 	agent, found := config.Find(id)
 	previousRuntime := agent.Runtime
@@ -291,17 +309,18 @@ func (a *App) setAgent(opts options, values []string) error {
 	} else {
 		config.Agents = append(config.Agents, agent)
 	}
-	return a.saveAgentConfig(config)
+	return a.saveAgentConfig(snapshot.Revision, config)
 }
 
 func (a *App) setAgentEnabled(action string, values []string) error {
 	if len(values) != 1 {
 		return fmt.Errorf("agents %s requires exactly one agent id", action)
 	}
-	_, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	config := snapshot.Config
 	id := strings.TrimSpace(values[0])
 	if _, found := config.Find(id); !found {
 		return fmt.Errorf("agent %q is not configured", id)
@@ -312,17 +331,18 @@ func (a *App) setAgentEnabled(action string, values []string) error {
 			break
 		}
 	}
-	return a.saveAgentConfig(config)
+	return a.saveAgentConfig(snapshot.Revision, config)
 }
 
 func (a *App) removeAgent(values []string) error {
 	if len(values) != 1 {
 		return errors.New("agents remove requires exactly one agent id")
 	}
-	_, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	config := snapshot.Config
 	id := strings.TrimSpace(values[0])
 	if _, found := config.Find(id); !found {
 		return fmt.Errorf("agent %q is not configured", id)
@@ -340,17 +360,18 @@ func (a *App) removeAgent(values []string) error {
 	config.Defaults.PlannerAgents = withoutString(config.Defaults.PlannerAgents, id)
 	config.Defaults.CoordinatorAgents = withoutString(config.Defaults.CoordinatorAgents, id)
 	config.Defaults.JudgeAgents = withoutString(config.Defaults.JudgeAgents, id)
-	return a.saveAgentConfig(config)
+	return a.saveAgentConfig(snapshot.Revision, config)
 }
 
 func (a *App) setAgentDefaults(opts options) error {
 	if !opts.present("worker") && !opts.present("planner") && !opts.present("coordinator") && !opts.present("judge") {
 		return errors.New("agents defaults requires --worker, --planner, --coordinator, or --judge")
 	}
-	_, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	config := snapshot.Config
 	if opts.present("worker") {
 		config.Defaults.WorkerAgents = commaOptions(opts.many("worker"))
 	}
@@ -363,17 +384,18 @@ func (a *App) setAgentDefaults(opts options) error {
 	if opts.present("judge") {
 		config.Defaults.JudgeAgents = commaOptions(opts.many("judge"))
 	}
-	return a.saveAgentConfig(config)
+	return a.saveAgentConfig(snapshot.Revision, config)
 }
 
 func (a *App) setAgentSupervisor(opts options) error {
 	if !opts.present("auto-start") && !opts.present("max-workers") && !opts.present("allow-writes") {
 		return errors.New("agents supervisor requires --auto-start, --max-workers, or --allow-writes")
 	}
-	_, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	config := snapshot.Config
 	if opts.present("auto-start") {
 		config.Supervisor.AutoStart = opts.flags["auto-start"]
 	}
@@ -389,14 +411,15 @@ func (a *App) setAgentSupervisor(opts options) error {
 			return errors.New("--max-workers must be at least 1")
 		}
 	}
-	return a.saveAgentConfig(config)
+	return a.saveAgentConfig(snapshot.Revision, config)
 }
 
 func (a *App) detectAgents(ctx context.Context, save bool) error {
-	path, _, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	path, config := snapshot.Path, snapshot.Config
 	commonDetections, err := a.detectSupportedAgents(ctx, config)
 	if err != nil {
 		return err
@@ -419,8 +442,10 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 		detections = append(detections, detection)
 	}
 	if save {
-		if err := agentconfig.Save(a.agentConfigOptions(), config); err != nil {
-			return err
+		if _, err := agentconfig.CompareAndSwap(
+			a.agentConfigOptions(), snapshot.Revision, config,
+		); err != nil {
+			return agentConfigSaveError(err)
 		}
 	}
 	return writeJSON(a.Stdout, agentDetectionReport{Path: path, Saved: save, Agents: detections})
@@ -429,7 +454,11 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 func (a *App) detectSupportedAgents(ctx context.Context, config agentconfig.Config) ([]agentconfig.Detection, error) {
 	runner := a.CommandRunner
 	if runner == nil {
-		runner = setupcfg.ExecRunner{}
+		return agentconfig.DetectSupportedAgents(ctx, config, agentconfig.DetectOptions{})
+	}
+	boundedRunner, ok := runner.(setupcfg.BoundedCommandRunner)
+	if !ok {
+		return nil, errors.New("injected agent detection runner must enforce bounded command output")
 	}
 	directory, err := a.workingDirectory()
 	if err != nil {
@@ -438,17 +467,23 @@ func (a *App) detectSupportedAgents(ctx context.Context, config agentconfig.Conf
 	return agentconfig.DetectSupportedAgents(ctx, config, agentconfig.DetectOptions{
 		LookPath: runner.LookPath,
 		RunVersion: func(ctx context.Context, executable string) (string, string, error) {
-			output, runErr := runner.Run(ctx, directory, executable, "--version")
+			output, runErr := boundedRunner.RunBounded(
+				ctx, directory, executable,
+				agentconfig.MaxDetectionOutputBytes,
+				agentconfig.MaxDetectionOutputBytes,
+				"--version",
+			)
 			return output.Stdout, output.Stderr, runErr
 		},
 	})
 }
 
 func (a *App) previewAgentPreset(ctx context.Context, id string, apply, replace bool) error {
-	path, exists, config, err := a.loadAgentConfig()
+	snapshot, err := a.loadAgentConfigSnapshot()
 	if err != nil {
 		return err
 	}
+	path, exists, config := snapshot.Path, snapshot.Exists, snapshot.Config
 	preset, found := agentconfig.FindPreset(id)
 	if !found {
 		return fmt.Errorf("unknown agent preset %q", strings.TrimSpace(id))
@@ -464,8 +499,10 @@ func (a *App) previewAgentPreset(ctx context.Context, id string, apply, replace 
 		return err
 	}
 	if apply {
-		if err := agentconfig.Save(a.agentConfigOptions(), preview); err != nil {
-			return err
+		if _, err := agentconfig.CompareAndSwap(
+			a.agentConfigOptions(), snapshot.Revision, preview,
+		); err != nil {
+			return agentConfigSaveError(err)
 		}
 		exists = true
 	}

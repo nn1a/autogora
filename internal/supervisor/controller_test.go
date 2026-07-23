@@ -85,6 +85,50 @@ func TestControllerStartsAppliesAndStopsSupervisorSettings(t *testing.T) {
 	}
 }
 
+func TestControllerReconcileUsesExplicitDesiredStateInsteadOfAutoStart(t *testing.T) {
+	started := make(chan dispatcher.Options, 2)
+	controller := New(Options{Run: func(ctx context.Context, options dispatcher.Options) error {
+		started <- options
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	config := agentconfig.Default()
+	config.Supervisor = agentconfig.Supervisor{
+		AutoStart: true, MaxWorkers: 2, AllowWrites: true,
+	}
+	apply, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.Reconcile(
+		apply, context.Background(), config, false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if status := controller.Status(); status.Desired || status.Running {
+		t.Fatalf("stopped intent was overridden by AutoStart: %#v", status)
+	}
+	config.Supervisor.AutoStart = false
+	config.Supervisor.MaxWorkers = 4
+	if err := controller.Reconcile(
+		apply, context.Background(), config, true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case options := <-started:
+		if options.MaxWorkers != 4 || !options.AllowWrites {
+			t.Fatalf("explicit desired start used stale options: %#v", options)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit desired start did not run")
+	}
+	if status := controller.Status(); !status.Desired || !status.Running {
+		t.Fatalf("AutoStart=false overrode running intent: %#v", status)
+	}
+	if err := controller.Stop(apply); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestControllerRestartsAfterTwoFailures(t *testing.T) {
 	var count atomic.Int32
 	attempts := make(chan int, 3)

@@ -1,11 +1,14 @@
 package agentconfig
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nn1a/autogora/internal/model"
 )
@@ -154,6 +157,143 @@ func TestLoadMissingReturnsNormalizedDefaults(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded, Default()) {
 		t.Fatalf("loaded = %#v, want %#v", loaded, Default())
+	}
+}
+
+func TestCompareAndSwapHandlesMissingRevisionAndRejectsStaleWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.json")
+	options := Options{Getenv: func(name string) string {
+		if name == "AUTOGORA_CONFIG" {
+			return path
+		}
+		return ""
+	}}
+	missing, err := LoadSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Exists || missing.Revision != MissingRevision ||
+		!reflect.DeepEqual(missing.Config, Default()) {
+		t.Fatalf("missing snapshot = %#v", missing)
+	}
+	first := missing.Config
+	first.Supervisor.MaxWorkers = 2
+	created, err := CompareAndSwap(options, missing.Revision, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Exists || created.Revision == MissingRevision ||
+		created.Config.Supervisor.MaxWorkers != 2 {
+		t.Fatalf("created snapshot = %#v", created)
+	}
+	stale := missing.Config
+	stale.Supervisor.MaxWorkers = 9
+	_, err = CompareAndSwap(options, missing.Revision, stale)
+	var conflict *RevisionConflictError
+	if !errors.Is(err, ErrRevisionConflict) || !errors.As(err, &conflict) ||
+		conflict.Expected != MissingRevision || conflict.Actual != created.Revision {
+		t.Fatalf("stale missing-file CAS error = %#v", err)
+	}
+	loaded, err := LoadSnapshot(options)
+	if err != nil || loaded.Config.Supervisor.MaxWorkers != 2 ||
+		loaded.Revision != created.Revision {
+		t.Fatalf("stale CAS changed config: %#v err=%v", loaded, err)
+	}
+}
+
+func TestConcurrentCompareAndSwapHasExactlyOneWinner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	options := Options{Getenv: func(name string) string {
+		if name == "AUTOGORA_CONFIG" {
+			return path
+		}
+		return ""
+	}}
+	if err := Save(options, Default()); err != nil {
+		t.Fatal(err)
+	}
+	base, err := LoadSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	type result struct {
+		workers int
+		value   Snapshot
+		err     error
+	}
+	results := make(chan result, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for _, workers := range []int{3, 7} {
+		go func() {
+			config := base.Config
+			config.Supervisor.MaxWorkers = workers
+			ready.Done()
+			<-start
+			value, saveErr := CompareAndSwap(options, base.Revision, config)
+			results <- result{workers: workers, value: value, err: saveErr}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	successes, conflicts, winner := 0, 0, 0
+	for range 2 {
+		outcome := <-results
+		switch {
+		case outcome.err == nil:
+			successes++
+			winner = outcome.workers
+		case errors.Is(outcome.err, ErrRevisionConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent CAS error: %v", outcome.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("CAS outcomes: successes=%d conflicts=%d", successes, conflicts)
+	}
+	loaded, err := LoadSnapshot(options)
+	if err != nil || loaded.Config.Supervisor.MaxWorkers != winner ||
+		loaded.Revision == base.Revision {
+		t.Fatalf("winner was not persisted: winner=%d loaded=%#v err=%v", winner, loaded, err)
+	}
+}
+
+func TestSaveAndCompareAndSwapShareTheSameFileLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	options := Options{Getenv: func(name string) string {
+		if name == "AUTOGORA_CONFIG" {
+			return path
+		}
+		return ""
+	}}
+	lock, err := acquireConfigLock(path + ".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		config := Default()
+		config.Supervisor.MaxWorkers = 4
+		done <- Save(options, config)
+	}()
+	select {
+	case err := <-done:
+		_ = lock.Close()
+		t.Fatalf("Save bypassed the config lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Save did not continue after the config lock was released")
 	}
 }
 

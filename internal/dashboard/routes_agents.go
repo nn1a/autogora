@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
@@ -20,9 +21,10 @@ import (
 )
 
 type agentConfigResponse struct {
-	Path   string             `json:"path"`
-	Exists bool               `json:"exists"`
-	Config agentconfig.Config `json:"config"`
+	Path     string               `json:"path"`
+	Exists   bool                 `json:"exists"`
+	Revision agentconfig.Revision `json:"revision"`
+	Config   agentconfig.Config   `json:"config"`
 }
 
 type agentDetectionResponse struct {
@@ -50,20 +52,14 @@ type effectiveAgentsResponse struct {
 }
 
 func loadAgentConfigResponse() (agentConfigResponse, error) {
-	options := agentconfig.Options{}
-	path, err := agentconfig.Path(options)
+	snapshot, err := agentconfig.LoadSnapshot(agentconfig.Options{})
 	if err != nil {
 		return agentConfigResponse{}, err
 	}
-	exists, err := agentconfig.Exists(options)
-	if err != nil {
-		return agentConfigResponse{}, err
-	}
-	config, err := agentconfig.Load(options)
-	if err != nil {
-		return agentConfigResponse{}, err
-	}
-	return agentConfigResponse{Path: path, Exists: exists, Config: config}, nil
+	return agentConfigResponse{
+		Path: snapshot.Path, Exists: snapshot.Exists,
+		Revision: snapshot.Revision, Config: snapshot.Config,
+	}, nil
 }
 
 func decodeAgentConfig(request *http.Request) (agentconfig.Config, error) {
@@ -121,23 +117,35 @@ func (s *Server) handleAgentConfig(response http.ResponseWriter, request *http.R
 		sendJSON(response, http.StatusOK, value)
 		return nil
 	case http.MethodPut:
+		expected := agentconfig.Revision(strings.TrimSpace(request.Header.Get("If-Match")))
+		if expected == "" {
+			return errors.New("agent configuration update requires an If-Match revision")
+		}
 		config, err := decodeAgentConfig(request)
 		if err != nil {
 			return err
 		}
-		if err := agentconfig.Save(agentconfig.Options{}, config); err != nil {
+		desired := s.supervisor.Status().Desired
+		switch strings.ToLower(strings.TrimSpace(request.Header.Get("X-Autogora-Supervisor-Desired"))) {
+		case "":
+		case "start":
+			desired = true
+		default:
+			return errors.New("invalid X-Autogora-Supervisor-Desired value")
+		}
+		snapshot, err := agentconfig.CompareAndSwap(agentconfig.Options{}, expected, config)
+		if err != nil {
 			return err
 		}
 		reconcile, cancel := context.WithTimeout(request.Context(), 5*time.Second)
 		defer cancel()
-		if err := s.supervisor.Apply(reconcile, s.ctx, config); err != nil {
+		if err := s.supervisor.Reconcile(reconcile, s.ctx, snapshot.Config, desired); err != nil {
 			return fmt.Errorf("apply supervisor configuration: %w", err)
 		}
-		value, err := loadAgentConfigResponse()
-		if err != nil {
-			return err
-		}
-		sendJSON(response, http.StatusOK, value)
+		sendJSON(response, http.StatusOK, agentConfigResponse{
+			Path: snapshot.Path, Exists: snapshot.Exists,
+			Revision: snapshot.Revision, Config: snapshot.Config,
+		})
 		return nil
 	default:
 		response.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)

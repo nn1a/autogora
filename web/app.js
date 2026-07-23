@@ -27,7 +27,8 @@ document.documentElement.dataset.theme = activeTheme;
 const state = {
   boards: [], board: localStorage.getItem("autogora.board") || "default", metadata: null,
   profiles: [], tasks: [], taskWindow: null, stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
-  agentConfig: null, agentConfigExists: false, agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
+  agentConfig: null, agentConfigExists: false, agentConfigRevision: "", agentSetupFirstRun: false,
+  agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
   stageFocus: BOARD_STAGE_FOCUSES.includes(storedStageFocus) ? storedStageFocus : "all",
   statusFocus: "",
   boardView: BOARD_VIEW_MODES.includes(storedBoardView) ? storedBoardView : "overview",
@@ -2879,6 +2880,7 @@ async function loadAgentConfiguration() {
   ]);
   state.agentConfig = configuration.config;
   state.agentConfigExists = configuration.exists;
+  state.agentConfigRevision = configuration.revision;
   state.agentPresets = presetCatalog.presets || [];
   state.supervisor = supervisor;
   $("#agents-config-path").textContent = configuration.path;
@@ -2923,7 +2925,8 @@ async function detectAgents(addSuggestions = true) {
 }
 
 async function openAgentSettings({ firstRun = false } = {}) {
-  if (!state.agentConfig) await loadAgentConfiguration();
+  await loadAgentConfiguration();
+  state.agentSetupFirstRun = firstRun;
   if (firstRun) state.agentConfig.supervisor.autoStart = true;
   renderAgentPresets();
   renderAgentEditor(state.agentConfig);
@@ -2951,16 +2954,35 @@ async function submitAgentSettings(event) {
   try {
     const config = readAgentEditor();
     button.disabled = true; button.textContent = "Applying…";
-    const saved = await api("/api/config", { method: "PUT", body: JSON.stringify(config) });
+    const headers = { "if-match": state.agentConfigRevision };
+    if (state.agentSetupFirstRun) headers["x-autogora-supervisor-desired"] = "start";
+    const saved = await api("/api/config", {
+      method: "PUT", headers, body: JSON.stringify(config),
+    });
     state.agentConfig = saved.config; state.agentConfigExists = saved.exists;
+    state.agentConfigRevision = saved.revision;
+    state.agentSetupFirstRun = false;
     state.supervisor = await api("/api/supervisor");
     renderSupervisorStatus();
     renderAutomationChip();
     $("#agents-dialog").close();
     await loadBoard();
     toast(state.supervisor.running ? "Agent settings saved; orchestration is running" : "Agent settings saved; automation is stopped");
-  } catch (error) { toast(error.message, true); }
+  } catch (error) {
+    const message = /revision conflict|changed while/i.test(error.message)
+      ? "Agent settings changed in another UI. Choose Reload, review the latest values, and apply your changes again."
+      : error.message;
+    toast(message, true);
+  }
   finally { button.disabled = false; button.textContent = "Save and apply"; }
+}
+
+async function reloadAgentSettings() {
+  await loadAgentConfiguration();
+  state.agentSetupFirstRun = false;
+  renderAgentEditor(state.agentConfig);
+  renderSupervisorStatus();
+  toast("Loaded the latest agent settings");
 }
 
 async function toggleSupervisor() {
@@ -3141,6 +3163,7 @@ function bindGlobalActions() {
     if (event.target.closest(".profile-remove")) event.target.closest(".profile-row").remove();
   });
   $("#agents-form").addEventListener("submit", submitAgentSettings);
+  $("#agents-reload").addEventListener("click", () => reloadAgentSettings().catch((error) => toast(error.message, true)));
   $("#detect-agents").addEventListener("click", () => detectAgents(true));
   $("#agent-preset").addEventListener("change", updateAgentPresetDescription);
   $("#apply-agent-preset").addEventListener("click", () => previewAgentPreset());
@@ -3162,6 +3185,7 @@ function bindGlobalActions() {
     $(".agent-row-title strong", event.target.closest(".agent-row")).textContent = event.target.value.trim() || "New agent";
   });
   $("#agents-later").addEventListener("click", () => {
+    state.agentSetupFirstRun = false;
     sessionStorage.setItem("autogora.agentSetupDeferred", "true"); $("#agents-dialog").close();
   });
   $("#supervisor-toggle").addEventListener("click", toggleSupervisor);
