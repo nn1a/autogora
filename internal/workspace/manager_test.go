@@ -228,4 +228,80 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	}
 }
 
+func TestExplicitWorktreeRootAllocatesOneDirectoryPerRun(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	repository := filepath.Join(directory, "repository")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+		command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Autogora", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Autogora", "GIT_COMMITTER_EMAIL=test@example.com")
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	git("init")
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "README.md")
+	git("commit", "-m", "fixture")
+
+	manager, err := boards.NewManager(filepath.Join(directory, "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	root := filepath.Join(directory, "explicit-worktrees")
+	intent := "worktree:" + root
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "retryable explicit worktree", Assignee: stringValue("worker"), Runtime: model.RuntimeCodex,
+		Workspace: &intent, WorkspaceKind: model.WorkspaceWorktree,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || firstClaim == nil {
+		t.Fatalf("first claim: %#v %v", firstClaim, err)
+	}
+	first, err := New(manager).Prepare(ctx, opened, firstClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Workspace == nil || first.Workspace.Path != filepath.Join(root, firstClaim.Run.ID) {
+		t.Fatalf("first explicit worktree = %#v", first.Workspace)
+	}
+	if err := os.WriteFile(filepath.Join(first.Workspace.Path, "preserved.txt"), []byte("first attempt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.FailRun(ctx, store.RunScope{RunID: firstClaim.Run.ID, ClaimToken: firstClaim.ClaimToken}, "retry", store.FailRunOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	secondClaim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || secondClaim == nil {
+		t.Fatalf("second claim: %#v %v", secondClaim, err)
+	}
+	second, err := New(manager).Prepare(ctx, opened, secondClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Workspace == nil || second.Workspace.Path != filepath.Join(root, secondClaim.Run.ID) || second.Workspace.Path == first.Workspace.Path {
+		t.Fatalf("second explicit worktree = %#v", second.Workspace)
+	}
+	if _, err := os.Stat(filepath.Join(first.Workspace.Path, "preserved.txt")); err != nil {
+		t.Fatalf("first attempt was not preserved: %v", err)
+	}
+}
+
 func stringValue(value string) *string { return &value }

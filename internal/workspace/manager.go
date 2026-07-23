@@ -210,7 +210,15 @@ func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model
 			target = strings.TrimPrefix(*task.Workspace, "worktree:")
 		}
 		if target != "worktree" && target != "" {
-			path, err = requireAbsolute(target, "worktree target")
+			var explicitRoot string
+			explicitRoot, err = requireAbsolute(target, "worktree root")
+			if err == nil {
+				// An explicit location is a stable root, not a one-shot checkout.
+				// Every attempt receives its own child so preserved work from a
+				// failed run cannot make all later retries impossible.
+				path = filepath.Join(explicitRoot, claim.Run.ID)
+				generated = true
+			}
 		} else {
 			path = filepath.Join(workspaceRoot, task.ID, claim.Run.ID)
 			generated = true
