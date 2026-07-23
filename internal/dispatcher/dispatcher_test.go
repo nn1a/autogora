@@ -639,6 +639,62 @@ touch "$AUTOGORA_TEST_FALLBACK_MARKER"
 	}
 }
 
+func TestDispatcherPreservesCleanCommittedWorkAfterNonzeroExit(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	repository := gitRepositoryFixture(t)
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	fixture := executableFixture(t, `
+printf '%s\n' 'committed before failure' > "$AUTOGORA_WORKSPACE/committed.txt"
+git -C "$AUTOGORA_WORKSPACE" add committed.txt
+git -C "$AUTOGORA_WORKSPACE" -c user.name=Autogora -c user.email=autogora@localhost commit -m 'partial worker commit' >/dev/null
+exit 2`)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "committing-worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "preserve committed failure", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: buildAutogora(t), Board: "default", Once: true, MaxWorkers: 1,
+		AllowWrites: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+			if name == "AUTOGORA_CODEX_BIN" {
+				return fixture
+			}
+			return ""
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked {
+		t.Fatalf("committed failure was not preserved without retry: %#v", detail)
+	}
+	if detail.Task.BlockReason == nil || !strings.Contains(*detail.Task.BlockReason, "partial changes remain") || len(detail.RunWorkspaces) != 1 {
+		t.Fatalf("preserved work was not explained: %#v", detail)
+	}
+	workspace := detail.RunWorkspaces[0]
+	if output, err := exec.Command("git", "-C", workspace.Path, "status", "--porcelain").CombinedOutput(); err != nil || len(output) != 0 {
+		t.Fatalf("fixture worktree is not clean: %q %v", output, err)
+	}
+	contents, err := os.ReadFile(filepath.Join(workspace.Path, "committed.txt"))
+	if err != nil || string(contents) != "committed before failure\n" {
+		t.Fatalf("committed work was not preserved: contents=%q err=%v", contents, err)
+	}
+}
+
 func TestDecompositionProfileOverridesCannotRelaxConfiguredPolicy(t *testing.T) {
 	manager, _ := testManager(t)
 	profiles := []boards.Profile{{Name: "guarded", Runtime: model.RuntimeCodex, Model: "board-model", Disabled: true, MaxConcurrent: 2}}

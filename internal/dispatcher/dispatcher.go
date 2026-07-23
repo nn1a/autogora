@@ -818,6 +818,59 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			}
 		}
 	}
+	blockPreservedRun := func(durable context.Context, reason string, exitCode int) error {
+		request, requestErr := opened.GetRunTerminalRequest(durable, scope.RunID)
+		if requestErr != nil {
+			return requestErr
+		}
+		if request != nil && request.FinalizedAt == nil {
+			if err := opened.DiscardRunTerminalRequest(durable, scope, "preserving workspace after failed execution"); err != nil {
+				return err
+			}
+		}
+		_, blockErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
+		if blockErr == nil {
+			_, blockErr = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, exitCode)
+		}
+		if blockErr == nil {
+			return nil
+		}
+		_ = opened.DiscardRunTerminalRequest(durable, scope, "preserved-work block finalization failed")
+		countFailure := false
+		_, failErr := opened.FailRun(durable, scope, reason, store.FailRunOptions{
+			CountFailure: &countFailure, FailureLimit: options.FailureLimit,
+		})
+		if failErr == nil {
+			_, failErr = opened.BlockTask(durable, taskID, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
+		}
+		return errors.Join(blockErr, failErr)
+	}
+	preserveIfChanged := func(durable context.Context, reason string, exitCode int) bool {
+		if !options.AllowWrites || prepared.Workspace == nil {
+			return false
+		}
+		partial, partialErr := false, error(nil)
+		switch prepared.Workspace.Kind {
+		case model.WorkspaceWorktree, model.WorkspaceScratch:
+			partial, partialErr = workspaces.HasChanges(durable, *prepared.Workspace)
+		case model.WorkspaceDir:
+			// A shared directory has no per-run baseline. Once a writable agent
+			// starts, a different agent must not overwrite an uncertain result.
+			partial = true
+		}
+		if !partial && partialErr == nil {
+			return false
+		}
+		reason += "; partial changes remain at " + prepared.Workspace.Path
+		if partialErr != nil {
+			reason += "; Autogora could not verify the workspace state: " + partialErr.Error()
+		}
+		if err := blockPreservedRun(durable, reason, exitCode); err != nil {
+			options.log("preserved-work block fallback failed %s: %v", taskID, err)
+		}
+		options.log("preserved partial work for %s", taskID)
+		return true
+	}
 
 	for {
 		var command RunnerCommand
@@ -828,7 +881,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		if err != nil {
 			durable, cancel := durableContext()
-			_, _ = opened.FailRun(durable, scope, err.Error(), store.FailRunOptions{Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit})
+			if !preserveIfChanged(durable, "Runner command construction failed after work began: "+err.Error(), 1) {
+				_, _ = opened.FailRun(durable, scope, err.Error(), store.FailRunOptions{Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit})
+			}
 			cancel()
 			return
 		}
@@ -885,7 +940,11 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 				}
 			} else {
 				if _, err := finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, execution.Code); err != nil {
-					_, _ = opened.FailRun(durable, scope, "Terminal finalization failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
+					reason := "Terminal finalization failed; the workspace was preserved for review: " + err.Error()
+					if prepared.Workspace != nil {
+						reason += "; workspace: " + prepared.Workspace.Path
+					}
+					_ = blockPreservedRun(durable, reason, execution.Code)
 					cancel()
 					options.log("terminal finalization failed %s: %v", taskID, err)
 					return
@@ -902,11 +961,19 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		availability, agentUnavailable := classifyAgentAvailability(execution)
 		switch {
 		case execution.TimedOut || (runtimeLimit != nil && *runtimeLimit <= 0):
+			if preserveIfChanged(durable, "Runner timed out after work began: "+detail, execution.Code) {
+				cancel()
+				return
+			}
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusTimedOut, FailureLimit: options.FailureLimit})
 			cancel()
 			options.log("requeue/fail %s: %s", taskID, detail)
 			return
 		case execution.Canceled:
+			if preserveIfChanged(durable, "Runner was canceled after work began: "+detail, execution.Code) {
+				cancel()
+				return
+			}
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{FailureLimit: options.FailureLimit})
 			cancel()
 			return
@@ -925,42 +992,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 				cancel()
 				return
 			}
-			partial, partialErr := false, error(nil)
-			if options.AllowWrites && prepared.Workspace != nil {
-				switch prepared.Workspace.Kind {
-				case model.WorkspaceWorktree, model.WorkspaceScratch:
-					partial, partialErr = workspaces.HasChanges(durable, *prepared.Workspace)
-				case model.WorkspaceDir:
-					// A shared directory has no baseline from which to prove that this
-					// process made no edits. Preserve it and ask for review before a
-					// different agent writes to the same path.
-					partial = true
-				}
-			}
-			if partial || partialErr != nil {
-				reason := fmt.Sprintf("Agent %s became %s after work began; partial changes remain at %s", configured.Profile, availability.Status, prepared.Workspace.Path)
-				if partialErr != nil {
-					reason += "; Autogora could not verify the workspace state: " + partialErr.Error()
-				}
-				if terminalRequest != nil && terminalRequest.FinalizedAt == nil {
-					_ = opened.DiscardRunTerminalRequest(durable, scope, "agent became unavailable with partial work")
-				}
-				_, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
-				if requestErr == nil {
-					_, requestErr = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, execution.Code)
-				}
-				if requestErr != nil {
-					_ = opened.DiscardRunTerminalRequest(durable, scope, "partial-work block finalization failed")
-					countFailure := false
-					if _, failErr := opened.FailRun(durable, scope, reason, store.FailRunOptions{
-						Outcome: availability.Outcome, CountFailure: &countFailure, FailureLimit: options.FailureLimit,
-					}); failErr == nil {
-						_, _ = opened.BlockTask(durable, taskID, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
-					}
-					options.log("partial-work block fallback failed %s: %v", taskID, requestErr)
-				}
+			if preserveIfChanged(durable, fmt.Sprintf("Agent %s became %s after work began", configured.Profile, availability.Status), execution.Code) {
 				cancel()
-				options.log("preserved partial work for %s after %s became %s", taskID, configured.Profile, availability.Status)
 				return
 			}
 			next, fallbackErr := resolveRunProfile(durable, manager, opened, prepared.Task.Task, options)
@@ -980,14 +1013,26 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			}
 			return
 		case execution.SpawnError != nil:
+			if preserveIfChanged(durable, "Runner could not restart after work began: "+detail, execution.Code) {
+				cancel()
+				return
+			}
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit})
 			cancel()
 			return
 		case execution.Code != 0:
+			if preserveIfChanged(durable, "Runner exited unsuccessfully after work began: "+detail, execution.Code) {
+				cancel()
+				return
+			}
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{FailureLimit: options.FailureLimit})
 			cancel()
 			return
 		case !goalMode:
+			if preserveIfChanged(durable, "Runner exited without reporting a terminal outcome after work began", execution.Code) {
+				cancel()
+				return
+			}
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusProtocolViolation, FailureLimit: options.FailureLimit})
 			cancel()
 			return
@@ -1000,7 +1045,10 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			sessionID = execution.SessionID
 		}
 		if sessionID == "" && prepared.Task.Task.Runtime != model.RuntimeCline {
-			_, _ = opened.FailRun(durable, scope, "Goal-mode runner did not report a resumable session id", store.FailRunOptions{Outcome: model.RunStatusProtocolViolation, FailureLimit: options.FailureLimit})
+			reason := "Goal-mode runner did not report a resumable session id"
+			if !preserveIfChanged(durable, reason, execution.Code) {
+				_, _ = opened.FailRun(durable, scope, reason, store.FailRunOptions{Outcome: model.RunStatusProtocolViolation, FailureLimit: options.FailureLimit})
+			}
 			cancel()
 			return
 		}
