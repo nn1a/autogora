@@ -89,6 +89,7 @@ type ClaimCoordinationIncidentInput struct {
 type CreateCoordinationProposalInput struct {
 	ID                    string
 	IncidentID            string
+	AttemptID             *string
 	CoordinatorAgent      string
 	CoordinatorModel      string
 	CoordinatorProvider   string
@@ -131,7 +132,7 @@ type TransitionCoordinationProposalInput struct {
 const incidentColumns = `id, board, root_task_id, task_id, trigger, severity, status,
 	graph_revision, summary, details_json, claim_token, claim_expires_at, created_at, updated_at`
 
-const proposalColumns = `id, incident_id, coordinator_agent, coordinator_model, coordinator_provider,
+const proposalColumns = `id, incident_id, attempt_id, coordinator_agent, coordinator_model, coordinator_provider,
 	status, expected_graph_revision, summary, rationale, actions_json, validation_errors_json,
 	created_at, updated_at, applied_at`
 
@@ -157,16 +158,25 @@ func scanCoordinationIncident(row scanner) (model.CoordinationIncident, error) {
 func scanCoordinationProposal(row scanner) (model.CoordinationProposal, error) {
 	var value model.CoordinationProposal
 	var actions, validationErrors []byte
-	var appliedAt sql.NullString
+	var attemptID, appliedAt sql.NullString
 	err := row.Scan(
-		&value.ID, &value.IncidentID, &value.CoordinatorAgent, &value.CoordinatorModel, &value.CoordinatorProvider,
+		&value.ID, &value.IncidentID, &attemptID,
+		&value.CoordinatorAgent, &value.CoordinatorModel, &value.CoordinatorProvider,
 		&value.Status, &value.ExpectedGraphRevision, &value.Summary, &value.Rationale, &actions, &validationErrors,
 		&value.CreatedAt, &value.UpdatedAt, &appliedAt,
 	)
+	value.AttemptID = stringPointer(attemptID)
 	value.Actions = append(json.RawMessage(nil), actions...)
 	value.ValidationErrors = append(json.RawMessage(nil), validationErrors...)
 	value.AppliedAt = stringPointer(appliedAt)
 	return value, err
+}
+
+func sameOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func normalizeJSON(raw json.RawMessage, fallback string, wantObject bool, field string) (json.RawMessage, error) {
@@ -834,6 +844,21 @@ func (s *Store) CreateCoordinationProposal(ctx context.Context, input CreateCoor
 	if input.ExpectedGraphRevision == nil {
 		return model.CoordinationProposal{}, false, errors.New("coordination proposal requires an expected graph revision")
 	}
+	if input.AttemptID != nil {
+		attemptID, err := validCoordinationAttemptID(
+			*input.AttemptID,
+			"coordination proposal attempt id",
+		)
+		if err != nil {
+			return model.CoordinationProposal{}, false, err
+		}
+		if attemptID == "" {
+			return model.CoordinationProposal{}, false, errors.New(
+				"coordination proposal attempt ID cannot be empty",
+			)
+		}
+		input.AttemptID = &attemptID
+	}
 	if input.Status == "" {
 		input.Status = model.CoordinationProposalDraft
 	}
@@ -888,7 +913,9 @@ func (s *Store) CreateCoordinationProposal(ctx context.Context, input CreateCoor
 		existing, getErr := scanCoordinationProposal(tx.QueryRowContext(ctx,
 			"SELECT "+proposalColumns+" FROM coordination_proposals WHERE id = ?", id))
 		if getErr == nil {
-			if existing.IncidentID != input.IncidentID || existing.ExpectedGraphRevision != *input.ExpectedGraphRevision {
+			if existing.IncidentID != input.IncidentID ||
+				existing.ExpectedGraphRevision != *input.ExpectedGraphRevision ||
+				!sameOptionalString(existing.AttemptID, input.AttemptID) {
 				return fmt.Errorf("coordination proposal id %s is already used for another proposal", id)
 			}
 			result = existing
@@ -897,20 +924,54 @@ func (s *Store) CreateCoordinationProposal(ctx context.Context, input CreateCoor
 		if !errors.Is(getErr, sql.ErrNoRows) {
 			return getErr
 		}
+		if input.AttemptID != nil {
+			attempt, attemptErr := scanCoordinationAttempt(tx.QueryRowContext(
+				ctx,
+				"SELECT "+coordinationAttemptColumns+" FROM coordination_attempts WHERE id = ?",
+				*input.AttemptID,
+			))
+			if errors.Is(attemptErr, sql.ErrNoRows) {
+				return fmt.Errorf(
+					"coordination attempt not found: %s",
+					*input.AttemptID,
+				)
+			}
+			if attemptErr != nil {
+				return attemptErr
+			}
+			if attempt.IncidentID != incident.ID || attempt.Board != incident.Board {
+				return fmt.Errorf(
+					"%w: coordination attempt %s belongs to incident %s on board %s",
+					ErrCoordinationStateConflict,
+					attempt.ID,
+					attempt.IncidentID,
+					attempt.Board,
+				)
+			}
+			if attempt.Status != model.CoordinationAttemptStarted {
+				return &CoordinationStateConflictError{
+					Kind: "attempt", ID: attempt.ID,
+					Expected: string(model.CoordinationAttemptStarted),
+					Actual:   string(attempt.Status),
+				}
+			}
+		}
 		timestamp := now()
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO coordination_proposals(
-				id, incident_id, coordinator_agent, coordinator_model, coordinator_provider,
+				id, incident_id, attempt_id, coordinator_agent, coordinator_model, coordinator_provider,
 				status, expected_graph_revision, summary, rationale, actions_json, validation_errors_json,
 				created_at, updated_at, applied_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-		`, id, input.IncidentID, input.CoordinatorAgent, input.CoordinatorModel, input.CoordinatorProvider,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+		`, id, input.IncidentID, nullableString(input.AttemptID),
+			input.CoordinatorAgent, input.CoordinatorModel, input.CoordinatorProvider,
 			input.Status, *input.ExpectedGraphRevision, input.Summary, input.Rationale, string(actions),
 			string(validationErrors), timestamp, timestamp); err != nil {
 			return err
 		}
 		result = model.CoordinationProposal{
-			ID: id, IncidentID: input.IncidentID, CoordinatorAgent: input.CoordinatorAgent,
+			ID: id, IncidentID: input.IncidentID, AttemptID: input.AttemptID,
+			CoordinatorAgent: input.CoordinatorAgent,
 			CoordinatorModel: input.CoordinatorModel, CoordinatorProvider: input.CoordinatorProvider,
 			Status: input.Status, ExpectedGraphRevision: *input.ExpectedGraphRevision,
 			Summary: input.Summary, Rationale: input.Rationale, Actions: actions,

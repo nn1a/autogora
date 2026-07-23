@@ -49,6 +49,22 @@ type FinishCoordinationAttemptInput struct {
 	Error            *string
 }
 
+// RecoverCoordinationAttemptInput closes the one logical analysis call that
+// produced a durable proposal before its normal attempt-finish write
+// completed. The live incident lease and both graph revisions bind recovery
+// to the Supervisor that currently owns that exact proposal.
+type RecoverCoordinationAttemptInput struct {
+	Board                         string
+	ProposalID                    string
+	ExpectedProposalStatus        model.CoordinationProposalStatus
+	ExpectedProposalGraphRevision *int64
+	ExpectedIncidentGraphRevision *int64
+	ClaimToken                    string
+	Current                       time.Time
+	Status                        model.CoordinationAttemptStatus
+	Error                         *string
+}
+
 type ReserveCoordinationAttemptInput struct {
 	ID                    string
 	IncidentID            string
@@ -724,6 +740,22 @@ func sameCoordinationAttemptFinish(
 	return *existing.Error == *input.Error
 }
 
+func sameRecoveredCoordinationAttemptFinish(
+	existing model.CoordinationAttempt,
+	input FinishCoordinationAttemptInput,
+) bool {
+	if existing.Status != input.Status ||
+		existing.SelectedAgent != input.SelectedAgent ||
+		existing.SelectedModel != input.SelectedModel ||
+		existing.SelectedProvider != input.SelectedProvider {
+		return false
+	}
+	if existing.Error == nil || input.Error == nil {
+		return existing.Error == nil && input.Error == nil
+	}
+	return *existing.Error == *input.Error
+}
+
 func fillCoordinationAttemptSelection(
 	current model.CoordinationAttempt,
 	input FinishCoordinationAttemptInput,
@@ -865,6 +897,198 @@ func (s *Store) FinishCoordinationAttempt(
 		return nil
 	})
 	return result, err
+}
+
+// RecoverCoordinationAttemptForProposal atomically finishes only the exact
+// attempt durably bound to proposalID. Terminal attempts are never rewritten,
+// and proposals without a paid-attempt binding are a no-op.
+func (s *Store) RecoverCoordinationAttemptForProposal(
+	ctx context.Context,
+	raw RecoverCoordinationAttemptInput,
+) (model.CoordinationAttempt, bool, error) {
+	proposalID, err := validRecordID(raw.ProposalID, "coordination proposal id")
+	if err != nil {
+		return model.CoordinationAttempt{}, false, err
+	}
+	if proposalID == "" {
+		return model.CoordinationAttempt{}, false, errors.New(
+			"coordination attempt recovery requires a proposal ID",
+		)
+	}
+	if !model.ValidCoordinationProposalStatus(raw.ExpectedProposalStatus) {
+		return model.CoordinationAttempt{}, false, fmt.Errorf(
+			"invalid expected coordination proposal status: %s",
+			raw.ExpectedProposalStatus,
+		)
+	}
+	if raw.ExpectedProposalGraphRevision == nil ||
+		raw.ExpectedIncidentGraphRevision == nil {
+		return model.CoordinationAttempt{}, false, errors.New(
+			"coordination attempt recovery requires proposal and incident graph revisions",
+		)
+	}
+	if *raw.ExpectedProposalGraphRevision < 0 ||
+		*raw.ExpectedIncidentGraphRevision < 0 {
+		return model.CoordinationAttempt{}, false, errors.New(
+			"coordination attempt recovery graph revisions cannot be negative",
+		)
+	}
+	finish, err := normalizeFinishCoordinationAttempt(FinishCoordinationAttemptInput{
+		Board: raw.Board, Status: raw.Status, Error: raw.Error,
+	}, s.board)
+	if err != nil {
+		return model.CoordinationAttempt{}, false, err
+	}
+	if raw.Current.IsZero() {
+		return model.CoordinationAttempt{}, false, errors.New(
+			"coordination attempt recovery requires a current time",
+		)
+	}
+
+	var recovered model.CoordinationAttempt
+	changed := false
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		proposal, incident, getErr := proposalWithIncident(ctx, tx, proposalID)
+		if getErr != nil {
+			return getErr
+		}
+		if incident.Board != finish.Board {
+			return fmt.Errorf(
+				"coordination proposal %s belongs to board %s, not %s",
+				proposal.ID,
+				incident.Board,
+				finish.Board,
+			)
+		}
+		if incident.Status != model.CoordinationIncidentCoordinating {
+			return &CoordinationStateConflictError{
+				Kind: "incident", ID: incident.ID,
+				Expected: string(model.CoordinationIncidentCoordinating),
+				Actual:   string(incident.Status),
+			}
+		}
+		if err := requireLiveCoordinationClaim(
+			incident,
+			raw.ClaimToken,
+			raw.Current,
+		); err != nil {
+			return err
+		}
+		if incident.GraphRevision != *raw.ExpectedIncidentGraphRevision {
+			return &GraphRevisionConflictError{
+				Board:    incident.Board,
+				Expected: *raw.ExpectedIncidentGraphRevision,
+				Actual:   incident.GraphRevision,
+			}
+		}
+		if _, err := requireBoardGraphRevision(
+			ctx,
+			tx,
+			incident.Board,
+			*raw.ExpectedIncidentGraphRevision,
+		); err != nil {
+			return err
+		}
+		if proposal.Status != raw.ExpectedProposalStatus {
+			return &CoordinationStateConflictError{
+				Kind: "proposal", ID: proposal.ID,
+				Expected: string(raw.ExpectedProposalStatus),
+				Actual:   string(proposal.Status),
+			}
+		}
+		if proposal.ExpectedGraphRevision != *raw.ExpectedProposalGraphRevision {
+			return &GraphRevisionConflictError{
+				Board:    incident.Board,
+				Expected: *raw.ExpectedProposalGraphRevision,
+				Actual:   proposal.ExpectedGraphRevision,
+			}
+		}
+		if proposal.AttemptID == nil {
+			return nil
+		}
+		attempt, attemptErr := scanCoordinationAttempt(tx.QueryRowContext(
+			ctx,
+			"SELECT "+coordinationAttemptColumns+" FROM coordination_attempts WHERE id = ?",
+			*proposal.AttemptID,
+		))
+		if errors.Is(attemptErr, sql.ErrNoRows) {
+			return fmt.Errorf(
+				"bound coordination attempt not found: %s",
+				*proposal.AttemptID,
+			)
+		}
+		if attemptErr != nil {
+			return attemptErr
+		}
+		if attempt.IncidentID != proposal.IncidentID || attempt.Board != incident.Board {
+			return fmt.Errorf(
+				"%w: proposal %s binds attempt %s for incident %s on board %s",
+				ErrCoordinationStateConflict,
+				proposal.ID,
+				attempt.ID,
+				attempt.IncidentID,
+				attempt.Board,
+			)
+		}
+		finish.SelectedAgent = proposal.CoordinatorAgent
+		finish.SelectedModel = proposal.CoordinatorModel
+		finish.SelectedProvider = proposal.CoordinatorProvider
+		if attempt.Status != model.CoordinationAttemptStarted {
+			if sameRecoveredCoordinationAttemptFinish(attempt, finish) {
+				recovered = attempt
+				return nil
+			}
+			return &CoordinationStateConflictError{
+				Kind: "attempt recovery", ID: attempt.ID,
+				Expected: string(finish.Status) + " with matching selection and error",
+				Actual:   string(attempt.Status) + " with a different terminal result",
+			}
+		}
+
+		selected, selectionErr := fillCoordinationAttemptSelection(attempt, finish)
+		if selectionErr != nil {
+			return selectionErr
+		}
+		endedAt := coordinationAttemptNow()
+		updateResult, updateErr := tx.ExecContext(ctx, `
+			UPDATE coordination_attempts
+			SET status = ?,
+				selected_agent = ?, selected_runtime = ?, selected_model = ?,
+				selected_provider = ?, selected_source = ?,
+				error = ?, ended_at = ?
+			WHERE id = ? AND incident_id = ? AND board = ? AND status = 'started'
+				AND selected_agent = ? AND selected_runtime = ? AND selected_model = ?
+				AND selected_provider = ? AND selected_source = ?
+				AND error IS NULL AND ended_at IS NULL
+		`, finish.Status,
+			selected.SelectedAgent, selected.SelectedRuntime, selected.SelectedModel,
+			selected.SelectedProvider, selected.SelectedSource,
+			nullableString(finish.Error), endedAt,
+			selected.ID, proposal.IncidentID, incident.Board,
+			attempt.SelectedAgent, attempt.SelectedRuntime, attempt.SelectedModel,
+			attempt.SelectedProvider, attempt.SelectedSource)
+		if updateErr != nil {
+			return updateErr
+		}
+		affected, updateErr := updateResult.RowsAffected()
+		if updateErr != nil {
+			return updateErr
+		}
+		if affected != 1 {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: selected.ID,
+				Expected: string(model.CoordinationAttemptStarted),
+				Actual:   "changed concurrently",
+			}
+		}
+		selected.Status = finish.Status
+		selected.Error = finish.Error
+		selected.EndedAt = &endedAt
+		recovered = selected
+		changed = true
+		return nil
+	})
+	return recovered, changed, err
 }
 
 // CountCoordinationAttemptsSince counts logical analysis calls when they

@@ -50,6 +50,259 @@ func reserveAttemptInput(
 	}
 }
 
+type boundAttemptProposalFixture struct {
+	opened   *Store
+	current  time.Time
+	incident model.CoordinationIncident
+	attempt  model.CoordinationAttempt
+	proposal model.CoordinationProposal
+}
+
+func createBoundAttemptProposalFixture(t *testing.T) boundAttemptProposalFixture {
+	t.Helper()
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident := createAttemptTestIncident(
+		t,
+		opened,
+		"default",
+		model.CoordinationTriggerGraphStalled,
+	)
+	current := time.Now().UTC()
+	reserved, err := opened.ReserveCoordinationAttempt(
+		ctx,
+		reserveAttemptInput("bound-attempt-"+newID("test"), incident, 0, current),
+	)
+	if err != nil || !reserved.Reserved {
+		opened.Close()
+		t.Fatalf("reserve bound attempt: %+v, %v", reserved, err)
+	}
+	attemptID := reserved.Attempt.ID
+	revision := reserved.Incident.GraphRevision
+	proposal, created, err := opened.CreateCoordinationProposal(
+		ctx,
+		CreateCoordinationProposalInput{
+			IncidentID: incident.ID, AttemptID: &attemptID,
+			CoordinatorAgent: "coordinator", CoordinatorModel: "coordinator-model",
+			CoordinatorProvider:   "coordinator-provider",
+			Status:                model.CoordinationProposalValidating,
+			ExpectedGraphRevision: &revision,
+			ClaimToken:            reserved.Incident.ClaimToken,
+			Current:               current.Add(time.Second),
+			Summary:               "Bound proposal",
+			Rationale:             "Exercise exact attempt recovery.",
+		},
+	)
+	if err != nil || !created {
+		opened.Close()
+		t.Fatalf("create bound proposal: created=%t value=%+v error=%v", created, proposal, err)
+	}
+	return boundAttemptProposalFixture{
+		opened: opened, current: current,
+		incident: reserved.Incident, attempt: reserved.Attempt, proposal: proposal,
+	}
+}
+
+func recoverBoundAttemptInput(
+	fixture boundAttemptProposalFixture,
+	status model.CoordinationAttemptStatus,
+	attemptError *string,
+) RecoverCoordinationAttemptInput {
+	proposalRevision := fixture.proposal.ExpectedGraphRevision
+	incidentRevision := fixture.incident.GraphRevision
+	return RecoverCoordinationAttemptInput{
+		Board: fixture.incident.Board, ProposalID: fixture.proposal.ID,
+		ExpectedProposalStatus:        fixture.proposal.Status,
+		ExpectedProposalGraphRevision: &proposalRevision,
+		ExpectedIncidentGraphRevision: &incidentRevision,
+		ClaimToken:                    fixture.incident.ClaimToken,
+		Current:                       fixture.current.Add(2 * time.Second),
+		Status:                        status,
+		Error:                         attemptError,
+	}
+}
+
+func TestBoundCoordinationProposalForeignKeysCascadeSafely(t *testing.T) {
+	t.Run("attempt deletion removes bound proposal", func(t *testing.T) {
+		fixture := createBoundAttemptProposalFixture(t)
+		defer fixture.opened.Close()
+		ctx := context.Background()
+		if _, err := fixture.opened.db.ExecContext(
+			ctx,
+			"DELETE FROM coordination_attempts WHERE id = ?",
+			fixture.attempt.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var proposals, incidents int
+		if err := fixture.opened.db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM coordination_proposals WHERE id = ?",
+			fixture.proposal.ID,
+		).Scan(&proposals); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.opened.db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM coordination_incidents WHERE id = ?",
+			fixture.incident.ID,
+		).Scan(&incidents); err != nil {
+			t.Fatal(err)
+		}
+		if proposals != 0 || incidents != 1 {
+			t.Fatalf("attempt cascade counts: proposals=%d incidents=%d", proposals, incidents)
+		}
+	})
+
+	t.Run("incident deletion removes attempt and proposal", func(t *testing.T) {
+		fixture := createBoundAttemptProposalFixture(t)
+		defer fixture.opened.Close()
+		ctx := context.Background()
+		if _, err := fixture.opened.db.ExecContext(
+			ctx,
+			"DELETE FROM coordination_incidents WHERE id = ?",
+			fixture.incident.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var attempts, proposals int
+		if err := fixture.opened.db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM coordination_attempts WHERE id = ?",
+			fixture.attempt.ID,
+		).Scan(&attempts); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.opened.db.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM coordination_proposals WHERE id = ?",
+			fixture.proposal.ID,
+		).Scan(&proposals); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := fixture.opened.db.QueryContext(ctx, "PRAGMA foreign_key_check")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		foreignKeyViolation := rows.Next()
+		if attempts != 0 || proposals != 0 || foreignKeyViolation {
+			t.Fatalf(
+				"incident cascade counts: attempts=%d proposals=%d foreignKeyViolation=%t",
+				attempts,
+				proposals,
+				foreignKeyViolation,
+			)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestRecoverBoundCoordinationAttemptRequiresExactTerminalResult(t *testing.T) {
+	t.Run("same terminal result is idempotent", func(t *testing.T) {
+		fixture := createBoundAttemptProposalFixture(t)
+		defer fixture.opened.Close()
+		ctx := context.Background()
+		finished, err := fixture.opened.FinishCoordinationAttempt(
+			ctx,
+			fixture.attempt.ID,
+			FinishCoordinationAttemptInput{
+				Status:           model.CoordinationAttemptSucceeded,
+				SelectedAgent:    fixture.proposal.CoordinatorAgent,
+				SelectedModel:    fixture.proposal.CoordinatorModel,
+				SelectedProvider: fixture.proposal.CoordinatorProvider,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recovered, changed, err := fixture.opened.RecoverCoordinationAttemptForProposal(
+			ctx,
+			recoverBoundAttemptInput(
+				fixture,
+				model.CoordinationAttemptSucceeded,
+				nil,
+			),
+		)
+		if err != nil || changed || recovered.ID != finished.ID ||
+			recovered.EndedAt == nil || *recovered.EndedAt != *finished.EndedAt {
+			t.Fatalf(
+				"idempotent terminal recovery: changed=%t recovered=%+v error=%v",
+				changed,
+				recovered,
+				err,
+			)
+		}
+
+		oppositeError := "recovered validation failed"
+		_, changed, err = fixture.opened.RecoverCoordinationAttemptForProposal(
+			ctx,
+			recoverBoundAttemptInput(
+				fixture,
+				model.CoordinationAttemptFailed,
+				&oppositeError,
+			),
+		)
+		if changed || !errors.Is(err, ErrCoordinationStateConflict) {
+			t.Fatalf("opposite terminal recovery: changed=%t error=%v", changed, err)
+		}
+		unchanged, err := fixture.opened.ListCoordinationAttempts(
+			ctx,
+			CoordinationAttemptFilter{IncidentID: fixture.incident.ID},
+		)
+		if err != nil || len(unchanged) != 1 ||
+			unchanged[0].Status != model.CoordinationAttemptSucceeded ||
+			unchanged[0].EndedAt == nil ||
+			*unchanged[0].EndedAt != *finished.EndedAt {
+			t.Fatalf("opposite recovery mutated terminal attempt: %+v, %v", unchanged, err)
+		}
+	})
+
+	t.Run("selection mismatch conflicts", func(t *testing.T) {
+		fixture := createBoundAttemptProposalFixture(t)
+		defer fixture.opened.Close()
+		ctx := context.Background()
+		finished, err := fixture.opened.FinishCoordinationAttempt(
+			ctx,
+			fixture.attempt.ID,
+			FinishCoordinationAttemptInput{
+				Status:        model.CoordinationAttemptSucceeded,
+				SelectedAgent: "different-coordinator",
+				SelectedModel: "different-model",
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, changed, err := fixture.opened.RecoverCoordinationAttemptForProposal(
+			ctx,
+			recoverBoundAttemptInput(
+				fixture,
+				model.CoordinationAttemptSucceeded,
+				nil,
+			),
+		)
+		if changed || !errors.Is(err, ErrCoordinationStateConflict) {
+			t.Fatalf("selection mismatch recovery: changed=%t error=%v", changed, err)
+		}
+		unchanged, err := fixture.opened.ListCoordinationAttempts(
+			ctx,
+			CoordinationAttemptFilter{IncidentID: fixture.incident.ID},
+		)
+		if err != nil || len(unchanged) != 1 ||
+			unchanged[0].SelectedAgent != finished.SelectedAgent ||
+			unchanged[0].SelectedModel != finished.SelectedModel ||
+			unchanged[0].Status != model.CoordinationAttemptSucceeded {
+			t.Fatalf("selection mismatch mutated terminal attempt: %+v, %v", unchanged, err)
+		}
+	})
+}
+
 func TestReserveCoordinationAttemptAtomicallyEnforcesBudgetAcrossStores(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/autogora.db"
@@ -1008,6 +1261,84 @@ func TestLatestSchemaRecreatesCoordinationAttemptTableWithoutVersionChange(t *te
 	})
 	if err != nil || !created || attempt.Status != model.CoordinationAttemptStarted {
 		t.Fatalf("recreated attempt table is unusable: created=%v value=%+v err=%v", created, attempt, err)
+	}
+}
+
+func TestOpenRejectsCoordinationProposalTableWithoutAttemptBinding(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/autogora.db"
+	initial, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP TABLE coordination_proposals;
+		CREATE TABLE coordination_proposals (
+			id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL REFERENCES coordination_incidents(id) ON DELETE CASCADE,
+			coordinator_agent TEXT NOT NULL,
+			coordinator_model TEXT NOT NULL DEFAULT '',
+			coordinator_provider TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL CHECK (status IN ('draft', 'validating', 'validated', 'awaiting_approval', 'approved', 'rejected', 'superseded', 'applying', 'applied', 'failed')),
+			expected_graph_revision INTEGER NOT NULL CHECK (expected_graph_revision >= 0),
+			summary TEXT NOT NULL,
+			rationale TEXT NOT NULL,
+			actions_json TEXT NOT NULL DEFAULT '[]',
+			validation_errors_json TEXT NOT NULL DEFAULT '[]',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			applied_at TEXT
+		);
+		PRAGMA user_version = 19;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, "default", "")
+	if err == nil {
+		reopened.Close()
+		t.Fatal("unsupported coordination proposal schema was accepted")
+	}
+	if !strings.Contains(err.Error(), "coordination_proposals.attempt_id is missing") ||
+		!strings.Contains(err.Error(), "fresh store or reset the data directory") {
+		t.Fatalf("open error = %q, want fresh-store/reset guidance", err)
+	}
+
+	raw, err = sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	rows, err := raw.QueryContext(ctx, "PRAGMA table_info(coordination_proposals)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "attempt_id" {
+			t.Fatal("initialization silently upgraded the incompatible table")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

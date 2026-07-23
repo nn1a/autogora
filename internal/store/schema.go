@@ -107,6 +107,9 @@ func (s *Store) Board() string           { return s.board }
 func (s *Store) AttachmentsRoot() string { return s.attachmentsRoot }
 
 func (s *Store) initialize(ctx context.Context) error {
+	if err := s.requireSupportedCoordinationProposalSchema(ctx); err != nil {
+		return err
+	}
 	var definition string
 	err := s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").Scan(&definition)
 	switch {
@@ -145,6 +148,36 @@ func (s *Store) initialize(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) requireSupportedCoordinationProposalSchema(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(coordination_proposals)")
+	if err != nil {
+		return fmt.Errorf("inspect coordination proposal schema: %w", err)
+	}
+	defer rows.Close()
+
+	tableExists := false
+	hasAttemptID := false
+	for rows.Next() {
+		tableExists = true
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan coordination proposal schema: %w", err)
+		}
+		if name == "attempt_id" {
+			hasAttemptID = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect coordination proposal schema: %w", err)
+	}
+	if tableExists && !hasAttemptID {
+		return errors.New("incompatible coordination schema: coordination_proposals.attempt_id is missing; this pre-release database cannot be upgraded, use a fresh store or reset the data directory")
 	}
 	return nil
 }
@@ -514,6 +547,7 @@ CREATE TABLE IF NOT EXISTS coordination_incidents (
 CREATE TABLE IF NOT EXISTS coordination_proposals (
   id TEXT PRIMARY KEY,
   incident_id TEXT NOT NULL REFERENCES coordination_incidents(id) ON DELETE CASCADE,
+  attempt_id TEXT UNIQUE REFERENCES coordination_attempts(id) ON DELETE CASCADE,
   coordinator_agent TEXT NOT NULL,
   coordinator_model TEXT NOT NULL DEFAULT '',
   coordinator_provider TEXT NOT NULL DEFAULT '',

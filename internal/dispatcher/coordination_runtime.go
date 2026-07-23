@@ -373,6 +373,42 @@ func activeReusableProposal(
 	return nil, nil
 }
 
+func recoverReusableCoordinationAttempt(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+	proposal model.CoordinationProposal,
+	status model.CoordinationAttemptStatus,
+	cause error,
+	current time.Time,
+) error {
+	var attemptError *string
+	if status == model.CoordinationAttemptFailed {
+		message := "recovered Coordinator proposal could not be used"
+		if cause != nil {
+			message = cause.Error()
+		}
+		attemptError = &message
+	}
+	proposalRevision := proposal.ExpectedGraphRevision
+	incidentRevision := incident.GraphRevision
+	_, _, err := opened.RecoverCoordinationAttemptForProposal(
+		ctx,
+		store.RecoverCoordinationAttemptInput{
+			Board:                         incident.Board,
+			ProposalID:                    proposal.ID,
+			ExpectedProposalStatus:        proposal.Status,
+			ExpectedProposalGraphRevision: &proposalRevision,
+			ExpectedIncidentGraphRevision: &incidentRevision,
+			ClaimToken:                    incident.ClaimToken,
+			Current:                       current,
+			Status:                        status,
+			Error:                         attemptError,
+		},
+	)
+	return err
+}
+
 func coordinationGraphRevision(
 	ctx context.Context,
 	opened *store.Store,
@@ -533,6 +569,7 @@ func persistValidatedCoordinationProposal(
 	ctx context.Context,
 	opened *store.Store,
 	incident model.CoordinationIncident,
+	attemptID string,
 	proposal coordinator.Proposal,
 	selection orchestration.PlannerSelection,
 	maxActions int,
@@ -550,7 +587,7 @@ func persistValidatedCoordinationProposal(
 	}
 	revision := incident.GraphRevision
 	record, _, err := opened.CreateCoordinationProposal(ctx, store.CreateCoordinationProposalInput{
-		IncidentID: incident.ID, CoordinatorAgent: agent,
+		IncidentID: incident.ID, AttemptID: &attemptID, CoordinatorAgent: agent,
 		CoordinatorModel: modelName, CoordinatorProvider: provider,
 		Status: model.CoordinationProposalValidating, ExpectedGraphRevision: &revision,
 		ClaimToken: incident.ClaimToken, Current: current,
@@ -759,9 +796,43 @@ func coordinateIncident(
 			return err
 		}
 		if reusable.ExpectedGraphRevision != incident.GraphRevision {
+			recoveryStatus := model.CoordinationAttemptFailed
+			var recoveryCause error = &store.GraphRevisionConflictError{
+				Board:    incident.Board,
+				Expected: reusable.ExpectedGraphRevision,
+				Actual:   incident.GraphRevision,
+			}
+			if reusable.Status == model.CoordinationProposalValidated {
+				recoveryStatus = model.CoordinationAttemptSucceeded
+				recoveryCause = nil
+			}
+			if err := recoverReusableCoordinationAttempt(
+				ctx,
+				opened,
+				incident,
+				*reusable,
+				recoveryStatus,
+				recoveryCause,
+				current,
+			); err != nil {
+				return err
+			}
 			return supersedeClaimedCoordinationProposal(
 				ctx, opened, *reusable, incident, incident.GraphRevision, current,
 			)
+		}
+		if reusable.Status == model.CoordinationProposalValidated {
+			if err := recoverReusableCoordinationAttempt(
+				ctx,
+				opened,
+				incident,
+				*reusable,
+				model.CoordinationAttemptSucceeded,
+				nil,
+				current,
+			); err != nil {
+				return err
+			}
 		}
 	} else {
 		since := current.Add(-time.Hour)
@@ -794,17 +865,55 @@ func coordinateIncident(
 			ctx, opened, *reusable, incident, snapshot, maxActions, current,
 		)
 		if validationErr != nil {
+			recoveryErr := recoverReusableCoordinationAttempt(
+				ctx,
+				opened,
+				incident,
+				record,
+				model.CoordinationAttemptFailed,
+				validationErr,
+				current,
+			)
+			if recoveryErr != nil {
+				return errors.Join(validationErr, recoveryErr)
+			}
 			return errors.Join(validationErr, supersedeClaimedCoordinationProposal(
 				ctx, opened, record, incident, incident.GraphRevision, current,
 			))
 		}
 		if !validation.Valid {
+			validationFailure := fmt.Errorf(
+				"recovered Coordinator proposal %s failed deterministic validation",
+				record.ID,
+			)
+			if err := recoverReusableCoordinationAttempt(
+				ctx,
+				opened,
+				incident,
+				record,
+				model.CoordinationAttemptFailed,
+				validationFailure,
+				current,
+			); err != nil {
+				return err
+			}
 			if record.Status != model.CoordinationProposalFailed {
 				return supersedeClaimedCoordinationProposal(
 					ctx, opened, record, incident, incident.GraphRevision, current,
 				)
 			}
 			return reopenClaimedCoordinationIncident(ctx, opened, incident, current)
+		}
+		if err := recoverReusableCoordinationAttempt(
+			ctx,
+			opened,
+			incident,
+			record,
+			model.CoordinationAttemptSucceeded,
+			nil,
+			current,
+		); err != nil {
+			return err
 		}
 		return handoffCoordinationProposal(
 			ctx, manager, opened, candidate, incident, record, options, current,
@@ -849,7 +958,7 @@ func coordinateIncident(
 	}
 	current = options.currentTime()
 	record, validation, err := persistValidatedCoordinationProposal(
-		ctx, opened, incident, proposal, selection, maxActions, snapshot, current,
+		ctx, opened, incident, attempt.ID, proposal, selection, maxActions, snapshot, current,
 	)
 	if err != nil {
 		return errors.Join(err, failCoordinationAttempt(
@@ -864,8 +973,8 @@ func coordinateIncident(
 	}
 	_, err = opened.FinishCoordinationAttempt(ctx, attempt.ID, store.FinishCoordinationAttemptInput{
 		Board: incident.Board, Status: model.CoordinationAttemptSucceeded,
-		SelectedAgent: selection.Candidate.Profile, SelectedRuntime: selection.Candidate.Runtime,
-		SelectedModel: selection.Candidate.Model, SelectedProvider: selection.Candidate.Provider,
+		SelectedAgent: record.CoordinatorAgent, SelectedRuntime: selection.Candidate.Runtime,
+		SelectedModel: record.CoordinatorModel, SelectedProvider: record.CoordinatorProvider,
 		SelectedSource: selection.Candidate.Source,
 	})
 	if err != nil {

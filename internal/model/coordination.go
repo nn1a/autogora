@@ -171,6 +171,7 @@ type CoordinationIncident struct {
 type CoordinationProposal struct {
 	ID                    string                     `json:"id"`
 	IncidentID            string                     `json:"incidentId"`
+	AttemptID             *string                    `json:"-"`
 	CoordinatorAgent      string                     `json:"coordinatorAgent"`
 	CoordinatorModel      string                     `json:"coordinatorModel"`
 	CoordinatorProvider   string                     `json:"coordinatorProvider"`

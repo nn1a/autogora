@@ -884,6 +884,372 @@ func TestCoordinationRuntimeFailureReopensWithBackoff(t *testing.T) {
 	}
 }
 
+func TestCoordinationRuntimeRecoversStartedAttemptFromReusableProposal(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	current := fixture.current
+	fixture.options.Now = func() time.Time { return current.Add(time.Second) }
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = priorityCoordinationPlanner(fixture, &calls)
+
+	raw, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TRIGGER fail_coordination_attempt_success
+		BEFORE UPDATE OF status ON coordination_attempts
+		WHEN OLD.status = 'started' AND NEW.status = 'succeeded'
+		BEGIN
+			SELECT RAISE(FAIL, 'injected coordination attempt finish failure');
+		END
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	firstErr := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, current,
+	)
+	if firstErr == nil ||
+		!strings.Contains(firstErr.Error(), "injected coordination attempt finish failure") {
+		t.Fatalf("injected attempt finish error = %v", firstErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("initial Coordinator calls = %d, want 1", calls.Load())
+	}
+
+	ctx := context.Background()
+	opened, err := fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err := opened.ListCoordinationProposals(
+		ctx,
+		store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if err != nil || len(proposals) != 1 ||
+		proposals[0].Status != model.CoordinationProposalValidated ||
+		proposals[0].AttemptID == nil {
+		opened.Close()
+		t.Fatalf("durable reusable proposal = %+v, %v", proposals, err)
+	}
+	attempts, err := opened.ListCoordinationAttempts(
+		ctx,
+		store.CoordinationAttemptFilter{IncidentID: fixture.incident.ID},
+	)
+	if err != nil || len(attempts) != 1 ||
+		attempts[0].Status != model.CoordinationAttemptStarted {
+		opened.Close()
+		t.Fatalf("abandoned attempt = %+v, %v", attempts, err)
+	}
+	abandonedAttemptID := attempts[0].ID
+	if *proposals[0].AttemptID != abandonedAttemptID {
+		opened.Close()
+		t.Fatalf(
+			"proposal attempt binding = %q, want %q",
+			*proposals[0].AttemptID,
+			abandonedAttemptID,
+		)
+	}
+	claimedIncident, err := opened.GetCoordinationIncident(ctx, fixture.incident.ID)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	proposalRevision := proposals[0].ExpectedGraphRevision
+	incidentRevision := claimedIncident.GraphRevision
+	duplicateAttemptID := abandonedAttemptID
+	if _, _, err := opened.CreateCoordinationProposal(
+		ctx,
+		store.CreateCoordinationProposalInput{
+			IncidentID: fixture.incident.ID, AttemptID: &duplicateAttemptID,
+			CoordinatorAgent:      "duplicate-binding",
+			Status:                model.CoordinationProposalValidating,
+			ExpectedGraphRevision: &incidentRevision,
+			ClaimToken:            claimedIncident.ClaimToken,
+			Current:               current.Add(time.Second),
+			Summary:               "duplicate attempt binding",
+			Rationale:             "One paid attempt must bind at most one proposal.",
+		},
+	); err == nil {
+		opened.Close()
+		t.Fatal("second proposal reused the bound attempt")
+	}
+	_, recovered, recoveryErr := opened.RecoverCoordinationAttemptForProposal(
+		ctx,
+		store.RecoverCoordinationAttemptInput{
+			Board: "default", ProposalID: proposals[0].ID,
+			ExpectedProposalStatus:        model.CoordinationProposalValidated,
+			ExpectedProposalGraphRevision: &proposalRevision,
+			ExpectedIncidentGraphRevision: &incidentRevision,
+			ClaimToken:                    "not-the-live-owner",
+			Current:                       current.Add(time.Second),
+			Status:                        model.CoordinationAttemptSucceeded,
+		},
+	)
+	if recovered || !errors.Is(recoveryErr, store.ErrCoordinationClaimNotOwner) {
+		opened.Close()
+		t.Fatalf("wrong-token recovery = recovered %t, error %v", recovered, recoveryErr)
+	}
+	wrongRevision := incidentRevision + 1
+	_, recovered, recoveryErr = opened.RecoverCoordinationAttemptForProposal(
+		ctx,
+		store.RecoverCoordinationAttemptInput{
+			Board: "default", ProposalID: proposals[0].ID,
+			ExpectedProposalStatus:        model.CoordinationProposalValidated,
+			ExpectedProposalGraphRevision: &proposalRevision,
+			ExpectedIncidentGraphRevision: &wrongRevision,
+			ClaimToken:                    claimedIncident.ClaimToken,
+			Current:                       current.Add(time.Second),
+			Status:                        model.CoordinationAttemptSucceeded,
+		},
+	)
+	if recovered || !errors.Is(recoveryErr, store.ErrGraphRevisionConflict) {
+		opened.Close()
+		t.Fatalf("wrong-graph recovery = recovered %t, error %v", recovered, recoveryErr)
+	}
+
+	olderAttempt, _, err := opened.StartCoordinationAttempt(
+		ctx,
+		store.StartCoordinationAttemptInput{
+			IncidentID: fixture.incident.ID,
+			Board:      "default",
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	terminalAttempt, _, err := opened.StartCoordinationAttempt(
+		ctx,
+		store.StartCoordinationAttemptInput{
+			IncidentID: fixture.incident.ID,
+			Board:      "default",
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	terminalError := "independent terminal audit record"
+	terminalAttempt, err = opened.FinishCoordinationAttempt(
+		ctx,
+		terminalAttempt.ID,
+		store.FinishCoordinationAttemptInput{
+			Board:  "default",
+			Status: model.CoordinationAttemptFailed,
+			Error:  &terminalError,
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+
+	proposalCreatedAt, err := time.Parse(time.RFC3339Nano, proposals[0].CreatedAt)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	raw, err = sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		UPDATE coordination_attempts
+		SET started_at = CASE id
+			WHEN ? THEN ?
+			WHEN ? THEN ?
+			ELSE started_at
+		END
+		WHERE id IN (?, ?)
+	`,
+		olderAttempt.ID,
+		proposalCreatedAt.Add(-time.Hour).Format(time.RFC3339Nano),
+		abandonedAttemptID,
+		proposalCreatedAt.Add(time.Hour).Format(time.RFC3339Nano),
+		olderAttempt.ID,
+		abandonedAttemptID,
+	); err != nil {
+		raw.Close()
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	graph, err := opened.GetBoardGraphState(ctx, "default")
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	revision := graph.Revision
+	otherIncident, _, err := opened.CreateCoordinationIncident(
+		ctx,
+		store.CreateCoordinationIncidentInput{
+			Board: "default", Trigger: model.CoordinationTriggerGraphStalled,
+			Severity:              model.CoordinationSeverityWarning,
+			ExpectedGraphRevision: &revision,
+			Summary:               "unrelated incident audit record",
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	otherAttempt, _, err := opened.StartCoordinationAttempt(
+		ctx,
+		store.StartCoordinationAttemptInput{
+			IncidentID: otherIncident.ID,
+			Board:      "default",
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	otherClaim, claimed, err := opened.ClaimCoordinationIncident(
+		ctx,
+		otherIncident.ID,
+		store.ClaimCoordinationIncidentInput{
+			ExpectedGraphRevision: &revision,
+			TTL:                   coordinationClaimTTL(fixture.options),
+			Current:               current,
+		},
+	)
+	if err != nil || !claimed {
+		opened.Close()
+		t.Fatalf("claim unrelated incident = %+v, claimed=%t, error=%v", otherClaim, claimed, err)
+	}
+	unboundProposal, _, err := opened.CreateCoordinationProposal(
+		ctx,
+		store.CreateCoordinationProposalInput{
+			IncidentID: otherIncident.ID, CoordinatorAgent: "manual-coordinator",
+			Status:                model.CoordinationProposalValidating,
+			ExpectedGraphRevision: &revision,
+			ClaimToken:            otherClaim.ClaimToken,
+			Current:               current.Add(time.Second),
+			Summary:               "unbound manual proposal",
+			Rationale:             "This proposal did not consume a paid runtime attempt.",
+		},
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if unboundProposal.AttemptID != nil {
+		opened.Close()
+		t.Fatalf("manual proposal unexpectedly bound attempt %q", *unboundProposal.AttemptID)
+	}
+	unboundRevision := unboundProposal.ExpectedGraphRevision
+	otherIncidentRevision := otherClaim.GraphRevision
+	_, recovered, recoveryErr = opened.RecoverCoordinationAttemptForProposal(
+		ctx,
+		store.RecoverCoordinationAttemptInput{
+			Board: "default", ProposalID: unboundProposal.ID,
+			ExpectedProposalStatus:        model.CoordinationProposalValidating,
+			ExpectedProposalGraphRevision: &unboundRevision,
+			ExpectedIncidentGraphRevision: &otherIncidentRevision,
+			ClaimToken:                    otherClaim.ClaimToken,
+			Current:                       current.Add(2 * time.Second),
+			Status:                        model.CoordinationAttemptSucceeded,
+		},
+	)
+	if recoveryErr != nil || recovered {
+		opened.Close()
+		t.Fatalf("unbound proposal recovery = recovered %t, error %v", recovered, recoveryErr)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err = sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("DROP TRIGGER fail_coordination_attempt_success"); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	current = fixture.current.Add(coordinationClaimTTL(fixture.options) + time.Second)
+	secondErr := runCoordinationPass(
+		ctx, fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, current,
+	)
+	if secondErr != nil {
+		t.Fatal(secondErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("reusable proposal made %d paid calls, want 1 total", calls.Load())
+	}
+
+	opened, err = fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	incident, err := opened.GetCoordinationIncident(ctx, fixture.incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err = opened.ListCoordinationProposals(
+		ctx,
+		store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err = opened.ListCoordinationAttempts(
+		ctx,
+		store.CoordinationAttemptFilter{IncidentID: fixture.incident.ID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]model.CoordinationAttempt, len(attempts))
+	for _, attempt := range attempts {
+		byID[attempt.ID] = attempt
+	}
+	unrelatedAttempts, err := opened.ListCoordinationAttempts(
+		ctx,
+		store.CoordinationAttemptFilter{IncidentID: otherIncident.ID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incident.Status != model.CoordinationIncidentAwaitingApproval ||
+		len(proposals) != 1 ||
+		proposals[0].Status != model.CoordinationProposalAwaitingApproval ||
+		proposals[0].AttemptID == nil ||
+		*proposals[0].AttemptID != abandonedAttemptID ||
+		byID[abandonedAttemptID].Status != model.CoordinationAttemptSucceeded ||
+		byID[abandonedAttemptID].SelectedAgent != proposals[0].CoordinatorAgent ||
+		byID[abandonedAttemptID].EndedAt == nil ||
+		byID[olderAttempt.ID].Status != model.CoordinationAttemptStarted ||
+		byID[terminalAttempt.ID].Status != model.CoordinationAttemptFailed ||
+		len(unrelatedAttempts) != 1 ||
+		unrelatedAttempts[0].ID != otherAttempt.ID ||
+		unrelatedAttempts[0].Status != model.CoordinationAttemptStarted {
+		t.Fatalf(
+			"recovered audit mismatch: incident=%+v proposals=%+v attempts=%+v unrelated=%+v",
+			incident,
+			proposals,
+			attempts,
+			unrelatedAttempts,
+		)
+	}
+}
+
 func TestCoordinationRuntimeBoundsWholeAnalysisByPlannerTimeout(t *testing.T) {
 	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
 	fixture.options.PlannerTimeout = 25 * time.Millisecond
