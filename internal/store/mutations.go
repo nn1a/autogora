@@ -185,8 +185,19 @@ func (s *Store) UnlinkTasks(ctx context.Context, parentID, childID string) (mode
 		if _, err := requireTask(ctx, tx, parentID); err != nil {
 			return err
 		}
-		if _, err := requireTask(ctx, tx, childID); err != nil {
+		child, err := requireTask(ctx, tx, childID)
+		if err != nil {
 			return err
+		}
+		if child.Status == model.TaskStatusRunning {
+			var existing int
+			if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?", parentID, childID).Scan(&existing); err != nil {
+				return err
+			}
+			if existing == 0 {
+				return nil
+			}
+			return errors.New("cannot remove a prerequisite while the dependent task is running; terminate or finish its active run first")
 		}
 		result, err := tx.ExecContext(ctx, "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", parentID, childID)
 		if err != nil {
@@ -273,16 +284,23 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 		if task.CurrentRunID != nil {
 			return errors.New("cannot delete a running task; terminate the active run first")
 		}
-		rows, err := tx.QueryContext(ctx, "SELECT child_id FROM task_links WHERE parent_id = ?", taskID)
+		rows, err := tx.QueryContext(ctx, `SELECT link.child_id, child.status
+			FROM task_links link JOIN tasks child ON child.id = link.child_id
+			WHERE link.parent_id = ?`, taskID)
 		if err != nil {
 			return err
 		}
 		dependents := []string{}
 		for rows.Next() {
 			var id string
-			if err := rows.Scan(&id); err != nil {
+			var status model.TaskStatus
+			if err := rows.Scan(&id, &status); err != nil {
 				rows.Close()
 				return err
+			}
+			if status == model.TaskStatusRunning {
+				rows.Close()
+				return fmt.Errorf("cannot delete prerequisite %s while dependent task %s is running", taskID, id)
 			}
 			dependents = append(dependents, id)
 		}

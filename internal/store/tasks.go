@@ -313,6 +313,16 @@ func linkTasks(ctx context.Context, q querier, parentID, childID string) error {
 	if parent.Board != child.Board {
 		return errors.New("cross-board dependencies are not allowed")
 	}
+	if child.Status == model.TaskStatusRunning {
+		var existing int
+		if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?", parentID, childID).Scan(&existing); err != nil {
+			return err
+		}
+		if existing > 0 {
+			return nil
+		}
+		return errors.New("cannot add a prerequisite while the dependent task is running; terminate or finish its active run first")
+	}
 	if err := assertDependencyAcyclic(ctx, q, parentID, childID); err != nil {
 		return err
 	}
@@ -322,9 +332,6 @@ func linkTasks(ctx context.Context, q querier, parentID, childID string) error {
 	}
 	if err := validateSatisfyingRun(ctx, q, parentID, satisfaction.runID); err != nil {
 		return err
-	}
-	if satisfaction.at == nil && child.Status == model.TaskStatusRunning {
-		return errors.New("cannot add an unfinished prerequisite to a running task; terminate or finish the active run first")
 	}
 	result, err := q.ExecContext(ctx,
 		"INSERT OR IGNORE INTO task_links(parent_id, child_id, satisfied_at, satisfied_run_id) VALUES (?, ?, ?, ?)",
