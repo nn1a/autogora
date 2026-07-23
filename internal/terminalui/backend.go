@@ -3,6 +3,7 @@ package terminalui
 import (
 	"context"
 
+	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
 	"github.com/nn1a/autogora/internal/runcontrol"
@@ -24,7 +25,7 @@ type Backend interface {
 	UnblockTask(context.Context, string) (model.TaskDetail, error)
 	ArchiveTask(context.Context, string) (model.TaskDetail, error)
 	AddComment(context.Context, string, string, string) (model.Comment, error)
-	BoardContext(context.Context) (taskservice.BoardContext, error)
+	BoardSettingsContext(context.Context) (taskservice.BoardContext, error)
 	SpecifyTask(context.Context, string, *orchestration.SpecificationPlan, string) (model.TaskDetail, error)
 	DecomposeTask(context.Context, string, *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error)
 	DispatchTask(context.Context, string) error
@@ -38,4 +39,5 @@ type Backend interface {
 	AttachFile(context.Context, string, string, string) (model.Attachment, error)
 	AttachURL(context.Context, string, string, string) (model.Attachment, error)
 	RemoveAttachment(context.Context, string, string) error
+	UpdateBoardOrchestration(context.Context, boards.OrchestrationSettings, boards.OrchestrationUpdate) (taskservice.BoardContext, error)
 }

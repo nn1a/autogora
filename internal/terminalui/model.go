@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
 	"github.com/nn1a/autogora/internal/taskservice"
@@ -48,6 +49,12 @@ type detailLoadedMsg struct {
 type refreshMsg time.Time
 
 type boardContextMsg struct {
+	context    taskservice.BoardContext
+	generation uint64
+	err        error
+}
+
+type boardSettingsSavedMsg struct {
 	context taskservice.BoardContext
 	err     error
 }
@@ -70,6 +77,7 @@ type Model struct {
 	backend          Backend
 	board            string
 	boardContext     *taskservice.BoardContext
+	boardContextGen  uint64
 	width            int
 	height           int
 	column           int
@@ -105,6 +113,7 @@ type Model struct {
 	confirm          *confirmState
 	desiredSelection string
 	form             *taskForm
+	settings         *boardSettingsForm
 	menu             *actionMenu
 }
 
@@ -121,9 +130,10 @@ func (m *Model) Init() tea.Cmd {
 }
 
 func (m *Model) loadBoardContext() tea.Cmd {
+	generation := m.boardContextGen
 	return func() tea.Msg {
-		value, err := m.backend.BoardContext(m.ctx)
-		return boardContextMsg{context: value, err: err}
+		value, err := m.backend.BoardSettingsContext(m.ctx)
+		return boardContextMsg{context: value, generation: generation, err: err}
 	}
 }
 
@@ -266,6 +276,33 @@ func (m *Model) openCreateForm() tea.Cmd {
 	)
 	m.clearMutationStatus()
 	return m.form.syncFocus()
+}
+
+func (m *Model) openBoardSettings() tea.Cmd {
+	if m.busy {
+		return nil
+	}
+	if m.boardContext == nil {
+		m.err = errors.New("board settings are still loading")
+		return nil
+	}
+	m.settings = newBoardSettingsForm(*m.boardContext)
+	m.clearMutationStatus()
+	return m.settings.syncFocus()
+}
+
+func (m *Model) saveBoardSettings(form *boardSettingsForm) tea.Cmd {
+	update, err := form.buildUpdate()
+	if err != nil {
+		form.err = err
+		return nil
+	}
+	form.saving = true
+	expected := cloneOrchestrationSettings(form.expected)
+	return func() tea.Msg {
+		context, err := m.backend.UpdateBoardOrchestration(m.ctx, expected, update)
+		return boardSettingsSavedMsg{context: context, err: err}
+	}
 }
 
 func (m *Model) openEditForm(focus formField) tea.Cmd {
@@ -493,6 +530,41 @@ func (m *Model) handlePrompt(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if m.settings != nil {
+		if key, ok := message.(tea.KeyMsg); ok {
+			if key.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			if m.settings.saving {
+				return m, nil
+			}
+			command, action := m.settings.Update(key)
+			switch action {
+			case formCancel:
+				m.settings = nil
+				return m, nil
+			case formSubmit:
+				return m, m.saveBoardSettings(m.settings)
+			default:
+				return m, command
+			}
+		}
+		if mouse, ok := message.(tea.MouseMsg); ok {
+			event := tea.MouseEvent(mouse)
+			switch event.Button {
+			case tea.MouseButtonWheelUp:
+				m.settings.scroll = max(0, m.settings.scroll-3)
+			case tea.MouseButtonWheelDown:
+				m.settings.scroll += 3
+			}
+			return m, nil
+		}
+		switch message.(type) {
+		case tea.WindowSizeMsg, tasksLoadedMsg, detailLoadedMsg, boardContextMsg, boardSettingsSavedMsg, refreshMsg, mutationMsg:
+		default:
+			return m, m.settings.UpdateMessage(message)
+		}
+	}
 	if m.form != nil {
 		if key, ok := message.(tea.KeyMsg); ok {
 			if key.String() == "ctrl+c" {
@@ -624,6 +696,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "f":
 			m.menu = m.filterMenu()
+		case "O":
+			return m, m.openBoardSettings()
 		case "n":
 			return m, m.openCreateForm()
 		case "e":
@@ -712,11 +786,35 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail, m.graph, m.detailErr = &message.detail, &message.graph, nil
 	case boardContextMsg:
+		if message.generation != m.boardContextGen {
+			break
+		}
 		if message.err != nil {
 			m.boardContextErr = message.err
 			break
 		}
 		m.boardContext, m.boardContextErr = &message.context, nil
+	case boardSettingsSavedMsg:
+		if m.settings == nil {
+			break
+		}
+		m.settings.saving = false
+		if message.err != nil {
+			if errors.Is(message.err, boards.ErrBoardSettingsConflict) {
+				m.settings.err = errors.New("Settings changed elsewhere. Cancel, reopen, and review the latest values")
+			} else {
+				m.settings.err = message.err
+			}
+			break
+		}
+		activeRuns := message.context.ActiveRuns
+		m.boardContextGen++
+		m.boardContext, m.boardContextErr, m.settings = &message.context, nil, nil
+		m.err, m.notice = nil, "Board orchestration settings saved"
+		if activeRuns > 0 {
+			m.notice = fmt.Sprintf("Board settings saved; %d active run(s) keep pinned settings", activeRuns)
+		}
+		m.noticeUntil = time.Now().Add(noticeDuration)
 	case mutationMsg:
 		m.busy, m.busyAction = false, ""
 		if message.err != nil {

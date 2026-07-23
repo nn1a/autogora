@@ -362,7 +362,7 @@ func (m *Model) View() string {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  " + busyLabel)
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  m move  f filters  C comment  p promote  c complete  ? help")
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  O board settings  m move  f filters  C comment  ? help")
 	contentHeight := max(3, m.height-4)
 	detailWidth := 0
 	boardWidth := m.width
@@ -388,7 +388,7 @@ func (m *Model) View() string {
 	}
 	if m.help {
 		help := baseBorder.Copy().BorderForeground(colorFocus).Width(min(62, m.width-4)).Padding(1, 2).Render(
-			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  f             tenant/assignee/runtime filters\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
+			"Navigate\n  h/l · ←/→     columns\n  j/k · ↑/↓     cards\n  g / G         first / last\n  /             search\n  f             tenant/assignee/runtime filters\n  a             archived column\n  tab · 1/2/3   detail tabs\n  pgup / pgdown scroll detail\n\nChange\n  space         task action menu\n  n             full create form\n  e / s         edit form / agent section\n  O             board orchestration settings\n  m             move to status\n  C             add comment\n  p / u         promote / unblock\n  b / c / x     block / complete / archive\n\n  r refresh  ? help  q quit",
 		)
 		content = lipgloss.Place(m.width, contentHeight, lipgloss.Center, lipgloss.Center, help)
 	}
@@ -410,6 +410,9 @@ func (m *Model) View() string {
 	}
 	if m.menu != nil {
 		content = m.renderActionMenu(m.width, contentHeight)
+	}
+	if m.settings != nil {
+		content = m.renderBoardSettings(m.width, contentHeight)
 	}
 	return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + content + "\n" + footer
 }

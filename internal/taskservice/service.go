@@ -26,8 +26,12 @@ type Service struct {
 }
 
 type BoardContext struct {
-	Metadata boards.Metadata              `json:"metadata"`
-	Profiles []orchestration.ProfileRoute `json:"profiles"`
+	Metadata          boards.Metadata              `json:"metadata"`
+	Profiles          []orchestration.ProfileRoute `json:"profiles"`
+	InheritedProfiles []orchestration.ProfileRoute `json:"inheritedProfiles,omitempty"`
+	// ActiveRuns are informational for settings clients. Already claimed runs
+	// keep their recorded agent configuration when board defaults change.
+	ActiveRuns int `json:"activeRuns,omitempty"`
 }
 
 func New(opened *store.Store, manager *boards.Manager, board string) *Service {
@@ -58,21 +62,81 @@ func (s *Service) BoardContext(ctx context.Context) (BoardContext, error) {
 	return BoardContext{Metadata: metadata, Profiles: profiles}, nil
 }
 
+// BoardSettingsContext adds the active-run safety note needed by interactive
+// settings clients without making every board snapshot repeat the run query.
+func (s *Service) BoardSettingsContext(ctx context.Context) (BoardContext, error) {
+	metadata, err := s.manager.Read(s.board)
+	if err != nil {
+		return BoardContext{}, err
+	}
+	profiles, inherited, err := s.profileRoutesWithSources(ctx, metadata)
+	if err != nil {
+		return BoardContext{}, err
+	}
+	activeRuns, err := s.ListActiveRuns(ctx, s.board)
+	if err != nil {
+		return BoardContext{}, err
+	}
+	return BoardContext{
+		Metadata: metadata, Profiles: profiles, InheritedProfiles: inherited,
+		ActiveRuns: len(activeRuns),
+	}, nil
+}
+
+// UpdateBoardOrchestration persists a settings form against the exact snapshot
+// it was opened from, then reloads the effective profile view. Active runs are
+// intentionally left alone: their run_agent_config remains authoritative and
+// the new policy is used by subsequent claims.
+func (s *Service) UpdateBoardOrchestration(
+	ctx context.Context,
+	expected boards.OrchestrationSettings,
+	update boards.OrchestrationUpdate,
+) (BoardContext, error) {
+	if _, err := s.manager.CompareAndSwapOrchestration(ctx, s.board, expected, update); err != nil {
+		return BoardContext{}, err
+	}
+	return s.BoardSettingsContext(ctx)
+}
+
 // ProfileRoutes matches the Web API profile list: task-derived routes first,
 // followed by global worker agents and board-local profiles. A board profile
 // may specialize a global agent without changing its runtime or relaxing its
 // availability and concurrency limits.
 func (s *Service) ProfileRoutes(ctx context.Context, metadata boards.Metadata) ([]orchestration.ProfileRoute, error) {
-	tasks, err := s.ListTasks(ctx, store.ListTaskFilter{Board: s.board, IncludeArchived: true, Limit: 500})
+	tasks, global, err := s.profileRouteInputs(ctx)
 	if err != nil {
 		return nil, err
 	}
+	configured := mergeProfileRoutes(global, profileRoutes(metadata.Orchestration.Profiles))
+	return orchestration.ResolveProfileRoutes(tasks, configured), nil
+}
+
+func (s *Service) profileRoutesWithSources(
+	ctx context.Context,
+	metadata boards.Metadata,
+) ([]orchestration.ProfileRoute, []orchestration.ProfileRoute, error) {
+	tasks, global, err := s.profileRouteInputs(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	inherited := orchestration.ResolveProfileRoutes(tasks, global)
+	configured := mergeProfileRoutes(global, profileRoutes(metadata.Orchestration.Profiles))
+	return orchestration.ResolveProfileRoutes(tasks, configured), inherited, nil
+}
+
+func (s *Service) profileRouteInputs(
+	ctx context.Context,
+) ([]model.Task, []orchestration.ProfileRoute, error) {
+	tasks, err := s.ListTasks(ctx, store.ListTaskFilter{Board: s.board, IncludeArchived: true, Limit: 500})
+	if err != nil {
+		return nil, nil, err
+	}
 	config, err := agentconfig.Load(agentconfig.Options{})
 	if err != nil {
-		return nil, fmt.Errorf("load global agent configuration: %w", err)
+		return nil, nil, fmt.Errorf("load global agent configuration: %w", err)
 	}
-	configured := mergeProfileRoutes(globalWorkerProfileRoutes(config), profileRoutes(metadata.Orchestration.Profiles))
-	return orchestration.ResolveProfileRoutes(tasks, configured), nil
+	global := globalWorkerProfileRoutes(config)
+	return tasks, global, nil
 }
 
 func (s *Service) planner(metadata boards.Metadata) (orchestration.Planner, error) {

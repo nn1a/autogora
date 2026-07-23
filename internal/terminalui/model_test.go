@@ -18,10 +18,13 @@ import (
 )
 
 type fakeBackend struct {
-	tasks   []model.Task
-	details map[string]model.TaskDetail
-	actions []string
-	updates []store.UpdateTaskInput
+	tasks                []model.Task
+	details              map[string]model.TaskDetail
+	actions              []string
+	updates              []store.UpdateTaskInput
+	boardContext         taskservice.BoardContext
+	boardSettingsUpdates []boards.OrchestrationUpdate
+	boardSettingsErr     error
 }
 
 func (f *fakeBackend) ListTasks(context.Context, store.ListTaskFilter) ([]model.Task, error) {
@@ -36,8 +39,17 @@ func (f *fakeBackend) RelationshipGraph(_ context.Context, id string) (model.Rel
 	return model.RelationshipGraph{FocusTaskID: id, TotalConnectedNodes: 1}, nil
 }
 
-func (f *fakeBackend) BoardContext(context.Context) (taskservice.BoardContext, error) {
-	return taskservice.BoardContext{}, nil
+func (f *fakeBackend) BoardSettingsContext(context.Context) (taskservice.BoardContext, error) {
+	return f.boardContext, nil
+}
+
+func (f *fakeBackend) UpdateBoardOrchestration(
+	_ context.Context,
+	_ boards.OrchestrationSettings,
+	update boards.OrchestrationUpdate,
+) (taskservice.BoardContext, error) {
+	f.boardSettingsUpdates = append(f.boardSettingsUpdates, update)
+	return f.boardContext, f.boardSettingsErr
 }
 
 func (f *fakeBackend) SpecifyTask(_ context.Context, id string, _ *orchestration.SpecificationPlan, _ string) (model.TaskDetail, error) {

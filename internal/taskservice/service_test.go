@@ -54,6 +54,77 @@ func TestBoardContextMergesStoredAndConfiguredProfiles(t *testing.T) {
 	if board.Profiles[1].Name != "implementer" || board.Profiles[1].Runtime != model.RuntimeClaude {
 		t.Fatalf("task-derived profile missing: %#v", board.Profiles[1])
 	}
+	if len(board.InheritedProfiles) != 0 {
+		t.Fatalf("regular board context exposed settings-only sources: %#v", board.InheritedProfiles)
+	}
+	settingsBoard, err := New(opened, manager, "default").BoardSettingsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settingsBoard.InheritedProfiles) != 2 ||
+		routeNamed(t, settingsBoard.InheritedProfiles, "reviewer").Runtime != model.RuntimeCodex {
+		t.Fatalf("settings context did not preserve inherited routes separately: %#v", settingsBoard.InheritedProfiles)
+	}
+}
+
+func TestBoardSettingsContextKeepsActiveRunsPinnedAcrossCASUpdate(t *testing.T) {
+	isolateGlobalAgentConfig(t)
+	ctx := context.Background()
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	assignee := "worker"
+	created, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Active work", Assignee: &assignee, Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{
+		TaskID: created.Task.ID, WorkerID: "settings-test",
+	})
+	if err != nil || claim == nil {
+		t.Fatalf("claim active task: claim=%#v err=%v", claim, err)
+	}
+	service := New(opened, manager, "default")
+	regular, err := service.BoardContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regular.ActiveRuns != 0 {
+		t.Fatalf("regular board context repeated active-run diagnostics: %#v", regular)
+	}
+	settings, err := service.BoardSettingsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.ActiveRuns != 1 {
+		t.Fatalf("settings active runs = %d", settings.ActiveRuns)
+	}
+	autoPlan := false
+	updated, err := service.UpdateBoardOrchestration(ctx, settings.Metadata.Orchestration, boards.OrchestrationUpdate{
+		Autopilot: &boards.AutopilotUpdate{AutoPlan: &autoPlan},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ActiveRuns != 1 || updated.Metadata.Orchestration.Autopilot.AutoPlan {
+		t.Fatalf("settings update lost policy or active run: %#v", updated)
+	}
+	task, err := opened.GetTask(ctx, created.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Task.CurrentRunID == nil || *task.Task.CurrentRunID != claim.Run.ID ||
+		task.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("settings update interrupted active run: %#v", task.Task)
+	}
 }
 
 func TestBoardContextMergesGlobalWorkerAgentsWithBoardSafetyLimits(t *testing.T) {
@@ -135,6 +206,15 @@ func TestBoardContextMergesGlobalWorkerAgentsWithBoardSafetyLimits(t *testing.T)
 	for _, profile := range board.Profiles {
 		if profile.Name == "planner-only" {
 			t.Fatalf("planner-only agent appeared in worker routes: %#v", board.Profiles)
+		}
+	}
+	settingsBoard, err := New(opened, manager, "default").BoardSettingsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range settingsBoard.InheritedProfiles {
+		if profile.Name == "board-only" || profile.Name == "planner-only" {
+			t.Fatalf("board/planner route leaked into inherited worker routes: %#v", settingsBoard.InheritedProfiles)
 		}
 	}
 }

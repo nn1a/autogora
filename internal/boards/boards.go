@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 var boardSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 var ErrBoardMutationInProgress = errors.New("board metadata mutation is in progress")
+var ErrBoardSettingsConflict = errors.New("board orchestration settings changed")
 
 type Profile struct {
 	Name          string        `json:"name"`
@@ -365,6 +367,83 @@ func normalizeAutopilot(value AutopilotSettings) AutopilotSettings {
 	return value
 }
 
+// ValidateOrchestrationUpdate validates the mutable orchestration values before
+// normalization can replace an invalid value with a default. Interactive
+// clients use this together with CompareAndSwapOrchestration so every settings
+// surface observes the same bounds.
+func ValidateOrchestrationUpdate(update *OrchestrationUpdate) error {
+	if update == nil {
+		return nil
+	}
+	if update.AutoDecomposePerTick != nil &&
+		(*update.AutoDecomposePerTick < 1 || *update.AutoDecomposePerTick > 100) {
+		return errors.New("autoDecomposePerTick must be between 1 and 100")
+	}
+	if update.PlannerRuntime != nil && !validWorkerRuntime(*update.PlannerRuntime) {
+		return fmt.Errorf("invalid planner runtime: %s", *update.PlannerRuntime)
+	}
+	if update.Profiles != nil {
+		if len(*update.Profiles) > 200 {
+			return errors.New("profiles cannot exceed 200 entries")
+		}
+		seen := make(map[string]bool, len(*update.Profiles))
+		for _, profile := range *update.Profiles {
+			name := strings.TrimSpace(profile.Name)
+			if name == "" || !validWorkerRuntime(profile.Runtime) {
+				return errors.New("profile requires a name and worker runtime")
+			}
+			if seen[name] {
+				return fmt.Errorf("duplicate profile name: %s", name)
+			}
+			seen[name] = true
+			if profile.MaxConcurrent < 0 {
+				return fmt.Errorf("profile %s maxConcurrent cannot be negative", name)
+			}
+			fallbacks := map[string]bool{}
+			for _, fallback := range profile.Fallbacks {
+				fallback = strings.TrimSpace(fallback)
+				if fallback == "" {
+					return fmt.Errorf("profile %s has an empty fallback", name)
+				}
+				if fallback == name {
+					return fmt.Errorf("profile %s cannot fall back to itself", name)
+				}
+				if fallbacks[fallback] {
+					return fmt.Errorf("profile %s repeats fallback %s", name, fallback)
+				}
+				fallbacks[fallback] = true
+			}
+		}
+	}
+	autopilot := update.Autopilot
+	if autopilot == nil {
+		return nil
+	}
+	if coordination := autopilot.Coordination; coordination != nil {
+		if coordination.Mode != nil && *coordination.Mode != CoordinationModeObserve &&
+			*coordination.Mode != CoordinationModeAssist && *coordination.Mode != CoordinationModeAuto {
+			return errors.New("coordination mode must be observe, assist, or auto")
+		}
+		if coordination.IdleSeconds != nil && *coordination.IdleSeconds < MinCoordinationIdleSeconds {
+			return fmt.Errorf("coordination idleSeconds must be at least %d", MinCoordinationIdleSeconds)
+		}
+		if coordination.MaxCallsPerHour != nil &&
+			(*coordination.MaxCallsPerHour < 1 || *coordination.MaxCallsPerHour > MaxCoordinationCallsPerHour) {
+			return fmt.Errorf("coordination maxCallsPerHour must be between 1 and %d", MaxCoordinationCallsPerHour)
+		}
+		if coordination.MaxActionsPerIncident != nil &&
+			(*coordination.MaxActionsPerIncident < 1 || *coordination.MaxActionsPerIncident > MaxCoordinationActionsPerIncident) {
+			return fmt.Errorf("coordination maxActionsPerIncident must be between 1 and %d", MaxCoordinationActionsPerIncident)
+		}
+	}
+	if publication := autopilot.Publication; publication != nil && publication.Mode != nil &&
+		*publication.Mode != PublicationModeManual && *publication.Mode != PublicationModeLocalFF &&
+		*publication.Mode != PublicationModePullRequest {
+		return errors.New("publication mode must be manual, local_ff, or pull_request")
+	}
+	return nil
+}
+
 func (m *Manager) BoardDir(board string) (string, error) {
 	slug, err := NormalizeSlug(board)
 	if err != nil {
@@ -701,6 +780,38 @@ func (m *Manager) Update(board string, update Update) (Metadata, error) {
 	err = m.withBoardMutation(context.Background(), slug, false, func(_ *store.Store) error {
 		var updateErr error
 		metadata, updateErr = m.update(slug, update)
+		return updateErr
+	})
+	return metadata, err
+}
+
+// CompareAndSwapOrchestration updates one board only when its normalized
+// orchestration settings still match the snapshot shown to the caller. The
+// board metadata lock makes the comparison and write one serialized mutation.
+func (m *Manager) CompareAndSwapOrchestration(
+	ctx context.Context,
+	board string,
+	expected OrchestrationSettings,
+	update OrchestrationUpdate,
+) (Metadata, error) {
+	slug, err := NormalizeSlug(board)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if err := ValidateOrchestrationUpdate(&update); err != nil {
+		return Metadata{}, err
+	}
+	var metadata Metadata
+	err = m.withBoardMutation(ctx, slug, false, func(_ *store.Store) error {
+		current, readErr := m.Read(slug)
+		if readErr != nil {
+			return readErr
+		}
+		if !reflect.DeepEqual(current.Orchestration, normalizeOrchestration(expected)) {
+			return fmt.Errorf("%w: %s", ErrBoardSettingsConflict, slug)
+		}
+		var updateErr error
+		metadata, updateErr = m.update(slug, Update{Orchestration: &update})
 		return updateErr
 	})
 	return metadata, err
