@@ -17,9 +17,10 @@ type hierarchyRow struct {
 }
 
 type dependencyRow struct {
-	parentID    string
-	childID     string
-	satisfiedAt *string
+	parentID       string
+	childID        string
+	satisfiedAt    *string
+	satisfiedRunID *string
 }
 
 func (s *Store) RelationshipGraph(ctx context.Context, taskID string) (model.RelationshipGraph, error) {
@@ -261,7 +262,10 @@ func (s *Store) RelationshipGraph(ctx context.Context, taskID string) (model.Rel
 	}
 	for _, edge := range dependencies {
 		if selected[edge.parentID] && selected[edge.childID] {
-			result.Dependencies = append(result.Dependencies, model.DependencyEdge{PrerequisiteID: edge.parentID, DependentID: edge.childID, SatisfiedAt: edge.satisfiedAt})
+			result.Dependencies = append(result.Dependencies, model.DependencyEdge{
+				PrerequisiteID: edge.parentID, DependentID: edge.childID,
+				SatisfiedAt: edge.satisfiedAt, SatisfiedRunID: edge.satisfiedRunID,
+			})
 		}
 	}
 	return result, nil
@@ -286,7 +290,7 @@ func (s *Store) queryHierarchy(ctx context.Context, board string) ([]hierarchyRo
 }
 
 func (s *Store) queryDependencies(ctx context.Context, board string) ([]dependencyRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT l.parent_id, l.child_id, l.satisfied_at FROM task_links l
+	rows, err := s.db.QueryContext(ctx, `SELECT l.parent_id, l.child_id, l.satisfied_at, l.satisfied_run_id FROM task_links l
 		JOIN tasks p ON p.id = l.parent_id WHERE p.board = ? ORDER BY l.parent_id, l.child_id`, board)
 	if err != nil {
 		return nil, err
@@ -295,11 +299,12 @@ func (s *Store) queryDependencies(ctx context.Context, board string) ([]dependen
 	result := []dependencyRow{}
 	for rows.Next() {
 		var edge dependencyRow
-		var satisfied sql.NullString
-		if err := rows.Scan(&edge.parentID, &edge.childID, &satisfied); err != nil {
+		var satisfied, satisfiedRunID sql.NullString
+		if err := rows.Scan(&edge.parentID, &edge.childID, &satisfied, &satisfiedRunID); err != nil {
 			return nil, err
 		}
 		edge.satisfiedAt = stringPointer(satisfied)
+		edge.satisfiedRunID = stringPointer(satisfiedRunID)
 		result = append(result, edge)
 	}
 	return result, rows.Err()

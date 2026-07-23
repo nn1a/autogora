@@ -545,7 +545,7 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 		if err := appendEvent(ctx, tx, taskID, "completed", map[string]any{"summary": truncate(summary, 400), "resultLength": len(result)}, runID); err != nil {
 			return err
 		}
-		return satisfyOutgoingDependencies(ctx, tx, taskID, timestamp)
+		return satisfyOutgoingDependencies(ctx, tx, taskID, timestamp, runID)
 	})
 	if err != nil {
 		return model.TaskDetail{}, err

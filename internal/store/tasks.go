@@ -202,29 +202,34 @@ func hasOpenParents(ctx context.Context, q querier, taskID string) (bool, error)
 	return count > 0, err
 }
 
-func dependencySatisfiedAt(ctx context.Context, q querier, parentID string) (*string, error) {
+type dependencySatisfaction struct {
+	at    *string
+	runID *string
+}
+
+func dependencySatisfactionForParent(ctx context.Context, q querier, parentID string) (dependencySatisfaction, error) {
 	parent, err := requireTask(ctx, q, parentID)
 	if err != nil {
-		return nil, err
+		return dependencySatisfaction{}, err
 	}
 	if parent.Status != model.TaskStatusDone && parent.Status != model.TaskStatusArchived {
-		return nil, nil
+		return dependencySatisfaction{}, nil
 	}
-	var completed string
+	var completed, runID sql.NullString
 	err = q.QueryRowContext(ctx,
-		"SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+		"SELECT created_at, run_id FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
 		parentID,
-	).Scan(&completed)
+	).Scan(&completed, &runID)
 	if err == nil {
-		return &completed, nil
+		return dependencySatisfaction{at: stringPointer(completed), runID: stringPointer(runID)}, nil
 	}
 	if err != sql.ErrNoRows {
-		return nil, err
+		return dependencySatisfaction{}, err
 	}
 	if parent.Status == model.TaskStatusDone {
-		return &parent.UpdatedAt, nil
+		return dependencySatisfaction{at: &parent.UpdatedAt}, nil
 	}
-	return nil, nil
+	return dependencySatisfaction{}, nil
 }
 
 func recomputeReady(ctx context.Context, q querier, taskID string) error {
@@ -311,16 +316,19 @@ func linkTasks(ctx context.Context, q querier, parentID, childID string) error {
 	if err := assertDependencyAcyclic(ctx, q, parentID, childID); err != nil {
 		return err
 	}
-	satisfiedAt, err := dependencySatisfiedAt(ctx, q, parentID)
+	satisfaction, err := dependencySatisfactionForParent(ctx, q, parentID)
 	if err != nil {
 		return err
 	}
-	if satisfiedAt == nil && child.Status == model.TaskStatusRunning {
+	if err := validateSatisfyingRun(ctx, q, parentID, satisfaction.runID); err != nil {
+		return err
+	}
+	if satisfaction.at == nil && child.Status == model.TaskStatusRunning {
 		return errors.New("cannot add an unfinished prerequisite to a running task; terminate or finish the active run first")
 	}
 	result, err := q.ExecContext(ctx,
-		"INSERT OR IGNORE INTO task_links(parent_id, child_id, satisfied_at) VALUES (?, ?, ?)",
-		parentID, childID, nullableString(satisfiedAt),
+		"INSERT OR IGNORE INTO task_links(parent_id, child_id, satisfied_at, satisfied_run_id) VALUES (?, ?, ?, ?)",
+		parentID, childID, nullableString(satisfaction.at), nullableString(satisfaction.runID),
 	)
 	if err != nil {
 		return err
@@ -329,10 +337,12 @@ func linkTasks(ctx context.Context, q querier, parentID, childID string) error {
 	if changes == 0 {
 		return nil
 	}
-	if err := appendEvent(ctx, q, childID, "linked", map[string]any{"parentId": parentID, "satisfiedAt": satisfiedAt}, nil); err != nil {
+	if err := appendEvent(ctx, q, childID, "linked", map[string]any{
+		"parentId": parentID, "satisfiedAt": satisfaction.at, "satisfiedRunId": satisfaction.runID,
+	}, nil); err != nil {
 		return err
 	}
-	if satisfiedAt == nil && child.Status == model.TaskStatusDone {
+	if satisfaction.at == nil && child.Status == model.TaskStatusDone {
 		if _, err := q.ExecContext(ctx, `
 			UPDATE tasks SET status = 'todo', block_kind = NULL, block_reason = NULL,
 			block_recurrences = 0, updated_at = ? WHERE id = ?
@@ -654,6 +664,10 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (model.TaskDetail, e
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
+	prerequisiteHandoffs, err := s.ListPrerequisiteHandoffs(ctx, taskID)
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
 	events, err := s.listTaskEvents(ctx, taskID)
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -662,7 +676,8 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (model.TaskDetail, e
 		Task: task, Parents: parents, Children: children, Prerequisites: parents,
 		Dependents: children, ParentTask: parentTask, Subtasks: subtasks,
 		Comments: comments, Attachments: attachments, Runs: runs, RunAgentConfigs: runAgentConfigs, RunWorkspaces: workspaces,
-		TerminalRequests: terminalRequests, ChangeSets: changeSets, Events: events,
+		TerminalRequests: terminalRequests, ChangeSets: changeSets,
+		PrerequisiteHandoffs: prerequisiteHandoffs, Events: events,
 	}, nil
 }
 

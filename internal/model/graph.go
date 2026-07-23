@@ -34,6 +34,7 @@ type DependencyEdge struct {
 	PrerequisiteID string  `json:"prerequisiteId"`
 	DependentID    string  `json:"dependentId"`
 	SatisfiedAt    *string `json:"satisfiedAt"`
+	SatisfiedRunID *string `json:"satisfiedRunId"`
 }
 
 type RelationshipGraph struct {

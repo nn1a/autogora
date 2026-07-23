@@ -52,6 +52,60 @@ func (s *Store) GetRunChangeSet(ctx context.Context, runID string) (*model.Chang
 	return &value, nil
 }
 
+// ListPrerequisiteHandoffs returns the completion provenance pinned to each
+// satisfied prerequisite edge. It deliberately does not select a newer run if
+// the prerequisite is reopened and completed again.
+func (s *Store) ListPrerequisiteHandoffs(ctx context.Context, taskID string) ([]model.PrerequisiteHandoff, error) {
+	if _, err := requireTask(ctx, s.db, taskID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT link.parent_id, link.child_id, link.satisfied_at, link.satisfied_run_id
+		FROM task_links link
+		JOIN tasks prerequisite ON prerequisite.id = link.parent_id
+		WHERE link.child_id = ? AND link.satisfied_at IS NOT NULL
+		ORDER BY prerequisite.created_at, prerequisite.id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	handoffs := make([]model.PrerequisiteHandoff, 0)
+	for rows.Next() {
+		var handoff model.PrerequisiteHandoff
+		var satisfiedRunID sql.NullString
+		if err := rows.Scan(&handoff.PrerequisiteID, &handoff.DependentID, &handoff.SatisfiedAt, &satisfiedRunID); err != nil {
+			return nil, err
+		}
+		handoff.SatisfiedRunID = stringPointer(satisfiedRunID)
+		handoffs = append(handoffs, handoff)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range handoffs {
+		handoff := &handoffs[index]
+		if handoff.SatisfiedRunID == nil {
+			continue
+		}
+		run, err := getRun(ctx, s.db, *handoff.SatisfiedRunID)
+		if err != nil {
+			return nil, err
+		}
+		if run.TaskID != handoff.PrerequisiteID || run.Status != model.RunStatusCompleted {
+			return nil, fmt.Errorf("dependency %s -> %s pins invalid satisfying run %s", handoff.PrerequisiteID, handoff.DependentID, run.ID)
+		}
+		handoff.Run = &run
+		changeSet, err := s.GetRunChangeSet(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		handoff.ChangeSet = changeSet
+	}
+	return handoffs, nil
+}
+
 func (s *Store) listChangeSets(ctx context.Context, taskID string) ([]model.ChangeSet, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT "+changeSetColumns+" FROM task_change_sets WHERE task_id = ? ORDER BY created_at", taskID)
 	if err != nil {

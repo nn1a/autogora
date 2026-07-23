@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 15
+const schemaVersion = 16
 
 type Store struct {
 	db              *sql.DB
@@ -119,11 +119,16 @@ func (s *Store) initialize(ctx context.Context) error {
 }
 
 func (s *Store) ensureDependencySatisfaction(ctx context.Context) error {
+	var currentVersion int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&currentVersion); err != nil {
+		return fmt.Errorf("inspect schema version: %w", err)
+	}
 	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(task_links)")
 	if err != nil {
 		return fmt.Errorf("inspect task links: %w", err)
 	}
-	hasColumn := false
+	hasSatisfiedAt := false
+	hasSatisfiedRunID := false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -132,16 +137,24 @@ func (s *Store) ensureDependencySatisfaction(ctx context.Context) error {
 			rows.Close()
 			return fmt.Errorf("scan task link column: %w", err)
 		}
-		if name == "satisfied_at" {
-			hasColumn = true
+		switch name {
+		case "satisfied_at":
+			hasSatisfiedAt = true
+		case "satisfied_run_id":
+			hasSatisfiedRunID = true
 		}
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if !hasColumn {
+	if !hasSatisfiedAt {
 		if _, err := s.db.ExecContext(ctx, "ALTER TABLE task_links ADD COLUMN satisfied_at TEXT"); err != nil {
 			return fmt.Errorf("add dependency satisfaction: %w", err)
+		}
+	}
+	if !hasSatisfiedRunID {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE task_links ADD COLUMN satisfied_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL"); err != nil {
+			return fmt.Errorf("add dependency satisfying run: %w", err)
 		}
 	}
 	_, err = s.db.ExecContext(ctx, `
@@ -162,6 +175,35 @@ func (s *Store) ensureDependencySatisfaction(ctx context.Context) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("backfill dependency satisfaction: %w", err)
+	}
+	if currentVersion < 16 {
+		_, err = s.db.ExecContext(ctx, `
+			UPDATE task_links AS link
+			SET satisfied_run_id = COALESCE(
+				(
+					SELECT event.run_id
+					FROM task_events event
+					JOIN task_runs run ON run.id = event.run_id
+					WHERE event.task_id = link.parent_id
+						AND event.kind = 'completed'
+						AND event.run_id IS NOT NULL
+						AND run.task_id = link.parent_id
+					ORDER BY ABS(julianday(event.created_at) - julianday(link.satisfied_at)), event.id
+					LIMIT 1
+				),
+				(
+					SELECT run.id
+					FROM task_runs run
+					WHERE run.task_id = link.parent_id AND run.status = 'completed'
+					ORDER BY ABS(julianday(COALESCE(run.ended_at, run.heartbeat_at)) - julianday(link.satisfied_at)), run.claimed_at
+					LIMIT 1
+				)
+			)
+			WHERE link.satisfied_at IS NOT NULL AND link.satisfied_run_id IS NULL
+		`)
+		if err != nil {
+			return fmt.Errorf("backfill dependency satisfying run: %w", err)
+		}
 	}
 	return nil
 }
@@ -334,6 +376,7 @@ CREATE TABLE IF NOT EXISTS task_links (
   parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   child_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   satisfied_at TEXT,
+  satisfied_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
   PRIMARY KEY (parent_id, child_id),
   CHECK (parent_id <> child_id)
 );

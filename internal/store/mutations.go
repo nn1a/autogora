@@ -15,7 +15,23 @@ import (
 	"github.com/nn1a/autogora/internal/model"
 )
 
-func satisfyOutgoingDependencies(ctx context.Context, q querier, parentID, satisfiedAt string) error {
+func validateSatisfyingRun(ctx context.Context, q querier, parentID string, satisfiedRunID *string) error {
+	if satisfiedRunID != nil {
+		var runTaskID, status string
+		if err := q.QueryRowContext(ctx, "SELECT task_id, status FROM task_runs WHERE id = ?", *satisfiedRunID).Scan(&runTaskID, &status); err != nil {
+			return err
+		}
+		if runTaskID != parentID || model.RunStatus(status) != model.RunStatusCompleted {
+			return fmt.Errorf("satisfying run %s is not a completed run for prerequisite %s", *satisfiedRunID, parentID)
+		}
+	}
+	return nil
+}
+
+func satisfyOutgoingDependencies(ctx context.Context, q querier, parentID, satisfiedAt string, satisfiedRunID *string) error {
+	if err := validateSatisfyingRun(ctx, q, parentID, satisfiedRunID); err != nil {
+		return err
+	}
 	rows, err := q.QueryContext(ctx, "SELECT child_id FROM task_links WHERE parent_id = ? AND satisfied_at IS NULL", parentID)
 	if err != nil {
 		return err
@@ -35,11 +51,14 @@ func satisfyOutgoingDependencies(ctx context.Context, q querier, parentID, satis
 	if len(children) == 0 {
 		return nil
 	}
-	if _, err := q.ExecContext(ctx, "UPDATE task_links SET satisfied_at = ? WHERE parent_id = ? AND satisfied_at IS NULL", satisfiedAt, parentID); err != nil {
+	if _, err := q.ExecContext(ctx, `UPDATE task_links SET satisfied_at = ?, satisfied_run_id = ?
+		WHERE parent_id = ? AND satisfied_at IS NULL`, satisfiedAt, nullableString(satisfiedRunID), parentID); err != nil {
 		return err
 	}
 	for _, childID := range children {
-		if err := appendEvent(ctx, q, childID, "dependency_satisfied", map[string]any{"parentId": parentID, "satisfiedAt": satisfiedAt}, nil); err != nil {
+		if err := appendEvent(ctx, q, childID, "dependency_satisfied", map[string]any{
+			"parentId": parentID, "satisfiedAt": satisfiedAt, "satisfiedRunId": satisfiedRunID,
+		}, satisfiedRunID); err != nil {
 			return err
 		}
 		if err := recomputeReady(ctx, q, childID); err != nil {
@@ -517,7 +536,7 @@ func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskI
 			if err := appendEvent(ctx, tx, taskID, "completed", map[string]any{"summary": "Completed by administrative status update"}, nil); err != nil {
 				return err
 			}
-			if err := satisfyOutgoingDependencies(ctx, tx, taskID, completedAt); err != nil {
+			if err := satisfyOutgoingDependencies(ctx, tx, taskID, completedAt, nil); err != nil {
 				return err
 			}
 		}

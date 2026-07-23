@@ -374,7 +374,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 			if err := appendEvent(ctx, tx, currentTask.ID, "completed", map[string]any{"summary": truncate(summary, 400), "resultLength": resultLength}, &runID); err != nil {
 				return err
 			}
-			if err := satisfyOutgoingDependencies(ctx, tx, currentTask.ID, timestamp); err != nil {
+			if err := satisfyOutgoingDependencies(ctx, tx, currentTask.ID, timestamp, &runID); err != nil {
 				return err
 			}
 		case "block":

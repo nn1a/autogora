@@ -208,6 +208,18 @@ type ChangeSet struct {
 	CreatedAt      string   `json:"createdAt"`
 }
 
+// PrerequisiteHandoff identifies the immutable completion run that satisfied
+// one dependency edge. Older or administrative completions may not have a run;
+// callers must treat a nil Run as a valid handoff without a change set.
+type PrerequisiteHandoff struct {
+	PrerequisiteID string     `json:"prerequisiteId"`
+	DependentID    string     `json:"dependentId"`
+	SatisfiedAt    string     `json:"satisfiedAt"`
+	SatisfiedRunID *string    `json:"satisfiedRunId"`
+	Run            *Run       `json:"run"`
+	ChangeSet      *ChangeSet `json:"changeSet"`
+}
+
 type Comment struct {
 	ID        int64  `json:"id"`
 	TaskID    string `json:"taskId"`
@@ -239,21 +251,22 @@ type TaskEvent struct {
 }
 
 type TaskDetail struct {
-	Task             Task              `json:"task"`
-	Parents          []Task            `json:"parents"`
-	Children         []Task            `json:"children"`
-	Prerequisites    []Task            `json:"prerequisites"`
-	Dependents       []Task            `json:"dependents"`
-	ParentTask       *Task             `json:"parentTask"`
-	Subtasks         []Task            `json:"subtasks"`
-	Comments         []Comment         `json:"comments"`
-	Attachments      []Attachment      `json:"attachments"`
-	Runs             []Run             `json:"runs"`
-	RunAgentConfigs  []RunAgentConfig  `json:"runAgentConfigs"`
-	RunWorkspaces    []RunWorkspace    `json:"runWorkspaces"`
-	TerminalRequests []TerminalRequest `json:"terminalRequests"`
-	ChangeSets       []ChangeSet       `json:"changeSets"`
-	Events           []TaskEvent       `json:"events"`
+	Task                 Task                  `json:"task"`
+	Parents              []Task                `json:"parents"`
+	Children             []Task                `json:"children"`
+	Prerequisites        []Task                `json:"prerequisites"`
+	Dependents           []Task                `json:"dependents"`
+	ParentTask           *Task                 `json:"parentTask"`
+	Subtasks             []Task                `json:"subtasks"`
+	Comments             []Comment             `json:"comments"`
+	Attachments          []Attachment          `json:"attachments"`
+	Runs                 []Run                 `json:"runs"`
+	RunAgentConfigs      []RunAgentConfig      `json:"runAgentConfigs"`
+	RunWorkspaces        []RunWorkspace        `json:"runWorkspaces"`
+	TerminalRequests     []TerminalRequest     `json:"terminalRequests"`
+	ChangeSets           []ChangeSet           `json:"changeSets"`
+	PrerequisiteHandoffs []PrerequisiteHandoff `json:"prerequisiteHandoffs"`
+	Events               []TaskEvent           `json:"events"`
 }
 
 type ClaimedTask struct {
