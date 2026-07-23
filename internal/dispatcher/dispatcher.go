@@ -1088,7 +1088,7 @@ func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []s
 	return nil
 }
 
-func Run(ctx context.Context, options Options) error {
+func Run(ctx context.Context, options Options) (runErr error) {
 	options.normalize()
 	if options.DBPath == "" || options.CLIPath == "" {
 		return errors.New("dispatcher requires DBPath and CLIPath")
@@ -1098,6 +1098,14 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	ctx, cancelDispatcher := context.WithCancel(ctx)
+	var leader *supervisorLease
+	if !options.Once {
+		leader, err = startSupervisorLease(ctx, cancelDispatcher, manager)
+		if err != nil {
+			cancelDispatcher()
+			return err
+		}
+	}
 	processes := NewProcessSet()
 	var active atomic.Int32
 	var workers sync.WaitGroup
@@ -1107,6 +1115,10 @@ func Run(ctx context.Context, options Options) error {
 		cancelDispatcher()
 		processes.StopAll()
 		workers.Wait()
+		leader.Close()
+		if runErr == nil && leader != nil {
+			runErr = leader.Err()
+		}
 		if generatedClineApprovalDir != "" {
 			_ = os.RemoveAll(generatedClineApprovalDir)
 		}
@@ -1123,6 +1135,9 @@ func Run(ctx context.Context, options Options) error {
 		deliverBoardNotifications(ctx, manager, boardSlugs, options)
 		decomposeBoardTriage(ctx, manager, boardSlugs, options)
 		if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		launched := false
@@ -1200,6 +1215,9 @@ func Run(ctx context.Context, options Options) error {
 					timer.Stop()
 				case <-timer.C:
 					if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
+						if ctx.Err() != nil {
+							return nil
+						}
 						return err
 					}
 				}

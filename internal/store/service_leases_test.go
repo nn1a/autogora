@@ -35,6 +35,10 @@ func TestServiceLeaseLifecycle(t *testing.T) {
 		initial.ExpiresAt != "2030-01-02T03:04:35.123456789Z" {
 		t.Fatalf("service lease timestamps were not normalized: %+v", initial)
 	}
+	loaded, err := store.GetServiceLease(ctx, " dispatcher ")
+	if err != nil || loaded != initial {
+		t.Fatalf("get service lease = %+v, %v", loaded, err)
+	}
 
 	reacquired, acquired, err := store.AcquireServiceLease(ctx, "dispatcher", "node-a", 30*time.Second, current.Add(5*time.Second))
 	if err != nil || !acquired {

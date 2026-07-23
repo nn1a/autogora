@@ -36,6 +36,19 @@ func scanServiceLease(row scanner) (ServiceLease, error) {
 	return lease, err
 }
 
+func (s *Store) GetServiceLease(ctx context.Context, name string) (ServiceLease, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ServiceLease{}, errors.New("service lease requires a name")
+	}
+	lease, err := scanServiceLease(s.db.QueryRowContext(ctx,
+		"SELECT "+serviceLeaseColumns+" FROM service_leases WHERE name = ?", name))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ServiceLease{}, fmt.Errorf("%w: %q", ErrServiceLeaseNotFound, name)
+	}
+	return lease, err
+}
+
 func normalizeServiceLeaseArgs(name, owner string, ttl time.Duration, current time.Time) (string, string, string, string, error) {
 	name = strings.TrimSpace(name)
 	owner = strings.TrimSpace(owner)

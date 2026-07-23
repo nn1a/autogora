@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -664,5 +665,46 @@ func TestDecompositionProfileOverridesCannotRelaxConfiguredPolicy(t *testing.T) 
 	profile := merged[0]
 	if profile.Runtime != model.RuntimeCodex || profile.Model != "board-model" || !profile.Disabled || profile.MaxConcurrent != 2 {
 		t.Fatalf("CLI decomposition override relaxed configured execution policy: %#v", profile)
+	}
+}
+
+func TestWatchDispatcherHoldsSingleSupervisorLease(t *testing.T) {
+	manager, dbPath := testManager(t)
+	config := agentconfig.Default()
+	ctx, cancel := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", MaxWorkers: 1,
+			Interval: 250 * time.Millisecond, AutoDecompose: boolValue(false), AgentConfig: &config, Getenv: func(string) string { return "" }})
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		opened, err := manager.OpenStore(context.Background(), "default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, leaseErr := opened.GetServiceLease(context.Background(), dispatcherLeaseName)
+		opened.Close()
+		if leaseErr == nil {
+			break
+		}
+		if !errors.Is(leaseErr, store.ErrServiceLeaseNotFound) || time.Now().After(deadline) {
+			t.Fatalf("dispatcher lease did not appear: %v", leaseErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	secondErr := Run(context.Background(), Options{DBPath: dbPath, CLIPath: "/tmp/autogora", MaxWorkers: 1,
+		AutoDecompose: boolValue(false), AgentConfig: &config, Getenv: func(string) string { return "" }})
+	if !errors.Is(secondErr, ErrDispatcherAlreadyRunning) {
+		t.Fatalf("second dispatcher error = %v, want ErrDispatcherAlreadyRunning", secondErr)
+	}
+	cancel()
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first dispatcher shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first dispatcher did not stop")
 	}
 }
