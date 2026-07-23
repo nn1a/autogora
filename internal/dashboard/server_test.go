@@ -13,12 +13,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 const testToken = "test-dashboard-token-32-characters"
 
 func startTestServer(t *testing.T) *Server {
 	t.Helper()
+	t.Setenv("AUTOGORA_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 	server, err := Start(context.Background(), Options{DBPath: filepath.Join(t.TempDir(), "autogora.db"), CLIPath: "/tmp/autogora", Token: testToken})
 	if err != nil {
 		t.Fatal(err)
@@ -74,6 +78,27 @@ func mapValue(t *testing.T, value any) map[string]any {
 	return result
 }
 
+func arrayValue(t *testing.T, value any) []any {
+	t.Helper()
+	result, ok := value.([]any)
+	if !ok {
+		t.Fatalf("expected array, got %#v", value)
+	}
+	return result
+}
+
+func namedValue(t *testing.T, values []any, name string) map[string]any {
+	t.Helper()
+	for _, value := range values {
+		candidate := mapValue(t, value)
+		if candidate["name"] == name {
+			return candidate
+		}
+	}
+	t.Fatalf("missing named value %q in %#v", name, values)
+	return nil
+}
+
 func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 	server := startTestServer(t)
 	unauthorized, err := http.Get(server.URL + "/api/boards")
@@ -104,6 +129,196 @@ func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 	if html.StatusCode != http.StatusOK || !strings.Contains(string(contents), "<title>Autogora</title>") || !strings.Contains(string(contents), `class="dialog-wide"`) {
 		t.Fatalf("embedded dashboard mismatch: %d %s", html.StatusCode, contents)
 	}
+}
+
+func TestGlobalAgentConfigAPIStartsEmptyAndPersistsValidatedConfig(t *testing.T) {
+	server := startTestServer(t)
+	response, initialValue := apiRequest(t, server, http.MethodGet, "/api/config", nil)
+	initial := mapValue(t, initialValue)
+	if response.StatusCode != http.StatusOK || initial["exists"] != false || initial["path"] == "" {
+		t.Fatalf("unexpected initial config response: %d %#v", response.StatusCode, initial)
+	}
+	if mapValue(t, initial["config"])["schemaVersion"] != float64(1) {
+		t.Fatalf("default config missing schema version: %#v", initial)
+	}
+
+	config := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"autoStart": true, "maxWorkers": 3, "allowWrites": false},
+		"defaults": map[string]any{
+			"workerAgents": []string{"primary"}, "plannerAgents": []string{"backup"}, "judgeAgents": []string{},
+		},
+		"agents": []any{
+			map[string]any{"id": "primary", "runtime": "codex", "command": "/opt/codex", "model": "codex-model", "enabled": true,
+				"maxConcurrent": 2, "roles": []string{"worker"}, "fallbacks": []string{"backup"}},
+			map[string]any{"id": "backup", "runtime": "claude", "command": "/opt/claude", "model": "claude-model", "enabled": true,
+				"maxConcurrent": 1, "roles": []string{"worker", "planner"}},
+		},
+	}
+	response, savedValue := apiRequest(t, server, http.MethodPut, "/api/config", config)
+	saved := mapValue(t, savedValue)
+	if response.StatusCode != http.StatusOK || saved["exists"] != true || saved["path"] != initial["path"] {
+		t.Fatalf("config save failed: %d %#v", response.StatusCode, saved)
+	}
+	savedConfig := mapValue(t, saved["config"])
+	if mapValue(t, savedConfig["supervisor"])["maxWorkers"] != float64(3) || len(arrayValue(t, savedConfig["agents"])) != 2 {
+		t.Fatalf("saved config was not returned: %#v", savedConfig)
+	}
+
+	invalid := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"maxWorkers": 1},
+		"defaults":      map[string]any{"workerAgents": []string{}, "plannerAgents": []string{}, "judgeAgents": []string{}},
+		"agents": []any{map[string]any{
+			"id": "leaky", "runtime": "codex", "command": "codex", "enabled": true, "maxConcurrent": 1,
+			"roles": []string{"worker"}, "apiKey": "must-not-be-accepted",
+		}},
+	}
+	rejected, rejectedValue := apiRequest(t, server, http.MethodPut, "/api/config", invalid)
+	if rejected.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, rejectedValue)["error"].(string), "unknown field") {
+		t.Fatalf("unknown config field was accepted: %d %#v", rejected.StatusCode, rejectedValue)
+	}
+	invalidPolicy := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"maxWorkers": 1},
+		"defaults":      map[string]any{"workerAgents": []string{"unknown"}, "plannerAgents": []string{}, "judgeAgents": []string{}},
+		"agents":        []any{},
+	}
+	rejected, rejectedValue = apiRequest(t, server, http.MethodPut, "/api/config", invalidPolicy)
+	if rejected.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, rejectedValue)["error"].(string), "unknown agent") {
+		t.Fatalf("invalid config references were accepted: %d %#v", rejected.StatusCode, rejectedValue)
+	}
+
+	response, loadedValue := apiRequest(t, server, http.MethodGet, "/api/config", nil)
+	loaded := mapValue(t, loadedValue)
+	if response.StatusCode != http.StatusOK || loaded["exists"] != true || len(arrayValue(t, mapValue(t, loaded["config"])["agents"])) != 2 {
+		t.Fatalf("invalid update changed persisted config: %d %#v", response.StatusCode, loaded)
+	}
+}
+
+func TestEffectiveAgentsIncludeBoardProfilesHealthAndActiveRuns(t *testing.T) {
+	server := startTestServer(t)
+	config := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"maxWorkers": 2},
+		"defaults":      map[string]any{"workerAgents": []string{"global-worker"}, "plannerAgents": []string{"planner-only"}, "judgeAgents": []string{}},
+		"agents": []any{
+			map[string]any{"id": "global-worker", "runtime": "codex", "command": "codex", "model": "global-model", "enabled": true,
+				"maxConcurrent": 2, "roles": []string{"worker"}},
+			map[string]any{"id": "planner-only", "runtime": "gemini", "command": "gemini", "enabled": true,
+				"maxConcurrent": 1, "roles": []string{"planner"}},
+		},
+	}
+	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
+	}
+	if response, value := apiRequest(t, server, http.MethodPatch, "/api/boards/default", map[string]any{
+		"orchestration": map[string]any{"profiles": []any{
+			map[string]any{"name": "global-worker", "runtime": "claude", "model": "board-model", "maxConcurrent": 9},
+			map[string]any{"name": "board-worker", "runtime": "cline", "model": "board-only-model"},
+		}},
+	}); response.StatusCode != http.StatusOK {
+		t.Fatalf("board update failed: %d %#v", response.StatusCode, value)
+	}
+
+	ctx := context.Background()
+	opened, err := server.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "global-worker"
+	activeTask, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "active global worker", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: activeTask.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim active task: claim=%#v err=%v", claim, err)
+	}
+	if _, err := opened.RecordRunAgentConfig(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.RecordRunAgentConfigInput{
+		Profile: "global-worker", Runtime: model.RuntimeCodex, Model: "board-model", Source: "board_profile",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lastRunID := claim.Run.ID
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{AgentID: "global-worker", Status: model.AgentHealthReady, LastRunID: &lastRunID}); err != nil {
+		t.Fatal(err)
+	}
+	taskOnly := "task-worker"
+	if _, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "task route", Assignee: &taskOnly, Runtime: model.RuntimeGemini}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response, value := apiRequest(t, server, http.MethodGet, "/api/agents/effective?board=default", nil)
+	effective := mapValue(t, value)
+	if response.StatusCode != http.StatusOK || mapValue(t, effective["metadata"])["slug"] != "default" {
+		t.Fatalf("effective agent response failed: %d %#v", response.StatusCode, effective)
+	}
+	if len(arrayValue(t, mapValue(t, effective["config"])["agents"])) != 2 {
+		t.Fatalf("global config missing from effective response: %#v", effective)
+	}
+	profiles := arrayValue(t, effective["profiles"])
+	global := namedValue(t, profiles, "global-worker")
+	if global["runtime"] != "codex" || global["model"] != "board-model" || global["maxConcurrent"] != float64(2) || global["activeRuns"] != float64(1) {
+		t.Fatalf("global/board policy or active count mismatch: %#v", global)
+	}
+	health := mapValue(t, global["health"])
+	if health["status"] != "ready" || health["lastRunId"] != claim.Run.ID {
+		t.Fatalf("agent health missing from effective profile: %#v", global)
+	}
+	boardWorker := namedValue(t, profiles, "board-worker")
+	if mapValue(t, boardWorker["health"])["status"] != "unknown" || boardWorker["activeRuns"] != float64(0) {
+		t.Fatalf("unknown board agent state mismatch: %#v", boardWorker)
+	}
+	_ = namedValue(t, profiles, "task-worker")
+	for _, raw := range profiles {
+		if mapValue(t, raw)["name"] == "planner-only" {
+			t.Fatalf("planner-only agent leaked into worker profiles: %#v", profiles)
+		}
+	}
+}
+
+func TestBoardSnapshotKeepsMetadataProfilesSeparateFromEffectiveProfiles(t *testing.T) {
+	server := startTestServer(t)
+	config := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"maxWorkers": 1},
+		"defaults":      map[string]any{"workerAgents": []string{"global-worker"}, "plannerAgents": []string{}, "judgeAgents": []string{}},
+		"agents": []any{map[string]any{
+			"id": "global-worker", "runtime": "claude", "command": "claude", "model": "global-model", "enabled": true,
+			"maxConcurrent": 1, "roles": []string{"worker"},
+		}},
+	}
+	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
+	}
+	if response, value := apiRequest(t, server, http.MethodPatch, "/api/boards/default", map[string]any{
+		"orchestration": map[string]any{"profiles": []any{map[string]any{"name": "board-worker", "runtime": "cline"}}},
+	}); response.StatusCode != http.StatusOK {
+		t.Fatalf("board update failed: %d %#v", response.StatusCode, value)
+	}
+	if response, value := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{
+		"title": "task-derived route", "assignee": "task-worker", "runtime": "gemini",
+	}); response.StatusCode != http.StatusCreated {
+		t.Fatalf("task create failed: %d %#v", response.StatusCode, value)
+	}
+
+	response, value := apiRequest(t, server, http.MethodGet, "/api/board", nil)
+	snapshot := mapValue(t, value)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("board snapshot failed: %d %#v", response.StatusCode, snapshot)
+	}
+	storedProfiles := arrayValue(t, mapValue(t, mapValue(t, snapshot["board"])["orchestration"])["profiles"])
+	if len(storedProfiles) != 1 || mapValue(t, storedProfiles[0])["name"] != "board-worker" {
+		t.Fatalf("global profiles leaked into board metadata: %#v", snapshot["board"])
+	}
+	effectiveProfiles := arrayValue(t, snapshot["profiles"])
+	_ = namedValue(t, effectiveProfiles, "global-worker")
+	_ = namedValue(t, effectiveProfiles, "board-worker")
+	_ = namedValue(t, effectiveProfiles, "task-worker")
 }
 
 func TestBoardTaskHierarchyAndAttachmentAPI(t *testing.T) {

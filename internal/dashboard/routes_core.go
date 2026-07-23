@@ -12,6 +12,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/taskservice"
 )
 
 func usingStore[T any](ctx context.Context, s *Server, board string, handler func(*store.Store) (T, error)) (T, error) {
@@ -38,6 +39,12 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	}
 	if segments[1] == "boards" {
 		return s.handleBoards(response, request, segments)
+	}
+	if segments[1] == "config" {
+		return s.handleAgentConfig(response, request, segments)
+	}
+	if segments[1] == "agents" && len(segments) == 3 && segments[2] == "effective" {
+		return s.handleEffectiveAgents(response, request)
 	}
 	board, err := s.boardFrom(request)
 	if err != nil {
@@ -196,7 +203,7 @@ func (s *Server) handleBoardSnapshot(response http.ResponseWriter, request *http
 			}
 			result = append(result, dashboardTask{Task: task, SubtasksDone: done, SubtasksTotal: len(detail.Subtasks), CommentsCount: len(detail.Comments), RelationshipsCount: relationships})
 		}
-		metadata, err := s.manager.Read(board)
+		boardContext, err := taskservice.New(opened, s.manager, board).BoardContext(request.Context())
 		if err != nil {
 			return nil, err
 		}
@@ -205,7 +212,7 @@ func (s *Server) handleBoardSnapshot(response http.ResponseWriter, request *http
 			return nil, err
 		}
 		diagnostics, err := opened.Diagnose(request.Context(), board)
-		return map[string]any{"board": metadata, "tasks": result, "stats": stats, "diagnostics": diagnostics}, err
+		return map[string]any{"board": boardContext.Metadata, "profiles": boardContext.Profiles, "tasks": result, "stats": stats, "diagnostics": diagnostics}, err
 	})
 	if err == nil {
 		sendJSON(response, http.StatusOK, value)
