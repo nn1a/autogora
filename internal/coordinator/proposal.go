@@ -43,20 +43,61 @@ type TaskDraft struct {
 	ParentTaskID  string             `json:"parentTaskId,omitempty"`
 }
 
+type TaskVersionMap map[string]string
+
+type taskVersionExpectation struct {
+	TaskID    string `json:"taskId"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+func (m *TaskVersionMap) UnmarshalJSON(value []byte) error {
+	trimmed := strings.TrimSpace(string(value))
+	if trimmed == "" || trimmed == "null" {
+		*m = nil
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		var versions map[string]string
+		if err := json.Unmarshal(value, &versions); err != nil {
+			return err
+		}
+		*m = versions
+		return nil
+	}
+	var entries []taskVersionExpectation
+	if err := json.Unmarshal(value, &entries); err != nil {
+		return err
+	}
+	versions := make(TaskVersionMap, len(entries))
+	for _, entry := range entries {
+		entry.TaskID = strings.TrimSpace(entry.TaskID)
+		entry.UpdatedAt = strings.TrimSpace(entry.UpdatedAt)
+		if entry.TaskID == "" || entry.UpdatedAt == "" {
+			return errors.New("expectedTaskVersions entries require taskId and updatedAt")
+		}
+		if _, exists := versions[entry.TaskID]; exists {
+			return fmt.Errorf("expectedTaskVersions contains duplicate taskId %s", entry.TaskID)
+		}
+		versions[entry.TaskID] = entry.UpdatedAt
+	}
+	*m = versions
+	return nil
+}
+
 type Action struct {
-	Kind                          ActionKind        `json:"kind"`
-	TaskID                        string            `json:"taskId,omitempty"`
-	ExpectedUpdatedAt             string            `json:"expectedUpdatedAt,omitempty"`
-	Assignee                      string            `json:"assignee,omitempty"`
-	Runtime                       model.Runtime     `json:"runtime,omitempty"`
-	Priority                      *int              `json:"priority,omitempty"`
-	PrerequisiteID                string            `json:"prerequisiteId,omitempty"`
-	ExpectedPrerequisiteUpdatedAt string            `json:"expectedPrerequisiteUpdatedAt,omitempty"`
-	DependentID                   string            `json:"dependentId,omitempty"`
-	ExpectedDependentUpdatedAt    string            `json:"expectedDependentUpdatedAt,omitempty"`
-	Task                          *TaskDraft        `json:"task,omitempty"`
-	ExpectedTaskVersions          map[string]string `json:"expectedTaskVersions,omitempty"`
-	Reason                        string            `json:"reason"`
+	Kind                          ActionKind     `json:"kind"`
+	TaskID                        string         `json:"taskId,omitempty"`
+	ExpectedUpdatedAt             string         `json:"expectedUpdatedAt,omitempty"`
+	Assignee                      string         `json:"assignee,omitempty"`
+	Runtime                       model.Runtime  `json:"runtime,omitempty"`
+	Priority                      *int           `json:"priority,omitempty"`
+	PrerequisiteID                string         `json:"prerequisiteId,omitempty"`
+	ExpectedPrerequisiteUpdatedAt string         `json:"expectedPrerequisiteUpdatedAt,omitempty"`
+	DependentID                   string         `json:"dependentId,omitempty"`
+	ExpectedDependentUpdatedAt    string         `json:"expectedDependentUpdatedAt,omitempty"`
+	Task                          *TaskDraft     `json:"task,omitempty"`
+	ExpectedTaskVersions          TaskVersionMap `json:"expectedTaskVersions,omitempty"`
+	Reason                        string         `json:"reason"`
 }
 
 func (a Action) Risk() ActionRisk {
@@ -417,7 +458,7 @@ func proposalSchema(maxActions int) map[string]any {
 		"type": "object", "additionalProperties": false,
 		"required": []string{
 			"key", "title", "body", "assignee", "runtime", "workflowRole",
-			"priority", "prerequisites", "dependents",
+			"priority", "prerequisites", "dependents", "parentTaskId",
 		},
 		"properties": map[string]any{
 			"key": stringProperty(), "title": stringProperty(), "body": stringProperty(),
@@ -430,7 +471,9 @@ func proposalSchema(maxActions int) map[string]any {
 			"dependents": map[string]any{
 				"type": "array", "uniqueItems": true, "items": stringProperty(),
 			},
-			"parentTaskId": stringProperty(),
+			"parentTaskId": map[string]any{
+				"type": []string{"string", "null"}, "minLength": 1,
+			},
 		},
 	}
 	actionSchemas := []any{
@@ -448,7 +491,14 @@ func proposalSchema(maxActions int) map[string]any {
 			"kind": map[string]any{"const": string(ActionCreateTask)},
 			"task": taskSchema,
 			"expectedTaskVersions": map[string]any{
-				"type": "object", "additionalProperties": stringProperty(),
+				"type": "array", "uniqueItems": true,
+				"items": map[string]any{
+					"type": "object", "additionalProperties": false,
+					"required": []string{"taskId", "updatedAt"},
+					"properties": map[string]any{
+						"taskId": stringProperty(), "updatedAt": stringProperty(),
+					},
+				},
 			},
 		}),
 	}

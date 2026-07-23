@@ -87,7 +87,7 @@ var decompositionSchema = map[string]any{
 				"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
 				"priority":     map[string]any{"type": "integer"}, "skills": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			},
-			"required": []string{"key", "title", "body", "assignee", "runtime", "priority", "skills"},
+			"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority", "skills"},
 		}},
 		"dependencies": map[string]any{"type": "array", "items": map[string]any{
 			"type": "object", "additionalProperties": false,
