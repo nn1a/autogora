@@ -752,6 +752,10 @@ func isGitHubImportedTask(task model.Task) bool {
 	return task.IdempotencyKey != nil && strings.HasPrefix(strings.TrimSpace(*task.IdempotencyKey), "github-issue:")
 }
 
+func isRepeatedBlockTriage(task model.Task) bool {
+	return task.Status == model.TaskStatusTriage && task.BlockReason != nil && task.BlockRecurrences >= 2
+}
+
 func (d *autoDecomposeDiagnostics) reportGitHubImportSkip(options Options, board string, task model.Task) {
 	if d == nil {
 		return
@@ -857,6 +861,12 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 				// only toward the bounded scan, never the planning quota.
 				if isGitHubImportedTask(task) {
 					diagnostics.reportGitHubImportSkip(options, board, task)
+					continue
+				}
+				// A repeated block is an exceptional recovery incident, not a
+				// new rough idea. Keep it for Coordinator/user review instead
+				// of asking Planner to overwrite its existing specification.
+				if isRepeatedBlockTriage(task) {
 					continue
 				}
 				if !diagnostics.allowAutoDecompose(board, task.ID) {

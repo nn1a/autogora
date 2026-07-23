@@ -611,6 +611,61 @@ func TestAutoDecomposeSkipsGitHubImportsWithoutStarvingLocalTriage(t *testing.T)
 	}
 }
 
+func TestAutoDecomposeLeavesRepeatedBlockTriageForCoordination(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Existing implementation", Body: "Keep this specification intact.",
+		Assignee: &assignee, Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := store.BlockInput{Kind: model.BlockKindCapability, Reason: "configured agent is unavailable"}
+	if _, err := opened.BlockTask(ctx, task.Task.ID, block); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.UnblockTask(ctx, task.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.BlockTask(ctx, task.Task.ID, block); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plannerCalls := 0
+	decomposeBoardTriage(ctx, manager, []string{"default"}, Options{
+		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
+		DecompositionPlanner: func(context.Context, orchestration.PlannerRequest) (any, error) {
+			plannerCalls++
+			return nil, errors.New("repeated block must not reach Planner")
+		},
+	}, &autoDecomposeDiagnostics{})
+	if plannerCalls != 0 {
+		t.Fatalf("repeated block was sent to Planner %d time(s)", plannerCalls)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusTriage || detail.Task.BlockRecurrences != 2 ||
+		detail.Task.Body != "Keep this specification intact." {
+		t.Fatalf("repeated block triage changed during planning: %+v", detail.Task)
+	}
+}
+
 func TestAutoDecomposeRotatesBoardsBetweenPlanningPasses(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)
