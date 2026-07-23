@@ -65,6 +65,78 @@ func claimedTask(t *testing.T, runtime model.Runtime) model.ClaimedTask {
 	return *claim
 }
 
+func TestWorkerPromptDescribesDistinctWorkflowRoleBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      model.WorkflowRole
+		required  []string
+		forbidden []string
+	}{
+		{
+			name: "worker",
+			role: model.WorkflowRoleWorker,
+			required: []string{
+				"assigned Autogora worker",
+				"Work only on that task in the current workspace",
+			},
+			forbidden: []string{
+				"assigned Autogora reviewer",
+				"independent review task",
+				"explicit final integration task",
+			},
+		},
+		{
+			name: "reviewer",
+			role: model.WorkflowRoleReviewer,
+			required: []string{
+				"assigned Autogora reviewer",
+				"independent review task",
+				"Do not implement fixes, modify product source, or take over prerequisite work",
+				"prerequisite handoff",
+				"acceptance criteria",
+				"relevant tests",
+				"clear pass or fail decision with concrete evidence",
+				"instead of fixing the implementation yourself",
+			},
+			forbidden: []string{
+				"assigned Autogora worker",
+				"explicit final integration task",
+			},
+		},
+		{
+			name: "finalizer",
+			role: model.WorkflowRoleFinalizer,
+			required: []string{
+				"assigned Autogora finalizer",
+				"explicit final integration task",
+				"Preserve every prerequisite change set in Git history",
+			},
+			forbidden: []string{
+				"assigned Autogora worker",
+				"assigned Autogora reviewer",
+				"independent review task",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claim := claimedTask(t, model.RuntimeCodex)
+			claim.Task.Task.WorkflowRole = test.role
+			prompt := workerPrompt(claim, filepath.Join(t.TempDir(), "autogora"))
+			for _, required := range test.required {
+				if !strings.Contains(prompt, required) {
+					t.Fatalf("%s prompt missing %q: %s", test.role, required, prompt)
+				}
+			}
+			for _, forbidden := range test.forbidden {
+				if strings.Contains(prompt, forbidden) {
+					t.Fatalf("%s prompt contains forbidden boundary %q: %s", test.role, forbidden, prompt)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 	for _, runtime := range []model.Runtime{model.RuntimeClaude, model.RuntimeCodex, model.RuntimeCline, model.RuntimeGemini} {
 		t.Run(string(runtime), func(t *testing.T) {

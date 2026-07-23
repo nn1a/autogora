@@ -57,7 +57,10 @@ func shellQuote(value string) string {
 func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 	task := claim.Task.Task
 	role := "worker"
-	if task.WorkflowRole == model.WorkflowRoleFinalizer {
+	switch task.WorkflowRole {
+	case model.WorkflowRoleReviewer:
+		role = "reviewer"
+	case model.WorkflowRoleFinalizer:
 		role = "finalizer"
 	}
 	instructions := []string{fmt.Sprintf("You are the assigned Autogora %s for %s.", role, task.ID)}
@@ -80,6 +83,12 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 	} else if task.WorkflowRole == model.WorkflowRoleFinalizer {
 		instructions = append(instructions,
 			"This is the explicit final integration task. Preserve every prerequisite change set in Git history, run final validation, and complete only with an integration-ready result.",
+		)
+	} else if task.WorkflowRole == model.WorkflowRoleReviewer {
+		instructions = append(instructions,
+			"This is an independent review task. Do not implement fixes, modify product source, or take over prerequisite work.",
+			"Inspect every prerequisite handoff available in workerContext, compare the delivered result with this task's acceptance criteria, and run or inspect the relevant tests.",
+			"Record a clear pass or fail decision with concrete evidence in durable comments and the completion summary. If evidence is missing or acceptance criteria are not met, block with actionable findings instead of fixing the implementation yourself.",
 		)
 	}
 	if task.Runtime == model.RuntimeCline || task.Runtime == model.RuntimeGemini {
