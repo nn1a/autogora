@@ -60,11 +60,13 @@ type Options struct {
 	PlannerTimeout           time.Duration
 	PlanningShutdownGrace    time.Duration
 	DecompositionPlanner     orchestration.Planner
+	CoordinatorPlanner       orchestration.Planner
 	AllowWrites              bool
 	Autopilot                bool
 	ClineApprovalDir         string
 	WorkingDirectory         string
 	Getenv                   func(string) string
+	Now                      func() time.Time
 	AgentConfig              *agentconfig.Config
 	OnLog                    func(string)
 }
@@ -108,12 +110,17 @@ func (o *Options) normalize() {
 	}
 	if o.PlannerTimeout <= 0 {
 		o.PlannerTimeout = 120 * time.Second
+	} else if o.PlannerTimeout > 10*time.Minute {
+		o.PlannerTimeout = 10 * time.Minute
 	}
 	if o.PlanningShutdownGrace <= 0 {
 		o.PlanningShutdownGrace = 2 * time.Second
 	}
 	if o.Getenv == nil {
 		o.Getenv = os.Getenv
+	}
+	if o.Now == nil {
+		o.Now = time.Now
 	}
 }
 
@@ -125,6 +132,13 @@ func (o Options) log(format string, values ...any) {
 	if o.OnLog != nil {
 		o.OnLog(fmt.Sprintf(format, values...))
 	}
+}
+
+func (o Options) currentTime() time.Time {
+	if o.Now == nil {
+		return time.Now().UTC()
+	}
+	return o.Now().UTC()
 }
 
 func parseTimestamp(value string) time.Time {
@@ -1709,7 +1723,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	}
 	generatedClineApprovalDir := ""
 	planning := startPlanningQueue(ctx, manager, options)
+	coordination := startCoordinationQueue(ctx, manager, options)
 	oncePlanningWaited := false
+	onceCoordinationWaited := false
 	nextClaimBoard := ""
 	defer func() {
 		cancelDispatcher()
@@ -1720,6 +1736,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		}
 		if !planning.Wait(options.PlanningShutdownGrace) {
 			options.log("planner did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
+		}
+		if !coordination.Wait(options.PlanningShutdownGrace) {
+			options.log("Coordinator did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
 		}
 		leader.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
@@ -1747,12 +1766,18 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			return err
 		}
 		deliverBoardNotifications(ctx, manager, boardSlugs, options)
-		planningDone := planning.Enqueue(boardSlugs)
 		if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
+		}
+		var planningDone <-chan struct{}
+		if !options.Once || !oncePlanningWaited {
+			planningDone = planning.Enqueue(boardSlugs)
+		}
+		if !options.Once {
+			coordination.Enqueue(boardSlugs)
 		}
 		launched := false
 		foundInPass := true
@@ -1866,6 +1891,19 @@ func Run(ctx context.Context, options Options) (runErr error) {
 					oncePlanningWaited = true
 					continue
 				}
+			}
+			if !launched && !onceCoordinationWaited {
+				coordinationDone := coordination.Enqueue(boardSlugs)
+				if coordinationDone != nil {
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-coordinationDone:
+						onceCoordinationWaited = true
+						continue
+					}
+				}
+				onceCoordinationWaited = true
 			}
 			deliverBoardNotifications(ctx, manager, boardSlugs, options)
 			return nil
