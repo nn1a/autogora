@@ -575,14 +575,16 @@ func autopilotBoardUpdate(input *boardAutopilotInput) (*boards.AutopilotUpdate, 
 			*coordination.Mode != boards.CoordinationModeAssist && *coordination.Mode != boards.CoordinationModeAuto {
 			return nil, errors.New("coordination mode must be observe, assist, or auto")
 		}
-		if coordination.IdleSeconds != nil && *coordination.IdleSeconds < 30 {
-			return nil, errors.New("coordination idleSeconds must be at least 30")
+		if coordination.IdleSeconds != nil && *coordination.IdleSeconds < boards.MinCoordinationIdleSeconds {
+			return nil, fmt.Errorf("coordination idleSeconds must be at least %d", boards.MinCoordinationIdleSeconds)
 		}
-		if coordination.MaxCallsPerHour != nil && (*coordination.MaxCallsPerHour < 1 || *coordination.MaxCallsPerHour > 100) {
-			return nil, errors.New("coordination maxCallsPerHour must be between 1 and 100")
+		if coordination.MaxCallsPerHour != nil && (*coordination.MaxCallsPerHour < 1 ||
+			*coordination.MaxCallsPerHour > boards.MaxCoordinationCallsPerHour) {
+			return nil, fmt.Errorf("coordination maxCallsPerHour must be between 1 and %d", boards.MaxCoordinationCallsPerHour)
 		}
-		if coordination.MaxActionsPerIncident != nil && (*coordination.MaxActionsPerIncident < 1 || *coordination.MaxActionsPerIncident > 100) {
-			return nil, errors.New("coordination maxActionsPerIncident must be between 1 and 100")
+		if coordination.MaxActionsPerIncident != nil && (*coordination.MaxActionsPerIncident < 1 ||
+			*coordination.MaxActionsPerIncident > boards.MaxCoordinationActionsPerIncident) {
+			return nil, fmt.Errorf("coordination maxActionsPerIncident must be between 1 and %d", boards.MaxCoordinationActionsPerIncident)
 		}
 		update.Coordination = &boards.CoordinationUpdate{
 			Mode: coordination.Mode, IdleSeconds: coordination.IdleSeconds,

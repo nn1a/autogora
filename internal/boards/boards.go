@@ -41,6 +41,12 @@ const (
 	CoordinationModeAuto    CoordinationMode = "auto"
 )
 
+const (
+	MinCoordinationIdleSeconds        = 30
+	MaxCoordinationCallsPerHour       = 100
+	MaxCoordinationActionsPerIncident = 20
+)
+
 type PublicationMode string
 
 const (
@@ -330,14 +336,18 @@ func normalizeAutopilot(value AutopilotSettings) AutopilotSettings {
 			value.Coordination.Profile = &profile
 		}
 	}
-	if value.Coordination.IdleSeconds < 30 {
+	if value.Coordination.IdleSeconds < MinCoordinationIdleSeconds {
 		value.Coordination.IdleSeconds = defaults.Coordination.IdleSeconds
 	}
 	if value.Coordination.MaxCallsPerHour < 1 {
 		value.Coordination.MaxCallsPerHour = defaults.Coordination.MaxCallsPerHour
+	} else if value.Coordination.MaxCallsPerHour > MaxCoordinationCallsPerHour {
+		value.Coordination.MaxCallsPerHour = MaxCoordinationCallsPerHour
 	}
 	if value.Coordination.MaxActionsPerIncident < 1 {
 		value.Coordination.MaxActionsPerIncident = defaults.Coordination.MaxActionsPerIncident
+	} else if value.Coordination.MaxActionsPerIncident > MaxCoordinationActionsPerIncident {
+		value.Coordination.MaxActionsPerIncident = MaxCoordinationActionsPerIncident
 	}
 	switch value.Publication.Mode {
 	case PublicationModeManual, PublicationModeLocalFF, PublicationModePullRequest:
