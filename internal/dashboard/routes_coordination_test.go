@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
@@ -30,10 +31,20 @@ func TestCoordinationAPIListsAndScopesIncidentProposals(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("create incident = %+v, created=%v, err=%v", incident, created, err)
 	}
+	claimTime := time.Now().UTC()
+	incident, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, store.ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: &state.Revision,
+		TTL:                   time.Minute,
+		Current:               claimTime,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("claim incident = %+v, claimed=%v, err=%v", incident, claimed, err)
+	}
 	proposal, created, err := opened.CreateCoordinationProposal(ctx, store.CreateCoordinationProposalInput{
 		ID: "cp-dashboard", IncidentID: incident.ID, CoordinatorAgent: "codex",
 		CoordinatorModel: "gpt-test", Status: model.CoordinationProposalDraft,
-		ExpectedGraphRevision: &state.Revision, Summary: "Inspect route",
+		ExpectedGraphRevision: &state.Revision, ClaimToken: incident.ClaimToken,
+		Current: claimTime.Add(time.Second), Summary: "Inspect route",
 		Rationale: "The graph has no runnable task.", Actions: json.RawMessage(`[]`),
 	})
 	if err != nil || !created {

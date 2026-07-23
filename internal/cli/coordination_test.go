@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
@@ -14,6 +15,7 @@ import (
 )
 
 func TestCoordinationCLIInspectsIncidentsAndProposals(t *testing.T) {
+	ctx := context.Background()
 	directory := t.TempDir()
 	dbPath := filepath.Join(directory, "autogora.db")
 	app := New(&bytes.Buffer{}, &bytes.Buffer{})
@@ -24,15 +26,15 @@ func TestCoordinationCLIInspectsIncidentsAndProposals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := manager.OpenStore(context.Background(), "default")
+	opened, err := manager.OpenStore(ctx, "default")
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := opened.GetBoardGraphState(context.Background(), "default")
+	state, err := opened.GetBoardGraphState(ctx, "default")
 	if err != nil {
 		t.Fatal(err)
 	}
-	incident, _, err := opened.CreateCoordinationIncident(context.Background(), store.CreateCoordinationIncidentInput{
+	incident, _, err := opened.CreateCoordinationIncident(ctx, store.CreateCoordinationIncidentInput{
 		ID: "ci-cli", Trigger: model.CoordinationTriggerRepeatedBlock,
 		ExpectedGraphRevision: &state.Revision, Summary: "Task blocked repeatedly",
 		Details: json.RawMessage(`{"recurrences":2}`),
@@ -40,9 +42,19 @@ func TestCoordinationCLIInspectsIncidentsAndProposals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proposal, _, err := opened.CreateCoordinationProposal(context.Background(), store.CreateCoordinationProposalInput{
+	claimTime := time.Now().UTC()
+	incident, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, store.ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: &state.Revision,
+		TTL:                   time.Minute,
+		Current:               claimTime,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("claim incident: claimed=%v incident=%+v err=%v", claimed, incident, err)
+	}
+	proposal, _, err := opened.CreateCoordinationProposal(ctx, store.CreateCoordinationProposalInput{
 		ID: "cp-cli", IncidentID: incident.ID, CoordinatorAgent: "claude",
-		ExpectedGraphRevision: &state.Revision, Summary: "Change route",
+		ExpectedGraphRevision: &state.Revision, ClaimToken: incident.ClaimToken,
+		Current: claimTime.Add(time.Second), Summary: "Change route",
 		Rationale: "The current route cannot proceed.", Actions: json.RawMessage(`[]`),
 	})
 	if err != nil {

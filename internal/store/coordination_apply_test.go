@@ -48,6 +48,16 @@ func applicableProposalForIncident(
 	authorization CoordinationApplyAuthorization,
 ) coordinationApplyFixture {
 	t.Helper()
+	claimTime := time.Now().UTC()
+	claimed, won, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
+		TTL:                   time.Minute,
+		Current:               claimTime,
+	})
+	if err != nil || !won {
+		t.Fatalf("claim incident: won=%v incident=%+v err=%v", won, claimed, err)
+	}
+	incident = claimed
 	encoded, err := json.Marshal(actions)
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +66,8 @@ func applicableProposalForIncident(
 		IncidentID: incident.ID, CoordinatorAgent: "coordinator",
 		CoordinatorModel: "test-model", CoordinatorProvider: "test-provider",
 		ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
+		ClaimToken:            incident.ClaimToken,
+		Current:               claimTime.Add(time.Second),
 		Summary:               "Apply bounded recovery", Rationale: "The deterministic recovery path is exhausted.",
 		Actions: encoded,
 	})
@@ -69,39 +81,17 @@ func applicableProposalForIncident(
 		proposal, err = opened.TransitionCoordinationProposal(ctx, proposal.ID, TransitionCoordinationProposalInput{
 			ExpectedStatus: proposal.Status, Status: status,
 			ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
+			ClaimToken:            incident.ClaimToken,
+			Current:               claimTime.Add(time.Second),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	claimTime := time.Now().UTC()
-	claimed, won, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
-		ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
-		TTL:                   time.Minute,
-		Current:               claimTime,
-	})
-	if err != nil || !won {
-		t.Fatalf("claim incident: won=%v incident=%+v err=%v", won, claimed, err)
-	}
-	incident = claimed
 	switch authorization {
 	case CoordinationApplyValidatedAuto:
 	case CoordinationApplyApproved:
-		for _, status := range []model.CoordinationProposalStatus{
-			model.CoordinationProposalAwaitingApproval,
-			model.CoordinationProposalApproved,
-		} {
-			proposal, err = opened.TransitionCoordinationProposal(ctx, proposal.ID, TransitionCoordinationProposalInput{
-				ExpectedStatus: proposal.Status, Status: status,
-				ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		incident, err = opened.TransitionCoordinationIncident(ctx, incident.ID, TransitionCoordinationIncidentInput{
-			ExpectedStatus:        model.CoordinationIncidentCoordinating,
-			Status:                model.CoordinationIncidentAwaitingApproval,
+		approval, err := opened.RequestCoordinationApproval(ctx, proposal.ID, RequestCoordinationApprovalInput{
 			ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
 			ClaimToken:            incident.ClaimToken,
 			Current:               claimTime.Add(time.Second),
@@ -109,6 +99,14 @@ func applicableProposalForIncident(
 		if err != nil {
 			t.Fatal(err)
 		}
+		approval, err = opened.ApproveCoordinationProposal(ctx, proposal.ID, ApproveCoordinationProposalInput{
+			ExpectedUpdatedAt:     approval.Proposal.UpdatedAt,
+			ExpectedGraphRevision: revisionPointer(incident.GraphRevision),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal, incident = approval.Proposal, approval.Incident
 	default:
 		t.Fatalf("unsupported test authorization %s", authorization)
 	}

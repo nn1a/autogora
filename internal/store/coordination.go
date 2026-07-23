@@ -94,6 +94,8 @@ type CreateCoordinationProposalInput struct {
 	CoordinatorProvider   string
 	Status                model.CoordinationProposalStatus
 	ExpectedGraphRevision *int64
+	ClaimToken            string
+	Current               time.Time
 	Summary               string
 	Rationale             string
 	Actions               json.RawMessage
@@ -109,6 +111,8 @@ type CoordinationProposalFilter struct {
 type UpdateCoordinationProposalInput struct {
 	ExpectedStatus        model.CoordinationProposalStatus
 	ExpectedGraphRevision *int64
+	ClaimToken            string
+	Current               time.Time
 	Summary               *string
 	Rationale             *string
 	Actions               *json.RawMessage
@@ -119,6 +123,8 @@ type TransitionCoordinationProposalInput struct {
 	ExpectedStatus        model.CoordinationProposalStatus
 	Status                model.CoordinationProposalStatus
 	ExpectedGraphRevision *int64
+	ClaimToken            string
+	Current               time.Time
 	ValidationErrors      *json.RawMessage
 }
 
@@ -251,6 +257,38 @@ func coordinationIncidentHasLiveClaim(incident model.CoordinationIncident, curre
 	}
 	expired, err := coordinationIncidentClaimExpired(incident, current)
 	return !expired, err
+}
+
+// requireLiveCoordinationClaim binds coordinator-owned proposal writes to the
+// exact incident lease that authorized them. Human approval writes happen only
+// after the incident leaves coordinating, so they do not need the retired
+// coordinator token.
+func requireLiveCoordinationClaim(
+	incident model.CoordinationIncident,
+	claimToken string,
+	current time.Time,
+) error {
+	if incident.Status != model.CoordinationIncidentCoordinating {
+		return nil
+	}
+	if incident.ClaimToken == "" || incident.ClaimExpiresAt == nil {
+		return fmt.Errorf("coordinating incident %s has no claim lease", incident.ID)
+	}
+	if claimToken != incident.ClaimToken {
+		return fmt.Errorf("%w: %s", ErrCoordinationClaimNotOwner, incident.ID)
+	}
+	claimTime, _, err := normalizeCoordinationClaimTime(current)
+	if err != nil {
+		return err
+	}
+	expired, err := coordinationIncidentClaimExpired(incident, claimTime)
+	if err != nil {
+		return err
+	}
+	if expired {
+		return fmt.Errorf("%w: %s", ErrCoordinationClaimExpired, incident.ID)
+	}
+	return nil
 }
 
 func (s *Store) CreateCoordinationIncident(ctx context.Context, input CreateCoordinationIncidentInput) (model.CoordinationIncident, bool, error) {
@@ -829,8 +867,15 @@ func (s *Store) CreateCoordinationProposal(ctx context.Context, input CreateCoor
 		if err != nil {
 			return err
 		}
-		if !activeIncidentStatus(incident.Status) {
-			return fmt.Errorf("cannot propose coordination for terminal incident %s in status %s", incident.ID, incident.Status)
+		if incident.Status != model.CoordinationIncidentCoordinating {
+			return &CoordinationStateConflictError{
+				Kind: "incident", ID: incident.ID,
+				Expected: string(model.CoordinationIncidentCoordinating),
+				Actual:   string(incident.Status),
+			}
+		}
+		if err := requireLiveCoordinationClaim(incident, input.ClaimToken, input.Current); err != nil {
+			return err
 		}
 		if incident.GraphRevision != *input.ExpectedGraphRevision {
 			return &GraphRevisionConflictError{
@@ -928,6 +973,9 @@ func (s *Store) UpdateCoordinationProposal(ctx context.Context, id string, input
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		current, incident, err := proposalWithIncident(ctx, tx, id)
 		if err != nil {
+			return err
+		}
+		if err := requireLiveCoordinationClaim(incident, input.ClaimToken, input.Current); err != nil {
 			return err
 		}
 		if input.ExpectedStatus != "" && current.Status != input.ExpectedStatus {
@@ -1043,6 +1091,29 @@ func emptyJSONArray(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &values) == nil && len(values) == 0
 }
 
+func validCoordinatorRuntimeProposalTransition(
+	from, to model.CoordinationProposalStatus,
+) bool {
+	switch from {
+	case model.CoordinationProposalDraft,
+		model.CoordinationProposalValidating,
+		model.CoordinationProposalValidated:
+		switch to {
+		case model.CoordinationProposalDraft,
+			model.CoordinationProposalValidating,
+			model.CoordinationProposalValidated,
+			model.CoordinationProposalFailed:
+			return from == to || validProposalTransition(from, to)
+		default:
+			return false
+		}
+	case model.CoordinationProposalFailed:
+		return to == model.CoordinationProposalFailed
+	default:
+		return false
+	}
+}
+
 func (s *Store) TransitionCoordinationProposal(ctx context.Context, id string, input TransitionCoordinationProposalInput) (model.CoordinationProposal, error) {
 	if !model.ValidCoordinationProposalStatus(input.Status) {
 		return model.CoordinationProposal{}, fmt.Errorf("invalid coordination proposal status: %s", input.Status)
@@ -1053,17 +1124,29 @@ func (s *Store) TransitionCoordinationProposal(ctx context.Context, id string, i
 		if err != nil {
 			return err
 		}
+		if incident.Status != model.CoordinationIncidentCoordinating {
+			return fmt.Errorf(
+				"coordination proposal transition requires incident %s to be coordinating; use an atomic approval, application, or supersede operation from %s",
+				incident.ID, incident.Status,
+			)
+		}
+		if err := requireLiveCoordinationClaim(incident, input.ClaimToken, input.Current); err != nil {
+			return err
+		}
 		if input.ExpectedStatus != "" && current.Status != input.ExpectedStatus {
 			return &CoordinationStateConflictError{
 				Kind: "proposal", ID: id, Expected: string(input.ExpectedStatus), Actual: string(current.Status),
 			}
 		}
+		if !validCoordinatorRuntimeProposalTransition(current.Status, input.Status) {
+			return fmt.Errorf(
+				"coordination proposal transition %s -> %s requires an atomic approval, application, or supersede operation",
+				current.Status, input.Status,
+			)
+		}
 		if current.Status == input.Status {
 			result = current
 			return nil
-		}
-		if !validProposalTransition(current.Status, input.Status) {
-			return fmt.Errorf("invalid coordination proposal transition: %s -> %s", current.Status, input.Status)
 		}
 		validationErrors := current.ValidationErrors
 		if input.ValidationErrors != nil {

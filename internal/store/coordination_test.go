@@ -83,51 +83,6 @@ func TestCoordinationIncidentDedupRefreshAndProposalLifecycle(t *testing.T) {
 		t.Fatalf("active incident dedupe list = %+v, %v", incidents, err)
 	}
 
-	proposal, created, err := opened.CreateCoordinationProposal(ctx, CreateCoordinationProposalInput{
-		IncidentID: refreshed.ID, CoordinatorAgent: "codex-coordinator",
-		CoordinatorModel: "gpt-5.4", CoordinatorProvider: "openai",
-		ExpectedGraphRevision: revisionPointer(2),
-		Summary:               "Add a conflict-resolution task",
-		Rationale:             "A dedicated integration step can preserve both changes.",
-		Actions:               []byte(`[{"type":"create_task","title":"Resolve integration conflict"}]`),
-	})
-	if err != nil || !created {
-		t.Fatalf("create proposal: created=%v value=%+v err=%v", created, proposal, err)
-	}
-	newSummary := "Add and gate a conflict-resolution task"
-	newActions := jsonRaw(`[{"type":"create_task","workflowRole":"worker"},{"type":"link"}]`)
-	proposal, err = opened.UpdateCoordinationProposal(ctx, proposal.ID, UpdateCoordinationProposalInput{
-		ExpectedStatus: model.CoordinationProposalDraft, ExpectedGraphRevision: revisionPointer(2),
-		Summary: &newSummary, Actions: &newActions,
-	})
-	if err != nil || proposal.Summary != newSummary {
-		t.Fatalf("update proposal: %+v %v", proposal, err)
-	}
-
-	incidentTransitions := []model.CoordinationIncidentStatus{
-		model.CoordinationIncidentAwaitingApproval,
-		model.CoordinationIncidentApplying,
-		model.CoordinationIncidentResolved,
-	}
-	proposalTransitions := []model.CoordinationProposalStatus{
-		model.CoordinationProposalValidating,
-		model.CoordinationProposalValidated,
-		model.CoordinationProposalAwaitingApproval,
-		model.CoordinationProposalApproved,
-		model.CoordinationProposalApplying,
-		model.CoordinationProposalApplied,
-	}
-	for _, status := range proposalTransitions {
-		proposal, err = opened.TransitionCoordinationProposal(ctx, proposal.ID, TransitionCoordinationProposalInput{
-			ExpectedStatus: proposal.Status, Status: status, ExpectedGraphRevision: revisionPointer(2),
-		})
-		if err != nil {
-			t.Fatalf("transition proposal to %s: %v", status, err)
-		}
-	}
-	if proposal.AppliedAt == nil {
-		t.Fatal("applied proposal has no appliedAt")
-	}
 	claimTime := time.Now().UTC()
 	currentIncident, claimed, err := opened.ClaimCoordinationIncident(ctx, refreshed.ID, ClaimCoordinationIncidentInput{
 		ExpectedGraphRevision: revisionPointer(2),
@@ -137,14 +92,72 @@ func TestCoordinationIncidentDedupRefreshAndProposalLifecycle(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("claim incident: claimed=%v value=%+v err=%v", claimed, currentIncident, err)
 	}
-	for _, status := range incidentTransitions {
-		currentIncident, err = opened.TransitionCoordinationIncident(ctx, currentIncident.ID, TransitionCoordinationIncidentInput{
-			ExpectedStatus: currentIncident.Status, Status: status, ExpectedGraphRevision: revisionPointer(2),
+	proposal, created, err := opened.CreateCoordinationProposal(ctx, CreateCoordinationProposalInput{
+		IncidentID: currentIncident.ID, CoordinatorAgent: "codex-coordinator",
+		CoordinatorModel: "gpt-5.4", CoordinatorProvider: "openai",
+		ExpectedGraphRevision: revisionPointer(2),
+		ClaimToken:            currentIncident.ClaimToken,
+		Current:               claimTime.Add(time.Second),
+		Summary:               "Add a conflict-resolution task",
+		Rationale:             "A dedicated integration step can preserve both changes.",
+		Actions:               []byte(`[]`),
+	})
+	if err != nil || !created {
+		t.Fatalf("create proposal: created=%v value=%+v err=%v", created, proposal, err)
+	}
+	newSummary := "Add and gate a conflict-resolution task"
+	newActions := jsonRaw(`[]`)
+	proposal, err = opened.UpdateCoordinationProposal(ctx, proposal.ID, UpdateCoordinationProposalInput{
+		ExpectedStatus: model.CoordinationProposalDraft, ExpectedGraphRevision: revisionPointer(2),
+		ClaimToken: currentIncident.ClaimToken, Current: claimTime.Add(time.Second),
+		Summary: &newSummary, Actions: &newActions,
+	})
+	if err != nil || proposal.Summary != newSummary {
+		t.Fatalf("update proposal: %+v %v", proposal, err)
+	}
+
+	proposalTransitions := []model.CoordinationProposalStatus{
+		model.CoordinationProposalValidating,
+		model.CoordinationProposalValidated,
+	}
+	for _, status := range proposalTransitions {
+		proposal, err = opened.TransitionCoordinationProposal(ctx, proposal.ID, TransitionCoordinationProposalInput{
+			ExpectedStatus: proposal.Status, Status: status, ExpectedGraphRevision: revisionPointer(2),
 			ClaimToken: currentIncident.ClaimToken, Current: claimTime.Add(time.Second),
 		})
 		if err != nil {
-			t.Fatalf("transition incident to %s: %v", status, err)
+			t.Fatalf("transition proposal to %s: %v", status, err)
 		}
+	}
+	approval, err := opened.RequestCoordinationApproval(ctx, proposal.ID, RequestCoordinationApprovalInput{
+		ExpectedGraphRevision: revisionPointer(2),
+		ClaimToken:            currentIncident.ClaimToken,
+		Current:               claimTime.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("request proposal approval: %v", err)
+	}
+	approval, err = opened.ApproveCoordinationProposal(ctx, proposal.ID, ApproveCoordinationProposalInput{
+		ExpectedUpdatedAt:     approval.Proposal.UpdatedAt,
+		ExpectedGraphRevision: revisionPointer(2),
+	})
+	if err != nil {
+		t.Fatalf("approve proposal: %v", err)
+	}
+	applied, err := opened.ApplyCoordinationProposal(ctx, proposal.ID, ApplyCoordinationProposalInput{
+		Authorization:         CoordinationApplyApproved,
+		ExpectedGraphRevision: revisionPointer(2),
+		Current:               claimTime.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("apply proposal: %v", err)
+	}
+	proposal, currentIncident = applied.Proposal, applied.Incident
+	if proposal.AppliedAt == nil {
+		t.Fatal("applied proposal has no appliedAt")
+	}
+	if currentIncident.Status != model.CoordinationIncidentResolved {
+		t.Fatalf("applied incident = %+v", currentIncident)
 	}
 	proposals, err := opened.ListCoordinationProposals(ctx, CoordinationProposalFilter{
 		IncidentID: incident.ID, Status: model.CoordinationProposalApplied,
@@ -532,8 +545,18 @@ func TestCoordinationProposalRejectsStaleGraphRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimTime := time.Date(2031, time.January, 2, 3, 4, 5, 0, time.UTC)
+	incident, claimed, err := opened.ClaimCoordinationIncident(ctx, incident.ID, ClaimCoordinationIncidentInput{
+		ExpectedGraphRevision: revisionPointer(0),
+		TTL:                   time.Minute,
+		Current:               claimTime,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("claim incident: claimed=%v incident=%+v err=%v", claimed, incident, err)
+	}
 	proposal, _, err := opened.CreateCoordinationProposal(ctx, CreateCoordinationProposalInput{
 		IncidentID: incident.ID, CoordinatorAgent: "claude", ExpectedGraphRevision: revisionPointer(0),
+		ClaimToken: incident.ClaimToken, Current: claimTime.Add(time.Second),
 		Summary: "Create a recovery task", Rationale: "The graph needs a new runnable entrypoint.",
 		Actions: []byte(`[{"type":"create_task"}]`),
 	})
@@ -548,6 +571,7 @@ func TestCoordinationProposalRejectsStaleGraphRevision(t *testing.T) {
 	reason := "Stale update must fail"
 	_, err = opened.UpdateCoordinationProposal(ctx, proposal.ID, UpdateCoordinationProposalInput{
 		ExpectedStatus: model.CoordinationProposalDraft, ExpectedGraphRevision: revisionPointer(0), Rationale: &reason,
+		ClaimToken: incident.ClaimToken, Current: claimTime.Add(time.Second),
 	})
 	if !errors.Is(err, ErrGraphRevisionConflict) {
 		t.Fatalf("stale proposal update error = %v", err)
@@ -556,15 +580,20 @@ func TestCoordinationProposalRejectsStaleGraphRevision(t *testing.T) {
 		ExpectedStatus:        model.CoordinationProposalDraft,
 		Status:                model.CoordinationProposalValidating,
 		ExpectedGraphRevision: revisionPointer(0),
+		ClaimToken:            incident.ClaimToken,
+		Current:               claimTime.Add(time.Second),
 	})
 	if !errors.Is(err, ErrGraphRevisionConflict) {
 		t.Fatalf("stale proposal transition error = %v", err)
 	}
-	superseded, err := opened.TransitionCoordinationProposal(ctx, proposal.ID, TransitionCoordinationProposalInput{
-		ExpectedStatus: model.CoordinationProposalDraft, Status: model.CoordinationProposalSuperseded,
+	supersededPair, err := opened.SupersedeCoordinationProposal(ctx, proposal.ID, SupersedeCoordinationProposalInput{
+		ExpectedUpdatedAt: proposal.UpdatedAt,
+		ClaimToken:        incident.ClaimToken,
+		Current:           claimTime.Add(time.Second),
 	})
-	if err != nil || superseded.Status != model.CoordinationProposalSuperseded {
-		t.Fatalf("supersede stale proposal: %+v %v", superseded, err)
+	if err != nil || supersededPair.Proposal.Status != model.CoordinationProposalSuperseded ||
+		supersededPair.Incident.Status != model.CoordinationIncidentOpen {
+		t.Fatalf("supersede stale proposal: %+v %v", supersededPair, err)
 	}
 	_, _, err = opened.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
 		Trigger: model.CoordinationTriggerAgentExhausted, Summary: "No agent is available",

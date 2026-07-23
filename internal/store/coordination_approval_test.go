@@ -63,9 +63,11 @@ func seedValidatedCoordinationProposal(
 		CoordinatorModel:      "model",
 		CoordinatorProvider:   "provider",
 		ExpectedGraphRevision: approvalRevision(0),
+		ClaimToken:            incident.ClaimToken,
+		Current:               claimAt.Add(time.Second),
 		Summary:               "Route the task to another worker",
 		Rationale:             "The current worker cannot make progress.",
-		Actions:               []byte(`[{"type":"set_route","taskId":"task-1","agent":"worker-2"}]`),
+		Actions:               []byte(`[]`),
 	})
 	if err != nil || !created {
 		t.Fatalf("create proposal: created=%v value=%+v err=%v", created, proposal, err)
@@ -78,6 +80,8 @@ func seedValidatedCoordinationProposal(
 			ExpectedStatus:        proposal.Status,
 			Status:                status,
 			ExpectedGraphRevision: approvalRevision(0),
+			ClaimToken:            incident.ClaimToken,
+			Current:               claimAt.Add(time.Second),
 		})
 		if err != nil {
 			t.Fatalf("transition proposal to %s: %v", status, err)
@@ -193,16 +197,12 @@ func TestCoordinationApprovalRequestRejectsWrongClaimAndMixedState(t *testing.T)
 		}
 		defer opened.Close()
 		fixture := seedValidatedCoordinationProposal(t, opened)
-		proposal, err := opened.TransitionCoordinationProposal(ctx, fixture.proposal.ID,
-			TransitionCoordinationProposalInput{
-				ExpectedStatus:        model.CoordinationProposalValidated,
-				Status:                model.CoordinationProposalAwaitingApproval,
-				ExpectedGraphRevision: approvalRevision(0),
-			})
-		if err != nil {
+		if _, err := opened.db.ExecContext(ctx, `
+			UPDATE coordination_proposals SET status = 'awaiting_approval' WHERE id = ?
+		`, fixture.proposal.ID); err != nil {
 			t.Fatal(err)
 		}
-		_, err = opened.RequestCoordinationApproval(ctx, proposal.ID,
+		_, err = opened.RequestCoordinationApproval(ctx, fixture.proposal.ID,
 			RequestCoordinationApprovalInput{
 				ExpectedGraphRevision: approvalRevision(0),
 				ClaimToken:            fixture.incident.ClaimToken,
