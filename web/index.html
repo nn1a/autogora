@@ -134,10 +134,23 @@
     </form>
   </dialog>
 
-  <dialog id="activity-dialog" class="dialog-wide">
+  <dialog id="activity-dialog" class="dialog-wide dialog-automation">
     <form method="dialog" class="dialog-form">
-      <header><div><h2>Automation & activity</h2><small>Connection, orchestration, active work, results, and recovery signals for this board.</small></div><button type="button" data-close-dialog class="icon-button">×</button></header>
-      <div id="activity-content" class="activity-content" aria-live="polite"></div>
+      <header class="automation-header">
+        <div class="automation-heading"><h2>Automation Center</h2><small id="automation-center-help">See who handles routine work, exceptional recovery, and publication for this board.</small></div>
+        <div class="automation-header-actions">
+          <button id="automation-help-language" type="button" class="ghost compact" aria-label="Switch help text to Korean">Help · EN</button>
+          <button type="button" data-close-dialog class="icon-button" aria-label="Close Automation Center">×</button>
+        </div>
+      </header>
+      <nav id="automation-tabs" class="automation-tabs" role="tablist" aria-label="Automation Center sections">
+        <button id="automation-tab-overview" type="button" role="tab" aria-controls="activity-content" aria-selected="true" tabindex="0" data-activity-tab="overview">Overview</button>
+        <button id="automation-tab-runs" type="button" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1" data-activity-tab="runs">Runs</button>
+        <button id="automation-tab-recovery" type="button" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1" data-activity-tab="recovery">Recovery</button>
+        <button id="automation-tab-publishing" type="button" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1" data-activity-tab="publishing">Publishing</button>
+        <button id="automation-tab-events" type="button" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1" data-activity-tab="events">Events</button>
+      </nav>
+      <div id="activity-content" class="activity-content" role="tabpanel" aria-labelledby="automation-tab-overview" aria-live="polite" tabindex="0"></div>
       <footer><button id="activity-refresh" type="button">Refresh</button><button type="button" data-close-dialog class="primary">Close</button></footer>
     </form>
   </dialog>

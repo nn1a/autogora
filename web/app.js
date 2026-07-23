@@ -10,10 +10,14 @@ const WORKFLOW_STAGES = [
 ];
 const BOARD_STAGE_FOCUSES = ["all", ...WORKFLOW_STAGES.map((stage) => stage.id)];
 const BOARD_VIEW_MODES = ["overview", "compact", "flow"];
+const AUTOMATION_TABS = ["overview", "runs", "recovery", "publishing", "events"];
+const AUTOMATION_HELP_LANGUAGES = ["en", "ko"];
 
 const storedTheme = localStorage.getItem("autogora.theme");
 const storedStageFocus = localStorage.getItem("autogora.boardStageFocus");
 const storedBoardView = localStorage.getItem("autogora.boardView");
+const storedAutomationTab = localStorage.getItem("autogora.automationCenterTab");
+const storedAutomationHelpLanguage = localStorage.getItem("autogora.automationHelpLanguage");
 let activeTheme = ["light", "dark"].includes(storedTheme)
   ? storedTheme
   : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -25,6 +29,11 @@ const state = {
   agentConfig: null, agentConfigExists: false, agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
   stageFocus: BOARD_STAGE_FOCUSES.includes(storedStageFocus) ? storedStageFocus : "all",
   boardView: BOARD_VIEW_MODES.includes(storedBoardView) ? storedBoardView : "overview",
+  automationTab: AUTOMATION_TABS.includes(storedAutomationTab) ? storedAutomationTab : "overview",
+  automationHelpLanguage: AUTOMATION_HELP_LANGUAGES.includes(storedAutomationHelpLanguage)
+    ? storedAutomationHelpLanguage
+    : (navigator.language.toLowerCase().startsWith("ko") ? "ko" : "en"),
+  automationData: null,
   drawerDirty: false, drawerVersion: null, drawerRequest: 0,
 };
 
@@ -205,9 +214,13 @@ function futureScheduleISO(value) {
   return parsed.toISOString();
 }
 
-function boardPath(path) {
+function boardPathFor(board, path) {
   const separator = path.includes("?") ? "&" : "?";
-  return `${path}${separator}board=${encodeURIComponent(state.board)}`;
+  return `${path}${separator}board=${encodeURIComponent(board)}`;
+}
+
+function boardPath(path) {
+  return boardPathFor(state.board, path);
 }
 
 async function api(path, options = {}) {
@@ -226,6 +239,10 @@ async function api(path, options = {}) {
 
 let toastTimer;
 let drawerReturnFocus = null;
+let automationLoadGeneration = 0;
+let automationLoadController = null;
+const automationRecoveryCache = new Map();
+let operationalStatusGeneration = 0;
 function toast(message, error = false) {
   const element = $("#toast");
   element.textContent = message;
@@ -1074,20 +1091,29 @@ async function submitGitHubImport(event) {
 function renderAutomationChip() {
   const chip = $("#automation");
   const supervisor = state.supervisor || {};
+  const presentation = supervisorPresentation(supervisor);
   const workers = availableWorkerAgents();
   chip.classList.remove("running", "stopped", "failed");
   if (!state.agentConfigExists || !workers.length) {
     chip.textContent = "Setup incomplete";
     chip.classList.add("stopped");
     chip.title = "Configure at least one enabled worker agent";
-  } else if (supervisor.running) {
+  } else if (presentation.status === "running") {
     chip.textContent = `Automation running · ${supervisor.allowWrites ? "write" : "read-only"}`;
     chip.classList.add("running");
-    chip.title = `${workers.length} configured worker agent(s); click for activity`;
-  } else if (supervisor.lastError) {
-    chip.textContent = supervisor.desired && supervisor.nextAttemptAt ? "Automation restarting" : "Automation failed";
+    chip.title = `${workers.length} configured worker agent(s) · ${presentation.detail}; click for activity`;
+  } else if (presentation.status === "restarting") {
+    chip.textContent = `Automation ${presentation.label.toLowerCase()}`;
     chip.classList.add("failed");
-    chip.title = `${supervisor.lastError}${supervisor.nextAttemptAt ? `; next attempt ${new Date(supervisor.nextAttemptAt).toLocaleString()}` : ""}`;
+    chip.title = `${supervisor.lastError || "Supervisor exited"} · ${presentation.detail}`;
+  } else if (presentation.status === "starting") {
+    chip.textContent = "Automation starting";
+    chip.classList.add("stopped");
+    chip.title = presentation.detail;
+  } else if (presentation.status === "failed") {
+    chip.textContent = "Automation failed";
+    chip.classList.add("failed");
+    chip.title = supervisor.lastError;
   } else {
     chip.textContent = "Automation stopped";
     chip.classList.add("stopped");
@@ -1096,9 +1122,12 @@ function renderAutomationChip() {
 }
 
 async function refreshOperationalStatus() {
+  const board = state.board;
+  const generation = ++operationalStatusGeneration;
   const requests = await Promise.allSettled([
-    api("/api/supervisor"), api(boardPath("/api/agents/effective")), api(boardPath("/api/operations")),
+    api("/api/supervisor"), api(boardPathFor(board, "/api/agents/effective")), api(boardPathFor(board, "/api/operations")),
   ]);
+  if (state.board !== board || operationalStatusGeneration !== generation) return;
   if (requests[0].status === "fulfilled") state.supervisor = requests[0].value;
   if (requests[1].status === "fulfilled") state.effectiveAgents = requests[1].value.profiles || [];
   if (requests[2].status === "fulfilled") state.operations = requests[2].value || [];
@@ -1106,42 +1135,871 @@ async function refreshOperationalStatus() {
   if ($("#activity-dialog").open) await loadActivity();
 }
 
-function payloadText(payload) {
-  if (payload == null) return "";
+const AUTOMATION_HELP = {
+  en: {
+    tabs: {
+      overview: "See who handles routine work, exceptional recovery, and publication for this board.",
+      runs: "Inspect active workers, agent readiness, dispatch operations, and board checks.",
+      recovery: "Review exceptional graph recovery separately from normal task planning.",
+      publishing: "Track the handoff from reviewed changes to a branch, pull request, or manual release.",
+      events: "Start with a readable event summary and expand raw details only when debugging.",
+    },
+    roles: {
+      Supervisor: "Deterministic host service that keeps board automation running and enforces the global write policy. It does not select a coding-agent model.",
+      Dispatcher: "Deterministic host service that assigns Ready tasks to workers and tracks execution. It does not select a coding-agent model for itself.",
+      Planner: "Coding-agent role for the normal Triage path: clarify, decompose, and prepare runnable work.",
+      Coordinator: "Coding-agent role for exceptional recovery when the task graph stalls, conflicts, or exhausts normal retries.",
+      Publisher: "Deterministic host service that moves reviewed finalizer changes to the configured target. It does not select a coding-agent model.",
+    },
+    boundary: "Supervisor, Dispatcher, and Publisher are deterministic host services with no coding-agent model. Planner and Coordinator invoke the configured coding-agent profile, runtime, model, and provider.",
+    recovery: "Planner handles normal Triage work. Coordinator only proposes recovery when the graph needs exceptional intervention.",
+    recoveryAssist: "Assist mode waits for a person to approve, reject, or request a new analysis before changing the graph.",
+    publishing: "Publication actions use the version currently shown. If another process changes it first, refresh and review the new state.",
+  },
+  ko: {
+    tabs: {
+      overview: "이 보드에서 일상 작업, 예외 복구, 배포를 누가 맡는지 확인합니다.",
+      runs: "실행 중인 작업자, 에이전트 준비 상태, 디스패치 작업, 보드 점검 결과를 확인합니다.",
+      recovery: "일반 작업 계획과 분리해 예외적인 작업 그래프 복구를 검토합니다.",
+      publishing: "검토를 마친 변경 사항이 브랜치, 풀 리퀘스트, 수동 배포로 전달되는 과정을 확인합니다.",
+      events: "읽기 쉬운 요약을 먼저 보고, 디버깅할 때만 원본 세부 정보를 펼칩니다.",
+    },
+    roles: {
+      Supervisor: "보드 자동화를 유지하고 전역 쓰기 정책을 적용하는 결정론적 호스트 서비스입니다. 코딩 에이전트 모델을 선택하지 않습니다.",
+      Dispatcher: "Ready 작업을 작업자에게 배정하고 실행을 추적하는 결정론적 호스트 서비스입니다. 자체 코딩 에이전트 모델을 선택하지 않습니다.",
+      Planner: "일반 Triage 흐름에서 요구 사항을 명확히 하고 작업을 나눠 실행할 수 있게 준비하는 코딩 에이전트 역할입니다.",
+      Coordinator: "작업 그래프가 멈추거나 충돌하고 일반 재시도를 소진했을 때 예외 복구를 담당하는 코딩 에이전트 역할입니다.",
+      Publisher: "검토를 마친 finalizer 변경 사항을 설정한 대상으로 전달하는 결정론적 호스트 서비스입니다. 코딩 에이전트 모델을 선택하지 않습니다.",
+    },
+    boundary: "Supervisor, Dispatcher, Publisher는 코딩 에이전트 모델 없이 동작하는 결정론적 호스트 서비스입니다. Planner와 Coordinator는 설정한 코딩 에이전트의 프로필, 런타임, 모델, 프로바이더를 사용합니다.",
+    recovery: "Planner는 일반 Triage 작업을 처리합니다. Coordinator는 그래프에 예외적인 개입이 필요할 때만 복구안을 제시합니다.",
+    recoveryAssist: "Assist 모드에서는 사람이 승인, 거절, 재분석을 선택한 뒤에만 그래프를 변경합니다.",
+    publishing: "배포 작업은 현재 화면에 표시된 버전을 기준으로 처리합니다. 다른 프로세스가 먼저 변경했다면 새로 고친 뒤 변경된 상태를 다시 확인하세요.",
+  },
+};
+
+const COORDINATION_ACTION_LABELS = {
+  set_route: "Set route",
+  update_priority: "Update priority",
+  unblock_task: "Unblock task",
+  move_to_triage: "Move to Triage",
+  add_dependency: "Add dependency",
+  remove_dependency: "Remove dependency",
+  create_task: "Create task",
+};
+
+function automationHelp(key) {
+  return AUTOMATION_HELP[state.automationHelpLanguage]?.[key] || AUTOMATION_HELP.en[key] || "";
+}
+
+function structuredValue(value) {
+  if (typeof value !== "string") return value;
+  try { return JSON.parse(value); } catch (_) { return value; }
+}
+
+function rawPayloadText(payload) {
+  if (payload == null || payload === "") return "";
   if (typeof payload === "string") return payload;
   try { return JSON.stringify(payload, null, 2); } catch (_) { return String(payload); }
 }
 
-async function loadActivity() {
-  const [inspection, supervisor, effective, operations] = await Promise.all([
-    api(boardPath("/api/inspect")), api("/api/supervisor"), api(boardPath("/api/agents/effective")), api(boardPath("/api/operations")),
-  ]);
-  state.supervisor = supervisor; state.effectiveAgents = effective.profiles || []; state.operations = operations || [];
-  renderAutomationChip();
-  const diagnostics = inspection.diagnostics || {};
-  const active = diagnostics.activeRuns || [];
+function humanizeIdentifier(value = "") {
+  return String(value).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function readableValue(value) {
+  value = structuredValue(value);
+  if (value == null || value === "") return "—";
+  if (Array.isArray(value)) return value.map(readableValue).join(", ");
+  if (typeof value === "object") {
+    return Object.entries(value).slice(0, 6)
+      .map(([key, item]) => `${humanizeIdentifier(key)}: ${readableValue(item)}`).join(" · ");
+  }
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value);
+}
+
+function readableFacts(value) {
+  value = structuredValue(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const facts = Object.entries(value).filter(([, item]) => item != null && item !== "").slice(0, 12);
+  if (!facts.length) return "";
+  return `<dl class="automation-facts">${facts.map(([key, item]) =>
+    `<div><dt>${escapeHtml(humanizeIdentifier(key))}</dt><dd>${escapeHtml(readableValue(item))}</dd></div>`).join("")}</dl>`;
+}
+
+function automationStatusClass(status = "") {
+  if (["running", "healthy", "resolved", "applied", "published", "no_change"].includes(status)) return "is-good";
+  if (["failed", "retry_required", "critical", "error", "unhealthy", "missing"].includes(status)) return "is-danger";
+  if (["restarting", "manual_completion", "awaiting_approval", "blocked", "warning", "rate_limited", "auth_required"].includes(status)) return "is-attention";
+  return "";
+}
+
+function automationStatus(status = "unknown") {
+  return `<span class="automation-status ${automationStatusClass(status)}">${escapeHtml(humanizeIdentifier(status))}</span>`;
+}
+
+function taskTitle(taskID) {
+  return state.tasks.find((task) => task.id === taskID)?.title || taskID || "Unknown task";
+}
+
+function activityTaskButton(taskID, label) {
+  if (!taskID) return "";
+  return `<button type="button" class="activity-task-link" data-automation-focus="task:${escapeHtml(taskID)}" data-activity-task="${escapeHtml(taskID)}">${escapeHtml(label || taskTitle(taskID))}</button>`;
+}
+
+function supervisorPresentation(supervisor = {}) {
+  const restartCount = Number(supervisor.restartCount || 0);
+  if (supervisor.running) {
+    return { status: "running", label: "Running", detail: restartCount ? `${restartCount} restart${restartCount === 1 ? "" : "s"} since start` : "Stable" };
+  }
+  if (supervisor.desired && supervisor.nextAttemptAt) {
+    const target = new Date(supervisor.nextAttemptAt);
+    const validTarget = !Number.isNaN(target.getTime());
+    const seconds = validTarget ? Math.max(0, Math.ceil((target.getTime() - Date.now()) / 1000)) : null;
+    const remaining = seconds == null ? "scheduled" : seconds < 60 ? `${seconds}s` : `${Math.ceil(seconds / 60)}m`;
+    return {
+      status: "restarting",
+      label: `Restarting · attempt ${restartCount + 1}`,
+      detail: `Backoff ${remaining} · next ${validTarget ? target.toLocaleString() : supervisor.nextAttemptAt}`,
+    };
+  }
+  if (supervisor.desired) return { status: "starting", label: "Starting", detail: `Attempt ${restartCount + 1}` };
+  if (supervisor.lastError) return { status: "failed", label: "Failed", detail: supervisor.lastError };
+  return { status: "stopped", label: "Stopped", detail: "Not requested" };
+}
+
+function configuredAgent(config, ids, role) {
+  const seen = new Set();
+  for (const root of ids || []) {
+    const queue = [root];
+    while (queue.length) {
+      const id = queue.shift();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const agent = (config.agents || []).find((item) => item.id === id);
+      if (!agent) continue;
+      queue.push(...(agent.fallbacks || []));
+      if (agent.enabled && (agent.roles || []).includes(role)) {
+        return { ...agent, fallbackFrom: id === root ? "" : root };
+      }
+    }
+  }
+  return null;
+}
+
+function plannerRoute(data) {
+  const metadata = data.metadata || {};
+  const orchestration = metadata.orchestration || {};
+  const config = data.effective.config || {};
+  const boardModel = String(orchestration.plannerModel || "").trim();
+  const boardProvider = String(orchestration.plannerProvider || "").trim();
+  if (!boardModel && !boardProvider) {
+    const global = configuredAgent(config, config.defaults?.plannerAgents, "planner");
+    if (global) return {
+      profile: global.id, runtime: global.runtime, model: global.model, provider: global.provider,
+      source: global.fallbackFrom ? `Global planner fallback for ${global.fallbackFrom}` : "Global planner default",
+      available: true,
+    };
+  }
+  return {
+    profile: "board-planner",
+    runtime: orchestration.plannerRuntime || "codex",
+    model: boardModel,
+    provider: boardProvider,
+    source: boardModel || boardProvider ? "Board planner override" : "Board planner fallback",
+    available: true,
+  };
+}
+
+function coordinatorRoute(data) {
+  const config = data.effective.config || {};
+  const override = String(data.coordination.policy?.profile || "").trim();
+  const ids = override ? [override] : (config.defaults?.coordinatorAgents || []);
+  const selected = configuredAgent(config, ids, "coordinator");
+  if (selected) {
+    return {
+      profile: selected.id, runtime: selected.runtime, model: selected.model,
+      provider: selected.provider,
+      source: selected.fallbackFrom
+        ? `${override ? "Board coordinator" : "Global coordinator"} fallback for ${selected.fallbackFrom}`
+        : override ? "Board coordinator override" : "Global coordinator default",
+      available: true,
+    };
+  }
+  return {
+    profile: override || ids[0] || "Not configured", runtime: "", model: "", provider: "",
+    source: override ? "Board coordinator override" : "Global coordinator default", available: false,
+  };
+}
+
+function codingAgentFacts(route, policyLabel, policyValue, signalLabel, signalValue) {
+  return [
+    [policyLabel, policyValue],
+    ["Profile", `${route.profile} · ${route.source}`],
+    ["Runtime", route.runtime || "Unavailable"],
+    ["Model", route.model || "CLI default (unpinned)"],
+    ["Provider", route.provider || "CLI default"],
+    [signalLabel, signalValue],
+  ];
+}
+
+function publicationRoleState(publications) {
+  const failed = publications.filter((item) => item.status === "failed").length;
+  const approvals = publications.filter((item) => item.status === "awaiting_approval").length;
+  const manual = publications.filter((item) => item.mode === "manual" && item.status === "pending" &&
+    (!item.requireApproval || item.approvedAt)).length;
+  const publishing = publications.filter((item) => item.status === "publishing").length;
+  const parts = [];
+  if (failed) parts.push(`${failed} failed · Retry required`);
+  if (approvals) parts.push(`${approvals} awaiting approval`);
+  if (manual) parts.push(`${manual} ready for manual completion`);
+  if (publishing) parts.push(`${publishing} publishing`);
+  return {
+    status: failed ? "retry_required" : approvals ? "awaiting_approval" : manual ? "manual_completion" : publishing ? "running" : "idle",
+    label: parts.join(" · ") || "No pending handoff",
+    attention: failed + approvals + manual,
+    failed, approvals, manual,
+  };
+}
+
+function roleCard({ name, kind, status, facts }) {
+  const help = automationHelp("roles")?.[name] || AUTOMATION_HELP.en.roles[name];
+  return `<article class="automation-role-card">
+    <header><div><span class="automation-role-kind ${kind === "Coding agent" ? "is-agent" : ""}">${escapeHtml(kind)}</span><h3>${escapeHtml(name)}</h3></div>${automationStatus(status)}</header>
+    <p>${escapeHtml(help)}</p>
+    <dl>${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+  </article>`;
+}
+
+function automationLoadWarnings(data) {
+  if (!data.loadErrors?.length) return "";
+  return `<div class="automation-warning" role="status"><strong>Some data could not be loaded.</strong><ul>${data.loadErrors.map((item) =>
+    `<li>${escapeHtml(item.label)}: ${escapeHtml(item.message)}</li>`).join("")}</ul></div>`;
+}
+
+function renderAutomationOverview(data) {
+  const diagnostics = data.inspection.diagnostics || {};
   const issues = diagnostics.issues || [];
-  const workerAgents = (effective.config?.agents || []).filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
-  const agentRows = (effective.profiles || []).map((profile) => `<div class="detail-row"><strong>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)} · ${escapeHtml(profile.model || "CLI default (unpinned)")}</strong><span class="detail-status">${escapeHtml(profile.health?.status || "unknown")}</span>${profile.health?.lastError ? `<div>${escapeHtml(profile.health.lastError)}</div>` : ""}<span class="mono">${profile.activeRuns || 0} active${profile.health?.cooldownUntil ? ` · cooldown until ${escapeHtml(new Date(profile.health.cooldownUntil).toLocaleString())}` : ""}</span></div>`).join("");
-  const activeRows = active.map(({ task, run, agentConfig }) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(task.id)}"><strong>${escapeHtml(task.title)}</strong><span class="detail-status">${escapeHtml(run.status)}</span><div>${escapeHtml(agentConfig ? `${agentConfig.profile} · ${agentConfig.runtime} · ${agentConfig.model || "CLI default (unpinned)"}${agentConfig.fallbackFrom ? ` · fallback from ${agentConfig.fallbackFrom}` : ""}` : `${run.workerId} · ${run.runtime}`)}</div><span class="mono">${escapeHtml(run.id)} · heartbeat ${relativeTime(run.heartbeatAt)} · lease ${escapeHtml(new Date(run.claimExpiresAt).toLocaleString())}</span></div>`).join("");
-  const operationRows = operations.slice(0, 20).map((operation) => `<div class="detail-row ${operation.taskId ? "activity-row" : ""}"${operation.taskId ? ` data-activity-task="${escapeHtml(operation.taskId)}"` : ""}><strong>${escapeHtml(operation.kind)} · ${escapeHtml(operation.status)}</strong><span class="mono">${escapeHtml(operation.id)} · ${escapeHtml(operation.mode)} · ${operation.allowWrites ? "write" : "read-only"} · ${relativeTime(operation.startedAt)}</span>${operation.error ? `<div>${escapeHtml(operation.error)}</div>` : ""}</div>`).join("");
-  const issueRows = issues.map((issue) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(issue.taskId)}"><strong>${escapeHtml(issue.kind)} · ${escapeHtml(issue.taskId)}</strong><div>${escapeHtml(issue.detail)}</div></div>`).join("");
-  const eventRows = (inspection.recentEvents || []).map((event) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(event.taskId)}"><strong>${escapeHtml(event.kind)} · ${escapeHtml(event.taskId)}</strong><span class="mono">#${event.id} · ${relativeTime(event.createdAt)}${event.runId ? ` · ${escapeHtml(event.runId)}` : ""}</span>${payloadText(event.payload) ? `<div class="event-payload">${escapeHtml(payloadText(event.payload))}</div>` : ""}</div>`).join("");
-  $("#activity-content").innerHTML = `
-    <section class="activity-section"><div class="activity-summary"><div><small>Event stream</small><strong>${$("#connection").classList.contains("online") ? "Connected" : "Offline"}</strong></div><div><small>Automation</small><strong>${supervisor.running ? `Running · ${supervisor.allowWrites ? "write" : "read-only"}` : supervisor.desired && supervisor.nextAttemptAt ? `Restarting · attempt ${Number(supervisor.restartCount || 0) + 1}` : supervisor.lastError ? "Failed" : "Stopped"}</strong></div><div><small>Worker readiness</small><strong>${workerAgents.length ? `${workerAgents.length} configured` : "Setup incomplete"}</strong></div></div>${supervisor.lastError ? `<div class="detail-row"><strong>Supervisor error</strong><div>${escapeHtml(supervisor.lastError)}</div>${supervisor.nextAttemptAt ? `<span class="mono">Next attempt ${escapeHtml(new Date(supervisor.nextAttemptAt).toLocaleString())}</span>` : ""}</div>` : ""}</section>
-    <section class="activity-section"><h3>Active runs · ${active.length}</h3><div class="detail-list">${activeRows || "<small>No workers are running.</small>"}</div></section>
-    <section class="activity-section"><h3>Agents</h3><div class="detail-list">${agentRows || "<small>No effective worker profiles.</small>"}</div></section>
-    <section class="activity-section"><h3>Dispatch operations</h3><div class="detail-list">${operationRows || "<small>No WebUI dispatch operations in this session.</small>"}</div></section>
-    <section class="activity-section"><h3>Board checks · ${issues.length ? `${issues.length} item(s)` : "clear"}</h3><div class="detail-list">${issueRows || "<small>No workflow, recovery, scheduling, or review items.</small>"}</div></section>
-    <section class="activity-section"><h3>Recent durable events</h3><div class="detail-list">${eventRows || "<small>No task events yet.</small>"}</div></section>`;
-  $$('[data-activity-task]', $("#activity-content")).forEach((row) => row.addEventListener("click", () => {
-    $("#activity-dialog").close(); openDrawer(row.dataset.activityTask);
-  }));
+  const activeRuns = diagnostics.activeRuns || [];
+  const coordination = data.coordination || {};
+  const orchestration = data.metadata?.orchestration || {};
+  const coordinationPolicy = coordination.policy || orchestration.autopilot?.coordination || {};
+  const publicationPolicy = orchestration.autopilot?.publication || {};
+  const autopilot = orchestration.autopilot || {};
+  const workerAgents = (data.effective.config?.agents || [])
+    .filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
+  const publicationState = publicationRoleState(data.publications);
+  const coordinationAttention = Number(coordination.activeCount || 0);
+  const supervisorAttention = data.supervisor.lastError ? 1 : 0;
+  const attention = issues.length + publicationState.attention + coordinationAttention + supervisorAttention;
+  const approvals = Number(coordination.awaitingApprovalCount || 0) +
+    publicationState.approvals;
+  const supervisor = supervisorPresentation(data.supervisor);
+  const supervisorPolicy = data.supervisor.allowWrites ? "Workspace writes allowed" : "Read-only";
+  const dispatcherStatus = activeRuns.length ? "running" : autopilot.autoExecute ? "ready" : "manual";
+  const plannerQueue = Number(diagnostics.stats?.byStatus?.triage || 0);
+  const planner = plannerRoute(data);
+  const coordinator = coordinatorRoute(data);
+  const roles = [
+    roleCard({
+      name: "Supervisor", kind: "Host service", status: supervisor.status,
+      facts: [["Policy", supervisorPolicy], ["State", supervisor.label], ["Restart / backoff", supervisor.detail], ["Attention", String(supervisorAttention)]],
+    }),
+    roleCard({
+      name: "Dispatcher", kind: "Host service", status: dispatcherStatus,
+      facts: [["Policy", `AutoExecute ${autopilot.autoExecute ? "on" : "off"}`], ["Execution", "Deterministic host service · no model"], ["Active runs", String(activeRuns.length)]],
+    }),
+    roleCard({
+      name: "Planner", kind: "Coding agent", status: planner.available ? (plannerQueue ? "ready" : "idle") : "missing",
+      facts: codingAgentFacts(planner, "Policy", `AutoPlan ${autopilot.autoPlan ? "on" : "off"}`, "Triage queue", String(plannerQueue)),
+    }),
+    roleCard({
+      name: "Coordinator", kind: "Coding agent", status: coordinator.available ? (coordinationAttention ? "warning" : "idle") : "missing",
+      facts: codingAgentFacts(coordinator, "Policy", `Mode ${coordinationPolicy.mode || "observe"}`, "Attention", String(coordinationAttention)),
+    }),
+    roleCard({
+      name: "Publisher", kind: "Host service", status: publicationState.status,
+      facts: [["Policy", `Mode ${publicationPolicy.mode || "manual"}`], ["Execution", "Deterministic host service · no model"], ["Queue state", publicationState.label], ["Attention", String(publicationState.attention)]],
+    }),
+  ].join("");
+  return `${automationLoadWarnings(data)}
+    <section class="activity-section">
+      <div class="activity-summary automation-summary">
+        <div><small>Board policy</small><strong>${autopilot.enabled ? "Autopilot enabled" : "Manual control"}</strong><span>${autopilot.workspaceWrites && data.supervisor.allowWrites ? "Writes permitted" : "Read-only boundary"}</span></div>
+        <div><small>Needs attention</small><strong>${attention}</strong><span>${approvals} approval${approvals === 1 ? "" : "s"}</span></div>
+        <div><small>Workers</small><strong>${workerAgents.length || 0} configured</strong><span>${activeRuns.length} active</span></div>
+        <div><small>Graph revision</small><strong>${coordination.graphState?.revision ?? "—"}</strong><span>${$("#connection").classList.contains("online") ? "Events connected" : "Events offline"}</span></div>
+      </div>
+    </section>
+    ${data.supervisor.lastError ? `<div class="automation-warning"><strong>Supervisor error</strong><p>${escapeHtml(data.supervisor.lastError)}</p>${data.supervisor.nextAttemptAt ? `<small>Next attempt ${escapeHtml(new Date(data.supervisor.nextAttemptAt).toLocaleString())}</small>` : ""}</div>` : ""}
+    <div class="automation-help-callout"><strong>Host services vs coding agents</strong><p>${escapeHtml(automationHelp("boundary"))}</p></div>
+    <section class="activity-section"><h2 class="automation-section-title">Roles</h2><div class="automation-role-grid">${roles}</div></section>`;
+}
+
+function renderAutomationRuns(data) {
+  const diagnostics = data.inspection.diagnostics || {};
+  const activeRows = (diagnostics.activeRuns || []).map(({ task, run, agentConfig }) => `<article class="detail-row automation-run">
+    <header><div><strong>${escapeHtml(task.title)}</strong>${automationStatus(run.status)}</div>${activityTaskButton(task.id, "Open task")}</header>
+    <p>${escapeHtml(agentConfig ? `${agentConfig.profile} · ${agentConfig.runtime} · ${agentConfig.model || "CLI default (unpinned)"}${agentConfig.fallbackFrom ? ` · fallback from ${agentConfig.fallbackFrom}` : ""}` : `${run.workerId} · ${run.runtime}`)}</p>
+    <span class="mono">${escapeHtml(run.id)} · heartbeat ${run.heartbeatAt ? relativeTime(run.heartbeatAt) : "unknown"}${run.claimExpiresAt ? ` · lease until ${escapeHtml(new Date(run.claimExpiresAt).toLocaleString())}` : ""}</span>
+  </article>`).join("");
+  const agentRows = (data.effective.profiles || []).map((profile) => `<article class="detail-row automation-run">
+    <header><div><strong>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)}</strong>${automationStatus(profile.health?.status || "unknown")}</div></header>
+    <p>${escapeHtml(profile.model || "CLI default (unpinned)")}${profile.health?.lastError ? ` · ${escapeHtml(profile.health.lastError)}` : ""}</p>
+    <span class="mono">${profile.activeRuns || 0} active${profile.health?.cooldownUntil ? ` · cooldown until ${escapeHtml(new Date(profile.health.cooldownUntil).toLocaleString())}` : ""}</span>
+  </article>`).join("");
+  const operationRows = data.operations.slice(0, 20).map((operation) => `<article class="detail-row automation-run">
+    <header><div><strong>${escapeHtml(humanizeIdentifier(operation.kind))}</strong>${automationStatus(operation.status)}</div>${activityTaskButton(operation.taskId, "Open task")}</header>
+    <span class="mono">${escapeHtml(operation.id)} · ${escapeHtml(operation.mode)} · ${operation.allowWrites ? "write" : "read-only"}${operation.startedAt ? ` · ${relativeTime(operation.startedAt)}` : ""}</span>
+    ${operation.error ? `<p class="automation-error">${escapeHtml(operation.error)}</p>` : ""}
+  </article>`).join("");
+  const issueRows = (diagnostics.issues || []).map((issue) => `<article class="detail-row automation-run">
+    <header><div><strong>${escapeHtml(humanizeIdentifier(issue.kind))}</strong>${automationStatus("warning")}</div>${activityTaskButton(issue.taskId, "Open task")}</header>
+    <p>${escapeHtml(issue.detail)}</p>
+  </article>`).join("");
+  return `${automationLoadWarnings(data)}
+    <section class="activity-section"><h2 class="automation-section-title">Active runs · ${(diagnostics.activeRuns || []).length}</h2><div class="detail-list">${activeRows || '<p class="automation-empty">No workers are running.</p>'}</div></section>
+    <section class="activity-section"><h2 class="automation-section-title">Agents · ${(data.effective.profiles || []).length}</h2><div class="detail-list">${agentRows || '<p class="automation-empty">No effective agent profiles.</p>'}</div></section>
+    <section class="activity-section"><h2 class="automation-section-title">Dispatch operations</h2><div class="detail-list">${operationRows || '<p class="automation-empty">No WebUI dispatch operations.</p>'}</div></section>
+    <section class="activity-section"><h2 class="automation-section-title">Board checks · ${(diagnostics.issues || []).length}</h2><div class="detail-list">${issueRows || '<p class="automation-empty">No workflow, recovery, scheduling, or review items.</p>'}</div></section>`;
+}
+
+function coordinationActionDescription(action) {
+  const task = action.taskId || action.task?.key || "task";
+  switch (action.kind) {
+  case "set_route":
+    return `${task} → ${action.assignee || "unassigned"} · ${action.runtime || "default runtime"}`;
+  case "update_priority":
+    return `${task} → priority ${action.priority ?? "unchanged"}`;
+  case "unblock_task":
+    return `Return ${task} to the runnable queue`;
+  case "move_to_triage":
+    return `Return ${task} to Triage for normal planning`;
+  case "add_dependency":
+    return `${action.dependentId || task} waits for ${action.prerequisiteId || "prerequisite"}`;
+  case "remove_dependency":
+    return `Remove ${action.prerequisiteId || "prerequisite"} from ${action.dependentId || task}`;
+  case "create_task":
+    return `${action.task?.title || action.task?.key || "New task"}${action.task?.assignee ? ` · ${action.task.assignee}` : ""}`;
+  default: {
+    const details = Object.entries(action).filter(([key, value]) =>
+      !["kind", "reason"].includes(key) && !key.startsWith("expected") && value != null && value !== "");
+    return details.length ? details.map(([key, value]) =>
+      `${humanizeIdentifier(key)}: ${readableValue(value)}`).join(" · ") : "No additional fields";
+  }
+  }
+}
+
+function coordinationTaskDraft(task = {}) {
+  const known = new Set([
+    "key", "title", "body", "assignee", "runtime", "workflowRole", "priority",
+    "parentTaskId", "prerequisites", "dependents",
+  ]);
+  const facts = [
+    ["Key", task.key || "—"],
+    ["Title", task.title || "—"],
+    ["Assignee", task.assignee || "Unassigned"],
+    ["Runtime", task.runtime || "Default"],
+    ["Workflow role", task.workflowRole || "worker"],
+    ["Priority", task.priority ?? 0],
+    ["Parent task", task.parentTaskId || "None"],
+    ["Prerequisites", (task.prerequisites || []).length ? task.prerequisites.join(", ") : "None"],
+    ["Dependents", (task.dependents || []).length ? task.dependents.join(", ") : "None"],
+  ];
+  for (const [key, value] of Object.entries(task)) {
+    if (!known.has(key) && value != null && value !== "") facts.push([humanizeIdentifier(key), readableValue(value)]);
+  }
+  return `<dl class="automation-facts coordination-task-facts">${facts.map(([label, value]) =>
+    `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+    <div class="coordination-task-body"><strong>Body</strong>${task.body
+      ? `<div class="markdown">${markdown(task.body)}</div>`
+      : '<p class="automation-empty">No body supplied.</p>'}</div>`;
+}
+
+function coordinationActionDetails(action) {
+  if (action.kind === "create_task") {
+    const versions = action.expectedTaskVersions && Object.keys(action.expectedTaskVersions).length
+      ? `<div class="coordination-action-versions"><strong>Expected task versions</strong>${readableFacts(action.expectedTaskVersions)}</div>`
+      : "";
+    return `${coordinationTaskDraft(action.task || {})}${versions}`;
+  }
+  const details = Object.fromEntries(Object.entries(action).filter(([key, value]) =>
+    !["kind", "reason"].includes(key) && !key.startsWith("expected") && value != null && value !== ""));
+  return readableFacts(details);
+}
+
+function coordinationActions(actions, proposalID) {
+  actions = structuredValue(actions);
+  if (!Array.isArray(actions) || !actions.length) return '<p class="automation-empty">No graph changes proposed.</p>';
+  return `<ol class="automation-action-list">${actions.map((action, index) => {
+    const details = coordinationActionDetails(action);
+    return `<li>
+      <strong>${index + 1}. ${escapeHtml(COORDINATION_ACTION_LABELS[action.kind] || humanizeIdentifier(action.kind || "Action"))}</strong>
+      <span>${escapeHtml(coordinationActionDescription(action))}</span>
+      ${action.reason ? `<small>Reason: ${escapeHtml(action.reason)}</small>` : ""}
+      ${details ? `<details class="coordination-action-details" data-automation-detail="proposal:${escapeHtml(proposalID)}:action:${index}"><summary>Review full action details</summary>${details}</details>` : ""}
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+function validationErrors(value) {
+  value = structuredValue(value);
+  if (!Array.isArray(value) || !value.length) return "";
+  return `<div class="automation-validation"><strong>Validation</strong><ul>${value.map((item) =>
+    `<li>${escapeHtml(readableValue(item))}</li>`).join("")}</ul></div>`;
+}
+
+function coordinationProposalCard(proposal, incident, actionsAvailable) {
+  const canDecide = actionsAvailable && proposal.status === "awaiting_approval" && incident.status === "awaiting_approval";
+  const canReanalyze = actionsAvailable && ["awaiting_approval", "approved"].includes(proposal.status) &&
+    incident.status === "awaiting_approval";
+  return `<section class="automation-proposal">
+    <header><div><strong>${escapeHtml(proposal.summary || "Recovery proposal")}</strong>${automationStatus(proposal.status)}</div><span class="mono">Graph ${proposal.expectedGraphRevision}</span></header>
+    <p class="automation-rationale">${escapeHtml(proposal.rationale || "No rationale supplied.")}</p>
+    <div class="automation-agent-line">Coordinator: ${escapeHtml(proposal.coordinatorAgent || "unknown")} · ${escapeHtml(proposal.coordinatorModel || "CLI default")}${proposal.coordinatorProvider ? ` · ${escapeHtml(proposal.coordinatorProvider)}` : ""}</div>
+    <h4>Proposed actions</h4>${coordinationActions(proposal.actions, proposal.id)}
+    ${validationErrors(proposal.validationErrors)}
+    ${(canDecide || canReanalyze) ? `<div class="automation-actions">
+      ${canDecide ? `<button type="button" class="primary" data-automation-focus="coordination:approve:${escapeHtml(proposal.id)}" data-coordination-action="approve" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Approve</button><button type="button" class="danger" data-automation-focus="coordination:reject:${escapeHtml(proposal.id)}" data-coordination-action="reject" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Reject</button>` : ""}
+      ${canReanalyze ? `<button type="button" data-automation-focus="coordination:retry:${escapeHtml(proposal.id)}" data-coordination-action="retry" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Reanalyze</button>` : ""}
+    </div>` : ""}
+  </section>`;
+}
+
+function coordinationIncidentCard(entry, actionsAvailable) {
+  const incident = entry.incident;
+  const proposals = entry.proposals || [];
+  return `<article class="automation-record">
+    <header class="automation-record-header"><div><h3>${escapeHtml(incident.summary || humanizeIdentifier(incident.trigger))}</h3><div class="automation-statuses">${automationStatus(incident.severity)}${automationStatus(incident.status)}</div></div>${activityTaskButton(incident.taskId || incident.rootTaskId, "Open task")}</header>
+    <dl class="automation-record-meta"><div><dt>Trigger</dt><dd>${escapeHtml(humanizeIdentifier(incident.trigger))}</dd></div><div><dt>Graph</dt><dd>${incident.graphRevision}</dd></div><div><dt>Updated</dt><dd>${incident.updatedAt ? escapeHtml(relativeTime(incident.updatedAt)) : "—"}</dd></div></dl>
+    ${readableFacts(incident.details)}
+    ${entry.loadError ? `<div class="automation-warning"><strong>Proposal details unavailable</strong><p>${escapeHtml(entry.loadError)}</p></div>` : proposals.map((proposal) => coordinationProposalCard(proposal, incident, actionsAvailable)).join("")}
+    ${!entry.loadError && !proposals.length ? '<p class="automation-empty">No proposal has been recorded for this incident.</p>' : ""}
+    ${actionsAvailable && incident.status === "open" ? `<div class="automation-actions"><button type="button" class="danger" data-automation-focus="coordination:dismiss:${escapeHtml(incident.id)}" data-coordination-action="dismiss" data-incident-id="${escapeHtml(incident.id)}" data-incident-version="${escapeHtml(incident.updatedAt)}">Dismiss incident</button></div>` : ""}
+  </article>`;
+}
+
+function renderAutomationRecovery(data) {
+  const policy = data.coordination.policy || {};
+  let records = '<p class="automation-empty">No coordination incidents.</p>';
+  if (data.recoveryLoading) records = '<div class="detail-row">Loading recovery proposals…</div>';
+  else if (data.recoveryLoaded && data.recoveryDetails.length) records = data.recoveryDetails
+    .map((entry) => coordinationIncidentCard(entry, data.actionsAvailable.recovery)).join("");
+  else if (!data.recoveryLoaded && (data.coordination.incidents || []).length) records = '<div class="detail-row">Loading recovery proposals…</div>';
+  return `${automationLoadWarnings(data)}
+    <div class="automation-help-callout"><strong>Planner ≠ Coordinator</strong><p>${escapeHtml(automationHelp("recovery"))}</p></div>
+    ${policy.mode === "assist" ? `<div class="automation-help-callout is-attention"><strong>Assist mode</strong><p>${escapeHtml(automationHelp("recoveryAssist"))}</p></div>` : ""}
+    <section class="activity-section">
+      <div class="activity-summary automation-summary">
+        <div><small>Policy</small><strong>${escapeHtml(humanizeIdentifier(policy.mode || "observe"))}</strong><span>${escapeHtml(policy.profile || "Default coordinator")}</span></div>
+        <div><small>Active incidents</small><strong>${Number(data.coordination.activeCount || 0)}</strong><span>${Number(data.coordination.awaitingApprovalCount || 0)} awaiting approval</span></div>
+        <div><small>Graph revision</small><strong>${data.coordination.graphState?.revision ?? "—"}</strong><span>Latest board state</span></div>
+      </div>
+    </section>
+    <section class="activity-section"><h2 class="automation-section-title">Incidents</h2><div class="automation-record-list">${records}</div></section>`;
+}
+
+function safeExternalURL(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : null;
+  } catch (_) { return null; }
+}
+
+function publicationCard(item, actionsAvailable) {
+  const link = safeExternalURL(item.url);
+  const canReject = actionsAvailable && ["awaiting_approval", "pending", "failed"].includes(item.status);
+  const canComplete = actionsAvailable && item.mode === "manual" && item.status === "pending" &&
+    (!item.requireApproval || item.approvedAt);
+  return `<article class="automation-record publication-record">
+    <header class="automation-record-header"><div><h3>${escapeHtml(taskTitle(item.taskId))}</h3><div class="automation-statuses">${automationStatus(item.status)}${automationStatus(item.mode)}</div></div>${activityTaskButton(item.taskId, "Open task")}</header>
+    <dl class="automation-record-meta publication-meta">
+      <div><dt>Status</dt><dd>${escapeHtml(humanizeIdentifier(item.status))}</dd></div>
+      <div><dt>Mode</dt><dd>${escapeHtml(humanizeIdentifier(item.mode))}</dd></div>
+      <div><dt>Task</dt><dd class="mono">${escapeHtml(item.taskId)}</dd></div>
+      <div><dt>Branch</dt><dd>${escapeHtml(item.targetBranch || "—")}</dd></div>
+      <div><dt>Remote</dt><dd>${escapeHtml(item.remote || "—")}</dd></div>
+      <div><dt>URL</dt><dd>${link ? `<a data-automation-focus="publication:url:${escapeHtml(item.id)}" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.url)}</a>` : escapeHtml(item.url || "—")}</dd></div>
+    </dl>
+    ${item.error ? `<div class="automation-error"><strong>Error</strong><p>${escapeHtml(item.error)}</p></div>` : ""}
+    ${actionsAvailable && (item.status === "awaiting_approval" || canReject || item.status === "failed" || canComplete) ? `<div class="automation-actions">
+      ${actionsAvailable && item.status === "awaiting_approval" ? `<button type="button" class="primary" data-automation-focus="publication:approve:${escapeHtml(item.id)}" data-publication-action="approve" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Approve</button>` : ""}
+      ${canReject ? `<button type="button" class="danger" data-automation-focus="publication:reject:${escapeHtml(item.id)}" data-publication-action="reject" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Reject</button>` : ""}
+      ${actionsAvailable && item.status === "failed" ? `<button type="button" data-automation-focus="publication:retry:${escapeHtml(item.id)}" data-publication-action="retry" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Retry</button>` : ""}
+      ${canComplete ? `<button type="button" class="primary" data-automation-focus="publication:complete:${escapeHtml(item.id)}" data-publication-action="complete" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Complete manually</button>` : ""}
+    </div>` : ""}
+  </article>`;
+}
+
+function renderAutomationPublishing(data) {
+  const policy = data.metadata?.orchestration?.autopilot?.publication || {};
+  const publicationState = publicationRoleState(data.publications);
+  return `${automationLoadWarnings(data)}
+    <div class="automation-help-callout"><strong>Publishing</strong><p>${escapeHtml(automationHelp("publishing"))}</p></div>
+    <section class="activity-section">
+      <div class="activity-summary automation-summary">
+        <div><small>Policy</small><strong>${escapeHtml(humanizeIdentifier(policy.mode || "manual"))}</strong><span>${policy.requireApproval ? "Approval required" : "No approval gate"}</span></div>
+        <div><small>Target</small><strong>${escapeHtml(policy.targetBranch || "main")}</strong><span>${escapeHtml(policy.remote || "origin")}</span></div>
+        <div><small>Needs attention</small><strong>${publicationState.attention}</strong><span>${publicationState.failed} failed · ${publicationState.approvals} approval · ${publicationState.manual} manual</span></div>
+      </div>
+    </section>
+    <section class="activity-section"><h2 class="automation-section-title">Publication handoffs</h2><div class="automation-record-list">${data.publications.map((item) => publicationCard(item, data.actionsAvailable.publishing)).join("") || '<p class="automation-empty">No publication handoffs yet.</p>'}</div></section>`;
+}
+
+function eventSummary(payload) {
+  const value = structuredValue(payload);
+  if (value == null || value === "") return "No additional summary.";
+  if (typeof value !== "object") return String(value);
+  const preferred = ["summary", "message", "reason", "error", "status", "action", "mode", "result", "url"];
+  const parts = preferred.filter((key) => value[key] != null && value[key] !== "")
+    .slice(0, 4).map((key) => `${humanizeIdentifier(key)}: ${readableValue(value[key])}`);
+  if (parts.length) return parts.join(" · ");
+  const first = Object.entries(value).slice(0, 4);
+  return first.length ? first.map(([key, item]) => `${humanizeIdentifier(key)}: ${readableValue(item)}`).join(" · ") : "No additional summary.";
+}
+
+function renderAutomationEvents(data) {
+  const events = data.inspection.recentEvents || [];
+  const rows = events.map((event) => {
+    const raw = rawPayloadText(event.payload);
+    return `<article class="automation-record event-record">
+      <header class="automation-record-header"><div><h3>${escapeHtml(humanizeIdentifier(event.kind))}</h3><span class="mono">#${event.id}${event.createdAt ? ` · ${relativeTime(event.createdAt)}` : ""}${event.runId ? ` · ${escapeHtml(event.runId)}` : ""}</span></div>${activityTaskButton(event.taskId, "Open task")}</header>
+      <p class="event-summary">${escapeHtml(eventSummary(event.payload))}</p>
+      ${raw ? `<details class="event-details" data-automation-detail="event:${escapeHtml(event.id)}"><summary>Raw details</summary><pre class="event-payload">${escapeHtml(raw)}</pre></details>` : ""}
+    </article>`;
+  }).join("");
+  return `${automationLoadWarnings(data)}
+    <section class="activity-section"><h2 class="automation-section-title">Recent durable events</h2><div class="automation-record-list">${rows || '<p class="automation-empty">No task events yet.</p>'}</div></section>`;
+}
+
+function updateAutomationShell() {
+  const language = state.automationHelpLanguage;
+  const help = AUTOMATION_HELP[language] || AUTOMATION_HELP.en;
+  $("#automation-center-help").textContent = help.tabs[state.automationTab];
+  const languageButton = $("#automation-help-language");
+  languageButton.textContent = `Help · ${language.toUpperCase()}`;
+  languageButton.setAttribute("aria-label", `Switch help text to ${language === "en" ? "Korean" : "English"}`);
+  $$("[data-activity-tab]", $("#automation-tabs")).forEach((button) => {
+    const selected = button.dataset.activityTab === state.automationTab;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  $("#activity-content").setAttribute("aria-labelledby", `automation-tab-${state.automationTab}`);
+}
+
+function captureAutomationViewState() {
+  const content = $("#activity-content");
+  const active = document.activeElement;
+  const focusTarget = active?.closest?.("[data-automation-focus]");
+  const focusedDetails = active?.closest?.("details[data-automation-detail]");
+  return {
+    tab: state.automationTab,
+    openDetails: $$("details[data-automation-detail]", content)
+      .filter((details) => details.open).map((details) => details.dataset.automationDetail),
+    focusKey: focusTarget?.dataset.automationFocus || "",
+    focusDetailsKey: active?.tagName === "SUMMARY" ? focusedDetails?.dataset.automationDetail || "" : "",
+    focusInContent: Boolean(active && content.contains(active)),
+    dialogScrollTop: $("#activity-dialog").scrollTop,
+  };
+}
+
+function restoreAutomationViewState(view) {
+  if (!view) return;
+  const content = $("#activity-content");
+  const expanded = new Set(view.openDetails || []);
+  $$("details[data-automation-detail]", content).forEach((details) => {
+    details.open = expanded.has(details.dataset.automationDetail);
+  });
+  if (view.tab === state.automationTab && view.focusInContent) {
+    let target = $$("[data-automation-focus]", content)
+      .find((element) => element.dataset.automationFocus === view.focusKey);
+    if (!target && view.focusDetailsKey) {
+      const details = $$("details[data-automation-detail]", content)
+        .find((element) => element.dataset.automationDetail === view.focusDetailsKey);
+      target = details && $("summary", details);
+    }
+    (target || content).focus({ preventScroll: true });
+  }
+  $("#activity-dialog").scrollTop = view.dialogScrollTop || 0;
+}
+
+function setAutomationBusy(busy) {
+  const content = $("#activity-content");
+  content.setAttribute("aria-busy", String(busy));
+  $("#activity-refresh").disabled = busy;
+  if (busy) {
+    $$("[data-coordination-action], [data-publication-action]", content)
+      .forEach((button) => { button.disabled = true; });
+  }
+}
+
+function cancelAutomationLoad() {
+  automationLoadGeneration++;
+  automationLoadController?.abort();
+  automationLoadController = null;
+}
+
+function currentAutomationRequest(board, generation, signal) {
+  return !signal?.aborted && state.board === board && automationLoadGeneration === generation;
+}
+
+function renderAutomationCenter(options = {}) {
+  const view = options.viewState || captureAutomationViewState();
+  updateAutomationShell();
+  if (!state.automationData) return;
+  const renderers = {
+    overview: renderAutomationOverview,
+    runs: renderAutomationRuns,
+    recovery: renderAutomationRecovery,
+    publishing: renderAutomationPublishing,
+    events: renderAutomationEvents,
+  };
+  const content = $("#activity-content");
+  content.dataset.board = state.automationData.board;
+  content.innerHTML = renderers[state.automationTab](state.automationData);
+  restoreAutomationViewState(view);
+}
+
+function recoveryCacheKey(board, incident) {
+  return JSON.stringify([board, incident.id, incident.updatedAt]);
+}
+
+function pruneRecoveryCache(board, incidents) {
+  const valid = new Set(incidents.map((incident) => recoveryCacheKey(board, incident)));
+  for (const key of automationRecoveryCache.keys()) {
+    let cachedBoard = "";
+    try { [cachedBoard] = JSON.parse(key); } catch (_) { automationRecoveryCache.delete(key); continue; }
+    if (cachedBoard === board && !valid.has(key)) automationRecoveryCache.delete(key);
+  }
+}
+
+async function ensureRecoveryDetails(data = state.automationData, options = {}) {
+  if (!data || data.recoveryLoaded || data.recoveryLoading) return;
+  const { board, loadGeneration: generation, requestSignal: signal } = data;
+  if (!currentAutomationRequest(board, generation, signal) || state.automationData !== data) return;
+  const view = options.viewState || captureAutomationViewState();
+  data.recoveryLoading = true;
+  const incidents = (data.coordination.incidents || []).slice(0, 20);
+  pruneRecoveryCache(board, incidents);
+  if (options.renderLoading !== false) {
+    renderAutomationCenter({ viewState: view });
+    setAutomationBusy(true);
+  }
+  const details = new Array(incidents.length);
+  const missing = [];
+  incidents.forEach((incident, index) => {
+    const cached = automationRecoveryCache.get(recoveryCacheKey(board, incident));
+    if (cached) details[index] = cached;
+    else missing.push({ incident, index });
+  });
+  const results = await Promise.allSettled(missing.map(({ incident }) =>
+    api(boardPathFor(board, `/api/coordination/incidents/${encodeURIComponent(incident.id)}`), { signal })));
+  if (!currentAutomationRequest(board, generation, signal) || state.automationData !== data) return;
+  results.forEach((result, resultIndex) => {
+    const { incident, index } = missing[resultIndex];
+    if (result.status === "fulfilled") {
+      details[index] = result.value;
+      automationRecoveryCache.set(recoveryCacheKey(board, incident), result.value);
+    } else {
+      details[index] = {
+        incident, proposals: [],
+        loadError: result.reason?.name === "AbortError" ? "Request canceled" : result.reason?.message || "Request failed",
+      };
+    }
+  });
+  data.recoveryDetails = details;
+  data.recoveryLoaded = true;
+  data.recoveryLoading = false;
+  if (options.renderResult !== false) {
+    renderAutomationCenter({ viewState: view });
+    setAutomationBusy(false);
+  }
+}
+
+function setAutomationTab(value, options = {}) {
+  if (!AUTOMATION_TABS.includes(value)) return;
+  state.automationTab = value;
+  if (options.persist !== false) localStorage.setItem("autogora.automationCenterTab", value);
+  renderAutomationCenter();
+  if (options.focus) $(`#automation-tab-${value}`)?.focus();
+  if (value === "recovery") ensureRecoveryDetails().catch((error) => toast(error.message, true));
+}
+
+function toggleAutomationHelpLanguage() {
+  state.automationHelpLanguage = state.automationHelpLanguage === "en" ? "ko" : "en";
+  localStorage.setItem("autogora.automationHelpLanguage", state.automationHelpLanguage);
+  renderAutomationCenter();
+}
+
+async function loadActivity() {
+  const board = state.board;
+  const generation = ++automationLoadGeneration;
+  automationLoadController?.abort();
+  const controller = new AbortController();
+  automationLoadController = controller;
+  const { signal } = controller;
+  setAutomationBusy(true);
+  try {
+    const requests = await Promise.allSettled([
+      api(boardPathFor(board, "/api/inspect"), { signal }),
+      api("/api/supervisor", { signal }),
+      api(boardPathFor(board, "/api/agents/effective"), { signal }),
+      api(boardPathFor(board, "/api/operations"), { signal }),
+      api(boardPathFor(board, "/api/coordination"), { signal }),
+      api(boardPathFor(board, "/api/publications?limit=100"), { signal }),
+    ]);
+    if (!currentAutomationRequest(board, generation, signal)) return false;
+    const previous = state.automationData?.board === board ? state.automationData : null;
+    const fallback = [
+      previous?.inspection || { diagnostics: {}, recentEvents: [] },
+      state.supervisor || {},
+      previous?.effective || { profiles: state.effectiveAgents || [], config: state.agentConfig || {}, metadata: state.metadata },
+      previous?.operations || state.operations || [],
+      previous?.coordination || { policy: state.metadata?.orchestration?.autopilot?.coordination || {}, incidents: [], activeCount: 0, awaitingApprovalCount: 0 },
+      previous?.publications || [],
+    ];
+    const labels = ["Board inspection", "Supervisor", "Agents", "Operations", "Recovery", "Publishing"];
+    const values = requests.map((request, index) => request.status === "fulfilled" ? request.value : fallback[index]);
+    const loadErrors = requests.flatMap((request, index) => request.status === "rejected" && request.reason?.name !== "AbortError"
+      ? [{ label: labels[index], message: request.reason?.message || "Request failed" }] : []);
+    const [inspection, supervisor, effective, operations, coordination, publications] = values;
+    const data = {
+      board, loadGeneration: generation, requestSignal: signal,
+      metadata: effective.metadata || previous?.metadata || state.metadata,
+      inspection, supervisor, effective, operations: operations || [], coordination,
+      publications: publications || [], loadErrors, recoveryDetails: [], recoveryLoaded: false,
+      recoveryLoading: false,
+      actionsAvailable: {
+        recovery: requests[4].status === "fulfilled",
+        publishing: requests[5].status === "fulfilled",
+      },
+    };
+    state.supervisor = supervisor;
+    state.effectiveAgents = effective.profiles || [];
+    state.operations = operations || [];
+    state.automationData = data;
+    renderAutomationChip();
+    if (state.automationTab === "recovery") {
+      await ensureRecoveryDetails(data, { renderLoading: false, renderResult: false });
+      if (!currentAutomationRequest(board, generation, signal) || state.automationData !== data) return false;
+    }
+    renderAutomationCenter({ viewState: captureAutomationViewState() });
+    return true;
+  } finally {
+    if (currentAutomationRequest(board, generation, signal)) setAutomationBusy(false);
+  }
+}
+
+function automationMutationMessage(error) {
+  return /conflict|changed|stale|revision|updated/i.test(error.message)
+    ? "The state changed before this action completed. Data was refreshed; review the current state and try again."
+    : error.message;
+}
+
+async function runAutomationMutation(button, action, successMessage) {
+  button.disabled = true;
+  try {
+    await action();
+    toast(successMessage);
+    await loadActivity();
+  } catch (error) {
+    toast(automationMutationMessage(error), true);
+    await loadActivity().catch(() => {});
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+async function mutateCoordination(button) {
+  const action = button.dataset.coordinationAction;
+  const data = state.automationData;
+  if (!data || data.board !== state.board || !data.actionsAvailable.recovery) {
+    toast("Recovery data is stale. Refresh before acting.", true);
+    return;
+  }
+  if (action === "dismiss") {
+    const entry = data.recoveryDetails.find((item) => item.incident.id === button.dataset.incidentId);
+    if (entry && button.dataset.incidentVersion !== entry.incident.updatedAt) {
+      toast("This incident changed. Refresh before dismissing it.", true);
+      await loadActivity();
+      return;
+    }
+    if (!entry || !confirm("Dismiss this open incident?")) return;
+    await runAutomationMutation(button, () => api(boardPathFor(data.board, `/api/coordination/incidents/${encodeURIComponent(entry.incident.id)}/dismiss`), {
+      method: "POST", body: JSON.stringify({ expectedGraphRevision: entry.incident.graphRevision }),
+    }), "Incident dismissed");
+    return;
+  }
+  const proposal = data.recoveryDetails.flatMap((item) => item.proposals || [])
+    .find((item) => item.id === button.dataset.proposalId);
+  if (!proposal) return;
+  if (button.dataset.proposalVersion !== proposal.updatedAt) {
+    toast("This recovery proposal changed. Refresh before acting.", true);
+    await loadActivity();
+    return;
+  }
+  const prompts = {
+    approve: "Approve and apply this recovery proposal?",
+    reject: "Reject this recovery proposal?",
+    retry: "Supersede this proposal and request a new analysis?",
+  };
+  if (!confirm(prompts[action])) return;
+  await runAutomationMutation(button, () => api(boardPathFor(data.board, `/api/coordination/proposals/${encodeURIComponent(proposal.id)}/${action}`), {
+    method: "POST",
+    body: JSON.stringify({
+      expectedUpdatedAt: proposal.updatedAt,
+      expectedGraphRevision: proposal.expectedGraphRevision,
+    }),
+  }), {
+    approve: "Recovery proposal approved",
+    reject: "Recovery proposal rejected",
+    retry: "Recovery reanalysis scheduled",
+  }[action]);
+}
+
+async function mutatePublication(button) {
+  const action = button.dataset.publicationAction;
+  const data = state.automationData;
+  if (!data || data.board !== state.board || !data.actionsAvailable.publishing) {
+    toast("Publishing data is stale. Refresh before acting.", true);
+    return;
+  }
+  const item = data.publications.find((value) => value.id === button.dataset.publicationId);
+  if (!item) return;
+  if (button.dataset.publicationVersion !== item.updatedAt) {
+    toast("This publication changed. Refresh before acting.", true);
+    await loadActivity();
+    return;
+  }
+  const body = { expectedUpdatedAt: item.updatedAt };
+  if (action === "reject") {
+    const reason = prompt("Reason for rejection:");
+    if (reason == null || !reason.trim()) return;
+    body.reason = reason.trim();
+  } else if (action === "complete") {
+    const url = prompt("Published URL (optional):", item.url || "");
+    if (url == null) return;
+    body.url = url.trim() || null;
+  } else if (!confirm(action === "approve"
+    ? "Approve this publication handoff?"
+    : "Retry this failed publication?")) return;
+  await runAutomationMutation(button, () => api(boardPathFor(data.board, `/api/publications/${encodeURIComponent(item.id)}/${action}`), {
+    method: "POST", body: JSON.stringify(body),
+  }), {
+    approve: "Publication approved",
+    reject: "Publication rejected",
+    retry: "Publication retry scheduled",
+    complete: "Manual publication completed",
+  }[action]);
 }
 
 async function openActivity() {
+  updateAutomationShell();
   if (!$("#activity-dialog").open) $("#activity-dialog").showModal();
-  $("#activity-content").innerHTML = '<div class="detail-row">Loading activity…</div>';
+  $("#activity-content").innerHTML = '<div class="detail-row">Loading Automation Center…</div>';
   await loadActivity();
 }
 
@@ -1544,6 +2402,7 @@ function bindGlobalActions() {
   bindSegmentedControl('[data-board-control="focus"]', "[data-stage-focus]", (button) => setStageFocus(button.dataset.stageFocus));
   bindSegmentedControl('[data-board-control="view"]', "[data-board-view]", (button) => setBoardView(button.dataset.boardView));
   $("#board-select").addEventListener("change", async (event) => {
+    cancelAutomationLoad();
     state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("autogora.board", state.board);
     await loadBoard(); connectEvents();
   });
@@ -1581,6 +2440,43 @@ function bindGlobalActions() {
   $("#import-issues").addEventListener("click", openGitHubImport);
   $("#automation").addEventListener("click", () => openActivity().catch((error) => toast(error.message, true)));
   $("#activity-refresh").addEventListener("click", () => loadActivity().catch((error) => toast(error.message, true)));
+  $("#activity-dialog").addEventListener("close", () => {
+    cancelAutomationLoad();
+    setAutomationBusy(false);
+  });
+  $("#automation-help-language").addEventListener("click", toggleAutomationHelpLanguage);
+  $("#automation-tabs").addEventListener("click", (event) => {
+    const tab = event.target.closest("[data-activity-tab]");
+    if (tab) setAutomationTab(tab.dataset.activityTab);
+  });
+  $("#automation-tabs").addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const current = AUTOMATION_TABS.indexOf(state.automationTab);
+    const next = event.key === "Home" ? 0
+      : event.key === "End" ? AUTOMATION_TABS.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + AUTOMATION_TABS.length) % AUTOMATION_TABS.length;
+    setAutomationTab(AUTOMATION_TABS[next], { focus: true });
+  });
+  $("#activity-content").addEventListener("click", (event) => {
+    if (state.automationData?.board !== state.board) {
+      toast("This Automation Center view is stale. Refresh before acting.", true);
+      return;
+    }
+    const taskButton = event.target.closest("[data-activity-task]");
+    if (taskButton) {
+      $("#activity-dialog").close();
+      openDrawer(taskButton.dataset.activityTask);
+      return;
+    }
+    const coordinationButton = event.target.closest("[data-coordination-action]");
+    if (coordinationButton) {
+      mutateCoordination(coordinationButton).catch((error) => toast(error.message, true));
+      return;
+    }
+    const publicationButton = event.target.closest("[data-publication-action]");
+    if (publicationButton) mutatePublication(publicationButton).catch((error) => toast(error.message, true));
+  });
   $("#manage-agents").addEventListener("click", () => {
     $("#settings-dialog").close();
     openAgentSettings().catch((error) => toast(error.message, true));
