@@ -44,16 +44,19 @@ type TaskDraft struct {
 }
 
 type Action struct {
-	Kind              ActionKind    `json:"kind"`
-	TaskID            string        `json:"taskId,omitempty"`
-	ExpectedUpdatedAt string        `json:"expectedUpdatedAt,omitempty"`
-	Assignee          string        `json:"assignee,omitempty"`
-	Runtime           model.Runtime `json:"runtime,omitempty"`
-	Priority          *int          `json:"priority,omitempty"`
-	PrerequisiteID    string        `json:"prerequisiteId,omitempty"`
-	DependentID       string        `json:"dependentId,omitempty"`
-	Task              *TaskDraft    `json:"task,omitempty"`
-	Reason            string        `json:"reason"`
+	Kind                          ActionKind        `json:"kind"`
+	TaskID                        string            `json:"taskId,omitempty"`
+	ExpectedUpdatedAt             string            `json:"expectedUpdatedAt,omitempty"`
+	Assignee                      string            `json:"assignee,omitempty"`
+	Runtime                       model.Runtime     `json:"runtime,omitempty"`
+	Priority                      *int              `json:"priority,omitempty"`
+	PrerequisiteID                string            `json:"prerequisiteId,omitempty"`
+	ExpectedPrerequisiteUpdatedAt string            `json:"expectedPrerequisiteUpdatedAt,omitempty"`
+	DependentID                   string            `json:"dependentId,omitempty"`
+	ExpectedDependentUpdatedAt    string            `json:"expectedDependentUpdatedAt,omitempty"`
+	Task                          *TaskDraft        `json:"task,omitempty"`
+	ExpectedTaskVersions          map[string]string `json:"expectedTaskVersions,omitempty"`
+	Reason                        string            `json:"reason"`
 }
 
 func (a Action) Risk() ActionRisk {
@@ -66,9 +69,11 @@ func (a Action) Risk() ActionRisk {
 }
 
 type Proposal struct {
-	Summary   string   `json:"summary"`
-	Rationale string   `json:"rationale"`
-	Actions   []Action `json:"actions"`
+	IncidentID            string   `json:"incidentId"`
+	ExpectedGraphRevision int64    `json:"expectedGraphRevision"`
+	Summary               string   `json:"summary"`
+	Rationale             string   `json:"rationale"`
+	Actions               []Action `json:"actions"`
 }
 
 type IncidentSnapshot struct {
@@ -98,7 +103,11 @@ type NodeSnapshot struct {
 	WorkflowRole     model.WorkflowRole `json:"workflowRole"`
 	Assignee         *string            `json:"assignee,omitempty"`
 	Runtime          model.Runtime      `json:"runtime"`
+	Priority         int                `json:"priority"`
 	UpdatedAt        string             `json:"updatedAt"`
+	CurrentRunID     *string            `json:"currentRunId,omitempty"`
+	PreservedWork    bool               `json:"preservedWork"`
+	WorkspaceDirty   bool               `json:"workspaceDirty"`
 	BlockKind        *model.BlockKind   `json:"blockKind,omitempty"`
 	BlockReason      *string            `json:"blockReason,omitempty"`
 	BlockRecurrences int                `json:"blockRecurrences"`
@@ -118,8 +127,12 @@ type AgentSnapshot struct {
 	Runtime       model.Runtime `json:"runtime"`
 	Model         string        `json:"model,omitempty"`
 	Provider      string        `json:"provider,omitempty"`
+	Enabled       bool          `json:"enabled"`
+	Roles         []string      `json:"roles"`
 	Health        string        `json:"health"`
 	MaxConcurrent int           `json:"maxConcurrent"`
+	ActiveSlots   int           `json:"activeSlots"`
+	CooldownUntil *string       `json:"cooldownUntil,omitempty"`
 	Fallbacks     []string      `json:"fallbacks"`
 }
 
@@ -146,6 +159,10 @@ func (a Analyzer) Analyze(ctx context.Context, snapshot IncidentSnapshot) (Propo
 	if err != nil {
 		return Proposal{}, err
 	}
+	if len(snapshot.Nodes) > 200 || len(snapshot.Dependencies) > 800 || len(snapshot.AvailableAgents) > 100 ||
+		len(encoded) > 512*1024 {
+		return Proposal{}, errors.New("coordinator snapshot exceeds the bounded analysis limit")
+	}
 	prompt := strings.Join([]string{
 		"You are the Autogora Coordinator. Analyze an exceptional workflow incident; normal scheduling belongs to the deterministic Supervisor and Dispatcher.",
 		"Do not call tools, run shell commands, edit files, access Git, or invent task state. Return only a proposal that conforms to the supplied JSON schema.",
@@ -169,6 +186,12 @@ func (a Analyzer) Analyze(ctx context.Context, snapshot IncidentSnapshot) (Propo
 	if err := json.Unmarshal(encodedProposal, &proposal); err != nil {
 		return Proposal{}, fmt.Errorf("decode coordinator response: %w", err)
 	}
+	if proposal.IncidentID != snapshot.IncidentID {
+		return Proposal{}, errors.New("coordinator proposal incident does not match the snapshot")
+	}
+	if proposal.ExpectedGraphRevision != snapshot.GraphRevision {
+		return Proposal{}, errors.New("coordinator proposal graph revision does not match the snapshot")
+	}
 	if err := ValidateProposal(proposal, maxActions); err != nil {
 		return Proposal{}, err
 	}
@@ -176,6 +199,12 @@ func (a Analyzer) Analyze(ctx context.Context, snapshot IncidentSnapshot) (Propo
 }
 
 func ValidateProposal(proposal Proposal, maxActions int) error {
+	if strings.TrimSpace(proposal.IncidentID) == "" {
+		return errors.New("coordinator proposal incidentId cannot be empty")
+	}
+	if proposal.ExpectedGraphRevision < 0 {
+		return errors.New("coordinator proposal expectedGraphRevision cannot be negative")
+	}
 	if strings.TrimSpace(proposal.Summary) == "" {
 		return errors.New("coordinator proposal summary cannot be empty")
 	}
@@ -218,6 +247,9 @@ func validateAction(action Action, createdKeys map[string]bool) error {
 		if strings.TrimSpace(action.Assignee) == "" || action.Runtime == model.RuntimeManual || !model.ValidRuntime(action.Runtime) {
 			return errors.New("set_route requires an assignee and coding-agent runtime")
 		}
+		if err := rejectActionFields(action, "priority", "dependency", "task"); err != nil {
+			return err
+		}
 	case ActionUpdatePriority:
 		if err := requireExistingTask(); err != nil {
 			return err
@@ -225,14 +257,27 @@ func validateAction(action Action, createdKeys map[string]bool) error {
 		if action.Priority == nil {
 			return errors.New("update_priority requires priority")
 		}
+		if err := rejectActionFields(action, "route", "dependency", "task"); err != nil {
+			return err
+		}
 	case ActionUnblockTask, ActionMoveToTriage:
 		if err := requireExistingTask(); err != nil {
+			return err
+		}
+		if err := rejectActionFields(action, "route", "priority", "dependency", "task"); err != nil {
 			return err
 		}
 	case ActionAddDependency, ActionRemoveDependency:
 		if strings.TrimSpace(action.PrerequisiteID) == "" || strings.TrimSpace(action.DependentID) == "" ||
 			action.PrerequisiteID == action.DependentID {
 			return errors.New("dependency action requires two distinct task IDs")
+		}
+		if strings.TrimSpace(action.ExpectedPrerequisiteUpdatedAt) == "" ||
+			strings.TrimSpace(action.ExpectedDependentUpdatedAt) == "" {
+			return errors.New("dependency action requires expected versions for both tasks")
+		}
+		if err := rejectActionFields(action, "existing_task", "route", "priority", "task"); err != nil {
+			return err
 		}
 	case ActionCreateTask:
 		if action.Task == nil {
@@ -255,10 +300,70 @@ func validateAction(action Action, createdKeys map[string]bool) error {
 		if duplicateString(task.Prerequisites) || duplicateString(task.Dependents) {
 			return errors.New("create_task relationship IDs must be unique")
 		}
+		prerequisites := uniqueStrings(task.Prerequisites)
+		for dependent := range uniqueStrings(task.Dependents) {
+			if prerequisites[dependent] {
+				return fmt.Errorf("create_task cannot use %s as both prerequisite and dependent", dependent)
+			}
+		}
+		related := append(append([]string{}, task.Prerequisites...), task.Dependents...)
+		if task.ParentTaskID != "" {
+			related = append(related, task.ParentTaskID)
+		}
+		if len(action.ExpectedTaskVersions) != len(uniqueStrings(related)) {
+			return errors.New("create_task requires one expected version for every related task")
+		}
+		for _, id := range related {
+			if strings.TrimSpace(action.ExpectedTaskVersions[id]) == "" {
+				return fmt.Errorf("create_task requires the expected version for related task %s", id)
+			}
+		}
+		if err := rejectActionFields(action, "existing_task", "route", "priority", "dependency"); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported action kind %q", action.Kind)
 	}
 	return nil
+}
+
+func rejectActionFields(action Action, groups ...string) error {
+	for _, group := range groups {
+		switch group {
+		case "existing_task":
+			if action.TaskID != "" || action.ExpectedUpdatedAt != "" {
+				return errors.New("action contains fields for an existing task mutation")
+			}
+		case "route":
+			if action.Assignee != "" || action.Runtime != "" {
+				return errors.New("action contains route fields that do not apply to its kind")
+			}
+		case "priority":
+			if action.Priority != nil {
+				return errors.New("action contains a priority field that does not apply to its kind")
+			}
+		case "dependency":
+			if action.PrerequisiteID != "" || action.ExpectedPrerequisiteUpdatedAt != "" ||
+				action.DependentID != "" || action.ExpectedDependentUpdatedAt != "" {
+				return errors.New("action contains dependency fields that do not apply to its kind")
+			}
+		case "task":
+			if action.Task != nil || len(action.ExpectedTaskVersions) != 0 {
+				return errors.New("action contains task creation fields that do not apply to its kind")
+			}
+		}
+	}
+	return nil
+}
+
+func uniqueStrings(values []string) map[string]bool {
+	result := make(map[string]bool, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result[value] = true
+		}
+	}
+	return result
 }
 
 func duplicateString(values []string) bool {
@@ -274,49 +379,93 @@ func duplicateString(values []string) bool {
 }
 
 func proposalSchema(maxActions int) map[string]any {
-	actionKinds := []string{
-		string(ActionSetRoute), string(ActionUpdatePriority), string(ActionUnblockTask),
-		string(ActionMoveToTriage), string(ActionAddDependency), string(ActionRemoveDependency),
-		string(ActionCreateTask),
+	stringProperty := func() map[string]any { return map[string]any{"type": "string", "minLength": 1} }
+	actionObject := func(required []string, properties map[string]any) map[string]any {
+		properties["reason"] = stringProperty()
+		required = append(required, "reason")
+		return map[string]any{
+			"type": "object", "additionalProperties": false,
+			"required": required, "properties": properties,
+		}
+	}
+	existingTask := func(kind ActionKind, extraRequired []string, extra map[string]any) map[string]any {
+		properties := map[string]any{
+			"kind":              map[string]any{"const": string(kind)},
+			"taskId":            stringProperty(),
+			"expectedUpdatedAt": stringProperty(),
+		}
+		for key, value := range extra {
+			properties[key] = value
+		}
+		required := append([]string{"kind", "taskId", "expectedUpdatedAt"}, extraRequired...)
+		return actionObject(required, properties)
+	}
+	runtime := map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}}
+	dependencyAction := func(kind ActionKind) map[string]any {
+		return actionObject([]string{
+			"kind", "prerequisiteId", "expectedPrerequisiteUpdatedAt",
+			"dependentId", "expectedDependentUpdatedAt",
+		}, map[string]any{
+			"kind":                          map[string]any{"const": string(kind)},
+			"prerequisiteId":                stringProperty(),
+			"expectedPrerequisiteUpdatedAt": stringProperty(),
+			"dependentId":                   stringProperty(),
+			"expectedDependentUpdatedAt":    stringProperty(),
+		})
+	}
+	taskSchema := map[string]any{
+		"type": "object", "additionalProperties": false,
+		"required": []string{
+			"key", "title", "body", "assignee", "runtime", "workflowRole",
+			"priority", "prerequisites", "dependents",
+		},
+		"properties": map[string]any{
+			"key": stringProperty(), "title": stringProperty(), "body": stringProperty(),
+			"assignee": stringProperty(), "runtime": runtime,
+			"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
+			"priority":     map[string]any{"type": "integer"},
+			"prerequisites": map[string]any{
+				"type": "array", "uniqueItems": true, "items": stringProperty(),
+			},
+			"dependents": map[string]any{
+				"type": "array", "uniqueItems": true, "items": stringProperty(),
+			},
+			"parentTaskId": stringProperty(),
+		},
+	}
+	actionSchemas := []any{
+		existingTask(ActionSetRoute, []string{"assignee", "runtime"}, map[string]any{
+			"assignee": stringProperty(), "runtime": runtime,
+		}),
+		existingTask(ActionUpdatePriority, []string{"priority"}, map[string]any{
+			"priority": map[string]any{"type": "integer"},
+		}),
+		existingTask(ActionUnblockTask, nil, map[string]any{}),
+		existingTask(ActionMoveToTriage, nil, map[string]any{}),
+		dependencyAction(ActionAddDependency),
+		dependencyAction(ActionRemoveDependency),
+		actionObject([]string{"kind", "task", "expectedTaskVersions"}, map[string]any{
+			"kind": map[string]any{"const": string(ActionCreateTask)},
+			"task": taskSchema,
+			"expectedTaskVersions": map[string]any{
+				"type": "object", "additionalProperties": stringProperty(),
+			},
+		}),
 	}
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
-		"required":             []string{"summary", "rationale", "actions"},
+		"required": []string{
+			"incidentId", "expectedGraphRevision", "summary", "rationale", "actions",
+		},
 		"properties": map[string]any{
-			"summary":   map[string]any{"type": "string", "minLength": 1},
-			"rationale": map[string]any{"type": "string", "minLength": 1},
+			"incidentId":            stringProperty(),
+			"expectedGraphRevision": map[string]any{"type": "integer", "minimum": 0},
+			"summary":               stringProperty(),
+			"rationale":             stringProperty(),
 			"actions": map[string]any{
 				"type": "array", "maxItems": maxActions,
-				"items": map[string]any{
-					"type": "object", "additionalProperties": false,
-					"required": []string{"kind", "reason"},
-					"properties": map[string]any{
-						"kind":              map[string]any{"type": "string", "enum": actionKinds},
-						"taskId":            map[string]any{"type": "string"},
-						"expectedUpdatedAt": map[string]any{"type": "string"},
-						"assignee":          map[string]any{"type": "string"},
-						"runtime":           map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
-						"priority":          map[string]any{"type": "integer"},
-						"prerequisiteId":    map[string]any{"type": "string"},
-						"dependentId":       map[string]any{"type": "string"},
-						"reason":            map[string]any{"type": "string", "minLength": 1},
-						"task": map[string]any{
-							"type": "object", "additionalProperties": false,
-							"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority", "prerequisites", "dependents"},
-							"properties": map[string]any{
-								"key": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"},
-								"body": map[string]any{"type": "string"}, "assignee": map[string]any{"type": "string"},
-								"runtime":       map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
-								"workflowRole":  map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
-								"priority":      map[string]any{"type": "integer"},
-								"prerequisites": map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string"}},
-								"dependents":    map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string"}},
-								"parentTaskId":  map[string]any{"type": "string"},
-							},
-						},
-					},
-				},
+				"items": map[string]any{"anyOf": actionSchemas},
 			},
 		},
 	}

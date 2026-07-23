@@ -16,8 +16,10 @@ func TestAnalyzerRequestsToolFreeStructuredProposal(t *testing.T) {
 		Planner: func(_ context.Context, request orchestration.PlannerRequest) (any, error) {
 			captured = request
 			return map[string]any{
-				"summary":   "Use the configured fallback",
-				"rationale": "The primary agent is unavailable and the task has not started.",
+				"incidentId":            "ci1",
+				"expectedGraphRevision": 7,
+				"summary":               "Use the configured fallback",
+				"rationale":             "The primary agent is unavailable and the task has not started.",
 				"actions": []any{map[string]any{
 					"kind": "set_route", "taskId": "t1", "expectedUpdatedAt": "v1",
 					"assignee": "claude", "runtime": "claude", "reason": "healthy fallback",
@@ -47,13 +49,19 @@ func TestAnalyzerRequestsToolFreeStructuredProposal(t *testing.T) {
 	if actions["maxItems"] != 2 {
 		t.Fatalf("schema maxItems = %#v", actions["maxItems"])
 	}
+	if variants, ok := actions["items"].(map[string]any)["anyOf"].([]any); !ok || len(variants) != 7 {
+		t.Fatalf("schema action variants = %#v", actions["items"])
+	}
 	if len(proposal.Actions) != 1 || proposal.Actions[0].Risk() != ActionRiskConditional {
 		t.Fatalf("unexpected proposal: %#v", proposal)
 	}
 }
 
 func TestValidateProposalRejectsForbiddenAndAmbiguousActions(t *testing.T) {
-	base := Proposal{Summary: "summary", Rationale: "rationale"}
+	base := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 1,
+		Summary: "summary", Rationale: "rationale",
+	}
 	tests := []struct {
 		name   string
 		action Action
@@ -85,6 +93,14 @@ func TestValidateProposalRejectsForbiddenAndAmbiguousActions(t *testing.T) {
 			}},
 			want: "worker or reviewer",
 		},
+		{
+			name: "mixed fields",
+			action: Action{
+				Kind: ActionUpdatePriority, TaskID: "t1", ExpectedUpdatedAt: "v1",
+				Priority: intPointer(5), Assignee: "claude", Reason: "ambiguous",
+			},
+			want: "route fields",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -98,9 +114,12 @@ func TestValidateProposalRejectsForbiddenAndAmbiguousActions(t *testing.T) {
 	}
 }
 
+func intPointer(value int) *int { return &value }
+
 func TestValidateProposalBoundsActionsAndClassifiesGraphChanges(t *testing.T) {
 	priority := 10
 	proposal := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 1,
 		Summary: "rebalance", Rationale: "two changes",
 		Actions: []Action{
 			{Kind: ActionUpdatePriority, TaskID: "t1", ExpectedUpdatedAt: "v1", Priority: &priority, Reason: "unblock capacity"},
