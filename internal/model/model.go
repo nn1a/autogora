@@ -225,6 +225,52 @@ type ChangeSet struct {
 	CreatedAt      string   `json:"createdAt"`
 }
 
+type RecoveryCheckpointState string
+
+const (
+	RecoveryCheckpointPending    RecoveryCheckpointState = "pending"
+	RecoveryCheckpointReserved   RecoveryCheckpointState = "reserved"
+	RecoveryCheckpointAdopted    RecoveryCheckpointState = "adopted"
+	RecoveryCheckpointConsumed   RecoveryCheckpointState = "consumed"
+	RecoveryCheckpointSuperseded RecoveryCheckpointState = "superseded"
+)
+
+// RecoveryCheckpoint is a hidden, execution-only handoff for partial work.
+// Unlike ChangeSet, it never represents a completed task and cannot satisfy a
+// dependency edge. The source snapshot fields are immutable; only the bounded
+// reservation/adoption lifecycle changes after registration.
+type RecoveryCheckpoint struct {
+	ID                      string                  `json:"id"`
+	TaskID                  string                  `json:"taskId"`
+	SourceRunID             string                  `json:"sourceRunId"`
+	RepositoryPath          string                  `json:"repositoryPath"`
+	WorktreePath            string                  `json:"worktreePath"`
+	OutputBaseCommit        string                  `json:"outputBaseCommit"`
+	StartCommit             string                  `json:"startCommit"`
+	HeadCommit              string                  `json:"headCommit"`
+	DurableRef              string                  `json:"durableRef"`
+	ChangedFiles            []string                `json:"changedFiles"`
+	TaskUpdatedAt           string                  `json:"taskUpdatedAt"`
+	TaskSpecFingerprint     string                  `json:"taskSpecFingerprint"`
+	PrerequisiteFingerprint string                  `json:"prerequisiteFingerprint"`
+	State                   RecoveryCheckpointState `json:"state"`
+	ReservedRunID           *string                 `json:"reservedRunId,omitempty"`
+	ReservationToken        string                  `json:"-"`
+	ReservedAt              *string                 `json:"reservedAt,omitempty"`
+	LastReleasedRunID       *string                 `json:"-"`
+	LastReleaseToken        string                  `json:"-"`
+	LastReleasedAt          *string                 `json:"-"`
+	AdoptedOutputBaseCommit *string                 `json:"adoptedOutputBaseCommit,omitempty"`
+	AdoptedHeadCommit       *string                 `json:"adoptedHeadCommit,omitempty"`
+	AdoptedAt               *string                 `json:"adoptedAt,omitempty"`
+	ConsumedAt              *string                 `json:"consumedAt,omitempty"`
+	SupersededAt            *string                 `json:"supersededAt,omitempty"`
+	SupersededByID          *string                 `json:"supersededById,omitempty"`
+	SupersedeReason         *string                 `json:"supersedeReason,omitempty"`
+	CreatedAt               string                  `json:"createdAt"`
+	UpdatedAt               string                  `json:"updatedAt"`
+}
+
 // PrerequisiteHandoff identifies the immutable completion run that satisfied
 // one dependency edge. Older or administrative completions may not have a run;
 // callers must treat a nil Run as a valid handoff without a change set.
@@ -339,6 +385,7 @@ type ClaimedTask struct {
 	Run                   Run                    `json:"run"`
 	ClaimToken            string                 `json:"claimToken"`
 	Workspace             *RunWorkspace          `json:"workspace,omitempty"`
+	RecoveryCheckpoint    *RecoveryCheckpoint    `json:"recoveryCheckpoint,omitempty"`
 	IntegrationResolution *IntegrationResolution `json:"integrationResolution,omitempty"`
 }
 

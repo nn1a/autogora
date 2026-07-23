@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 22
+const schemaVersion = 23
 
 type Store struct {
 	db              *sql.DB
@@ -748,6 +748,326 @@ CREATE TABLE IF NOT EXISTS run_workspaces (
   prepared_at TEXT NOT NULL
 );
 
+-- A recovery checkpoint is intentionally separate from task_change_sets. It
+-- preserves an unsuccessful run's partial Git result without completing the
+-- task or satisfying any dependency. At most one checkpoint can be pending,
+-- reserved, or adopted for a task.
+CREATE TABLE IF NOT EXISTS recovery_checkpoints (
+  id TEXT PRIMARY KEY CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  source_run_id TEXT NOT NULL UNIQUE
+    REFERENCES task_runs(id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+  repository_path TEXT NOT NULL CHECK (length(CAST(repository_path AS BLOB)) BETWEEN 1 AND 4096),
+  worktree_path TEXT NOT NULL CHECK (length(CAST(worktree_path AS BLOB)) BETWEEN 1 AND 4096),
+  output_base_commit TEXT NOT NULL CHECK (length(CAST(output_base_commit AS BLOB)) BETWEEN 1 AND 128),
+  start_commit TEXT NOT NULL CHECK (length(CAST(start_commit AS BLOB)) BETWEEN 1 AND 128),
+  head_commit TEXT NOT NULL CHECK (length(CAST(head_commit AS BLOB)) BETWEEN 1 AND 128),
+  durable_ref TEXT NOT NULL CHECK (
+    length(CAST(durable_ref AS BLOB)) BETWEEN 1 AND 4096
+    AND durable_ref = 'refs/autogora/checkpoints/' || source_run_id
+  ),
+  changed_files_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (
+      length(CAST(changed_files_json AS BLOB)) <= 16777216
+      AND json_valid(changed_files_json)
+      AND CASE
+        WHEN json_valid(changed_files_json) THEN json_type(changed_files_json) = 'array'
+        ELSE 0
+      END
+    ),
+  task_updated_at TEXT NOT NULL,
+  task_spec_fingerprint TEXT NOT NULL
+    CHECK (length(task_spec_fingerprint) = 64 AND task_spec_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  prerequisite_fingerprint TEXT NOT NULL
+    CHECK (length(prerequisite_fingerprint) = 64 AND prerequisite_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'reserved', 'adopted', 'consumed', 'superseded')),
+  reserved_run_id TEXT UNIQUE REFERENCES task_runs(id) ON DELETE RESTRICT,
+  reservation_token TEXT UNIQUE,
+  reserved_at TEXT,
+  last_released_run_id TEXT REFERENCES task_runs(id) ON DELETE RESTRICT,
+  last_release_token TEXT,
+  last_released_at TEXT,
+  adopted_output_base_commit TEXT CHECK (
+    adopted_output_base_commit IS NULL OR length(CAST(adopted_output_base_commit AS BLOB)) BETWEEN 1 AND 128
+  ),
+  adopted_head_commit TEXT CHECK (
+    adopted_head_commit IS NULL OR length(CAST(adopted_head_commit AS BLOB)) BETWEEN 1 AND 128
+  ),
+  adopted_at TEXT,
+  consumed_at TEXT,
+  superseded_at TEXT,
+  superseded_by_id TEXT REFERENCES recovery_checkpoints(id) ON DELETE RESTRICT,
+  supersede_reason TEXT CHECK (
+    supersede_reason IS NULL OR length(CAST(supersede_reason AS BLOB)) BETWEEN 1 AND 2000
+  ),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (source_run_id <> IFNULL(reserved_run_id, '')),
+  CHECK (
+    (last_released_run_id IS NULL AND last_release_token IS NULL AND last_released_at IS NULL)
+    OR
+    (last_released_run_id IS NOT NULL AND last_release_token IS NOT NULL
+      AND last_release_token <> '' AND last_released_at IS NOT NULL)
+  ),
+  CHECK (
+    (state = 'pending'
+      AND reserved_run_id IS NULL AND reservation_token IS NULL AND reserved_at IS NULL
+      AND adopted_output_base_commit IS NULL AND adopted_head_commit IS NULL AND adopted_at IS NULL
+      AND consumed_at IS NULL AND superseded_at IS NULL
+      AND superseded_by_id IS NULL AND supersede_reason IS NULL)
+    OR
+    (state = 'reserved'
+      AND reserved_run_id IS NOT NULL AND reservation_token IS NOT NULL AND reservation_token <> ''
+      AND reserved_at IS NOT NULL AND adopted_output_base_commit IS NULL
+      AND adopted_head_commit IS NULL AND adopted_at IS NULL
+      AND consumed_at IS NULL AND superseded_at IS NULL
+      AND superseded_by_id IS NULL AND supersede_reason IS NULL)
+    OR
+    (state = 'adopted'
+      AND reserved_run_id IS NOT NULL AND reservation_token IS NOT NULL AND reservation_token <> ''
+      AND reserved_at IS NOT NULL AND adopted_output_base_commit IS NOT NULL
+      AND adopted_head_commit IS NOT NULL AND adopted_at IS NOT NULL
+      AND consumed_at IS NULL AND superseded_at IS NULL
+      AND superseded_by_id IS NULL AND supersede_reason IS NULL)
+    OR
+    (state = 'consumed'
+      AND reserved_run_id IS NOT NULL AND reservation_token IS NOT NULL AND reservation_token <> ''
+      AND reserved_at IS NOT NULL AND adopted_output_base_commit IS NOT NULL
+      AND adopted_head_commit IS NOT NULL AND adopted_at IS NOT NULL
+      AND consumed_at IS NOT NULL AND superseded_at IS NULL
+      AND superseded_by_id IS NULL AND supersede_reason IS NULL)
+    OR
+    (state = 'superseded'
+      AND consumed_at IS NULL AND superseded_at IS NOT NULL AND supersede_reason IS NOT NULL
+      AND (
+        (reserved_run_id IS NULL AND reservation_token IS NULL AND reserved_at IS NULL
+          AND adopted_output_base_commit IS NULL AND adopted_head_commit IS NULL AND adopted_at IS NULL)
+        OR
+        (reserved_run_id IS NOT NULL AND reservation_token IS NOT NULL AND reservation_token <> ''
+          AND reserved_at IS NOT NULL AND adopted_output_base_commit IS NOT NULL
+          AND adopted_head_commit IS NOT NULL AND adopted_at IS NOT NULL)
+      ))
+  )
+);
+
+-- Application code already updates only lifecycle columns. These triggers make
+-- the immutable provenance and bounded transition graph durable invariants
+-- even if a future caller issues a broader UPDATE.
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_source_binding
+BEFORE INSERT ON recovery_checkpoints
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM task_runs source
+  JOIN tasks task ON task.id = source.task_id
+  WHERE source.id = NEW.source_run_id
+    AND source.task_id = NEW.task_id
+    AND source.status = 'running'
+    AND task.status = 'running'
+    AND task.current_run_id = source.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'recovery checkpoint source run must actively own its task');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_changed_files_integrity
+BEFORE INSERT ON recovery_checkpoints
+WHEN CASE
+  WHEN json_valid(NEW.changed_files_json)
+    AND json_type(NEW.changed_files_json) = 'array'
+  THEN
+    (SELECT COUNT(*) FROM json_each(NEW.changed_files_json)) > 10000
+    OR EXISTS (
+      SELECT 1
+      FROM json_each(NEW.changed_files_json)
+      WHERE type <> 'text'
+        OR length(CAST(value AS BLOB)) NOT BETWEEN 1 AND 4096
+        OR instr(value, char(0)) > 0
+    )
+  ELSE 0
+END
+BEGIN
+  SELECT RAISE(ABORT, 'recovery checkpoint changed files must be bounded text paths');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_immutable_provenance
+BEFORE UPDATE OF task_id, source_run_id, repository_path, worktree_path,
+  output_base_commit, start_commit, head_commit, durable_ref,
+  changed_files_json, task_updated_at, task_spec_fingerprint,
+  prerequisite_fingerprint ON recovery_checkpoints
+WHEN OLD.task_id IS NOT NEW.task_id
+  OR OLD.source_run_id IS NOT NEW.source_run_id
+  OR OLD.repository_path IS NOT NEW.repository_path
+  OR OLD.worktree_path IS NOT NEW.worktree_path
+  OR OLD.output_base_commit IS NOT NEW.output_base_commit
+  OR OLD.start_commit IS NOT NEW.start_commit
+  OR OLD.head_commit IS NOT NEW.head_commit
+  OR OLD.durable_ref IS NOT NEW.durable_ref
+  OR OLD.changed_files_json IS NOT NEW.changed_files_json
+  OR OLD.task_updated_at IS NOT NEW.task_updated_at
+  OR OLD.task_spec_fingerprint IS NOT NEW.task_spec_fingerprint
+  OR OLD.prerequisite_fingerprint IS NOT NEW.prerequisite_fingerprint
+BEGIN
+  SELECT RAISE(ABORT, 'recovery checkpoint provenance is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_state_transition
+BEFORE UPDATE OF state ON recovery_checkpoints
+WHEN OLD.state <> NEW.state AND NOT (
+  (OLD.state = 'pending' AND NEW.state IN ('reserved', 'superseded'))
+  OR (OLD.state = 'reserved' AND NEW.state IN ('pending', 'adopted'))
+  OR (OLD.state = 'adopted' AND NEW.state IN ('consumed', 'superseded'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid recovery checkpoint state transition');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_reservation_ownership
+BEFORE UPDATE OF reserved_run_id, reservation_token, reserved_at ON recovery_checkpoints
+WHEN NOT (
+  (OLD.state = 'pending' AND NEW.state = 'reserved' AND EXISTS (
+    SELECT 1
+    FROM task_runs reservation
+    JOIN tasks task ON task.id = reservation.task_id
+    WHERE reservation.id = NEW.reserved_run_id
+      AND reservation.task_id = OLD.task_id
+      AND reservation.status = 'running'
+      AND task.status = 'running'
+      AND task.current_run_id = reservation.id
+  ))
+  OR (OLD.state = 'reserved' AND NEW.state = 'pending')
+  OR (
+    OLD.reserved_run_id IS NEW.reserved_run_id
+    AND OLD.reservation_token IS NEW.reservation_token
+    AND OLD.reserved_at IS NEW.reserved_at
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'recovery checkpoint reservation ownership is immutable within a state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_release_provenance
+BEFORE UPDATE OF last_released_run_id, last_release_token, last_released_at ON recovery_checkpoints
+WHEN NOT (
+  (OLD.state = 'pending' AND NEW.state = 'reserved'
+    AND NEW.last_released_run_id IS NULL
+    AND NEW.last_release_token IS NULL
+    AND NEW.last_released_at IS NULL)
+  OR
+  (OLD.state = 'reserved' AND NEW.state = 'pending'
+    AND NEW.last_released_run_id IS OLD.reserved_run_id
+    AND NEW.last_release_token IS OLD.reservation_token
+    AND NEW.last_released_at IS NOT NULL)
+  OR (
+    OLD.last_released_run_id IS NEW.last_released_run_id
+    AND OLD.last_release_token IS NEW.last_release_token
+    AND OLD.last_released_at IS NEW.last_released_at
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid recovery checkpoint release provenance');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_adoption_immutable
+BEFORE UPDATE OF adopted_output_base_commit, adopted_head_commit, adopted_at ON recovery_checkpoints
+WHEN OLD.adopted_head_commit IS NOT NULL
+  AND (OLD.adopted_output_base_commit IS NOT NEW.adopted_output_base_commit
+    OR OLD.adopted_head_commit IS NOT NEW.adopted_head_commit
+    OR OLD.adopted_at IS NOT NEW.adopted_at)
+BEGIN
+  SELECT RAISE(ABORT, 'recovery checkpoint adoption is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_terminal_immutable
+BEFORE UPDATE ON recovery_checkpoints
+WHEN OLD.state IN ('consumed', 'superseded') AND (
+  OLD.state IS NOT NEW.state
+  OR OLD.reserved_run_id IS NOT NEW.reserved_run_id
+  OR OLD.reservation_token IS NOT NEW.reservation_token
+  OR OLD.reserved_at IS NOT NEW.reserved_at
+  OR OLD.last_released_run_id IS NOT NEW.last_released_run_id
+  OR OLD.last_release_token IS NOT NEW.last_release_token
+  OR OLD.last_released_at IS NOT NEW.last_released_at
+  OR OLD.adopted_output_base_commit IS NOT NEW.adopted_output_base_commit
+  OR OLD.adopted_head_commit IS NOT NEW.adopted_head_commit
+  OR OLD.adopted_at IS NOT NEW.adopted_at
+  OR OLD.consumed_at IS NOT NEW.consumed_at
+  OR OLD.superseded_at IS NOT NEW.superseded_at
+  OR (OLD.superseded_by_id IS NOT NULL AND OLD.superseded_by_id IS NOT NEW.superseded_by_id)
+  OR OLD.supersede_reason IS NOT NEW.supersede_reason
+)
+BEGIN
+  SELECT RAISE(ABORT, 'terminal recovery checkpoint is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_superseded_by_integrity
+BEFORE UPDATE OF superseded_by_id ON recovery_checkpoints
+WHEN OLD.superseded_by_id IS NOT NEW.superseded_by_id AND NOT (
+  OLD.state = 'superseded'
+  AND NEW.state = 'superseded'
+  AND OLD.superseded_by_id IS NULL
+  AND NEW.superseded_by_id IS NOT NULL
+  AND NEW.superseded_by_id <> OLD.id
+  AND EXISTS (
+    SELECT 1 FROM recovery_checkpoints replacement
+    WHERE replacement.id = NEW.superseded_by_id
+      AND replacement.task_id = OLD.task_id
+      AND replacement.source_run_id = OLD.reserved_run_id
+      AND replacement.repository_path = OLD.repository_path
+      AND replacement.output_base_commit = OLD.adopted_output_base_commit
+      AND replacement.start_commit = OLD.adopted_head_commit
+      AND replacement.task_spec_fingerprint = OLD.task_spec_fingerprint
+      AND replacement.prerequisite_fingerprint = OLD.prerequisite_fingerprint
+      AND replacement.state = 'pending'
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid recovery checkpoint replacement');
+END;
+
+-- An unadopted reservation contains no workspace mutation and can safely
+-- return to pending when a generic crash/reclaim path terminalizes its run.
+-- Once adoption changed the workspace, terminalization must instead consume a
+-- successful result or atomically replace the checkpoint with cumulative work.
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_require_adopted_resolution
+BEFORE UPDATE OF status ON task_runs
+WHEN OLD.status = 'running' AND NEW.status <> 'running' AND EXISTS (
+  SELECT 1 FROM recovery_checkpoints
+  WHERE reserved_run_id = OLD.id AND state = 'adopted'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'adopted recovery checkpoint must be consumed or superseded before terminalizing run');
+END;
+
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_release_unadopted_terminal_run
+AFTER UPDATE OF status ON task_runs
+WHEN OLD.status = 'running' AND NEW.status <> 'running' AND EXISTS (
+  SELECT 1 FROM recovery_checkpoints
+  WHERE reserved_run_id = OLD.id AND state = 'reserved'
+)
+BEGIN
+  INSERT INTO task_events(task_id, run_id, kind, payload_json, created_at)
+  SELECT task_id, OLD.id, 'recovery_checkpoint_released',
+    json_object(
+      'checkpointId', id,
+      'reason', 'active run terminalized before checkpoint adoption',
+      'automatic', 1
+    ),
+    COALESCE(NEW.ended_at, NEW.heartbeat_at, OLD.heartbeat_at)
+  FROM recovery_checkpoints
+  WHERE reserved_run_id = OLD.id AND state = 'reserved';
+
+  UPDATE recovery_checkpoints
+  SET state = 'pending',
+    last_released_run_id = OLD.id,
+    last_release_token = reservation_token,
+    last_released_at = COALESCE(NEW.ended_at, NEW.heartbeat_at, OLD.heartbeat_at),
+    reserved_run_id = NULL,
+    reservation_token = NULL,
+    reserved_at = NULL,
+    updated_at = COALESCE(NEW.ended_at, NEW.heartbeat_at, OLD.heartbeat_at)
+  WHERE reserved_run_id = OLD.id AND state = 'reserved';
+END;
+
 -- Conflict-resolution preparations and started attempts are control-plane
 -- safety state. They survive event retention so GC cannot reset retry bounds.
 CREATE TABLE IF NOT EXISTS integration_resolution_attempts (
@@ -1043,6 +1363,14 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(board, status, scheduled_at,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
 CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
+CREATE INDEX IF NOT EXISTS idx_recovery_checkpoints_task
+  ON recovery_checkpoints(task_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_checkpoints_active_task
+  ON recovery_checkpoints(task_id)
+  WHERE state IN ('pending', 'reserved', 'adopted');
+CREATE INDEX IF NOT EXISTS idx_recovery_checkpoints_reserved_run
+  ON recovery_checkpoints(reserved_run_id)
+  WHERE reserved_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_integration_resolution_attempts_task
   ON integration_resolution_attempts(task_id, conflict_fingerprint, attempt DESC);
 CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_id, configured_at DESC);

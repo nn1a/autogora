@@ -405,6 +405,15 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 					return fmt.Errorf("change set is not ready: %s", state)
 				}
 			}
+			if err := consumeRecoveryCheckpointForSuccessfulCompletion(
+				ctx,
+				tx,
+				currentTask.ID,
+				runID,
+				timestamp,
+			); err != nil {
+				return err
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?,
 				exit_code = ?, summary = ?, metadata_json = ? WHERE id = ?`, timestamp, timestamp, exitCode,
 				currentRequest.Summary, metadataJSON, runID); err != nil {

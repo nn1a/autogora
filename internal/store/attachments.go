@@ -52,7 +52,36 @@ func (s *Store) ListAttachments(ctx context.Context, taskID string) ([]model.Att
 	return s.listAttachments(ctx, taskID)
 }
 
+func requireAttachmentMutationAllowed(
+	ctx context.Context,
+	q querier,
+	task model.Task,
+	completionArtifact bool,
+) error {
+	if task.Status != model.TaskStatusRunning && task.CurrentRunID == nil {
+		return nil
+	}
+	if completionArtifact && task.Status == model.TaskStatusRunning && task.CurrentRunID != nil {
+		request, err := getTerminalRequest(ctx, q, *task.CurrentRunID)
+		if err != nil {
+			return err
+		}
+		if request != nil && request.Kind == "complete" && request.FinalizedAt == nil {
+			return nil
+		}
+	}
+	return errors.New("cannot change task attachments while running; terminate or complete the active run first")
+}
+
 func (s *Store) AttachFile(ctx context.Context, taskID, sourcePath, displayName string) (model.Attachment, error) {
+	return s.attachFile(ctx, taskID, sourcePath, displayName, false)
+}
+
+func (s *Store) attachFile(
+	ctx context.Context,
+	taskID, sourcePath, displayName string,
+	completionArtifact bool,
+) (model.Attachment, error) {
 	if _, err := requireTask(ctx, s.db, taskID); err != nil {
 		return model.Attachment{}, err
 	}
@@ -129,7 +158,11 @@ func (s *Store) AttachFile(ctx context.Context, taskID, sourcePath, displayName 
 	digest := hex.EncodeToString(hash.Sum(nil))
 	mediaType := attachmentMediaType(name)
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := requireTask(ctx, tx, taskID); err != nil {
+		task, err := requireTask(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAttachmentMutationAllowed(ctx, tx, task, completionArtifact); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
@@ -155,7 +188,11 @@ func (s *Store) AttachURL(ctx context.Context, taskID, rawURL, displayName strin
 	}
 	id := newID("a")
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := requireTask(ctx, tx, taskID); err != nil {
+		task, err := requireTask(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAttachmentMutationAllowed(ctx, tx, task, false); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
@@ -232,6 +269,13 @@ func (s *Store) CreateTaskWithURLSource(ctx context.Context, input CreateTaskInp
 		if existing > 0 {
 			return nil
 		}
+		task, err := requireTask(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAttachmentMutationAllowed(ctx, tx, task, false); err != nil {
+			return err
+		}
 		id := newID("a")
 		if _, err := tx.ExecContext(ctx, `INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
 			VALUES (?, ?, 'url', ?, NULL, NULL, NULL, NULL, ?, ?)`, id, taskID, name, normalized, now()); err != nil {
@@ -255,6 +299,13 @@ func (s *Store) RemoveAttachment(ctx context.Context, taskID, attachmentID strin
 		return err
 	}
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		task, err := requireTask(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if err := requireAttachmentMutationAllowed(ctx, tx, task, false); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM task_attachments WHERE id = ? AND task_id = ?", attachmentID, taskID); err != nil {
 			return err
 		}
@@ -292,7 +343,7 @@ func (s *Store) captureArtifactsAt(ctx context.Context, task model.Task, workspa
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(workspace, path)
 		}
-		attachment, err := s.AttachFile(ctx, task.ID, path, "")
+		attachment, err := s.attachFile(ctx, task.ID, path, "", true)
 		if err != nil {
 			return nil, err
 		}
