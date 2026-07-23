@@ -53,6 +53,20 @@ func TestDecompositionPromptConstrainsChildSkillsToRootConfiguration(t *testing.
 	}
 }
 
+func TestPlanningPromptsKeepGitLifecycleHostOwned(t *testing.T) {
+	task := model.TaskDetail{Task: model.Task{
+		ID: "t_managed", Title: "Build feature", Body: "Implement and commit the result.",
+	}}
+	if prompt := specificationPrompt(task); !strings.Contains(prompt, "Do not require the worker to create or push Git commits") ||
+		!strings.Contains(prompt, "immutable change set") {
+		t.Fatalf("specification prompt omits the managed Git lifecycle:\n%s", prompt)
+	}
+	if prompt := decompositionPrompt(task, []ProfileRoute{{Name: "worker", Runtime: model.RuntimeCodex}}); !strings.Contains(prompt, "must not ask workers to create or push Git commits") ||
+		!strings.Contains(prompt, "Autogora owns that lifecycle") {
+		t.Fatalf("decomposition prompt omits the managed Git lifecycle:\n%s", prompt)
+	}
+}
+
 func TestDecompositionRejectsSkillNotConfiguredOnRoot(t *testing.T) {
 	for name, rootSkills := range map[string][]string{
 		"root has no skills":         nil,

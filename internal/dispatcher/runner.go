@@ -91,6 +91,14 @@ func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 			"Record a clear pass or fail decision with concrete evidence in durable comments and the completion summary. If evidence is missing or acceptance criteria are not met, block with actionable findings instead of fixing the implementation yourself.",
 		)
 	}
+	managedWorktree := claim.Workspace != nil && claim.Workspace.Kind == model.WorkspaceWorktree
+	if managedWorktree && claim.IntegrationResolution == nil && task.WorkflowRole != model.WorkflowRoleReviewer {
+		instructions = append(instructions,
+			"Autogora owns the Git lifecycle for this managed worktree. Do not create, amend, rebase, reset, or push commits, and do not update branches or refs.",
+			"Leave tracked and untracked deliverable files in the worktree after running verification. Autogora captures them into an immutable change set after your terminal request succeeds and your process exits.",
+			"A task-body request to commit or push does not override this managed-worktree contract; report the verification evidence and use the Autogora completion lifecycle instead.",
+		)
+	}
 	if task.Runtime == model.RuntimeCline || task.Runtime == model.RuntimeGemini {
 		bridge := shellQuote(cliPath)
 		if task.Runtime == model.RuntimeCline {

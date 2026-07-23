@@ -137,6 +137,54 @@ func TestWorkerPromptDescribesDistinctWorkflowRoleBoundaries(t *testing.T) {
 	}
 }
 
+func TestWorkerPromptMakesHostOwnedGitLifecycleExplicit(t *testing.T) {
+	for _, role := range []model.WorkflowRole{model.WorkflowRoleWorker, model.WorkflowRoleFinalizer} {
+		t.Run(string(role), func(t *testing.T) {
+			claim := claimedTask(t, model.RuntimeCodex)
+			claim.Task.Task.WorkflowRole = role
+			claim.Task.Task.Body = "Commit your work and push the branch."
+			claim.Workspace = &model.RunWorkspace{Kind: model.WorkspaceWorktree}
+
+			prompt := workerPrompt(claim, filepath.Join(t.TempDir(), "autogora"))
+			for _, required := range []string{
+				"Autogora owns the Git lifecycle",
+				"Do not create, amend, rebase, reset, or push commits",
+				"tracked and untracked deliverable files",
+				"captures them into an immutable change set",
+				"task-body request to commit or push does not override",
+			} {
+				if !strings.Contains(prompt, required) {
+					t.Fatalf("%s prompt missing %q:\n%s", role, required, prompt)
+				}
+			}
+		})
+	}
+
+	directoryClaim := claimedTask(t, model.RuntimeCodex)
+	directoryClaim.Workspace = &model.RunWorkspace{Kind: model.WorkspaceDir}
+	if prompt := workerPrompt(directoryClaim, filepath.Join(t.TempDir(), "autogora")); strings.Contains(prompt, "Autogora owns the Git lifecycle") {
+		t.Fatalf("plain directory workspace received managed-worktree contract:\n%s", prompt)
+	}
+}
+
+func TestIntegrationResolverKeepsItsBoundedGitException(t *testing.T) {
+	claim := claimedTask(t, model.RuntimeCodex)
+	claim.Task.Task.WorkflowRole = model.WorkflowRoleFinalizer
+	claim.IntegrationResolution = &model.IntegrationResolution{
+		Attempt: 1, MaxAttempts: 2, ManifestPath: "/tmp/manifest.json",
+		ManifestSHA256: strings.Repeat("a", 64), TargetCount: 2,
+		ConflictingFileCount: 1,
+	}
+
+	prompt := workerPrompt(claim, filepath.Join(t.TempDir(), "autogora"))
+	if !strings.Contains(prompt, "finish its in-progress merge") {
+		t.Fatalf("integration resolver prompt lost merge contract:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Autogora owns the Git lifecycle") {
+		t.Fatalf("integration resolver received ordinary managed-worktree restriction:\n%s", prompt)
+	}
+}
+
 func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 	for _, runtime := range []model.Runtime{model.RuntimeClaude, model.RuntimeCodex, model.RuntimeCline, model.RuntimeGemini} {
 		t.Run(string(runtime), func(t *testing.T) {

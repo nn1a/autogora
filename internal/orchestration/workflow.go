@@ -276,6 +276,7 @@ func specificationPrompt(task model.TaskDetail) string {
 		"You are an Autogora triage specifier.",
 		"Rewrite the rough idea into a precise, executable task without inventing external facts.",
 		"The body must include scope, concrete deliverables, acceptance criteria, constraints, and verification.",
+		"Do not require the worker to create or push Git commits; Autogora captures the managed worktree as an immutable change set.",
 		"Return only the requested structured object.", "",
 	}
 	if task.Task.IdempotencyKey != nil && strings.HasPrefix(*task.Task.IdempotencyKey, "github-issue:") {
@@ -328,6 +329,7 @@ func decompositionPrompt(task model.TaskDetail, profiles []ProfileRoute) string 
 		"Dependencies control execution only: dependency parent is the prerequisite and child waits for parent.",
 		"Do not add dependency edges to the root; Autogora automatically makes the root wait for every terminal subtask so it can perform final coordination or verification.",
 		"Use only assignee names from the profile roster. Every task needs a complete handoff-ready body.",
+		"Generated task bodies must describe deliverables and verification, but must not ask workers to create or push Git commits, switch branches, or update refs. Autogora owns that lifecycle and captures each managed worktree.",
 		skillContract,
 		"Never invent or infer skill IDs from the task title, body, technology, or profile descriptions.",
 		"Return only the requested structured object.",
