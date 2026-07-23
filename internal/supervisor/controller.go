@@ -84,6 +84,7 @@ func (c *Controller) dispatcherOptions(config agentconfig.Config) dispatcher.Opt
 	return dispatcher.Options{
 		DBPath: c.options.DBPath, CLIPath: c.options.CLIPath,
 		MaxWorkers: config.Supervisor.MaxWorkers, AllowWrites: config.Supervisor.AllowWrites,
+		Autopilot:   true,
 		AgentConfig: &config, WorkingDirectory: c.options.WorkingDirectory,
 		Getenv: c.options.Getenv, OnLog: c.options.OnLog,
 	}

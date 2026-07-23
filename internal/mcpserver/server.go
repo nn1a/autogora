@@ -156,17 +156,44 @@ type boardUpdateInput struct {
 }
 
 type boardOrchestrationInput struct {
-	AutoDecompose        *bool           `json:"autoDecompose,omitempty"`
-	AutoDecomposePerTick *int            `json:"autoDecomposePerTick,omitempty"`
-	AutoPromoteChildren  *bool           `json:"autoPromoteChildren,omitempty"`
-	PlannerRuntime       *model.Runtime  `json:"plannerRuntime,omitempty"`
-	PlannerModel         *string         `json:"plannerModel,omitempty"`
-	PlannerProvider      *string         `json:"plannerProvider,omitempty"`
-	DefaultProfile       *string         `json:"defaultProfile,omitempty"`
-	FinalizerProfile     *string         `json:"finalizerProfile,omitempty"`
-	Profiles             *[]profileRoute `json:"profiles,omitempty"`
+	AutoDecompose        *bool                `json:"autoDecompose,omitempty"`
+	AutoDecomposePerTick *int                 `json:"autoDecomposePerTick,omitempty"`
+	AutoPromoteChildren  *bool                `json:"autoPromoteChildren,omitempty"`
+	PlannerRuntime       *model.Runtime       `json:"plannerRuntime,omitempty"`
+	PlannerModel         *string              `json:"plannerModel,omitempty"`
+	PlannerProvider      *string              `json:"plannerProvider,omitempty"`
+	DefaultProfile       *string              `json:"defaultProfile,omitempty"`
+	FinalizerProfile     *string              `json:"finalizerProfile,omitempty"`
+	Profiles             *[]profileRoute      `json:"profiles,omitempty"`
+	Autopilot            *boardAutopilotInput `json:"autopilot,omitempty"`
 	defaultProfileSet    bool
 	finalizerProfileSet  bool
+}
+
+type boardAutopilotInput struct {
+	Enabled         *bool                   `json:"enabled,omitempty"`
+	AutoPlan        *bool                   `json:"autoPlan,omitempty"`
+	AutoExecute     *bool                   `json:"autoExecute,omitempty"`
+	WorkspaceWrites *bool                   `json:"workspaceWrites,omitempty"`
+	ReviewGate      *bool                   `json:"reviewGate,omitempty"`
+	Coordination    *boardCoordinationInput `json:"coordination,omitempty"`
+	Publication     *boardPublicationInput  `json:"publication,omitempty"`
+}
+
+type boardCoordinationInput struct {
+	Mode                  *boards.CoordinationMode `json:"mode,omitempty"`
+	Profile               *string                  `json:"profile,omitempty"`
+	IdleSeconds           *int                     `json:"idleSeconds,omitempty"`
+	MaxCallsPerHour       *int                     `json:"maxCallsPerHour,omitempty"`
+	MaxActionsPerIncident *int                     `json:"maxActionsPerIncident,omitempty"`
+	profileSet            bool
+}
+
+type boardPublicationInput struct {
+	Mode            *boards.PublicationMode `json:"mode,omitempty"`
+	TargetBranch    *string                 `json:"targetBranch,omitempty"`
+	Remote          *string                 `json:"remote,omitempty"`
+	RequireApproval *bool                   `json:"requireApproval,omitempty"`
 }
 
 func presence(raw []byte, names ...string) map[string]bool {
@@ -210,6 +237,17 @@ func (input *boardOrchestrationInput) UnmarshalJSON(raw []byte) error {
 	*input = boardOrchestrationInput(value)
 	found := presence(raw, "defaultProfile", "finalizerProfile")
 	input.defaultProfileSet, input.finalizerProfileSet = found["defaultProfile"], found["finalizerProfile"]
+	return nil
+}
+
+func (input *boardCoordinationInput) UnmarshalJSON(raw []byte) error {
+	type plain boardCoordinationInput
+	var value plain
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	*input = boardCoordinationInput(value)
+	input.profileSet = presence(raw, "profile")["profile"]
 	return nil
 }
 
@@ -478,6 +516,11 @@ func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.Orchestra
 		AutoPromoteChildren: input.AutoPromoteChildren, PlannerRuntime: input.PlannerRuntime,
 		PlannerModel: input.PlannerModel, PlannerProvider: input.PlannerProvider,
 	}
+	autopilot, err := autopilotBoardUpdate(input.Autopilot)
+	if err != nil {
+		return nil, err
+	}
+	update.Autopilot = autopilot
 	if input.defaultProfileSet {
 		update.DefaultProfile = store.OptionalString{Set: true, Value: input.DefaultProfile}
 	}
@@ -499,6 +542,49 @@ func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.Orchestra
 				MaxConcurrent: profile.MaxConcurrent, Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...)})
 		}
 		update.Profiles = &profiles
+	}
+	return update, nil
+}
+
+func autopilotBoardUpdate(input *boardAutopilotInput) (*boards.AutopilotUpdate, error) {
+	if input == nil {
+		return nil, nil
+	}
+	update := &boards.AutopilotUpdate{
+		Enabled: input.Enabled, AutoPlan: input.AutoPlan, AutoExecute: input.AutoExecute,
+		WorkspaceWrites: input.WorkspaceWrites, ReviewGate: input.ReviewGate,
+	}
+	if coordination := input.Coordination; coordination != nil {
+		if coordination.Mode != nil && *coordination.Mode != boards.CoordinationModeObserve &&
+			*coordination.Mode != boards.CoordinationModeAssist && *coordination.Mode != boards.CoordinationModeAuto {
+			return nil, errors.New("coordination mode must be observe, assist, or auto")
+		}
+		if coordination.IdleSeconds != nil && *coordination.IdleSeconds < 30 {
+			return nil, errors.New("coordination idleSeconds must be at least 30")
+		}
+		if coordination.MaxCallsPerHour != nil && (*coordination.MaxCallsPerHour < 1 || *coordination.MaxCallsPerHour > 100) {
+			return nil, errors.New("coordination maxCallsPerHour must be between 1 and 100")
+		}
+		if coordination.MaxActionsPerIncident != nil && (*coordination.MaxActionsPerIncident < 1 || *coordination.MaxActionsPerIncident > 100) {
+			return nil, errors.New("coordination maxActionsPerIncident must be between 1 and 100")
+		}
+		update.Coordination = &boards.CoordinationUpdate{
+			Mode: coordination.Mode, IdleSeconds: coordination.IdleSeconds,
+			MaxCallsPerHour: coordination.MaxCallsPerHour, MaxActionsPerIncident: coordination.MaxActionsPerIncident,
+		}
+		if coordination.profileSet {
+			update.Coordination.Profile = store.OptionalString{Set: true, Value: coordination.Profile}
+		}
+	}
+	if publication := input.Publication; publication != nil {
+		if publication.Mode != nil && *publication.Mode != boards.PublicationModeManual &&
+			*publication.Mode != boards.PublicationModeLocalFF && *publication.Mode != boards.PublicationModePullRequest {
+			return nil, errors.New("publication mode must be manual, local_ff, or pull_request")
+		}
+		update.Publication = &boards.PublicationUpdate{
+			Mode: publication.Mode, TargetBranch: publication.TargetBranch, Remote: publication.Remote,
+			RequireApproval: publication.RequireApproval,
+		}
 	}
 	return update, nil
 }

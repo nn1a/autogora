@@ -185,6 +185,11 @@ func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
 	}
 	update.DefaultProfile = optionalString(body, "defaultProfile")
 	update.FinalizerProfile = optionalString(body, "finalizerProfile")
+	autopilot, err := autopilotUpdate(body["autopilot"])
+	if err != nil {
+		return nil, err
+	}
+	update.Autopilot = autopilot
 	if raw, exists := body["profiles"]; exists {
 		items, ok := raw.([]any)
 		if !ok {
@@ -205,6 +210,70 @@ func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
 				MaxConcurrent: intValue(record["maxConcurrent"], 0), Priority: intValue(record["priority"], 0), Fallbacks: stringArray(record["fallbacks"])})
 		}
 		update.Profiles = &profiles
+	}
+	return update, nil
+}
+
+func autopilotUpdate(value any) (*boards.AutopilotUpdate, error) {
+	body, ok := value.(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	update := &boards.AutopilotUpdate{
+		Enabled: boolPointerFrom(body, "enabled"), AutoPlan: boolPointerFrom(body, "autoPlan"),
+		AutoExecute: boolPointerFrom(body, "autoExecute"), WorkspaceWrites: boolPointerFrom(body, "workspaceWrites"),
+		ReviewGate: boolPointerFrom(body, "reviewGate"),
+	}
+	if raw, exists := body["coordination"]; exists {
+		coordination, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("autopilot coordination must be an object")
+		}
+		mode := boards.CoordinationMode(strings.TrimSpace(stringValue(coordination["mode"])))
+		if _, provided := coordination["mode"]; provided {
+			if mode != boards.CoordinationModeObserve && mode != boards.CoordinationModeAssist && mode != boards.CoordinationModeAuto {
+				return nil, errors.New("coordination mode must be observe, assist, or auto")
+			}
+		}
+		coordinationUpdate := &boards.CoordinationUpdate{
+			Profile:               optionalString(coordination, "profile"),
+			IdleSeconds:           intPointerFrom(coordination, "idleSeconds"),
+			MaxCallsPerHour:       intPointerFrom(coordination, "maxCallsPerHour"),
+			MaxActionsPerIncident: intPointerFrom(coordination, "maxActionsPerIncident"),
+		}
+		if _, provided := coordination["mode"]; provided {
+			coordinationUpdate.Mode = &mode
+		}
+		if coordinationUpdate.IdleSeconds != nil && *coordinationUpdate.IdleSeconds < 30 {
+			return nil, errors.New("coordination idleSeconds must be at least 30")
+		}
+		if coordinationUpdate.MaxCallsPerHour != nil && (*coordinationUpdate.MaxCallsPerHour < 1 || *coordinationUpdate.MaxCallsPerHour > 100) {
+			return nil, errors.New("coordination maxCallsPerHour must be between 1 and 100")
+		}
+		if coordinationUpdate.MaxActionsPerIncident != nil && (*coordinationUpdate.MaxActionsPerIncident < 1 || *coordinationUpdate.MaxActionsPerIncident > 100) {
+			return nil, errors.New("coordination maxActionsPerIncident must be between 1 and 100")
+		}
+		update.Coordination = coordinationUpdate
+	}
+	if raw, exists := body["publication"]; exists {
+		publication, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("autopilot publication must be an object")
+		}
+		mode := boards.PublicationMode(strings.TrimSpace(stringValue(publication["mode"])))
+		if _, provided := publication["mode"]; provided {
+			if mode != boards.PublicationModeManual && mode != boards.PublicationModeLocalFF && mode != boards.PublicationModePullRequest {
+				return nil, errors.New("publication mode must be manual, local_ff, or pull_request")
+			}
+		}
+		publicationUpdate := &boards.PublicationUpdate{
+			TargetBranch: stringPointerFrom(publication, "targetBranch"), Remote: stringPointerFrom(publication, "remote"),
+			RequireApproval: boolPointerFrom(publication, "requireApproval"),
+		}
+		if _, provided := publication["mode"]; provided {
+			publicationUpdate.Mode = &mode
+		}
+		update.Publication = publicationUpdate
 	}
 	return update, nil
 }

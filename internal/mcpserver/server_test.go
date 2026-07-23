@@ -129,6 +129,10 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 		"orchestration": map[string]any{
 			"autoDecompose": false, "autoDecomposePerTick": 4, "autoPromoteChildren": false,
 			"plannerRuntime": "gemini", "defaultProfile": "worker",
+			"autopilot": map[string]any{
+				"enabled": true, "autoPlan": false, "workspaceWrites": true,
+				"coordination": map[string]any{"mode": "assist", "profile": "worker"},
+			},
 			"profiles": []any{map[string]any{"name": "worker", "runtime": "gemini", "description": "general work"}},
 		},
 	}, nil)
@@ -136,7 +140,12 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metadata.DefaultWorkdir != nil || metadata.Orchestration.AutoDecompose || metadata.Orchestration.AutoDecomposePerTick != 4 || metadata.Orchestration.PlannerRuntime != model.RuntimeGemini || len(metadata.Orchestration.Profiles) != 1 {
+	if metadata.DefaultWorkdir != nil || metadata.Orchestration.AutoDecompose || metadata.Orchestration.AutoDecomposePerTick != 4 ||
+		metadata.Orchestration.PlannerRuntime != model.RuntimeGemini || len(metadata.Orchestration.Profiles) != 1 ||
+		metadata.Orchestration.Autopilot.AutoPlan || !metadata.Orchestration.Autopilot.WorkspaceWrites ||
+		metadata.Orchestration.Autopilot.Coordination.Mode != boards.CoordinationModeAssist ||
+		metadata.Orchestration.Autopilot.Coordination.Profile == nil ||
+		*metadata.Orchestration.Autopilot.Coordination.Profile != "worker" {
 		t.Fatalf("MCP board orchestration update mismatch: %+v", metadata)
 	}
 	var created struct {

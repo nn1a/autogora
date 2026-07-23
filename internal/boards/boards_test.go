@@ -124,6 +124,47 @@ func TestBoardPersistsExplicitAgentModelsAndAvailability(t *testing.T) {
 	}
 }
 
+func TestBoardPersistsNormalizedAutopilotPolicy(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(ctx, "default", Update{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Orchestration.Autopilot.Enabled || !created.Orchestration.Autopilot.AutoPlan ||
+		!created.Orchestration.Autopilot.AutoExecute || created.Orchestration.Autopilot.WorkspaceWrites ||
+		created.Orchestration.Autopilot.Coordination.Mode != CoordinationModeObserve ||
+		created.Orchestration.Autopilot.Publication.Mode != PublicationModeManual {
+		t.Fatalf("unexpected default autopilot policy: %#v", created.Orchestration.Autopilot)
+	}
+
+	mode, profile := CoordinationModeAssist, "coordinator"
+	publicationMode, branch := PublicationModePullRequest, "develop"
+	writes, review := true, true
+	updated, err := manager.Update("default", Update{Orchestration: &OrchestrationUpdate{
+		Autopilot: &AutopilotUpdate{
+			WorkspaceWrites: &writes, ReviewGate: &review,
+			Coordination: &CoordinationUpdate{
+				Mode: &mode, Profile: store.OptionalString{Set: true, Value: &profile},
+			},
+			Publication: &PublicationUpdate{Mode: &publicationMode, TargetBranch: &branch},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := updated.Orchestration.Autopilot
+	if !policy.WorkspaceWrites || !policy.ReviewGate || policy.Coordination.Mode != mode ||
+		policy.Coordination.Profile == nil || *policy.Coordination.Profile != profile ||
+		policy.Publication.Mode != publicationMode || policy.Publication.TargetBranch != branch ||
+		policy.Coordination.IdleSeconds != 300 || policy.Publication.Remote != "origin" {
+		t.Fatalf("unexpected persisted autopilot policy: %#v", policy)
+	}
+}
+
 func TestBoardRemovalRejectsActiveRunsForArchiveAndHardDelete(t *testing.T) {
 	for _, hardDelete := range []bool{false, true} {
 		t.Run(map[bool]string{false: "archive", true: "hard-delete"}[hardDelete], func(t *testing.T) {

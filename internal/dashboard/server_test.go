@@ -500,10 +500,20 @@ func TestBoardTaskHierarchyAndAttachmentAPI(t *testing.T) {
 		"name": "Default Project", "orchestration": map[string]any{
 			"autoDecompose": true, "autoDecomposePerTick": 2, "autoPromoteChildren": false,
 			"plannerRuntime": "gemini", "defaultProfile": "worker",
+			"autopilot": map[string]any{
+				"enabled": true, "autoPlan": true, "autoExecute": true, "workspaceWrites": true,
+				"coordination": map[string]any{"mode": "assist", "profile": "worker", "idleSeconds": 60},
+				"publication":  map[string]any{"mode": "pull_request", "targetBranch": "develop", "requireApproval": true},
+			},
 			"profiles": []any{map[string]any{"name": "worker", "runtime": "gemini", "description": "general work"}},
 		},
 	})
-	if response.StatusCode != http.StatusOK || mapValue(t, mapValue(t, updated)["orchestration"])["plannerRuntime"] != "gemini" {
+	orchestration := mapValue(t, mapValue(t, updated)["orchestration"])
+	autopilot := mapValue(t, orchestration["autopilot"])
+	if response.StatusCode != http.StatusOK || orchestration["plannerRuntime"] != "gemini" ||
+		autopilot["workspaceWrites"] != true ||
+		mapValue(t, autopilot["coordination"])["mode"] != "assist" ||
+		mapValue(t, autopilot["publication"])["targetBranch"] != "develop" {
 		t.Fatalf("board update failed: %d %#v", response.StatusCode, updated)
 	}
 	invalid, _ := apiRequest(t, server, http.MethodGet, "/api/tasks?sort=drop-table", nil)

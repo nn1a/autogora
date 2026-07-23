@@ -33,16 +33,58 @@ type Profile struct {
 	Fallbacks     []string      `json:"fallbacks,omitempty"`
 }
 
+type CoordinationMode string
+
+const (
+	CoordinationModeObserve CoordinationMode = "observe"
+	CoordinationModeAssist  CoordinationMode = "assist"
+	CoordinationModeAuto    CoordinationMode = "auto"
+)
+
+type PublicationMode string
+
+const (
+	PublicationModeManual      PublicationMode = "manual"
+	PublicationModeLocalFF     PublicationMode = "local_ff"
+	PublicationModePullRequest PublicationMode = "pull_request"
+)
+
+type CoordinationSettings struct {
+	Mode                  CoordinationMode `json:"mode"`
+	Profile               *string          `json:"profile"`
+	IdleSeconds           int              `json:"idleSeconds"`
+	MaxCallsPerHour       int              `json:"maxCallsPerHour"`
+	MaxActionsPerIncident int              `json:"maxActionsPerIncident"`
+}
+
+type PublicationSettings struct {
+	Mode            PublicationMode `json:"mode"`
+	TargetBranch    string          `json:"targetBranch"`
+	Remote          string          `json:"remote"`
+	RequireApproval bool            `json:"requireApproval"`
+}
+
+type AutopilotSettings struct {
+	Enabled         bool                 `json:"enabled"`
+	AutoPlan        bool                 `json:"autoPlan"`
+	AutoExecute     bool                 `json:"autoExecute"`
+	WorkspaceWrites bool                 `json:"workspaceWrites"`
+	ReviewGate      bool                 `json:"reviewGate"`
+	Coordination    CoordinationSettings `json:"coordination"`
+	Publication     PublicationSettings  `json:"publication"`
+}
+
 type OrchestrationSettings struct {
-	AutoDecompose        bool          `json:"autoDecompose"`
-	AutoDecomposePerTick int           `json:"autoDecomposePerTick"`
-	AutoPromoteChildren  bool          `json:"autoPromoteChildren"`
-	PlannerRuntime       model.Runtime `json:"plannerRuntime"`
-	PlannerModel         string        `json:"plannerModel,omitempty"`
-	PlannerProvider      string        `json:"plannerProvider,omitempty"`
-	DefaultProfile       *string       `json:"defaultProfile"`
-	FinalizerProfile     *string       `json:"finalizerProfile"`
-	Profiles             []Profile     `json:"profiles"`
+	AutoDecompose        bool              `json:"autoDecompose"`
+	AutoDecomposePerTick int               `json:"autoDecomposePerTick"`
+	AutoPromoteChildren  bool              `json:"autoPromoteChildren"`
+	PlannerRuntime       model.Runtime     `json:"plannerRuntime"`
+	PlannerModel         string            `json:"plannerModel,omitempty"`
+	PlannerProvider      string            `json:"plannerProvider,omitempty"`
+	DefaultProfile       *string           `json:"defaultProfile"`
+	FinalizerProfile     *string           `json:"finalizerProfile"`
+	Profiles             []Profile         `json:"profiles"`
+	Autopilot            AutopilotSettings `json:"autopilot"`
 }
 
 type Metadata struct {
@@ -81,6 +123,32 @@ type OrchestrationUpdate struct {
 	DefaultProfile       store.OptionalString
 	FinalizerProfile     store.OptionalString
 	Profiles             *[]Profile
+	Autopilot            *AutopilotUpdate
+}
+
+type AutopilotUpdate struct {
+	Enabled         *bool
+	AutoPlan        *bool
+	AutoExecute     *bool
+	WorkspaceWrites *bool
+	ReviewGate      *bool
+	Coordination    *CoordinationUpdate
+	Publication     *PublicationUpdate
+}
+
+type CoordinationUpdate struct {
+	Mode                  *CoordinationMode
+	Profile               store.OptionalString
+	IdleSeconds           *int
+	MaxCallsPerHour       *int
+	MaxActionsPerIncident *int
+}
+
+type PublicationUpdate struct {
+	Mode            *PublicationMode
+	TargetBranch    *string
+	Remote          *string
+	RequireApproval *bool
 }
 
 type RemoveResult struct {
@@ -186,7 +254,21 @@ func defaultName(slug string) string {
 
 func defaultOrchestration() OrchestrationSettings {
 	return OrchestrationSettings{AutoDecompose: true, AutoDecomposePerTick: 3, AutoPromoteChildren: true,
-		PlannerRuntime: model.RuntimeCodex, Profiles: []Profile{}}
+		PlannerRuntime: model.RuntimeCodex, Profiles: []Profile{}, Autopilot: defaultAutopilot()}
+}
+
+func defaultAutopilot() AutopilotSettings {
+	return AutopilotSettings{
+		Enabled: true, AutoPlan: true, AutoExecute: true,
+		Coordination: CoordinationSettings{
+			Mode: CoordinationModeObserve, IdleSeconds: 300,
+			MaxCallsPerHour: 4, MaxActionsPerIncident: 3,
+		},
+		Publication: PublicationSettings{
+			Mode: PublicationModeManual, TargetBranch: "main",
+			Remote: "origin", RequireApproval: true,
+		},
+	}
 }
 
 func validWorkerRuntime(runtime model.Runtime) bool {
@@ -194,6 +276,9 @@ func validWorkerRuntime(runtime model.Runtime) bool {
 }
 
 func normalizeOrchestration(value OrchestrationSettings) OrchestrationSettings {
+	if value.Autopilot.Coordination.Mode == "" && value.Autopilot.Publication.Mode == "" {
+		value.Autopilot = defaultAutopilot()
+	}
 	if value.AutoDecomposePerTick < 1 {
 		value.AutoDecomposePerTick = 3
 	}
@@ -226,6 +311,47 @@ func normalizeOrchestration(value OrchestrationSettings) OrchestrationSettings {
 		}
 	}
 	value.Profiles = profiles
+	value.Autopilot = normalizeAutopilot(value.Autopilot)
+	return value
+}
+
+func normalizeAutopilot(value AutopilotSettings) AutopilotSettings {
+	defaults := defaultAutopilot()
+	switch value.Coordination.Mode {
+	case CoordinationModeObserve, CoordinationModeAssist, CoordinationModeAuto:
+	default:
+		value.Coordination.Mode = defaults.Coordination.Mode
+	}
+	if value.Coordination.Profile != nil {
+		profile := strings.TrimSpace(*value.Coordination.Profile)
+		if profile == "" {
+			value.Coordination.Profile = nil
+		} else {
+			value.Coordination.Profile = &profile
+		}
+	}
+	if value.Coordination.IdleSeconds < 30 {
+		value.Coordination.IdleSeconds = defaults.Coordination.IdleSeconds
+	}
+	if value.Coordination.MaxCallsPerHour < 1 {
+		value.Coordination.MaxCallsPerHour = defaults.Coordination.MaxCallsPerHour
+	}
+	if value.Coordination.MaxActionsPerIncident < 1 {
+		value.Coordination.MaxActionsPerIncident = defaults.Coordination.MaxActionsPerIncident
+	}
+	switch value.Publication.Mode {
+	case PublicationModeManual, PublicationModeLocalFF, PublicationModePullRequest:
+	default:
+		value.Publication.Mode = defaults.Publication.Mode
+	}
+	value.Publication.TargetBranch = strings.TrimSpace(value.Publication.TargetBranch)
+	if value.Publication.TargetBranch == "" {
+		value.Publication.TargetBranch = defaults.Publication.TargetBranch
+	}
+	value.Publication.Remote = strings.TrimSpace(value.Publication.Remote)
+	if value.Publication.Remote == "" {
+		value.Publication.Remote = defaults.Publication.Remote
+	}
 	return value
 }
 
@@ -392,7 +518,61 @@ func applyOrchestration(current OrchestrationSettings, update *OrchestrationUpda
 	if update.Profiles != nil {
 		current.Profiles = *update.Profiles
 	}
+	current.Autopilot = applyAutopilot(current.Autopilot, update.Autopilot)
 	return normalizeOrchestration(current)
+}
+
+func applyAutopilot(current AutopilotSettings, update *AutopilotUpdate) AutopilotSettings {
+	if update == nil {
+		return current
+	}
+	if update.Enabled != nil {
+		current.Enabled = *update.Enabled
+	}
+	if update.AutoPlan != nil {
+		current.AutoPlan = *update.AutoPlan
+	}
+	if update.AutoExecute != nil {
+		current.AutoExecute = *update.AutoExecute
+	}
+	if update.WorkspaceWrites != nil {
+		current.WorkspaceWrites = *update.WorkspaceWrites
+	}
+	if update.ReviewGate != nil {
+		current.ReviewGate = *update.ReviewGate
+	}
+	if coordination := update.Coordination; coordination != nil {
+		if coordination.Mode != nil {
+			current.Coordination.Mode = *coordination.Mode
+		}
+		if coordination.Profile.Set {
+			current.Coordination.Profile = coordination.Profile.Value
+		}
+		if coordination.IdleSeconds != nil {
+			current.Coordination.IdleSeconds = *coordination.IdleSeconds
+		}
+		if coordination.MaxCallsPerHour != nil {
+			current.Coordination.MaxCallsPerHour = *coordination.MaxCallsPerHour
+		}
+		if coordination.MaxActionsPerIncident != nil {
+			current.Coordination.MaxActionsPerIncident = *coordination.MaxActionsPerIncident
+		}
+	}
+	if publication := update.Publication; publication != nil {
+		if publication.Mode != nil {
+			current.Publication.Mode = *publication.Mode
+		}
+		if publication.TargetBranch != nil {
+			current.Publication.TargetBranch = *publication.TargetBranch
+		}
+		if publication.Remote != nil {
+			current.Publication.Remote = *publication.Remote
+		}
+		if publication.RequireApproval != nil {
+			current.Publication.RequireApproval = *publication.RequireApproval
+		}
+	}
+	return normalizeAutopilot(current)
 }
 
 func (m *Manager) write(board string, update Update, archived *bool) (Metadata, error) {

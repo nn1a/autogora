@@ -1427,6 +1427,7 @@ async function submitBoard(event) {
 
 function openSettings() {
   const form = $("#settings-form"); const metadata = state.metadata; const settings = metadata.orchestration;
+  const autopilot = settings.autopilot || {}; const coordination = autopilot.coordination || {}; const publication = autopilot.publication || {};
   form.elements.name.value = metadata.name; form.elements.description.value = metadata.description;
   form.elements.color.value = /^#[0-9a-f]{6}$/i.test(metadata.color) ? metadata.color : "#5b7cff";
   form.elements.defaultWorkdir.value = metadata.defaultWorkdir || ""; form.elements.autoDecompose.checked = settings.autoDecompose;
@@ -1434,6 +1435,12 @@ function openSettings() {
   form.elements.plannerRuntime.value = settings.plannerRuntime; form.elements.autoDecomposePerTick.value = settings.autoDecomposePerTick;
   form.elements.plannerModel.value = settings.plannerModel || ""; form.elements.plannerProvider.value = settings.plannerProvider || "";
   form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.finalizerProfile.value = settings.finalizerProfile || "";
+  form.elements.autopilotEnabled.checked = Boolean(autopilot.enabled); form.elements.autoPlan.checked = Boolean(autopilot.autoPlan);
+  form.elements.autoExecute.checked = Boolean(autopilot.autoExecute); form.elements.workspaceWrites.checked = Boolean(autopilot.workspaceWrites);
+  form.elements.reviewGate.checked = Boolean(autopilot.reviewGate); form.elements.coordinatorMode.value = coordination.mode || "observe";
+  form.elements.coordinatorProfile.value = coordination.profile || ""; form.elements.publicationMode.value = publication.mode || "manual";
+  form.elements.publicationTargetBranch.value = publication.targetBranch || "main"; form.elements.publicationRemote.value = publication.remote || "origin";
+  form.elements.publicationApproval.checked = Boolean(publication.requireApproval);
   renderProfileEditor(settings.profiles || []);
   $("#archive-board").classList.toggle("hidden", state.board === "default");
   $("#settings-dialog").showModal();
@@ -1448,7 +1455,14 @@ async function submitSettings(event) {
       orchestration: { autoDecompose: data.get("autoDecompose") === "on", autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
         plannerModel: data.get("plannerModel"), plannerProvider: data.get("plannerProvider"),
         autoDecomposePerTick: Number(data.get("autoDecomposePerTick")), defaultProfile: data.get("defaultProfile") || null,
-        finalizerProfile: data.get("finalizerProfile") || null, profiles },
+        finalizerProfile: data.get("finalizerProfile") || null, profiles,
+        autopilot: {
+          enabled: data.get("autopilotEnabled") === "on", autoPlan: data.get("autoPlan") === "on",
+          autoExecute: data.get("autoExecute") === "on", workspaceWrites: data.get("workspaceWrites") === "on",
+          reviewGate: data.get("reviewGate") === "on",
+          coordination: { mode: data.get("coordinatorMode"), profile: data.get("coordinatorProfile") || null },
+          publication: { mode: data.get("publicationMode"), targetBranch: data.get("publicationTargetBranch"), remote: data.get("publicationRemote"), requireApproval: data.get("publicationApproval") === "on" },
+        } },
     }) });
     $("#settings-dialog").close(); await loadBoards(); await loadBoard();
   } catch (error) { toast(error.message, true); }

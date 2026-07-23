@@ -1197,6 +1197,125 @@ sleep 1
 	}
 }
 
+func TestAutopilotSkipsExecutionWhenBoardExecutionIsDisabled(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	enabled, execute := true, false
+	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
+		Autopilot: &boards.AutopilotUpdate{Enabled: &enabled, AutoExecute: &execute},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "wait for manual dispatch", Assignee: &assignee, Runtime: model.RuntimeCline,
+	})
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(ctx, Options{
+		DBPath: dbPath, CLIPath: "/tmp/autogora", Board: "default", Once: true,
+		Autopilot: true, AutoDecompose: boolValue(false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusReady || len(detail.Runs) != 0 {
+		t.Fatalf("disabled board execution claimed a task: %#v", detail)
+	}
+}
+
+func TestAutopilotWorkspaceWritesRequireGlobalAndBoardPermission(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
+	fixture := executableFixture(t, `"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "policy observed" >/dev/null`)
+	assignee := "worker"
+
+	for _, test := range []struct {
+		name       string
+		global     bool
+		board      bool
+		wantWrites bool
+	}{
+		{name: "global denied", global: false, board: true, wantWrites: false},
+		{name: "board denied", global: true, board: false, wantWrites: false},
+		{name: "both allowed", global: true, board: true, wantWrites: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
+				Autopilot: &boards.AutopilotUpdate{WorkspaceWrites: &test.board},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+				Title: test.name, Assignee: &assignee, Runtime: model.RuntimeCline,
+			})
+			if err != nil {
+				opened.Close()
+				t.Fatal(err)
+			}
+			if err := opened.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := Run(ctx, Options{
+				DBPath: dbPath, CLIPath: cliPath, Board: "default", TaskID: task.Task.ID,
+				Once: true, AllowWrites: test.global, Autopilot: true,
+				AutoDecompose: boolValue(false), Getenv: func(name string) string {
+					if name == "AUTOGORA_CLINE_BIN" {
+						return fixture
+					}
+					return ""
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			check, err := manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			detail, err := check.GetTask(ctx, task.Task.ID)
+			if err != nil {
+				check.Close()
+				t.Fatal(err)
+			}
+			if len(detail.Runs) != 1 {
+				check.Close()
+				t.Fatalf("runs = %d, want 1", len(detail.Runs))
+			}
+			policy, err := check.GetManagedRunWritePolicy(ctx, detail.Runs[0].ID)
+			closeErr := check.Close()
+			if err != nil || closeErr != nil {
+				t.Fatal(errors.Join(err, closeErr))
+			}
+			if policy == nil || *policy != test.wantWrites {
+				t.Fatalf("write policy = %v, want %v", policy, test.wantWrites)
+			}
+		})
+	}
+}
+
 func TestDispatcherCapturesWorktreeChangesWithoutMovingUserCheckout(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)

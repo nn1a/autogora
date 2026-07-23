@@ -144,6 +144,25 @@
         <button id="manage-agents" type="button">Manage agents</button>
       </section>
       <hr>
+      <section class="profile-editor" aria-labelledby="autopilot-settings-title">
+        <div class="profile-editor-header">
+          <div><strong id="autopilot-settings-title">Board Autopilot</strong><small>Supervisor automation is capped by both global and board permissions. Coordinator handles exceptional recovery, not normal dispatch.</small></div>
+        </div>
+        <label class="inline"><input name="autopilotEnabled" type="checkbox"> Enable Autopilot for this board</label>
+        <label class="inline"><input name="autoPlan" type="checkbox"> Plan triage tasks automatically</label>
+        <label class="inline"><input name="autoExecute" type="checkbox"> Execute ready tasks automatically</label>
+        <label class="inline"><input name="workspaceWrites" type="checkbox"> Permit workspace writes when the global policy also allows them</label>
+        <label class="inline"><input name="reviewGate" type="checkbox"> Require a review gate before publication</label>
+        <div class="form-grid">
+          <label>Coordinator mode<select name="coordinatorMode"><option value="observe">observe</option><option value="assist">assist</option><option value="auto">auto</option></select></label>
+          <label>Coordinator profile<input name="coordinatorProfile" placeholder="global agent default"></label>
+          <label>Publication<select name="publicationMode"><option value="manual">manual</option><option value="local_ff">local_ff</option><option value="pull_request">pull_request</option></select></label>
+          <label>Target branch<input name="publicationTargetBranch" placeholder="main"></label>
+          <label>Remote<input name="publicationRemote" placeholder="origin"></label>
+          <label class="inline"><input name="publicationApproval" type="checkbox"> Require publication approval</label>
+        </div>
+      </section>
+      <hr>
       <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
       <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
       <div class="form-grid">

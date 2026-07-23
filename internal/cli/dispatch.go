@@ -216,7 +216,8 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, FinalizerProfile: finalizerProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
 		PlannerModel: opts.value("planner-model"), PlannerProvider: opts.value("planner-provider"),
-		AllowWrites: opts.flags["allow-writes"], WorkingDirectory: cwd, Getenv: a.Getenv,
+		AllowWrites: opts.flags["allow-writes"], Autopilot: command == "daemon",
+		WorkingDirectory: cwd, Getenv: a.Getenv,
 		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})
 }

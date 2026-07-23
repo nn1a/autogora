@@ -61,6 +61,7 @@ type Options struct {
 	PlanningShutdownGrace    time.Duration
 	DecompositionPlanner     orchestration.Planner
 	AllowWrites              bool
+	Autopilot                bool
 	ClineApprovalDir         string
 	WorkingDirectory         string
 	Getenv                   func(string) string
@@ -788,6 +789,10 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 			continue
 		}
 		enabled := metadata.Orchestration.AutoDecompose
+		if options.Autopilot {
+			autopilot := metadata.Orchestration.Autopilot
+			enabled = enabled && autopilot.Enabled && autopilot.AutoPlan
+		}
 		if options.AutoDecompose != nil {
 			enabled = *options.AutoDecompose
 		}
@@ -1748,11 +1753,23 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				if ctx.Err() != nil || int(active.Load()) >= options.MaxWorkers {
 					break
 				}
+				runOptions := options
+				if options.Autopilot {
+					metadata, metadataErr := manager.Read(board)
+					if metadataErr != nil {
+						return metadataErr
+					}
+					autopilot := metadata.Orchestration.Autopilot
+					if !autopilot.Enabled || !autopilot.AutoExecute {
+						continue
+					}
+					runOptions.AllowWrites = options.AllowWrites && autopilot.WorkspaceWrites
+				}
 				opened, err := manager.OpenStore(ctx, board)
 				if err != nil {
 					return err
 				}
-				excluded, profileLimits, err := claimProfilePolicy(ctx, manager, opened, board, options)
+				excluded, profileLimits, err := claimProfilePolicy(ctx, manager, opened, board, runOptions)
 				if err != nil {
 					opened.Close()
 					return err
@@ -1784,13 +1801,13 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				nextClaimBoard = boardAfter(claimOrder, board)
 				active.Add(1)
 				workers.Add(1)
-				go func(opened *store.Store, claim *model.ClaimedTask, approvalDir string) {
+				go func(opened *store.Store, claim *model.ClaimedTask, approvalDir string, runOptions Options) {
 					defer workers.Done()
-					workerErr := runClaim(ctx, manager, opened, claim, options, processes, approvalDir)
+					workerErr := runClaim(ctx, manager, opened, claim, runOptions, processes, approvalDir)
 					closeErr := opened.Close()
 					active.Add(-1)
 					recordWorkerResult(errors.Join(workerErr, closeErr))
-				}(opened, claim, approvalDir)
+				}(opened, claim, approvalDir, runOptions)
 				if options.Once {
 					break
 				}
