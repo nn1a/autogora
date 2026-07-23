@@ -280,6 +280,9 @@ func (s *Store) ApproveCoordinationProposal(
 		if !emptyJSONArray(proposal.ValidationErrors) {
 			return errors.New("a coordination proposal with validation errors cannot be approved")
 		}
+		if emptyJSONArray(proposal.Actions) {
+			return ErrCoordinationManualEscalation
+		}
 
 		timestamp := now()
 		update, err := tx.ExecContext(ctx, `

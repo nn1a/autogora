@@ -17,6 +17,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/dispatcher"
 	"github.com/nn1a/autogora/internal/model"
 	setupcfg "github.com/nn1a/autogora/internal/setup"
 	"github.com/nn1a/autogora/internal/store"
@@ -216,6 +217,58 @@ func TestAgentConfigAPIUsesRevisionCASAndPreservesSupervisorIntent(t *testing.T)
 	}
 	if loaded.Supervisor.MaxWorkers != 2 {
 		t.Fatalf("stale Web save overwrote current config: %#v", loaded.Supervisor)
+	}
+}
+
+func TestDashboardSupervisorPassesLiveGlobalAgentConfigLoader(t *testing.T) {
+	started := make(chan dispatcher.Options, 1)
+	server := startTestServerWithOptions(t, func(options *Options) {
+		options.supervisorRun = func(
+			ctx context.Context,
+			dispatchOptions dispatcher.Options,
+		) error {
+			started <- dispatchOptions
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	config := agentconfig.Default()
+	config.Supervisor.MaxWorkers = 1
+	config.Agents = []agentconfig.Agent{{
+		ID: "coordinator", Runtime: model.RuntimeCodex, Command: "codex",
+		Model: "first-model", Enabled: true, MaxConcurrent: 1,
+		Roles: []agentconfig.Role{agentconfig.RoleCoordinator},
+	}}
+	config.Defaults.CoordinatorAgents = []string{"coordinator"}
+	response, value := putAgentConfig(t, server, config, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("start Dashboard Supervisor: %d %#v", response.StatusCode, value)
+	}
+	var dispatchOptions dispatcher.Options
+	select {
+	case dispatchOptions = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Dashboard Supervisor did not start dispatcher")
+	}
+	if dispatchOptions.AgentConfig == nil || dispatchOptions.AgentConfigLoader == nil ||
+		dispatchOptions.AgentConfig.Agents[0].Model != "first-model" {
+		t.Fatalf("Dashboard Supervisor dispatcher options = %#v", dispatchOptions)
+	}
+	config.Agents[0].Model = "second-model"
+	if err := agentconfig.Save(agentconfig.Options{}, config); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := dispatchOptions.AgentConfigLoader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Agents[0].Model != "second-model" ||
+		dispatchOptions.AgentConfig.Agents[0].Model != "first-model" {
+		t.Fatalf(
+			"Dashboard Supervisor loader = snapshot:%#v live:%#v",
+			dispatchOptions.AgentConfig,
+			reloaded,
+		)
 	}
 }
 

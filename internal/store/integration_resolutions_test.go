@@ -422,7 +422,7 @@ func TestIntegrationResolutionRequiresWritePolicyAndRefundsUnstartedProcess(t *t
 	assertUnstarted()
 }
 
-func TestSchema21CreatesIntegrationResolutionLedgerForVersion20Database(t *testing.T) {
+func TestLatestSchemaCreatesIntegrationResolutionLedgerForVersion20Database(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "autogora.db")
 	initial, err := Open(path, "default", "")
@@ -460,7 +460,12 @@ func TestSchema21CreatesIntegrationResolutionLedgerForVersion20Database(t *testi
 		WHERE type = 'table' AND name = 'integration_resolution_attempts'`).Scan(&tableCount); err != nil {
 		t.Fatal(err)
 	}
-	if version != 21 || tableCount != 1 {
-		t.Fatalf("schema migration = version:%d ledger:%d, want 21 and 1", version, tableCount)
+	if version != schemaVersion || tableCount != 1 {
+		t.Fatalf(
+			"schema migration = version:%d ledger:%d, want %d and 1",
+			version,
+			tableCount,
+			schemaVersion,
+		)
 	}
 }

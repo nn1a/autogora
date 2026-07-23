@@ -16,6 +16,7 @@ const (
 	CoordinationTriggerGraphStalled        CoordinationTrigger = "graph_stalled"
 	CoordinationTriggerIntegrationConflict CoordinationTrigger = "integration_conflict"
 	CoordinationTriggerAgentExhausted      CoordinationTrigger = "agent_exhausted"
+	CoordinationTriggerRunInvariant        CoordinationTrigger = "run_invariant"
 )
 
 var CoordinationTriggers = []CoordinationTrigger{
@@ -24,6 +25,7 @@ var CoordinationTriggers = []CoordinationTrigger{
 	CoordinationTriggerGraphStalled,
 	CoordinationTriggerIntegrationConflict,
 	CoordinationTriggerAgentExhausted,
+	CoordinationTriggerRunInvariant,
 }
 
 type CoordinationSeverity string

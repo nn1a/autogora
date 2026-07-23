@@ -92,21 +92,31 @@ func TestCoordinationIncidentDedupRefreshAndProposalLifecycle(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("claim incident: claimed=%v value=%+v err=%v", claimed, currentIncident, err)
 	}
+	actions, err := json.Marshal([]map[string]any{{
+		"kind":              "update_priority",
+		"taskId":            task.Task.ID,
+		"expectedUpdatedAt": task.Task.UpdatedAt,
+		"priority":          7,
+		"reason":            "Prioritize the blocked task.",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	proposal, created, err := opened.CreateCoordinationProposal(ctx, CreateCoordinationProposalInput{
 		IncidentID: currentIncident.ID, CoordinatorAgent: "codex-coordinator",
 		CoordinatorModel: "gpt-5.4", CoordinatorProvider: "openai",
 		ExpectedGraphRevision: revisionPointer(2),
 		ClaimToken:            currentIncident.ClaimToken,
 		Current:               claimTime.Add(time.Second),
-		Summary:               "Add a conflict-resolution task",
-		Rationale:             "A dedicated integration step can preserve both changes.",
-		Actions:               []byte(`[]`),
+		Summary:               "Prioritize the blocked task",
+		Rationale:             "Higher priority can move the recovery task ahead.",
+		Actions:               actions,
 	})
 	if err != nil || !created {
 		t.Fatalf("create proposal: created=%v value=%+v err=%v", created, proposal, err)
 	}
-	newSummary := "Add and gate a conflict-resolution task"
-	newActions := jsonRaw(`[]`)
+	newSummary := "Prioritize the blocked recovery task"
+	newActions := json.RawMessage(actions)
 	proposal, err = opened.UpdateCoordinationProposal(ctx, proposal.ID, UpdateCoordinationProposalInput{
 		ExpectedStatus: model.CoordinationProposalDraft, ExpectedGraphRevision: revisionPointer(2),
 		ClaimToken: currentIncident.ClaimToken, Current: claimTime.Add(time.Second),

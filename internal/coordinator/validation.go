@@ -211,6 +211,27 @@ func ValidateAgainstSnapshot(proposal Proposal, snapshot IncidentSnapshot, maxAc
 			simulateCreatedTask(index, action, nodes, edges, adjacency, addIssue)
 		}
 	}
+	// An empty action list is an explicit manual-escalation proposal. It does
+	// not claim that the integration condition was repaired, so preserve it as
+	// a valid approval handoff. Any proposal that does mutate state must still
+	// prove through simulation that the triggering block is gone.
+	if snapshot.Trigger == string(model.CoordinationTriggerIntegrationConflict) &&
+		len(proposal.Actions) > 0 {
+		focus, found := nodes[snapshot.FocusTaskID]
+		if !found {
+			addIssue(
+				-1,
+				"integration_condition_unknown",
+				"integration incident focus task is not present in the bounded snapshot",
+			)
+		} else if coordinatorIntegrationConditionRemains(snapshot.Details, focus) {
+			addIssue(
+				-1,
+				"integration_condition_remains",
+				"proposal does not clear the integration block that opened the incident",
+			)
+		}
+	}
 	for _, action := range proposal.Actions {
 		result.Actions = append(result.Actions, ValidatedAction{
 			Action: action, Risk: classifyValidatedRisk(action, originalNodes, nodes, agents),
@@ -218,6 +239,76 @@ func ValidateAgainstSnapshot(proposal Proposal, snapshot IncidentSnapshot, maxAc
 	}
 	result.Valid = len(result.Issues) == 0
 	return result
+}
+
+func coordinatorIntegrationConditionRemains(
+	details map[string]any,
+	focus NodeSnapshot,
+) bool {
+	if focus.Status == model.TaskStatusRunning {
+		return true
+	}
+	if focus.Status == model.TaskStatusDone ||
+		focus.Status == model.TaskStatusArchived {
+		return false
+	}
+	if focus.Status != model.TaskStatusBlocked &&
+		focus.Status != model.TaskStatusTriage {
+		return false
+	}
+	detailString := func(value any) string {
+		text, _ := value.(string)
+		return strings.TrimSpace(text)
+	}
+	expectedKind := detailString(details["blockKind"])
+	expectedReason := detailString(details["reason"])
+	if expectedKind != "" {
+		if focus.BlockKind == nil ||
+			strings.TrimSpace(string(*focus.BlockKind)) != expectedKind {
+			return false
+		}
+	}
+	if expectedReason != "" {
+		if focus.BlockReason == nil ||
+			!coordinatorIntegrationReasonMatches(*focus.BlockReason, expectedReason) {
+			return false
+		}
+	}
+	// Malformed legacy details are handled conservatively: a still-blocked
+	// focus task must not be declared recovered merely because the expected
+	// kind or reason was absent from the incident payload.
+	return focus.BlockKind != nil || focus.BlockReason != nil ||
+		(expectedKind == "" && expectedReason == "")
+}
+
+// ManualEscalationConditionResolved reports whether an empty integration
+// proposal has been satisfied by a person since it was created. Other trigger
+// types remain explicit decisions because their recovery condition cannot be
+// inferred safely from one focus task.
+func ManualEscalationConditionResolved(
+	proposal Proposal,
+	snapshot IncidentSnapshot,
+) bool {
+	if len(proposal.Actions) != 0 ||
+		snapshot.Trigger != string(model.CoordinationTriggerIntegrationConflict) {
+		return false
+	}
+	for _, node := range snapshot.Nodes {
+		if node.ID == snapshot.FocusTaskID {
+			return !coordinatorIntegrationConditionRemains(snapshot.Details, node)
+		}
+	}
+	return false
+}
+
+func coordinatorIntegrationReasonMatches(actual, expected string) bool {
+	actual, expected = strings.TrimSpace(actual), strings.TrimSpace(expected)
+	if actual == expected {
+		return actual != ""
+	}
+	const truncationSuffix = "…"
+	return strings.HasSuffix(expected, truncationSuffix) &&
+		strings.HasPrefix(actual, strings.TrimSuffix(expected, truncationSuffix))
 }
 
 func validateRoute(index int, assignee string, runtime model.Runtime, agents map[string]AgentSnapshot, addIssue func(int, string, string)) {

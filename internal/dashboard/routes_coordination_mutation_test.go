@@ -97,7 +97,17 @@ func coordinationMutationBody(fixture dashboardCoordinationFixture) map[string]a
 
 func TestCoordinationProposalApproveAppliesAtomically(t *testing.T) {
 	server := startTestServer(t)
-	fixture := seedDashboardAwaitingProposal(t, server, "default", json.RawMessage(`[]`))
+	fixture := seedDashboardAwaitingProposal(t, server, "default", json.RawMessage(`[{
+		"kind":"create_task",
+		"reason":"create bounded recovery work",
+		"task":{
+			"key":"dashboard-recovery","title":"Dashboard recovery",
+			"body":"Run the approved recovery.","assignee":"codex-worker",
+			"runtime":"codex","workflowRole":"worker","priority":1,
+			"prerequisites":[],"dependents":[]
+		},
+		"expectedTaskVersions":{}
+	}]`))
 	path := "/api/coordination/proposals/" + fixture.Proposal.ID + "/approve?board=default"
 	body := coordinationMutationBody(fixture)
 
@@ -120,6 +130,57 @@ func TestCoordinationProposalApproveAppliesAtomically(t *testing.T) {
 	if duplicate.StatusCode != http.StatusConflict ||
 		!strings.Contains(strings.ToLower(mapValue(t, duplicateValue)["error"].(string)), "conflict") {
 		t.Fatalf("duplicate approval: %d %#v", duplicate.StatusCode, duplicateValue)
+	}
+}
+
+func TestCoordinationProposalApproveRejectsManualEscalationWithoutSuperseding(t *testing.T) {
+	server := startTestServer(t)
+	fixture := seedDashboardAwaitingProposal(
+		t,
+		server,
+		"default",
+		json.RawMessage(`[]`),
+	)
+	response, value := apiRequest(
+		t,
+		server,
+		http.MethodPost,
+		"/api/coordination/proposals/"+fixture.Proposal.ID+"/approve?board=default",
+		coordinationMutationBody(fixture),
+	)
+	result := mapValue(t, value)
+	if response.StatusCode != http.StatusConflict ||
+		!strings.Contains(strings.ToLower(result["error"].(string)), "manual escalation") {
+		t.Fatalf("manual escalation approval response: %d %#v", response.StatusCode, result)
+	}
+	opened, err := server.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	proposal, err := opened.GetCoordinationProposal(
+		context.Background(),
+		fixture.Proposal.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, err := opened.GetCoordinationIncident(
+		context.Background(),
+		fixture.Incident.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Status != model.CoordinationProposalAwaitingApproval ||
+		proposal.UpdatedAt != fixture.Proposal.UpdatedAt ||
+		incident.Status != model.CoordinationIncidentAwaitingApproval ||
+		incident.UpdatedAt != fixture.Incident.UpdatedAt {
+		t.Fatalf(
+			"manual escalation API changed state: proposal=%+v incident=%+v",
+			proposal,
+			incident,
+		)
 	}
 }
 

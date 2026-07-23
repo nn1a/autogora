@@ -713,6 +713,9 @@ func (s *Store) ApplyCoordinationProposal(
 		if err != nil {
 			return err
 		}
+		if err := requireCoordinationIncidentPostcondition(ctx, tx, incident); err != nil {
+			return err
+		}
 		if graphChanged {
 			state, err = bumpBoardGraphRevision(ctx, tx, incident.Board)
 			if err != nil {
@@ -782,6 +785,78 @@ func (s *Store) ApplyCoordinationProposal(
 		return nil
 	})
 	return result, err
+}
+
+type coordinationIntegrationIncidentDetails struct {
+	BlockKind model.BlockKind `json:"blockKind"`
+	Reason    string          `json:"reason"`
+}
+
+func coordinationIntegrationReasonMatches(actual, expected string) bool {
+	actual, expected = strings.TrimSpace(actual), strings.TrimSpace(expected)
+	if actual == expected {
+		return actual != ""
+	}
+	const truncationSuffix = "…"
+	return strings.HasSuffix(expected, truncationSuffix) &&
+		strings.HasPrefix(actual, strings.TrimSuffix(expected, truncationSuffix))
+}
+
+// requireCoordinationIncidentPostcondition prevents an applied proposal from
+// resolving an integration incident while the exact block that opened it is
+// still present. This store-level check protects approved/manual callers even
+// when they bypass the Coordinator's snapshot validator.
+func requireCoordinationIncidentPostcondition(
+	ctx context.Context,
+	tx *sql.Tx,
+	incident model.CoordinationIncident,
+) error {
+	if incident.Trigger != model.CoordinationTriggerIntegrationConflict {
+		return nil
+	}
+	if incident.TaskID == nil || strings.TrimSpace(*incident.TaskID) == "" {
+		return errors.New("integration coordination incident has no focus task")
+	}
+	task, err := requireTask(ctx, tx, strings.TrimSpace(*incident.TaskID))
+	if err != nil {
+		return err
+	}
+	if task.Status == model.TaskStatusDone ||
+		task.Status == model.TaskStatusArchived {
+		return nil
+	}
+	if task.Status == model.TaskStatusRunning {
+		return fmt.Errorf(
+			"integration coordination incident %s remains active: task %s is still running",
+			incident.ID,
+			task.ID,
+		)
+	}
+	if task.Status != model.TaskStatusBlocked &&
+		task.Status != model.TaskStatusTriage {
+		return nil
+	}
+	var expected coordinationIntegrationIncidentDetails
+	if err := json.Unmarshal(incident.Details, &expected); err != nil {
+		return fmt.Errorf(
+			"decode integration coordination incident %s postcondition: %w",
+			incident.ID,
+			err,
+		)
+	}
+	kindMatches := expected.BlockKind == "" ||
+		(task.BlockKind != nil && *task.BlockKind == expected.BlockKind)
+	reasonMatches := strings.TrimSpace(expected.Reason) == "" ||
+		(task.BlockReason != nil &&
+			coordinationIntegrationReasonMatches(*task.BlockReason, expected.Reason))
+	if kindMatches && reasonMatches {
+		return fmt.Errorf(
+			"integration coordination incident %s remains active: task %s retains its integration block",
+			incident.ID,
+			task.ID,
+		)
+	}
+	return nil
 }
 
 func (s *Store) executeCoordinationApply(

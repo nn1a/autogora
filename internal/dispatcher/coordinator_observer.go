@@ -31,6 +31,7 @@ const (
 	coordinatorTaskTitleLimit          = 512
 	coordinatorObservationTaskLimit    = 5000
 	coordinatorConditionFingerprintKey = "conditionFingerprint"
+	coordinatorRunOwnershipReadLimit   = 3
 )
 
 type coordinatorCondition struct {
@@ -64,7 +65,8 @@ func activeCoordinatorIncident(status model.CoordinationIncidentStatus) bool {
 func coordinatorManagedTrigger(trigger model.CoordinationTrigger) bool {
 	switch trigger {
 	case model.CoordinationTriggerRepeatedBlock, model.CoordinationTriggerRetryExhausted,
-		model.CoordinationTriggerGraphStalled, model.CoordinationTriggerAgentExhausted:
+		model.CoordinationTriggerGraphStalled, model.CoordinationTriggerAgentExhausted,
+		model.CoordinationTriggerRunInvariant:
 		return true
 	default:
 		return false
@@ -191,7 +193,8 @@ func integrationCoordinatorIncidentState(
 			)
 		}
 		relevantCode := expected.Code == workspace.IntegrationFailureConflict ||
-			expected.Code == workspace.IntegrationFailureHistoryRewrite
+			expected.Code == workspace.IntegrationFailureHistoryRewrite ||
+			expected.Code == workspace.IntegrationFailureResolutionExhausted
 		matchingKind := detail.Task.BlockKind != nil &&
 			*detail.Task.BlockKind == expected.BlockKind
 		matchingReason := detail.Task.BlockReason != nil &&
@@ -391,6 +394,10 @@ func detectCoordinatorConditions(
 	if err != nil {
 		return nil, err
 	}
+	activeRunIDs := make(map[string]bool, len(activeRuns))
+	for _, active := range activeRuns {
+		activeRunIDs[active.Run.ID] = true
+	}
 	graphs := map[string]model.RelationshipGraph{}
 	graphFor := func(taskID string) (model.RelationshipGraph, error) {
 		if graph, found := graphs[taskID]; found {
@@ -424,11 +431,58 @@ func detectCoordinatorConditions(
 	var actionable []model.Task
 	unfinishedCount, intentionallyWaiting := 0, 0
 	latestActivity := time.Time{}
+	observedRunOwnership := false
 	for _, task := range tasks {
 		if task.Status == model.TaskStatusDone || task.Status == model.TaskStatusArchived {
 			continue
 		}
 		unfinishedCount++
+		if task.Status == model.TaskStatusRunning || task.CurrentRunID != nil {
+			listedActive := task.Status == model.TaskStatusRunning &&
+				task.CurrentRunID != nil &&
+				activeRunIDs[strings.TrimSpace(*task.CurrentRunID)]
+			if listedActive {
+				observedRunOwnership = true
+			} else {
+				invariant, mixed, inspectErr := inspectCoordinatorRunOwnership(
+					ctx,
+					opened,
+					task,
+					activeRunIDs,
+				)
+				if inspectErr != nil {
+					return nil, inspectErr
+				}
+				if mixed || invariant == nil {
+					// Tasks and active runs are intentionally read without
+					// holding a transaction across this comparatively expensive
+					// pass. A changing or genuinely live owner suppresses
+					// graph-stall diagnosis for this pass.
+					observedRunOwnership = true
+				}
+				if invariant != nil {
+					condition, conditionErr := conditionForTask(
+						invariant.task,
+						model.CoordinationTriggerRunInvariant,
+						model.CoordinationSeverityCritical,
+						"Task run ownership invariant requires recovery",
+						map[string]any{
+							"taskStatus":      invariant.task.Status,
+							"currentRunId":    invariant.runID,
+							"runStatus":       invariant.runStatus,
+							"reason":          invariant.reason,
+							"taskUpdatedAt":   invariant.task.UpdatedAt,
+							"boundedRechecks": coordinatorRunOwnershipReadLimit,
+							"observedAt":      current.Format(time.RFC3339Nano),
+						},
+					)
+					if conditionErr != nil {
+						return nil, conditionErr
+					}
+					conditions = append(conditions, condition)
+				}
+			}
+		}
 		if coordinatorTaskIntentionallyWaiting(task, current) {
 			intentionallyWaiting++
 		} else {
@@ -532,7 +586,7 @@ func detectCoordinatorConditions(
 			}
 		}
 	}
-	if len(actionable) == 0 || len(activeRuns) > 0 || specific {
+	if len(actionable) == 0 || len(activeRuns) > 0 || observedRunOwnership || specific {
 		return conditions, nil
 	}
 	idle := time.Duration(metadata.Orchestration.Autopilot.Coordination.IdleSeconds) * time.Second
@@ -580,6 +634,111 @@ func detectCoordinatorConditions(
 		return nil, err
 	}
 	return append(conditions, condition), nil
+}
+
+type coordinatorRunOwnershipInvariant struct {
+	task      model.Task
+	runID     string
+	runStatus model.RunStatus
+	reason    string
+}
+
+type coordinatorRunOwnershipReader interface {
+	GetTask(context.Context, string) (model.TaskDetail, error)
+	GetRun(context.Context, string) (store.RunInspection, error)
+	ListActiveRuns(context.Context, string) ([]store.ActiveRun, error)
+}
+
+func coordinatorTaskHasRunOwnership(task model.Task) bool {
+	return task.Status == model.TaskStatusRunning || task.CurrentRunID != nil
+}
+
+// inspectCoordinatorRunOwnership distinguishes a mixed task/run snapshot from
+// a stable persisted invariant. Only the same invalid ownership observed on
+// every bounded read becomes an incident; any transition receives one pass of
+// grace so deterministic stale-run recovery can finish.
+func inspectCoordinatorRunOwnership(
+	ctx context.Context,
+	opened coordinatorRunOwnershipReader,
+	snapshot model.Task,
+	initialActiveRunIDs map[string]bool,
+) (*coordinatorRunOwnershipInvariant, bool, error) {
+	var stable *coordinatorRunOwnershipInvariant
+	stableKey := ""
+	for read := 0; read < coordinatorRunOwnershipReadLimit; read++ {
+		detail, err := opened.GetTask(ctx, snapshot.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		task := detail.Task
+		if !coordinatorTaskHasRunOwnership(task) {
+			return nil, true, nil
+		}
+		candidate := coordinatorRunOwnershipInvariant{task: task}
+		if task.Status != model.TaskStatusRunning {
+			candidate.runID = optionalString(task.CurrentRunID)
+			candidate.reason = "current_run_on_non_running_task"
+		} else if task.CurrentRunID == nil ||
+			strings.TrimSpace(*task.CurrentRunID) == "" {
+			candidate.reason = "running_task_without_current_run"
+		} else {
+			candidate.runID = strings.TrimSpace(*task.CurrentRunID)
+			inspection, runErr := opened.GetRun(ctx, candidate.runID)
+			if runErr != nil {
+				if strings.Contains(strings.ToLower(runErr.Error()), "run not found") {
+					candidate.reason = "referenced_run_missing"
+				} else {
+					return nil, false, runErr
+				}
+			} else if inspection.Run.TaskID != task.ID {
+				candidate.runStatus = inspection.Run.Status
+				candidate.reason = "referenced_run_belongs_to_another_task"
+			} else if inspection.Run.Status != model.RunStatusRunning {
+				candidate.runStatus = inspection.Run.Status
+				candidate.reason = "referenced_run_terminal"
+			} else {
+				if initialActiveRunIDs[candidate.runID] {
+					return nil, false, nil
+				}
+				latestActive, listErr := opened.ListActiveRuns(ctx, task.Board)
+				if listErr != nil {
+					return nil, false, listErr
+				}
+				found := false
+				for _, active := range latestActive {
+					if active.Run.ID == candidate.runID {
+						found = true
+						break
+					}
+				}
+				if found {
+					return nil, true, nil
+				}
+				candidate.runStatus = inspection.Run.Status
+				candidate.reason = "running_owner_missing_from_active_runs"
+			}
+		}
+		key := fmt.Sprintf(
+			"%s\x00%s\x00%s\x00%s",
+			candidate.task.Status,
+			candidate.runID,
+			candidate.runStatus,
+			candidate.reason,
+		)
+		if stable == nil || key != stableKey {
+			copy := candidate
+			stable, stableKey = &copy, key
+			if read > 0 {
+				// A changing invalid value is still a mixed snapshot. It must
+				// remain identical for a full bounded window before exposure.
+				return nil, true, nil
+			}
+			continue
+		}
+		copy := candidate
+		stable = &copy
+	}
+	return stable, false, nil
 }
 
 func listCoordinatorObservationTasks(ctx context.Context, opened *store.Store, board string) ([]model.Task, error) {
@@ -731,6 +890,26 @@ func buildCoordinatorIncidentSnapshot(
 	options Options,
 	incident model.CoordinationIncident,
 ) (coordinator.IncidentSnapshot, error) {
+	return buildCoordinatorIncidentSnapshotWithProfiles(
+		ctx,
+		manager,
+		opened,
+		metadata,
+		options,
+		incident,
+		nil,
+	)
+}
+
+func buildCoordinatorIncidentSnapshotWithProfiles(
+	ctx context.Context,
+	manager *boards.Manager,
+	opened *store.Store,
+	metadata boards.Metadata,
+	options Options,
+	incident model.CoordinationIncident,
+	capturedProfiles *configuredProfileSet,
+) (coordinator.IncidentSnapshot, error) {
 	if manager == nil || opened == nil {
 		return coordinator.IncidentSnapshot{}, errors.New("coordinator snapshot requires a board manager and store")
 	}
@@ -810,7 +989,7 @@ func buildCoordinatorIncidentSnapshot(
 		})
 	}
 	snapshot.AvailableAgents, err = buildCoordinatorAgentSnapshots(
-		ctx, manager, opened, metadata, options,
+		ctx, manager, opened, metadata, options, capturedProfiles,
 	)
 	if err != nil {
 		return coordinator.IncidentSnapshot{}, err
@@ -870,10 +1049,14 @@ func buildCoordinatorAgentSnapshots(
 	opened *store.Store,
 	metadata boards.Metadata,
 	options Options,
+	capturedProfiles *configuredProfileSet,
 ) ([]coordinator.AgentSnapshot, error) {
 	configured, err := configuredProfiles(manager, metadata.Slug, options)
 	if err != nil {
 		return nil, err
+	}
+	if capturedProfiles != nil {
+		*capturedProfiles = configured
 	}
 	coordinationStore, err := manager.OpenCoordinationStore(ctx)
 	if err != nil {

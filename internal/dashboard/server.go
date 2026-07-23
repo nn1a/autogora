@@ -35,6 +35,7 @@ type Options struct {
 	OnLog          func(string)
 	AgentDetection agentconfig.DetectOptions
 	GitHubRunner   githubissues.CommandRunner
+	supervisorRun  supervisor.RunFunc
 }
 
 type Server struct {
@@ -54,6 +55,10 @@ type Server struct {
 	operationsMu  sync.Mutex
 	operations    []operationRecord
 	runDispatcher func(context.Context, dispatcher.Options) error
+}
+
+func liveDashboardAgentConfig() (agentconfig.Config, error) {
+	return agentconfig.Load(agentconfig.Options{})
 }
 
 func randomToken() (string, error) {
@@ -90,7 +95,11 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 		Token: token, manager: manager, options: options, ctx: serverContext, cancel: cancelServer,
 		serveDone: make(chan struct{}), runDispatcher: dispatcher.Run,
 	}
-	service.supervisor = supervisor.New(supervisor.Options{DBPath: options.DBPath, CLIPath: options.CLIPath, OnLog: options.OnLog})
+	service.supervisor = supervisor.New(supervisor.Options{
+		DBPath: options.DBPath, CLIPath: options.CLIPath, OnLog: options.OnLog,
+		AgentConfigLoader: liveDashboardAgentConfig,
+		Run:               options.supervisorRun,
+	})
 	service.HTTP = &http.Server{
 		Handler: service, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second,
 		BaseContext: func(net.Listener) context.Context {
@@ -105,7 +114,7 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 	service.Listener = listener
 	host := listener.Addr().String()
 	service.URL = "http://" + host
-	if config, configErr := agentconfig.Load(agentconfig.Options{}); configErr != nil {
+	if config, configErr := liveDashboardAgentConfig(); configErr != nil {
 		if options.OnLog != nil {
 			options.OnLog("global agent configuration was not loaded: " + configErr.Error())
 		}

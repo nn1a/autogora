@@ -46,6 +46,60 @@ func TestValidateAgainstSnapshotAcceptsVersionedHealthyReroute(t *testing.T) {
 	}
 }
 
+func TestValidateAgainstSnapshotRequiresIntegrationBlockPostcondition(t *testing.T) {
+	snapshot := validationSnapshot()
+	snapshot.Trigger = string(model.CoordinationTriggerIntegrationConflict)
+	snapshot.Details = map[string]any{
+		"code":      "resolution_exhausted",
+		"blockKind": string(model.BlockKindCapability),
+		"reason":    "primary unavailable",
+	}
+	priority := 9
+	routeOnly := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 4,
+		Summary: "Prioritize finalizer", Rationale: "Try the same blocked finalizer first.",
+		Actions: []Action{{
+			Kind: ActionUpdatePriority, TaskID: "blocked",
+			ExpectedUpdatedAt: "v2", Priority: &priority,
+			Reason: "raise priority",
+		}},
+	}
+	result := ValidateAgainstSnapshot(routeOnly, snapshot, 3)
+	if result.Valid || len(result.Issues) != 1 ||
+		result.Issues[0].Code != "integration_condition_remains" {
+		t.Fatalf("route-only integration validation = %#v", result)
+	}
+
+	unblock := routeOnly
+	unblock.Actions = append(unblock.Actions, Action{
+		Kind: ActionUnblockTask, TaskID: "blocked",
+		ExpectedUpdatedAt: "v2", Reason: "clear the exhausted integration block",
+	})
+	result = ValidateAgainstSnapshot(unblock, snapshot, 3)
+	if !result.Valid || len(result.Issues) != 0 {
+		t.Fatalf("integration unblock validation = %#v", result)
+	}
+}
+
+func TestValidateAgainstSnapshotAcceptsEmptyIntegrationManualEscalation(t *testing.T) {
+	snapshot := validationSnapshot()
+	snapshot.Trigger = string(model.CoordinationTriggerIntegrationConflict)
+	snapshot.Details = map[string]any{
+		"code":      "resolution_exhausted",
+		"blockKind": string(model.BlockKindCapability),
+		"reason":    "primary unavailable",
+	}
+	result := ValidateAgainstSnapshot(Proposal{
+		IncidentID: snapshot.IncidentID, ExpectedGraphRevision: snapshot.GraphRevision,
+		Summary:   "Manual integration decision required",
+		Rationale: "No bounded automatic action can safely resolve the exhausted conflict.",
+		Actions:   []Action{},
+	}, snapshot, 3)
+	if !result.Valid || len(result.Issues) != 0 || len(result.Actions) != 0 {
+		t.Fatalf("empty integration escalation validation = %#v", result)
+	}
+}
+
 func TestValidateAgainstSnapshotRejectsStaleUnknownAndCyclicChanges(t *testing.T) {
 	snapshot := validationSnapshot()
 	snapshot.Dependencies = append(snapshot.Dependencies,

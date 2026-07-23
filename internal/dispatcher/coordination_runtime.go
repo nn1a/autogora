@@ -341,8 +341,20 @@ func coordinatorIncidentEligible(
 	return true, nil
 }
 
+func coordinationAnalysisTimeout(options Options) time.Duration {
+	timeout := options.PlannerTimeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	maximum := store.MaxCoordinationIncidentClaimTTL - coordinationClaimGrace
+	if timeout > maximum {
+		timeout = maximum
+	}
+	return timeout
+}
+
 func coordinationClaimTTL(options Options) time.Duration {
-	ttl := options.PlannerTimeout + coordinationClaimGrace
+	ttl := coordinationAnalysisTimeout(options) + coordinationClaimGrace
 	if ttl < store.MinCoordinationIncidentClaimTTL {
 		return store.MinCoordinationIncidentClaimTTL
 	}
@@ -407,6 +419,123 @@ func recoverReusableCoordinationAttempt(
 		},
 	)
 	return err
+}
+
+func reusableCoordinationAttempt(
+	ctx context.Context,
+	opened *store.Store,
+	proposal model.CoordinationProposal,
+) (*model.CoordinationAttempt, error) {
+	if proposal.AttemptID == nil {
+		return nil, nil
+	}
+	attempts, err := opened.ListCoordinationAttempts(
+		ctx,
+		store.CoordinationAttemptFilter{
+			IncidentID: proposal.IncidentID,
+			Limit:      500,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	for index := range attempts {
+		attempt := &attempts[index]
+		if attempt.ID == *proposal.AttemptID {
+			return attempt, nil
+		}
+	}
+	return nil, fmt.Errorf(
+		"bound coordination attempt not found: %s",
+		*proposal.AttemptID,
+	)
+}
+
+func finishStartedReusableCoordinationAttempt(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+	proposal model.CoordinationProposal,
+	status model.CoordinationAttemptStatus,
+	cause error,
+	current time.Time,
+) error {
+	attempt, err := reusableCoordinationAttempt(ctx, opened, proposal)
+	if err != nil || attempt == nil {
+		return err
+	}
+	if attempt.Status != model.CoordinationAttemptStarted {
+		return nil
+	}
+	recoveryErr := recoverReusableCoordinationAttempt(
+		ctx,
+		opened,
+		incident,
+		proposal,
+		status,
+		cause,
+		current,
+	)
+	if recoveryErr == nil {
+		return nil
+	}
+	// The previous owner can finish concurrently after the read above. Never
+	// rewrite that terminal audit result; only a still-started attempt makes the
+	// recovery conflict fatal.
+	latest, latestErr := reusableCoordinationAttempt(ctx, opened, proposal)
+	if latestErr == nil && latest != nil &&
+		latest.Status != model.CoordinationAttemptStarted {
+		return nil
+	}
+	return errors.Join(recoveryErr, latestErr)
+}
+
+func failStartedReusableCoordinationAttempt(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+	proposal model.CoordinationProposal,
+	cause error,
+	current time.Time,
+) error {
+	return finishStartedReusableCoordinationAttempt(
+		ctx,
+		opened,
+		incident,
+		proposal,
+		model.CoordinationAttemptFailed,
+		cause,
+		current,
+	)
+}
+
+func discardReusableCoordinationProposal(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+	proposal model.CoordinationProposal,
+	replacementRevision int64,
+	cause error,
+	current time.Time,
+) error {
+	if err := failStartedReusableCoordinationAttempt(
+		ctx,
+		opened,
+		incident,
+		proposal,
+		cause,
+		current,
+	); err != nil {
+		return err
+	}
+	return supersedeClaimedCoordinationProposal(
+		ctx,
+		opened,
+		proposal,
+		incident,
+		replacementRevision,
+		current,
+	)
 }
 
 func coordinationGraphRevision(
@@ -475,6 +604,56 @@ func failCoordinationAttempt(
 	}
 	reopenErr := reopenClaimedCoordinationIncident(cleanup, opened, incident, current)
 	return errors.Join(finishErr, reopenErr)
+}
+
+func cancelUnconsumedCoordinationAttempt(
+	ctx context.Context,
+	opened *store.Store,
+	attempt *model.CoordinationAttempt,
+	incident model.CoordinationIncident,
+) error {
+	if attempt == nil {
+		return nil
+	}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	revision := incident.GraphRevision
+	err := opened.CancelCoordinationAttemptReservation(
+		cleanup,
+		attempt.ID,
+		store.CancelCoordinationAttemptReservationInput{
+			Board: incident.Board, IncidentID: incident.ID,
+			ExpectedIncidentGraphRevision: &revision,
+			ClaimToken:                    incident.ClaimToken,
+		},
+	)
+	// Losing the token means another process already reclaimed and terminalized
+	// this reservation. The current process must stop before the paid call, but
+	// there is no remaining claim for it to release.
+	if errors.Is(err, store.ErrCoordinationClaimNotOwner) {
+		return nil
+	}
+	return err
+}
+
+func renewCoordinationAnalysisClaim(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+	options Options,
+	current time.Time,
+) (model.CoordinationIncident, error) {
+	revision := incident.GraphRevision
+	return opened.RenewCoordinationIncidentClaim(
+		ctx,
+		incident.ID,
+		store.RenewCoordinationIncidentClaimInput{
+			ExpectedGraphRevision: &revision,
+			ClaimToken:            incident.ClaimToken,
+			TTL:                   coordinationClaimTTL(options),
+			Current:               current,
+		},
+	)
 }
 
 func proposalFromRecord(value model.CoordinationProposal) (coordinator.Proposal, error) {
@@ -707,10 +886,11 @@ func handoffCoordinationProposal(
 			ctx, opened, proposal, incident, revision, current,
 		)
 	}
-	if latest.Archived || !latest.Orchestration.Autopilot.Enabled {
-		// A disabled or archived board will not run another reconciliation
-		// pass. Do not strand a proposal in AwaitingApproval where nobody can
-		// safely advance it; retire it while the live claim can still do so.
+	if latest.Archived || !latest.Orchestration.Autopilot.Enabled ||
+		latest.Orchestration.Autopilot.Coordination.Mode == boards.CoordinationModeObserve {
+		// Disabled, archived, and Observe boards must not turn a stale analysis
+		// result into either an automatic mutation or a new approval request.
+		// Retire the proposal while the live claim can still release it.
 		return supersedeClaimedCoordinationProposal(
 			ctx, opened, proposal, incident, revision, current,
 		)
@@ -740,6 +920,12 @@ func handoffCoordinationProposal(
 	return err
 }
 
+type coordinatorPlannerPolicy struct {
+	Config     agentconfig.Config
+	Candidates []orchestration.PlannerCandidate
+	Injected   bool
+}
+
 func coordinatorPlanner(
 	ctx context.Context,
 	manager *boards.Manager,
@@ -747,22 +933,56 @@ func coordinatorPlanner(
 	metadata boards.Metadata,
 	options Options,
 	cwd string,
+	snapshotProfiles *configuredProfileSet,
 	selected *orchestration.PlannerSelection,
-) (orchestration.Planner, error) {
+) (orchestration.Planner, coordinatorPlannerPolicy, error) {
 	if options.CoordinatorPlanner != nil {
-		return options.CoordinatorPlanner, nil
+		return options.CoordinatorPlanner, coordinatorPlannerPolicy{Injected: true}, nil
 	}
-	configured, err := configuredProfiles(manager, metadata.Slug, options)
-	if err != nil {
-		return nil, err
+	var configured configuredProfileSet
+	if snapshotProfiles != nil {
+		configured = *snapshotProfiles
+	} else {
+		var err error
+		configured, err = configuredProfiles(manager, metadata.Slug, options)
+		if err != nil {
+			return nil, coordinatorPlannerPolicy{}, err
+		}
 	}
-	return createRolePlannerWithSelection(
+	policy := coordinatorPlannerPolicy{
+		Config: configured.Config,
+		Candidates: dispatcherPlannerCandidates(
+			metadata,
+			configured,
+			options,
+			agentconfig.RoleCoordinator,
+		),
+	}
+	planner, err := createRolePlannerWithSelection(
 		manager, opened, metadata, configured, options, agentconfig.RoleCoordinator, cwd,
 		func(_ context.Context, selection orchestration.PlannerSelection) error {
 			*selected = selection
 			return nil
 		},
 	)
+	return planner, policy, err
+}
+
+func sameCoordinatorAnalysisPolicy(before, after boards.Metadata) bool {
+	return before.Archived == after.Archived &&
+		before.Orchestration.Autopilot.Enabled == after.Orchestration.Autopilot.Enabled &&
+		reflect.DeepEqual(
+			before.Orchestration.Autopilot.Coordination,
+			after.Orchestration.Autopilot.Coordination,
+		) &&
+		reflect.DeepEqual(
+			before.Orchestration.DefaultProfile,
+			after.Orchestration.DefaultProfile,
+		) &&
+		reflect.DeepEqual(
+			before.Orchestration.Profiles,
+			after.Orchestration.Profiles,
+		)
 }
 
 func coordinateIncident(
@@ -772,6 +992,21 @@ func coordinateIncident(
 	options Options,
 	current time.Time,
 ) error {
+	latestMetadata, err := manager.Read(candidate.board)
+	if err != nil {
+		return err
+	}
+	latestPolicy := latestMetadata.Orchestration.Autopilot
+	if latestMetadata.Archived || !latestPolicy.Enabled ||
+		latestPolicy.Coordination.Mode == boards.CoordinationModeObserve {
+		// Candidate collection is intentionally separate from the paid call.
+		// Recheck the mutation boundary so a stale Assist/Auto candidate cannot
+		// start analysis after an operator switches the board to Observe.
+		return nil
+	}
+	candidate.metadata = latestMetadata
+	candidate.mode = latestPolicy.Coordination.Mode
+
 	opened, err := manager.OpenStore(ctx, candidate.board)
 	if err != nil {
 		return err
@@ -788,6 +1023,7 @@ func coordinateIncident(
 	var incident model.CoordinationIncident
 	var attempt *model.CoordinationAttempt
 	if reusable != nil {
+		current = options.currentTime()
 		var claimed bool
 		incident, claimed, err = claimCoordinationForReuse(
 			ctx, opened, candidate.incident, revision, options, current,
@@ -796,45 +1032,23 @@ func coordinateIncident(
 			return err
 		}
 		if reusable.ExpectedGraphRevision != incident.GraphRevision {
-			recoveryStatus := model.CoordinationAttemptFailed
-			var recoveryCause error = &store.GraphRevisionConflictError{
+			recoveryCause := &store.GraphRevisionConflictError{
 				Board:    incident.Board,
 				Expected: reusable.ExpectedGraphRevision,
 				Actual:   incident.GraphRevision,
 			}
-			if reusable.Status == model.CoordinationProposalValidated {
-				recoveryStatus = model.CoordinationAttemptSucceeded
-				recoveryCause = nil
-			}
-			if err := recoverReusableCoordinationAttempt(
+			return discardReusableCoordinationProposal(
 				ctx,
 				opened,
 				incident,
 				*reusable,
-				recoveryStatus,
+				incident.GraphRevision,
 				recoveryCause,
 				current,
-			); err != nil {
-				return err
-			}
-			return supersedeClaimedCoordinationProposal(
-				ctx, opened, *reusable, incident, incident.GraphRevision, current,
 			)
 		}
-		if reusable.Status == model.CoordinationProposalValidated {
-			if err := recoverReusableCoordinationAttempt(
-				ctx,
-				opened,
-				incident,
-				*reusable,
-				model.CoordinationAttemptSucceeded,
-				nil,
-				current,
-			); err != nil {
-				return err
-			}
-		}
 	} else {
+		current = options.currentTime()
 		since := current.Add(-time.Hour)
 		reserved, reserveErr := opened.ReserveCoordinationAttempt(ctx, store.ReserveCoordinationAttemptInput{
 			IncidentID: candidate.incident.ID, Board: candidate.board,
@@ -849,14 +1063,37 @@ func coordinateIncident(
 		attempt = &reserved.Attempt
 	}
 
-	snapshot, err := buildCoordinatorIncidentSnapshot(
+	var snapshotProfiles configuredProfileSet
+	snapshot, err := buildCoordinatorIncidentSnapshotWithProfiles(
 		ctx, manager, opened, candidate.metadata, options, incident,
+		&snapshotProfiles,
 	)
 	if err != nil {
 		current = options.currentTime()
-		return errors.Join(err, failCoordinationAttempt(
-			ctx, opened, attempt, incident, current, err,
-		))
+		if attempt != nil {
+			return errors.Join(
+				err,
+				failCoordinationAttempt(ctx, opened, attempt, incident, current, err),
+			)
+		}
+		if reusable != nil {
+			return errors.Join(
+				err,
+				discardReusableCoordinationProposal(
+					ctx,
+					opened,
+					incident,
+					*reusable,
+					incident.GraphRevision,
+					err,
+					current,
+				),
+			)
+		}
+		return errors.Join(
+			err,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, err),
+		)
 	}
 	current = options.currentTime()
 	maxActions := candidate.metadata.Orchestration.Autopilot.Coordination.MaxActionsPerIncident
@@ -865,33 +1102,29 @@ func coordinateIncident(
 			ctx, opened, *reusable, incident, snapshot, maxActions, current,
 		)
 		if validationErr != nil {
-			recoveryErr := recoverReusableCoordinationAttempt(
-				ctx,
-				opened,
-				incident,
-				record,
-				model.CoordinationAttemptFailed,
+			return errors.Join(
 				validationErr,
-				current,
+				discardReusableCoordinationProposal(
+					ctx,
+					opened,
+					incident,
+					record,
+					incident.GraphRevision,
+					validationErr,
+					current,
+				),
 			)
-			if recoveryErr != nil {
-				return errors.Join(validationErr, recoveryErr)
-			}
-			return errors.Join(validationErr, supersedeClaimedCoordinationProposal(
-				ctx, opened, record, incident, incident.GraphRevision, current,
-			))
 		}
 		if !validation.Valid {
 			validationFailure := fmt.Errorf(
 				"recovered Coordinator proposal %s failed deterministic validation",
 				record.ID,
 			)
-			if err := recoverReusableCoordinationAttempt(
+			if err := failStartedReusableCoordinationAttempt(
 				ctx,
 				opened,
 				incident,
 				record,
-				model.CoordinationAttemptFailed,
 				validationFailure,
 				current,
 			); err != nil {
@@ -899,12 +1132,17 @@ func coordinateIncident(
 			}
 			if record.Status != model.CoordinationProposalFailed {
 				return supersedeClaimedCoordinationProposal(
-					ctx, opened, record, incident, incident.GraphRevision, current,
+					ctx,
+					opened,
+					record,
+					incident,
+					incident.GraphRevision,
+					current,
 				)
 			}
 			return reopenClaimedCoordinationIncident(ctx, opened, incident, current)
 		}
-		if err := recoverReusableCoordinationAttempt(
+		if err := finishStartedReusableCoordinationAttempt(
 			ctx,
 			opened,
 			incident,
@@ -923,25 +1161,130 @@ func coordinateIncident(
 	cwd, err := os.MkdirTemp("", "autogora-coordinator-")
 	if err != nil {
 		current = options.currentTime()
-		return errors.Join(err, failCoordinationAttempt(
-			ctx, opened, attempt, incident, current, err,
-		))
+		return errors.Join(
+			err,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, err),
+		)
 	}
 	defer os.RemoveAll(cwd)
 	var selection orchestration.PlannerSelection
-	planner, err := coordinatorPlanner(
-		ctx, manager, opened, candidate.metadata, options, cwd, &selection,
+	planner, preparedPlannerPolicy, err := coordinatorPlanner(
+		ctx, manager, opened, candidate.metadata, options, cwd, &snapshotProfiles,
+		&selection,
 	)
 	if err != nil {
 		current = options.currentTime()
-		return errors.Join(err, failCoordinationAttempt(
-			ctx, opened, attempt, incident, current, err,
-		))
+		return errors.Join(
+			err,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, err),
+		)
 	}
-	analysisTimeout := options.PlannerTimeout
-	if analysisTimeout <= 0 {
-		analysisTimeout = 120 * time.Second
+	analysisTimeout := coordinationAnalysisTimeout(options)
+	// Snapshot and planner preparation can be comparatively expensive. Extend
+	// ownership before the live policy/config preflight, then prove it once more
+	// after that preflight immediately before the external call.
+	current = options.currentTime()
+	renewed, renewErr := renewCoordinationAnalysisClaim(
+		ctx,
+		opened,
+		incident,
+		options,
+		current,
+	)
+	if renewErr != nil {
+		current = options.currentTime()
+		return errors.Join(
+			renewErr,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, renewErr),
+		)
 	}
+	incident = renewed
+	latestMetadata, metadataErr := manager.Read(candidate.board)
+	if metadataErr != nil {
+		current = options.currentTime()
+		return errors.Join(
+			metadataErr,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, metadataErr),
+		)
+	}
+	if !sameCoordinatorAnalysisPolicy(candidate.metadata, latestMetadata) {
+		// The reservation has not produced a proposal and no paid call has
+		// started. Any change to the planner, bounded agent snapshot, action
+		// limit, or rolling budget invalidates this preparation. Retire both
+		// atomically so the next pass reserves against the new policy and
+		// rebuilds the planner instead of paying with stale inputs.
+		return cancelUnconsumedCoordinationAttempt(ctx, opened, attempt, incident)
+	}
+	latestConfigured, configErr := configuredProfiles(
+		manager,
+		latestMetadata.Slug,
+		options,
+	)
+	if configErr != nil {
+		current = options.currentTime()
+		return errors.Join(
+			configErr,
+			failCoordinationAttempt(
+				ctx,
+				opened,
+				attempt,
+				incident,
+				current,
+				configErr,
+			),
+		)
+	}
+	latestAfterConfig, readErr := manager.Read(candidate.board)
+	if readErr != nil {
+		current = options.currentTime()
+		return errors.Join(
+			readErr,
+			failCoordinationAttempt(
+				ctx,
+				opened,
+				attempt,
+				incident,
+				current,
+				readErr,
+			),
+		)
+	}
+	if !sameCoordinatorAnalysisPolicy(latestMetadata, latestAfterConfig) ||
+		!reflect.DeepEqual(snapshotProfiles, latestConfigured) {
+		return cancelUnconsumedCoordinationAttempt(ctx, opened, attempt, incident)
+	}
+	if !preparedPlannerPolicy.Injected {
+		latestCandidates := dispatcherPlannerCandidates(
+			latestAfterConfig,
+			latestConfigured,
+			options,
+			agentconfig.RoleCoordinator,
+		)
+		if !reflect.DeepEqual(preparedPlannerPolicy.Config, latestConfigured.Config) ||
+			!reflect.DeepEqual(preparedPlannerPolicy.Candidates, latestCandidates) {
+			return cancelUnconsumedCoordinationAttempt(ctx, opened, attempt, incident)
+		}
+	}
+	// AgentConfigLoader and board reads are external I/O with no strict latency
+	// bound. A second Supervisor may reclaim an expired lease while this
+	// preflight is blocked. Renew from a fresh clock at the final paid boundary;
+	// a stolen or expired claim stops before Analyze.
+	current = options.currentTime()
+	renewed, renewErr = renewCoordinationAnalysisClaim(
+		ctx,
+		opened,
+		incident,
+		options,
+		current,
+	)
+	if renewErr != nil {
+		current = options.currentTime()
+		return errors.Join(
+			renewErr,
+			failCoordinationAttempt(ctx, opened, attempt, incident, current, renewErr),
+		)
+	}
+	incident = renewed
 	// PlannerTimeout is an end-to-end budget for the fallback chain. Individual
 	// candidates also observe this context, so a slow primary cannot outlive the
 	// incident lease and let another Supervisor duplicate the same paid analysis.
@@ -1070,7 +1413,8 @@ func reconcilePendingCoordination(
 						proposal, snapshot,
 						latest.Orchestration.Autopilot.Coordination.MaxActionsPerIncident,
 					)
-					stale = !validation.Valid
+					stale = !validation.Valid ||
+						coordinator.ManualEscalationConditionResolved(proposal, snapshot)
 				}
 			}
 			if !stale {

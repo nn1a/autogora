@@ -67,7 +67,16 @@ func createCoordinationCLIFixture(
 		Status: model.CoordinationProposalValidating, ExpectedGraphRevision: &state.Revision,
 		ClaimToken: incident.ClaimToken, Current: claimTime.Add(time.Second),
 		Summary: "Apply a bounded recovery", Rationale: "The deterministic path is exhausted.",
-		Actions: json.RawMessage(`[]`),
+		Actions: json.RawMessage(`[{
+			"kind":"create_task",
+			"reason":"create bounded recovery work",
+			"task":{
+				"key":"cli-recovery","title":"CLI recovery","body":"Run the approved recovery.",
+				"assignee":"codex-worker","runtime":"codex","workflowRole":"worker",
+				"priority":1,"prerequisites":[],"dependents":[]
+			},
+			"expectedTaskVersions":{}
+		}]`),
 	})
 	if err != nil {
 		t.Fatal(err)

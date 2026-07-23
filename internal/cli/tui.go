@@ -13,6 +13,23 @@ import (
 	"github.com/nn1a/autogora/internal/terminalui"
 )
 
+func tuiAgentConfigLoader(
+	configOptions agentconfig.Options,
+	overrideAllowWrites bool,
+	overrideAllowWritesValue bool,
+) dispatcher.AgentConfigLoader {
+	return func() (agentconfig.Config, error) {
+		config, err := agentconfig.Load(configOptions)
+		if err != nil {
+			return agentconfig.Config{}, err
+		}
+		if overrideAllowWrites {
+			config.Supervisor.AllowWrites = overrideAllowWritesValue
+		}
+		return config, nil
+	}
+}
+
 func newTUITaskDispatcher(
 	run DispatchRunner,
 	configOptions agentconfig.Options,
@@ -24,20 +41,23 @@ func newTUITaskDispatcher(
 	if run == nil {
 		run = dispatcher.Run
 	}
+	loadConfig := tuiAgentConfigLoader(
+		configOptions,
+		overrideAllowWrites,
+		overrideAllowWritesValue,
+	)
 	return func(dispatchContext context.Context, taskID string) error {
-		currentConfig, err := agentconfig.Load(configOptions)
+		currentConfig, err := loadConfig()
 		if err != nil {
 			return err
-		}
-		allowWrites := currentConfig.Supervisor.AllowWrites
-		if overrideAllowWrites {
-			allowWrites = overrideAllowWritesValue
 		}
 		autoDecompose := false
 		return run(dispatchContext, dispatcher.Options{
 			DBPath: dbPath, CLIPath: cliPath, Board: board, TaskID: taskID, Once: true,
 			AutoDecompose: &autoDecompose, AgentConfig: &currentConfig,
-			AllowWrites: allowWrites, WorkingDirectory: workingDirectory, Getenv: getenv,
+			AgentConfigLoader: loadConfig,
+			AllowWrites:       currentConfig.Supervisor.AllowWrites,
+			WorkingDirectory:  workingDirectory, Getenv: getenv,
 		})
 	}
 }
@@ -68,8 +88,14 @@ func (a *App) runTUI(ctx context.Context, opts options) error {
 	}
 	overrideAllowWrites := opts.present("allow-writes")
 	overrideAllowWritesValue := opts.flags["allow-writes"]
+	loadConfig := tuiAgentConfigLoader(
+		configOptions,
+		overrideAllowWrites,
+		overrideAllowWritesValue,
+	)
 	controller := supervisor.New(supervisor.Options{
 		DBPath: dbPath, CLIPath: cliPath, WorkingDirectory: cwd, Getenv: a.Getenv,
+		AgentConfigLoader: loadConfig,
 	})
 	globalAgents := &tuiGlobalAgentsBackend{
 		options: configOptions, controller: controller, parent: ctx,

@@ -14,9 +14,12 @@ import (
 )
 
 var (
-	ErrCoordinationStateConflict = errors.New("coordination state conflict")
-	ErrCoordinationClaimNotOwner = errors.New("coordination incident claim is owned by another caller")
-	ErrCoordinationClaimExpired  = errors.New("coordination incident claim has expired")
+	ErrCoordinationStateConflict    = errors.New("coordination state conflict")
+	ErrCoordinationClaimNotOwner    = errors.New("coordination incident claim is owned by another caller")
+	ErrCoordinationClaimExpired     = errors.New("coordination incident claim has expired")
+	ErrCoordinationManualEscalation = errors.New(
+		"coordination manual escalation has no actions and cannot be approved",
+	)
 )
 
 const (
@@ -82,6 +85,17 @@ type TransitionCoordinationIncidentInput struct {
 
 type ClaimCoordinationIncidentInput struct {
 	ExpectedGraphRevision *int64
+	TTL                   time.Duration
+	Current               time.Time
+}
+
+// RenewCoordinationIncidentClaimInput extends an existing live claim without
+// changing its capability token. It is used immediately before an external
+// analysis call so time spent preparing a bounded snapshot cannot let another
+// process reclaim the incident while the first call is still running.
+type RenewCoordinationIncidentClaimInput struct {
+	ExpectedGraphRevision *int64
+	ClaimToken            string
 	TTL                   time.Duration
 	Current               time.Time
 }
@@ -688,6 +702,142 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 		return nil
 	})
 	return claimedIncident, claimed, err
+}
+
+// RenewCoordinationIncidentClaim atomically proves that the caller still owns
+// a live incident claim and extends that claim from Current. An already expired
+// claim cannot be revived: another process may be reclaiming it concurrently.
+func (s *Store) RenewCoordinationIncidentClaim(
+	ctx context.Context,
+	id string,
+	input RenewCoordinationIncidentClaimInput,
+) (model.CoordinationIncident, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return model.CoordinationIncident{}, errors.New(
+			"coordination incident claim renewal requires an incident ID",
+		)
+	}
+	if input.ExpectedGraphRevision == nil {
+		return model.CoordinationIncident{}, errors.New(
+			"coordination incident claim renewal requires an expected graph revision",
+		)
+	}
+	input.ClaimToken = strings.TrimSpace(input.ClaimToken)
+	if input.ClaimToken == "" {
+		return model.CoordinationIncident{}, errors.New(
+			"coordination incident claim renewal requires a claim token",
+		)
+	}
+	if input.TTL < MinCoordinationIncidentClaimTTL ||
+		input.TTL > MaxCoordinationIncidentClaimTTL {
+		return model.CoordinationIncident{}, fmt.Errorf(
+			"coordination incident claim renewal TTL must be between %s and %s",
+			MinCoordinationIncidentClaimTTL,
+			MaxCoordinationIncidentClaimTTL,
+		)
+	}
+	current, currentTimestamp, err := normalizeCoordinationClaimTime(input.Current)
+	if err != nil {
+		return model.CoordinationIncident{}, err
+	}
+	expires := current.Add(input.TTL)
+	if expires.Year() < 0 || expires.Year() > 9999 {
+		return model.CoordinationIncident{}, errors.New(
+			"coordination incident claim renewal expiry must fit RFC3339",
+		)
+	}
+	expiresAt := expires.Format(coordinationIncidentClaimTimestampLayout)
+
+	var renewed model.CoordinationIncident
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		incident, getErr := scanCoordinationIncident(tx.QueryRowContext(
+			ctx,
+			"SELECT "+incidentColumns+" FROM coordination_incidents WHERE id = ?",
+			id,
+		))
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return fmt.Errorf("coordination incident not found: %s", id)
+		}
+		if getErr != nil {
+			return getErr
+		}
+		if incident.Status != model.CoordinationIncidentCoordinating {
+			return &CoordinationStateConflictError{
+				Kind: "incident", ID: incident.ID,
+				Expected: string(model.CoordinationIncidentCoordinating),
+				Actual:   string(incident.Status),
+			}
+		}
+		expectedRevision := *input.ExpectedGraphRevision
+		if incident.GraphRevision != expectedRevision {
+			return &GraphRevisionConflictError{
+				Board: incident.Board, Expected: expectedRevision,
+				Actual: incident.GraphRevision,
+			}
+		}
+		if _, stateErr := requireBoardGraphRevision(
+			ctx,
+			tx,
+			incident.Board,
+			expectedRevision,
+		); stateErr != nil {
+			return stateErr
+		}
+		if incident.ClaimToken != input.ClaimToken {
+			return fmt.Errorf("%w: %s", ErrCoordinationClaimNotOwner, incident.ID)
+		}
+		if incident.ClaimExpiresAt == nil {
+			return fmt.Errorf("coordinating incident %s has no claim expiry", incident.ID)
+		}
+		expired, expiryErr := coordinationIncidentClaimExpired(incident, current)
+		if expiryErr != nil {
+			return expiryErr
+		}
+		if expired {
+			return fmt.Errorf("%w: %s", ErrCoordinationClaimExpired, incident.ID)
+		}
+		previousExpiry, parseErr := time.Parse(
+			time.RFC3339Nano,
+			*incident.ClaimExpiresAt,
+		)
+		if parseErr != nil {
+			return fmt.Errorf(
+				"parse coordination incident %s claim expiry: %w",
+				incident.ID,
+				parseErr,
+			)
+		}
+		if previousExpiry.After(expires) {
+			expiresAt = previousExpiry.UTC().Format(
+				coordinationIncidentClaimTimestampLayout,
+			)
+		}
+		updatedAt := now()
+		update, updateErr := tx.ExecContext(ctx, `
+			UPDATE coordination_incidents
+			SET claim_expires_at = ?, updated_at = ?
+			WHERE id = ? AND status = 'coordinating' AND graph_revision = ?
+				AND claim_token = ? AND claim_expires_at = ?
+				AND claim_expires_at > ?
+		`, expiresAt, updatedAt, incident.ID, expectedRevision,
+			input.ClaimToken, *incident.ClaimExpiresAt, currentTimestamp)
+		if updateErr != nil {
+			return updateErr
+		}
+		changed, rowsErr := update.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if changed != 1 {
+			return fmt.Errorf("%w: %s", ErrCoordinationClaimNotOwner, incident.ID)
+		}
+		incident.ClaimExpiresAt = &expiresAt
+		incident.UpdatedAt = updatedAt
+		renewed = incident
+		return nil
+	})
+	return renewed, err
 }
 
 func validIncidentTransition(from, to model.CoordinationIncidentStatus) bool {

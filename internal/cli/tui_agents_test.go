@@ -290,10 +290,18 @@ func TestTUITargetedDispatchLoadsLatestGlobalConfiguration(t *testing.T) {
 	}
 	if len(captured) != 2 ||
 		captured[0].AgentConfig == nil || captured[1].AgentConfig == nil ||
+		captured[0].AgentConfigLoader == nil || captured[1].AgentConfigLoader == nil ||
 		captured[0].AgentConfig.Agents[0].Model != "first-model" ||
 		captured[1].AgentConfig.Agents[0].Model != "second-model" ||
 		captured[0].AllowWrites || !captured[1].AllowWrites {
 		t.Fatalf("targeted dispatch did not reload the latest config: %#v", captured)
+	}
+	reloaded, err := captured[0].AgentConfigLoader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Agents[0].Model != "second-model" || !reloaded.Supervisor.AllowWrites {
+		t.Fatalf("targeted dispatch live loader = %#v", reloaded)
 	}
 
 	override := newTUITaskDispatcher(
@@ -305,5 +313,12 @@ func TestTUITargetedDispatchLoadsLatestGlobalConfiguration(t *testing.T) {
 	}
 	if captured[2].AllowWrites {
 		t.Fatal("explicit TUI --allow-writes=false did not remain an upper-bound override")
+	}
+	reloaded, err = captured[2].AgentConfigLoader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Supervisor.AllowWrites {
+		t.Fatal("TUI live loader dropped explicit --allow-writes=false")
 	}
 }

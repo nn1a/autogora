@@ -84,6 +84,16 @@ type ReserveCoordinationAttemptResult struct {
 	RetryAt         *string                    `json:"retryAt"`
 }
 
+// CancelCoordinationAttemptReservationInput identifies an analysis reservation
+// that has not crossed the external-call boundary. Cancellation removes that
+// unconsumed budget record and releases the exact incident claim atomically.
+type CancelCoordinationAttemptReservationInput struct {
+	Board                         string
+	IncidentID                    string
+	ExpectedIncidentGraphRevision *int64
+	ClaimToken                    string
+}
+
 type CoordinationAttemptFilter struct {
 	Board      string
 	IncidentID string
@@ -568,6 +578,151 @@ func (s *Store) ReserveCoordinationAttempt(
 		return nil
 	})
 	return result, err
+}
+
+// CancelCoordinationAttemptReservation releases a claim only while its started
+// attempt has produced no proposal. Once a proposal exists, the durable
+// attempt/proposal recovery path owns the record and cancellation is rejected.
+func (s *Store) CancelCoordinationAttemptReservation(
+	ctx context.Context,
+	attemptID string,
+	raw CancelCoordinationAttemptReservationInput,
+) error {
+	attemptID = strings.TrimSpace(attemptID)
+	if attemptID == "" {
+		return errors.New("coordination attempt cancellation requires an attempt ID")
+	}
+	input := raw
+	var err error
+	input.Board, err = normalizeCoordinationAttemptBoard(input.Board, s.board)
+	if err != nil {
+		return err
+	}
+	input.IncidentID, err = validCoordinationAttemptID(
+		input.IncidentID,
+		"coordination attempt cancellation incident id",
+	)
+	if err != nil {
+		return err
+	}
+	if input.IncidentID == "" {
+		return errors.New("coordination attempt cancellation requires an incident ID")
+	}
+	if input.ExpectedIncidentGraphRevision == nil {
+		return errors.New(
+			"coordination attempt cancellation requires an expected incident graph revision",
+		)
+	}
+	input.ClaimToken = strings.TrimSpace(input.ClaimToken)
+	if input.ClaimToken == "" {
+		return errors.New("coordination attempt cancellation requires a claim token")
+	}
+
+	return s.withWrite(ctx, func(tx *sql.Tx) error {
+		// Check the capability first. If another process already reclaimed the
+		// incident, its transaction may also have terminalized or removed this
+		// reservation; both cases are simply loss of ownership to this caller.
+		incident, incidentErr := scanCoordinationIncident(tx.QueryRowContext(
+			ctx,
+			"SELECT "+incidentColumns+" FROM coordination_incidents WHERE id = ?",
+			input.IncidentID,
+		))
+		if errors.Is(incidentErr, sql.ErrNoRows) {
+			return fmt.Errorf("coordination incident not found: %s", input.IncidentID)
+		}
+		if incidentErr != nil {
+			return incidentErr
+		}
+		if incident.Board != input.Board ||
+			incident.Status != model.CoordinationIncidentCoordinating ||
+			incident.ClaimToken != input.ClaimToken {
+			return fmt.Errorf("%w: %s", ErrCoordinationClaimNotOwner, incident.ID)
+		}
+		expectedRevision := *input.ExpectedIncidentGraphRevision
+		if incident.GraphRevision != expectedRevision {
+			return &GraphRevisionConflictError{
+				Board: incident.Board, Expected: expectedRevision,
+				Actual: incident.GraphRevision,
+			}
+		}
+		attempt, getErr := scanCoordinationAttempt(tx.QueryRowContext(
+			ctx,
+			"SELECT "+coordinationAttemptColumns+" FROM coordination_attempts WHERE id = ?",
+			attemptID,
+		))
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return fmt.Errorf("coordination attempt not found: %s", attemptID)
+		}
+		if getErr != nil {
+			return getErr
+		}
+		if attempt.IncidentID != input.IncidentID || attempt.Board != input.Board {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: attempt.ID,
+				Expected: input.Board + "/" + input.IncidentID,
+				Actual:   attempt.Board + "/" + attempt.IncidentID,
+			}
+		}
+		if attempt.Status != model.CoordinationAttemptStarted ||
+			attempt.EndedAt != nil {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: attempt.ID,
+				Expected: string(model.CoordinationAttemptStarted),
+				Actual:   string(attempt.Status),
+			}
+		}
+		var proposalCount int
+		if err := tx.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM coordination_proposals WHERE attempt_id = ?",
+			attempt.ID,
+		).Scan(&proposalCount); err != nil {
+			return err
+		}
+		if proposalCount != 0 {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: attempt.ID,
+				Expected: "no durable proposal", Actual: "proposal created",
+			}
+		}
+		updatedAt := now()
+		released, err := tx.ExecContext(ctx, `
+			UPDATE coordination_incidents
+			SET status = 'open', claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+			WHERE id = ? AND board = ? AND status = 'coordinating'
+				AND graph_revision = ? AND claim_token = ?
+		`, updatedAt, incident.ID, incident.Board, expectedRevision, input.ClaimToken)
+		if err != nil {
+			return err
+		}
+		changed, err := released.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return fmt.Errorf("%w: %s", ErrCoordinationClaimNotOwner, incident.ID)
+		}
+		deleted, err := tx.ExecContext(ctx, `
+			DELETE FROM coordination_attempts
+			WHERE id = ? AND incident_id = ? AND board = ?
+				AND status = 'started' AND ended_at IS NULL
+		`, attempt.ID, incident.ID, incident.Board)
+		if err != nil {
+			return err
+		}
+		changed, err = deleted.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: attempt.ID,
+				Expected: string(model.CoordinationAttemptStarted),
+				Actual:   "changed while canceling",
+			}
+		}
+		return nil
+	})
 }
 
 // StartCoordinationAttempt persists one logical Coordinator analysis call.

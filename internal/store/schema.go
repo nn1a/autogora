@@ -10,12 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 21
+const schemaVersion = 22
 
 type Store struct {
 	db              *sql.DB
@@ -146,6 +147,9 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensureBoardGraphState(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureCoordinationIncidentTriggerSchema(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
 	}
@@ -188,6 +192,116 @@ func (s *Store) ensureBoardGraphState(ctx context.Context) error {
 		SELECT board, 0, COALESCE(MAX(updated_at), '') FROM tasks GROUP BY board
 	`); err != nil {
 		return fmt.Errorf("backfill board graph state: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureCoordinationIncidentTriggerSchema(ctx context.Context) (resultErr error) {
+	var definition string
+	err := s.db.QueryRowContext(
+		ctx,
+		"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'coordination_incidents'",
+	).Scan(&definition)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect coordination incident schema: %w", err)
+	}
+	normalized := strings.Join(strings.Fields(strings.ToLower(definition)), " ")
+	if strings.Contains(normalized, "'run_invariant'") {
+		return nil
+	}
+	legacyTriggerCheck := strings.Join(strings.Fields(strings.ToLower(
+		"trigger TEXT NOT NULL CHECK (trigger IN ('repeated_block', 'retry_exhausted', 'graph_stalled', 'integration_conflict', 'agent_exhausted'))",
+	)), " ")
+	if !strings.Contains(normalized, legacyTriggerCheck) {
+		return errors.New(
+			"incompatible coordination incident schema: trigger constraint cannot be upgraded safely",
+		)
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open coordination incident migration connection: %w", err)
+	}
+	foreignKeysDisabled := false
+	var tx *sql.Tx
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if tx != nil {
+			resultErr = errors.Join(resultErr, tx.Rollback())
+		}
+		if foreignKeysDisabled {
+			_, restoreErr := conn.ExecContext(cleanupCtx, "PRAGMA foreign_keys = ON")
+			if restoreErr != nil {
+				resultErr = errors.Join(
+					resultErr,
+					fmt.Errorf("restore coordination incident foreign keys: %w", restoreErr),
+				)
+			}
+		}
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("prepare coordination incident migration: %w", err)
+	}
+	foreignKeysDisabled = true
+	tx, err = conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("start coordination incident migration: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE coordination_incidents_rebuild `+coordinationIncidentTableDefinition+`;
+		INSERT INTO coordination_incidents_rebuild(
+			id, board, root_task_id, task_id, trigger, severity, status,
+			graph_revision, summary, details_json, claim_token, claim_expires_at,
+			created_at, updated_at
+		)
+		SELECT
+			id, board, root_task_id, task_id, trigger, severity, status,
+			graph_revision, summary, details_json, claim_token, claim_expires_at,
+			created_at, updated_at
+		FROM coordination_incidents;
+		DROP TABLE coordination_incidents;
+		ALTER TABLE coordination_incidents_rebuild RENAME TO coordination_incidents;
+		`+coordinationIncidentIndexes); err != nil {
+		return fmt.Errorf("rebuild coordination incident schema: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("check rebuilt coordination incident foreign keys: %w", err)
+	}
+	violations := 0
+	for rows.Next() {
+		violations++
+	}
+	rowsErr := rows.Err()
+	closeErr := rows.Close()
+	if rowsErr != nil || closeErr != nil {
+		return errors.Join(rowsErr, closeErr)
+	}
+	if violations != 0 {
+		return fmt.Errorf(
+			"coordination incident migration produced %d foreign key violation(s)",
+			violations,
+		)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit coordination incident migration: %w", err)
+	}
+	tx = nil
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("restore coordination incident foreign keys: %w", err)
+	}
+	foreignKeysDisabled = false
+	var foreignKeysEnabled int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeysEnabled); err != nil {
+		return fmt.Errorf("verify coordination incident foreign keys: %w", err)
+	}
+	if foreignKeysEnabled != 1 {
+		return errors.New("coordination incident migration left foreign keys disabled")
 	}
 	return nil
 }
@@ -466,6 +580,37 @@ func (s *Store) migrateLegacySchema(ctx context.Context) error {
 	return nil
 }
 
+const coordinationIncidentTableDefinition = `(
+  id TEXT PRIMARY KEY,
+  board TEXT NOT NULL,
+  root_task_id TEXT,
+  task_id TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('repeated_block', 'retry_exhausted', 'graph_stalled', 'integration_conflict', 'agent_exhausted', 'run_invariant')),
+  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+  status TEXT NOT NULL CHECK (status IN ('open', 'coordinating', 'awaiting_approval', 'applying', 'resolved', 'dismissed', 'failed')),
+  graph_revision INTEGER NOT NULL CHECK (graph_revision >= 0),
+  summary TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  claim_token TEXT,
+  claim_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'coordinating' AND claim_token IS NOT NULL AND claim_token <> '' AND claim_expires_at IS NOT NULL)
+    OR
+    (status <> 'coordinating' AND claim_token IS NULL AND claim_expires_at IS NULL)
+  )
+)`
+
+const coordinationIncidentIndexes = `
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_board_status ON coordination_incidents(board, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_task ON coordination_incidents(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_root ON coordination_incidents(root_task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_claim_due ON coordination_incidents(status, claim_expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_incidents_active_dedupe
+  ON coordination_incidents(board, trigger, IFNULL(root_task_id, ''), IFNULL(task_id, ''))
+  WHERE status IN ('open', 'coordinating', 'awaiting_approval', 'applying');`
+
 const latestSchema = `
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -522,27 +667,7 @@ CREATE TABLE IF NOT EXISTS board_graph_state (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS coordination_incidents (
-  id TEXT PRIMARY KEY,
-  board TEXT NOT NULL,
-  root_task_id TEXT,
-  task_id TEXT,
-  trigger TEXT NOT NULL CHECK (trigger IN ('repeated_block', 'retry_exhausted', 'graph_stalled', 'integration_conflict', 'agent_exhausted')),
-  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
-  status TEXT NOT NULL CHECK (status IN ('open', 'coordinating', 'awaiting_approval', 'applying', 'resolved', 'dismissed', 'failed')),
-  graph_revision INTEGER NOT NULL CHECK (graph_revision >= 0),
-  summary TEXT NOT NULL,
-  details_json TEXT NOT NULL DEFAULT '{}',
-  claim_token TEXT,
-  claim_expires_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  CHECK (
-    (status = 'coordinating' AND claim_token IS NOT NULL AND claim_token <> '' AND claim_expires_at IS NOT NULL)
-    OR
-    (status <> 'coordinating' AND claim_token IS NULL AND claim_expires_at IS NULL)
-  )
-);
+CREATE TABLE IF NOT EXISTS coordination_incidents ` + coordinationIncidentTableDefinition + `;
 
 CREATE TABLE IF NOT EXISTS coordination_proposals (
   id TEXT PRIMARY KEY,
@@ -934,13 +1059,7 @@ CREATE INDEX IF NOT EXISTS idx_publications_task ON publications(board, task_id,
 CREATE INDEX IF NOT EXISTS idx_publications_run ON publications(board, run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_publications_claim_due ON publications(board, status, claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
-CREATE INDEX IF NOT EXISTS idx_coordination_incidents_board_status ON coordination_incidents(board, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_coordination_incidents_task ON coordination_incidents(task_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_coordination_incidents_root ON coordination_incidents(root_task_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_coordination_incidents_claim_due ON coordination_incidents(status, claim_expires_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_incidents_active_dedupe
-  ON coordination_incidents(board, trigger, IFNULL(root_task_id, ''), IFNULL(task_id, ''))
-  WHERE status IN ('open', 'coordinating', 'awaiting_approval', 'applying');
+` + coordinationIncidentIndexes + `
 CREATE INDEX IF NOT EXISTS idx_coordination_proposals_incident ON coordination_proposals(incident_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_coordination_attempts_board_started ON coordination_attempts(board, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_coordination_attempts_incident ON coordination_attempts(incident_id, started_at DESC);

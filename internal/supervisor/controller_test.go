@@ -85,6 +85,68 @@ func TestControllerStartsAppliesAndStopsSupervisorSettings(t *testing.T) {
 	}
 }
 
+func TestControllerPassesLiveAgentConfigLoaderAlongsideStartSnapshot(t *testing.T) {
+	started := make(chan dispatcher.Options, 1)
+	live := agentconfig.Default()
+	live.Agents = []agentconfig.Agent{{
+		ID: "coordinator", Runtime: "codex", Command: "codex",
+		Model: "first-model", Enabled: true, MaxConcurrent: 1,
+		Roles: []agentconfig.Role{agentconfig.RoleCoordinator},
+	}}
+	live.Defaults.CoordinatorAgents = []string{"coordinator"}
+	var mu sync.Mutex
+	controller := New(Options{
+		AgentConfigLoader: func() (agentconfig.Config, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return agentconfig.Normalize(live), nil
+		},
+		Run: func(ctx context.Context, options dispatcher.Options) error {
+			started <- options
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	snapshot := agentconfig.Normalize(live)
+	if !controller.Start(context.Background(), snapshot) {
+		t.Fatal("supervisor did not start")
+	}
+	var options dispatcher.Options
+	select {
+	case options = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("supervisor did not pass dispatcher options")
+	}
+	if options.AgentConfig == nil || options.AgentConfigLoader == nil ||
+		options.AgentConfig.Agents[0].Model != "first-model" {
+		t.Fatalf("dispatcher did not receive snapshot and live loader: %#v", options)
+	}
+	mu.Lock()
+	next := agentconfig.Normalize(live)
+	next.Agents = append([]agentconfig.Agent(nil), next.Agents...)
+	next.Agents[0].Roles = append([]agentconfig.Role(nil), next.Agents[0].Roles...)
+	next.Agents[0].Model = "second-model"
+	live = next
+	mu.Unlock()
+	reloaded, err := options.AgentConfigLoader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Agents[0].Model != "second-model" ||
+		options.AgentConfig.Agents[0].Model != "first-model" {
+		t.Fatalf(
+			"dispatcher loader semantics = snapshot:%#v live:%#v",
+			options.AgentConfig,
+			reloaded,
+		)
+	}
+	stop, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.Stop(stop); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestControllerReconcileUsesExplicitDesiredStateInsteadOfAutoStart(t *testing.T) {
 	started := make(chan dispatcher.Options, 2)
 	controller := New(Options{Run: func(ctx context.Context, options dispatcher.Options) error {

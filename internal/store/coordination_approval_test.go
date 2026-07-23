@@ -67,7 +67,17 @@ func seedValidatedCoordinationProposal(
 		Current:               claimAt.Add(time.Second),
 		Summary:               "Route the task to another worker",
 		Rationale:             "The current worker cannot make progress.",
-		Actions:               []byte(`[]`),
+		Actions: []byte(`[{
+			"kind":"create_task",
+			"reason":"create bounded recovery work",
+			"task":{
+				"key":"approval-recovery","title":"Approval recovery",
+				"body":"Run the approved recovery.","assignee":"codex-worker",
+				"runtime":"codex","workflowRole":"worker","priority":1,
+				"prerequisites":[],"dependents":[]
+			},
+			"expectedTaskVersions":{}
+		}]`),
 	})
 	if err != nil || !created {
 		t.Fatalf("create proposal: created=%v value=%+v err=%v", created, proposal, err)
@@ -152,6 +162,60 @@ func TestCoordinationApprovalRequestAndApprove(t *testing.T) {
 	if approved.Proposal.Status != model.CoordinationProposalApproved ||
 		approved.Incident.Status != model.CoordinationIncidentAwaitingApproval {
 		t.Fatalf("approved pair = %+v", approved)
+	}
+}
+
+func TestCoordinationApprovalRejectsManualEscalationWithoutChangingState(t *testing.T) {
+	for _, actions := range []string{"[]", "null"} {
+		t.Run(actions, func(t *testing.T) {
+			ctx := context.Background()
+			opened, err := Open(":memory:", "default", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			fixture := seedValidatedCoordinationProposal(t, opened)
+			if _, err := opened.db.ExecContext(
+				ctx,
+				"UPDATE coordination_proposals SET actions_json = ? WHERE id = ?",
+				actions,
+				fixture.proposal.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			awaiting := requestFixtureApproval(t, opened, fixture)
+			_, err = opened.ApproveCoordinationProposal(
+				ctx,
+				awaiting.Proposal.ID,
+				ApproveCoordinationProposalInput{
+					ExpectedUpdatedAt: awaiting.Proposal.UpdatedAt,
+					ExpectedGraphRevision: approvalRevision(
+						awaiting.Proposal.ExpectedGraphRevision,
+					),
+				},
+			)
+			if !errors.Is(err, ErrCoordinationManualEscalation) {
+				t.Fatalf("manual escalation approval error = %v", err)
+			}
+			proposal, err := opened.GetCoordinationProposal(ctx, awaiting.Proposal.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			incident, err := opened.GetCoordinationIncident(ctx, awaiting.Incident.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if proposal.Status != model.CoordinationProposalAwaitingApproval ||
+				proposal.UpdatedAt != awaiting.Proposal.UpdatedAt ||
+				incident.Status != model.CoordinationIncidentAwaitingApproval ||
+				incident.UpdatedAt != awaiting.Incident.UpdatedAt {
+				t.Fatalf(
+					"manual escalation approval changed state: proposal=%+v incident=%+v",
+					proposal,
+					incident,
+				)
+			}
+		})
 	}
 }
 

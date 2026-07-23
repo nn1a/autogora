@@ -28,6 +28,7 @@ import (
 )
 
 type GoalJudge func(context.Context, model.TaskDetail, int, string) (orchestration.GoalJudgment, error)
+type AgentConfigLoader func() (agentconfig.Config, error)
 
 type Options struct {
 	DBPath                   string
@@ -73,6 +74,7 @@ type Options struct {
 	Getenv                   func(string) string
 	Now                      func() time.Time
 	AgentConfig              *agentconfig.Config
+	AgentConfigLoader        AgentConfigLoader
 	OnLog                    func(string)
 	testHooks                *dispatcherTestHooks
 }
@@ -507,14 +509,44 @@ func concurrencyCap(global, board int) int {
 	}
 }
 
+func cloneAgentConfig(config agentconfig.Config) agentconfig.Config {
+	cloned := config
+	cloned.Defaults.WorkerAgents = append([]string(nil), config.Defaults.WorkerAgents...)
+	cloned.Defaults.PlannerAgents = append([]string(nil), config.Defaults.PlannerAgents...)
+	cloned.Defaults.CoordinatorAgents = append([]string(nil), config.Defaults.CoordinatorAgents...)
+	cloned.Defaults.JudgeAgents = append([]string(nil), config.Defaults.JudgeAgents...)
+	cloned.Agents = append([]agentconfig.Agent(nil), config.Agents...)
+	for index := range cloned.Agents {
+		cloned.Agents[index].Roles = append(
+			[]agentconfig.Role(nil),
+			config.Agents[index].Roles...,
+		)
+		cloned.Agents[index].Fallbacks = append(
+			[]string(nil),
+			config.Agents[index].Fallbacks...,
+		)
+	}
+	return cloned
+}
+
 func configuredProfiles(manager *boards.Manager, board string, options Options) (configuredProfileSet, error) {
 	metadata, err := manager.Read(board)
 	if err != nil {
 		return configuredProfileSet{}, err
 	}
 	config := agentconfig.Default()
-	if options.AgentConfig != nil {
-		config = agentconfig.Normalize(*options.AgentConfig)
+	if options.AgentConfigLoader != nil {
+		config, err = options.AgentConfigLoader()
+		if err != nil {
+			return configuredProfileSet{}, fmt.Errorf("load live agent configuration: %w", err)
+		}
+		config = cloneAgentConfig(config)
+		config = agentconfig.Normalize(config)
+		if err := agentconfig.Validate(config); err != nil {
+			return configuredProfileSet{}, fmt.Errorf("validate live agent configuration: %w", err)
+		}
+	} else if options.AgentConfig != nil {
+		config = agentconfig.Normalize(cloneAgentConfig(*options.AgentConfig))
 		if err := agentconfig.Validate(config); err != nil {
 			return configuredProfileSet{}, fmt.Errorf("validate agent configuration: %w", err)
 		}

@@ -365,7 +365,8 @@ func (s *Server) handleExtendedAPI(response http.ResponseWriter, request *http.R
 					DBPath: s.options.DBPath, CLIPath: s.options.CLIPath, Board: board, TaskID: taskID,
 					ExpectedUpdatedAt: expectedUpdatedAt, Once: true,
 					MaxWorkers:  intValue(body["maxWorkers"], config.Supervisor.MaxWorkers),
-					AllowWrites: allowWrites, Autopilot: taskID == "", AutoDecompose: autoDecompose, AgentConfig: &config,
+					AllowWrites: allowWrites, Autopilot: taskID == "", AutoDecompose: autoDecompose,
+					AgentConfig: &config, AgentConfigLoader: liveDashboardAgentConfig,
 				})
 				s.finishOperation(operation.ID, runErr)
 				if runErr != nil && s.options.OnLog != nil {

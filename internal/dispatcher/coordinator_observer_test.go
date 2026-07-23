@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -82,6 +83,20 @@ func createCoordinatorIntegrationIncident(
 	reason string,
 ) model.CoordinationIncident {
 	t.Helper()
+	return createCoordinatorIntegrationIncidentWithCode(
+		t, ctx, opened, taskID, reason, workspace.IntegrationFailureConflict,
+	)
+}
+
+func createCoordinatorIntegrationIncidentWithCode(
+	t *testing.T,
+	ctx context.Context,
+	opened *store.Store,
+	taskID string,
+	reason string,
+	code string,
+) model.CoordinationIncident {
+	t.Helper()
 	detail, err := opened.GetTask(ctx, taskID)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +106,7 @@ func createCoordinatorIntegrationIncident(
 		t.Fatal(err)
 	}
 	details, err := json.Marshal(map[string]any{
-		"code":      workspace.IntegrationFailureConflict,
+		"code":      code,
 		"blockKind": model.BlockKindNeedsInput,
 		"reason":    reason,
 	})
@@ -504,6 +519,72 @@ func TestCoordinatorObserverReconcilesIntegrationIncidentLifecycle(t *testing.T)
 	})
 }
 
+func TestCoordinatorObserverKeepsExhaustedIntegrationResolutionActionable(t *testing.T) {
+	const reason = "finalizer resolution attempts exhausted"
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	created, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "finalizer exhausted conflict recovery", Assignee: &assignee,
+		Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := opened.BlockTask(ctx, created.Task.ID, store.BlockInput{
+		Kind: model.BlockKindNeedsInput, Reason: reason,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident := createCoordinatorIntegrationIncidentWithCode(
+		t, ctx, opened, blocked.Task.ID, reason,
+		workspace.IntegrationFailureResolutionExhausted,
+	)
+	observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now())
+
+	current, err := opened.GetCoordinationIncident(ctx, incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepOpen, actionable, err := integrationCoordinatorIncidentState(ctx, opened, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := activeCoordinationCandidates(ctx, opened, metadata, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.ID == incident.ID {
+			found = true
+			break
+		}
+	}
+	if current.Status != model.CoordinationIncidentOpen || !keepOpen || !actionable || !found {
+		t.Fatalf(
+			"resolution exhaustion was retired: incident=%+v keepOpen=%v actionable=%v candidates=%+v",
+			current, keepOpen, actionable, candidates,
+		)
+	}
+}
+
 func TestCoordinatorObserverRetryExhaustionPreservesFailureDetails(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)
@@ -813,6 +894,258 @@ func TestCoordinatorObserverGraphStalledWaitsForIdleAndReconciles(t *testing.T) 
 	})
 	if err != nil || len(resolved) != 1 || resolved[0].ID != stalled.ID {
 		t.Fatalf("resolved graph incidents = %+v, %v", resolved, err)
+	}
+}
+
+func TestCoordinatorObserverDefersGraphStallUntilStaleRunRecoveryCompletes(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	parked, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "parked manual work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	running, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "worker whose heartbeat became stale", Assignee: &assignee,
+		Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: running.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim stale worker: claim=%+v err=%v", claim, err)
+	}
+	parkedUpdatedAt, err := time.Parse(time.RFC3339Nano, parked.Task.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := parkedUpdatedAt.Add(2 * time.Hour)
+	staleAt := current.Add(-time.Hour).Format(time.RFC3339Nano)
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		UPDATE task_runs
+		SET status = 'reclaimed', claimed_at = ?, heartbeat_at = ?,
+			claim_expires_at = ?, ended_at = ?
+		WHERE id = ?
+	`, staleAt, staleAt, staleAt, staleAt, claim.Run.ID); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.Orchestration.Autopilot.Coordination.IdleSeconds = 60
+	options := Options{AgentConfig: &config, Getenv: func(string) string { return "" }}
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, current,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled != nil {
+		t.Fatalf("stale active run opened graph_stalled before recovery: %+v", stalled)
+	}
+	invariant := findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant)
+	if invariant == nil || invariant.TaskID == nil || *invariant.TaskID != running.Task.ID {
+		t.Fatalf("terminal run ownership invariant was not exposed: %+v", incidents)
+	}
+	var invariantDetails map[string]any
+	if err := json.Unmarshal(invariant.Details, &invariantDetails); err != nil {
+		t.Fatal(err)
+	}
+	if invariantDetails["reason"] != "referenced_run_terminal" ||
+		invariantDetails["runStatus"] != string(model.RunStatusReclaimed) {
+		t.Fatalf("run invariant details = %#v", invariantDetails)
+	}
+
+	// The persisted store updates both records atomically. Restoring the run
+	// here lets the test complete that recovery after emulating the mixed
+	// task-before/run-after observation that separate read snapshots can see.
+	raw, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		UPDATE task_runs SET status = 'running', ended_at = NULL WHERE id = ?
+	`, claim.Run.ID); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := opened.RecoverAbandonedRun(
+		ctx, claim.Run.ID, model.RunStatusReclaimed, "stale heartbeat recovered", false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Task.CurrentRunID != nil || recovered.Task.Status == model.TaskStatusRunning {
+		t.Fatalf("stale run recovery did not release ownership: %+v", recovered.Task)
+	}
+	if _, err := opened.ArchiveTask(ctx, recovered.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	incidents, err = reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, current.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled)
+	if stalled == nil || stalled.TaskID == nil || *stalled.TaskID != parked.Task.ID {
+		t.Fatalf("resolved run did not allow a fresh graph diagnosis: %+v", incidents)
+	}
+	resolvedInvariants, err := opened.ListCoordinationIncidents(
+		ctx,
+		store.CoordinationIncidentFilter{
+			Trigger: model.CoordinationTriggerRunInvariant,
+			Status:  model.CoordinationIncidentResolved,
+		},
+	)
+	if err != nil || len(resolvedInvariants) != 1 ||
+		resolvedInvariants[0].ID != invariant.ID {
+		t.Fatalf("resolved run invariants = %+v, %v", resolvedInvariants, err)
+	}
+}
+
+func TestCoordinatorObserverExposesStableMissingRunOwnership(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "task with missing current run", Assignee: &assignee,
+		Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'running', current_run_id = 'missing-run', updated_at = ?
+		WHERE id = ?
+	`, time.Now().UTC().Format(time.RFC3339Nano), task.Task.ID); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx,
+		manager,
+		opened,
+		metadata,
+		Options{AgentConfig: &config, Getenv: func(string) string { return "" }},
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invariant := findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant)
+	if invariant == nil || invariant.TaskID == nil || *invariant.TaskID != task.Task.ID {
+		t.Fatalf("missing run invariant was not exposed: %+v", incidents)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(invariant.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["reason"] != "referenced_run_missing" ||
+		details["currentRunId"] != "missing-run" {
+		t.Fatalf("missing run invariant details = %#v", details)
+	}
+	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled != nil {
+		t.Fatalf("missing run was misreported as graph_stalled: %+v", stalled)
+	}
+}
+
+type mixedRunOwnershipReader struct {
+	tasks []model.Task
+	index int
+}
+
+func (r *mixedRunOwnershipReader) GetTask(
+	_ context.Context,
+	_ string,
+) (model.TaskDetail, error) {
+	index := min(r.index, len(r.tasks)-1)
+	r.index++
+	return model.TaskDetail{Task: r.tasks[index]}, nil
+}
+
+func (*mixedRunOwnershipReader) GetRun(
+	context.Context,
+	string,
+) (store.RunInspection, error) {
+	return store.RunInspection{}, fmt.Errorf("GetRun must not be called after ownership clears")
+}
+
+func (*mixedRunOwnershipReader) ListActiveRuns(
+	context.Context,
+	string,
+) ([]store.ActiveRun, error) {
+	return nil, fmt.Errorf("ListActiveRuns must not be called after ownership clears")
+}
+
+func TestInspectCoordinatorRunOwnershipTreatsClearedOwnerAsMixedSnapshot(t *testing.T) {
+	runID := "run-transitioning"
+	snapshot := model.Task{
+		ID: "task-transitioning", Board: "default",
+		Status: model.TaskStatusRunning, CurrentRunID: &runID,
+	}
+	cleared := snapshot
+	cleared.Status, cleared.CurrentRunID = model.TaskStatusTodo, nil
+	reader := &mixedRunOwnershipReader{tasks: []model.Task{cleared}}
+	invariant, mixed, err := inspectCoordinatorRunOwnership(
+		context.Background(),
+		reader,
+		snapshot,
+		map[string]bool{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invariant != nil || !mixed || reader.index != 1 {
+		t.Fatalf(
+			"cleared ownership inspection: invariant=%+v mixed=%t reads=%d",
+			invariant,
+			mixed,
+			reader.index,
+		)
 	}
 }
 

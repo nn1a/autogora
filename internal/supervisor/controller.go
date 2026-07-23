@@ -13,15 +13,16 @@ import (
 type RunFunc func(context.Context, dispatcher.Options) error
 
 type Options struct {
-	DBPath           string
-	CLIPath          string
-	WorkingDirectory string
-	Getenv           func(string) string
-	OnLog            func(string)
-	Run              RunFunc
-	RestartMinDelay  time.Duration
-	RestartMaxDelay  time.Duration
-	StableRunWindow  time.Duration
+	DBPath            string
+	CLIPath           string
+	WorkingDirectory  string
+	Getenv            func(string) string
+	AgentConfigLoader dispatcher.AgentConfigLoader
+	OnLog             func(string)
+	Run               RunFunc
+	RestartMinDelay   time.Duration
+	RestartMaxDelay   time.Duration
+	StableRunWindow   time.Duration
 }
 
 type Status struct {
@@ -85,8 +86,9 @@ func (c *Controller) dispatcherOptions(config agentconfig.Config) dispatcher.Opt
 		DBPath: c.options.DBPath, CLIPath: c.options.CLIPath,
 		MaxWorkers: config.Supervisor.MaxWorkers, AllowWrites: config.Supervisor.AllowWrites,
 		Autopilot:   true,
-		AgentConfig: &config, WorkingDirectory: c.options.WorkingDirectory,
-		Getenv: c.options.Getenv, OnLog: c.options.OnLog,
+		AgentConfig: &config, AgentConfigLoader: c.options.AgentConfigLoader,
+		WorkingDirectory: c.options.WorkingDirectory,
+		Getenv:           c.options.Getenv, OnLog: c.options.OnLog,
 	}
 }
 
