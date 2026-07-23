@@ -71,6 +71,7 @@ Commands:
   dispatch              Run the worker dispatcher
   dashboard             Run the authenticated local web dashboard
   tui                   Open the interactive terminal board
+  agents <action>       Configure and detect coding agents
   skills <action>       Install, inspect, or uninstall bundled Agent Skills
   mcp <action>          Register, inspect, or unregister the MCP server
   setup                 Install bundled Skills and register MCP together
@@ -273,6 +274,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runDashboard(ctx, opts)
 	case "tui":
 		return a.runTUI(ctx, opts)
+	case "agents":
+		return a.runAgents(ctx, opts)
 	case "skills":
 		return a.runSkills(opts)
 	case "mcp":

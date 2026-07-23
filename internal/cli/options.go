@@ -23,7 +23,7 @@ var booleanOptions = map[string]bool{
 	"switch": true, "triage": true, "goal": true, "mine": true,
 	"follow": true, "clear-secret": true, "once": true, "watch": true,
 	"force": true, "dry-run": true, "allow-writes": true, "auto-decompose": true,
-	"replace": true, "reset-data-dir": true,
+	"replace": true, "reset-data-dir": true, "save": true, "auto-start": true,
 }
 
 func parseOptions(args []string) (options, error) {
