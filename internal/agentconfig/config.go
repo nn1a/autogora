@@ -24,9 +24,10 @@ const (
 type Role string
 
 const (
-	RoleWorker  Role = "worker"
-	RolePlanner Role = "planner"
-	RoleJudge   Role = "judge"
+	RoleWorker      Role = "worker"
+	RolePlanner     Role = "planner"
+	RoleCoordinator Role = "coordinator"
+	RoleJudge       Role = "judge"
 )
 
 type Options struct {
@@ -49,9 +50,10 @@ type Supervisor struct {
 }
 
 type Defaults struct {
-	WorkerAgents  []string `json:"workerAgents"`
-	PlannerAgents []string `json:"plannerAgents"`
-	JudgeAgents   []string `json:"judgeAgents"`
+	WorkerAgents      []string `json:"workerAgents"`
+	PlannerAgents     []string `json:"plannerAgents"`
+	CoordinatorAgents []string `json:"coordinatorAgents"`
+	JudgeAgents       []string `json:"judgeAgents"`
 }
 
 type Agent struct {
@@ -73,9 +75,10 @@ func Default() Config {
 		SchemaVersion: SchemaVersion,
 		Supervisor:    Supervisor{MaxWorkers: 1},
 		Defaults: Defaults{
-			WorkerAgents:  []string{},
-			PlannerAgents: []string{},
-			JudgeAgents:   []string{},
+			WorkerAgents:      []string{},
+			PlannerAgents:     []string{},
+			CoordinatorAgents: []string{},
+			JudgeAgents:       []string{},
 		},
 		Agents: []Agent{},
 	}
@@ -213,6 +216,7 @@ func Normalize(config Config) Config {
 	}
 	config.Defaults.WorkerAgents = normalizedStrings(config.Defaults.WorkerAgents)
 	config.Defaults.PlannerAgents = normalizedStrings(config.Defaults.PlannerAgents)
+	config.Defaults.CoordinatorAgents = normalizedStrings(config.Defaults.CoordinatorAgents)
 	config.Defaults.JudgeAgents = normalizedStrings(config.Defaults.JudgeAgents)
 	if config.Agents == nil {
 		config.Agents = []Agent{}
@@ -277,6 +281,9 @@ func Validate(config Config) error {
 		return err
 	}
 	if err := validateDefaultReferences(config.Defaults.PlannerAgents, RolePlanner, agents); err != nil {
+		return err
+	}
+	if err := validateDefaultReferences(config.Defaults.CoordinatorAgents, RoleCoordinator, agents); err != nil {
 		return err
 	}
 	if err := validateDefaultReferences(config.Defaults.JudgeAgents, RoleJudge, agents); err != nil {
@@ -345,6 +352,8 @@ func (config Config) defaultIDs(role Role) []string {
 		return config.Defaults.WorkerAgents
 	case RolePlanner:
 		return config.Defaults.PlannerAgents
+	case RoleCoordinator:
+		return config.Defaults.CoordinatorAgents
 	case RoleJudge:
 		return config.Defaults.JudgeAgents
 	default:
@@ -357,7 +366,7 @@ func validWorkerRuntime(value model.Runtime) bool {
 }
 
 func validRole(role Role) bool {
-	return role == RoleWorker || role == RolePlanner || role == RoleJudge
+	return role == RoleWorker || role == RolePlanner || role == RoleCoordinator || role == RoleJudge
 }
 
 func hasRole(agent Agent, role Role) bool {

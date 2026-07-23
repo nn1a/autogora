@@ -17,6 +17,8 @@ Actions:
   path                  Show the global agent configuration path
   list                  Show the global agent registry and defaults
   detect [--save]       Find supported CLIs through PATH and run only --version
+  presets               List built-in agent registry presets
+  preset <id>           Preview a preset; use --apply to save it
   set <id>              Add or update an agent
   enable <id>           Make a configured agent eligible for work
   disable <id>          Keep an agent configured but exclude it from work
@@ -29,14 +31,19 @@ Set options:
   --command <path>      Executable name or path (default: runtime)
   --model <model>       Model pinned for this agent
   --provider <name>     Provider pinned for this agent
-  --roles <roles>       Comma-separated worker, planner, and/or judge
+  --roles <roles>       Comma-separated worker, planner, coordinator, and/or judge
   --fallbacks <ids>     Comma-separated fallback agent IDs
   --max-concurrent <n>  Maximum concurrent runs for this agent
 
 Defaults options:
   --worker <ids>        Comma-separated worker agent IDs
   --planner <ids>       Comma-separated planner agent IDs
+  --coordinator <ids>   Comma-separated coordinator agent IDs
   --judge <ids>         Comma-separated judge agent IDs
+
+Preset options:
+  --apply               Save the previewed preset
+  --replace             Replace matching preset agents and preferred orders
 
 Supervisor options:
   --auto-start=<bool>   Start orchestration with supported user interfaces
@@ -77,9 +84,23 @@ type agentDetectionReport struct {
 	Agents []agentDetection `json:"agents"`
 }
 
+type agentPresetCatalogReport struct {
+	Presets []agentconfig.Preset `json:"presets"`
+}
+
+type agentPresetReport struct {
+	Path       string                  `json:"path"`
+	Exists     bool                    `json:"exists"`
+	Preset     agentconfig.Preset      `json:"preset"`
+	Applied    bool                    `json:"applied"`
+	Replaced   bool                    `json:"replaced"`
+	Detections []agentconfig.Detection `json:"detections"`
+	Config     agentconfig.Config      `json:"config"`
+}
+
 func (a *App) runAgents(ctx context.Context, opts options) error {
 	if len(opts.positionals) == 0 {
-		return errors.New("agents requires path, list, detect, set, enable, disable, remove, defaults, or supervisor")
+		return errors.New("agents requires path, list, detect, presets, preset, set, enable, disable, remove, defaults, or supervisor")
 	}
 	action := strings.ToLower(strings.TrimSpace(opts.positionals[0]))
 	values := opts.positionals[1:]
@@ -112,6 +133,25 @@ func (a *App) runAgents(ctx context.Context, opts options) error {
 			return errors.New("agents detect does not accept arguments")
 		}
 		return a.detectAgents(ctx, opts.flags["save"])
+	case "presets":
+		if err := rejectAgentOptions(opts); err != nil {
+			return err
+		}
+		if len(values) != 0 {
+			return errors.New("agents presets does not accept arguments")
+		}
+		return writeJSON(a.Stdout, agentPresetCatalogReport{Presets: agentconfig.BuiltinPresets()})
+	case "preset":
+		if err := rejectAgentOptions(opts, "apply", "replace"); err != nil {
+			return err
+		}
+		if len(values) != 1 {
+			return errors.New("agents preset requires exactly one preset id")
+		}
+		if opts.flags["replace"] && !opts.flags["apply"] {
+			return errors.New("agents preset --replace requires --apply")
+		}
+		return a.previewAgentPreset(ctx, values[0], opts.flags["apply"], opts.flags["replace"])
 	case "set":
 		if err := rejectAgentOptions(opts, "runtime", "command", "model", "provider", "roles", "fallbacks", "max-concurrent"); err != nil {
 			return err
@@ -128,7 +168,7 @@ func (a *App) runAgents(ctx context.Context, opts options) error {
 		}
 		return a.removeAgent(values)
 	case "defaults":
-		if err := rejectAgentOptions(opts, "worker", "planner", "judge"); err != nil {
+		if err := rejectAgentOptions(opts, "worker", "planner", "coordinator", "judge"); err != nil {
 			return err
 		}
 		if len(values) != 0 {
@@ -226,7 +266,7 @@ func (a *App) setAgent(opts options, values []string) error {
 	if opts.present("roles") {
 		agent.Roles = roleOptions(opts.many("roles"))
 		if len(agent.Roles) == 0 {
-			return errors.New("--roles requires worker, planner, and/or judge")
+			return errors.New("--roles requires worker, planner, coordinator, and/or judge")
 		}
 	}
 	if opts.present("fallbacks") {
@@ -298,13 +338,14 @@ func (a *App) removeAgent(values []string) error {
 	config.Agents = agents
 	config.Defaults.WorkerAgents = withoutString(config.Defaults.WorkerAgents, id)
 	config.Defaults.PlannerAgents = withoutString(config.Defaults.PlannerAgents, id)
+	config.Defaults.CoordinatorAgents = withoutString(config.Defaults.CoordinatorAgents, id)
 	config.Defaults.JudgeAgents = withoutString(config.Defaults.JudgeAgents, id)
 	return a.saveAgentConfig(config)
 }
 
 func (a *App) setAgentDefaults(opts options) error {
-	if !opts.present("worker") && !opts.present("planner") && !opts.present("judge") {
-		return errors.New("agents defaults requires --worker, --planner, or --judge")
+	if !opts.present("worker") && !opts.present("planner") && !opts.present("coordinator") && !opts.present("judge") {
+		return errors.New("agents defaults requires --worker, --planner, --coordinator, or --judge")
 	}
 	_, _, config, err := a.loadAgentConfig()
 	if err != nil {
@@ -315,6 +356,9 @@ func (a *App) setAgentDefaults(opts options) error {
 	}
 	if opts.present("planner") {
 		config.Defaults.PlannerAgents = commaOptions(opts.many("planner"))
+	}
+	if opts.present("coordinator") {
+		config.Defaults.CoordinatorAgents = commaOptions(opts.many("coordinator"))
 	}
 	if opts.present("judge") {
 		config.Defaults.JudgeAgents = commaOptions(opts.many("judge"))
@@ -353,21 +397,7 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 	if err != nil {
 		return err
 	}
-	runner := a.CommandRunner
-	if runner == nil {
-		runner = setupcfg.ExecRunner{}
-	}
-	directory, err := a.workingDirectory()
-	if err != nil {
-		return err
-	}
-	commonDetections, err := agentconfig.DetectSupportedAgents(ctx, config, agentconfig.DetectOptions{
-		LookPath: runner.LookPath,
-		RunVersion: func(ctx context.Context, executable string) (string, string, error) {
-			output, runErr := runner.Run(ctx, directory, executable, "--version")
-			return output.Stdout, output.Stderr, runErr
-		},
-	})
+	commonDetections, err := a.detectSupportedAgents(ctx, config)
 	if err != nil {
 		return err
 	}
@@ -381,7 +411,7 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 		if save && !detection.Configured && detection.State != "missing" {
 			config.Agents = append(config.Agents, agentconfig.Agent{
 				ID: detection.ID, Runtime: detection.Runtime, Command: detection.Executable, Enabled: true, MaxConcurrent: 1,
-				Roles: []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleJudge},
+				Roles: []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleCoordinator, agentconfig.RoleJudge},
 			})
 			detection.Configured = true
 			detection.Saved = true
@@ -394,6 +424,55 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 		}
 	}
 	return writeJSON(a.Stdout, agentDetectionReport{Path: path, Saved: save, Agents: detections})
+}
+
+func (a *App) detectSupportedAgents(ctx context.Context, config agentconfig.Config) ([]agentconfig.Detection, error) {
+	runner := a.CommandRunner
+	if runner == nil {
+		runner = setupcfg.ExecRunner{}
+	}
+	directory, err := a.workingDirectory()
+	if err != nil {
+		return nil, err
+	}
+	return agentconfig.DetectSupportedAgents(ctx, config, agentconfig.DetectOptions{
+		LookPath: runner.LookPath,
+		RunVersion: func(ctx context.Context, executable string) (string, string, error) {
+			output, runErr := runner.Run(ctx, directory, executable, "--version")
+			return output.Stdout, output.Stderr, runErr
+		},
+	})
+}
+
+func (a *App) previewAgentPreset(ctx context.Context, id string, apply, replace bool) error {
+	path, exists, config, err := a.loadAgentConfig()
+	if err != nil {
+		return err
+	}
+	preset, found := agentconfig.FindPreset(id)
+	if !found {
+		return fmt.Errorf("unknown agent preset %q", strings.TrimSpace(id))
+	}
+	detections, err := a.detectSupportedAgents(ctx, config)
+	if err != nil {
+		return err
+	}
+	preview, err := agentconfig.ApplyPreset(config, preset.ID, agentconfig.PresetApplyOptions{
+		Detections: detections, ReplaceExisting: replace,
+	})
+	if err != nil {
+		return err
+	}
+	if apply {
+		if err := agentconfig.Save(a.agentConfigOptions(), preview); err != nil {
+			return err
+		}
+		exists = true
+	}
+	return writeJSON(a.Stdout, agentPresetReport{
+		Path: path, Exists: exists, Preset: preset, Applied: apply, Replaced: replace,
+		Detections: detections, Config: preview,
+	})
 }
 
 func workerRuntime(value string) (model.Runtime, error) {

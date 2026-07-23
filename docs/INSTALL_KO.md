@@ -149,7 +149,7 @@ autogora init --data-dir /absolute/previous/dataRoot
 
 ## 4. coding agent와 supervisor 설정
 
-전역 agent 설정은 worker, planner, judge가 사용할 CLI와 모델을 한 곳에서 관리한다. `autogora agents path`로 `config.json` 위치를 확인할 수 있으며, `AUTOGORA_CONFIG`에 절대 경로를 지정해 위치를 바꿀 수 있다. 이 파일에는 API 키나 로그인 토큰을 저장하지 않는다.
+전역 agent 설정은 worker, planner, Coordinator, judge가 사용할 CLI와 모델을 한 곳에서 관리한다. `autogora agents path`로 `config.json` 위치를 확인할 수 있으며, `AUTOGORA_CONFIG`에 절대 경로를 지정해 위치를 바꿀 수 있다. 이 파일에는 API 키나 로그인 토큰을 저장하지 않는다.
 
 Web UI는 전역 설정 파일이 없을 때 첫 화면에서 `Agents` 대화상자를 자동으로 연다. `Detect CLIs`는 `PATH`에서 `claude`, `codex`, `cline`, `gemini`를 찾고 각 실행 파일에 `--version`만 호출한다. prompt를 보내거나 유료 API를 호출하지 않으며 로그인, 구독 한도, quota도 확인하지 않는다. 자동 실행을 켜기 전에 각 CLI에서 인증과 사용 가능 여부를 따로 확인한다.
 
@@ -160,6 +160,11 @@ Web UI는 전역 설정 파일이 없을 때 첫 화면에서 `Agents` 대화상
 CLI에서도 같은 설정을 관리할 수 있다.
 
 ```bash
+# 자주 쓰는 구성을 먼저 확인하고 적용한다.
+autogora agents presets
+autogora agents preset codex-claude
+autogora agents preset codex-claude --apply
+
 # 먼저 결과를 확인한다. --save는 PATH에서 찾은 CLI를 전역 목록에 추가한다.
 autogora agents detect
 autogora agents detect --save
@@ -167,19 +172,20 @@ autogora agents detect --save
 autogora agents set claude-backup \
   --runtime claude \
   --model <model-id> \
-  --roles worker,planner,judge
+  --roles worker,planner,coordinator,judge
 
 autogora agents set codex-primary \
   --runtime codex \
   --command codex \
   --model <model-id> \
-  --roles worker,planner,judge \
+  --roles worker,planner,coordinator,judge \
   --fallbacks claude-backup \
   --max-concurrent 2
 
 autogora agents defaults \
   --worker codex-primary,claude-backup \
   --planner codex-primary,claude-backup \
+  --coordinator claude-backup,codex-primary \
   --judge claude-backup,codex-primary
 
 autogora agents supervisor \
@@ -188,11 +194,13 @@ autogora agents supervisor \
   --allow-writes=true
 ```
 
+내장 preset은 model과 provider를 비워 각 CLI의 현재 기본 모델을 사용한다. 미리보기는 파일을 변경하지 않는다. `--apply`는 기존 설정을 보존하면서 빠진 agent와 비어 있는 역할 순서만 채운다. 같은 ID의 preset 설정과 역할별 순서를 교체하려면 `--apply --replace`를 함께 지정한다. `PATH`에서 찾지 못한 CLI는 preset에 남기되 비활성화한다.
+
 각 agent에는 다음 값을 저장한다.
 
 - ID, runtime, 실행 명령
 - model과 Cline 등에서 사용할 provider
-- `worker`, `planner`, `judge` 역할
+- `worker`, `planner`, `coordinator`, `judge` 역할
 - agent별 최대 동시 실행 수
 - 사용 불가 시 순서대로 확인할 fallback agent
 

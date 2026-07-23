@@ -41,7 +41,7 @@ autogora dashboard
 `dashboard`가 출력한 URL을 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL 토큰을 HTTP-only, `SameSite=Strict` 세션 쿠키로 저장한 뒤 토큰 없는 URL로 이동한다. 전역 agent 설정 파일이 없으면 첫 화면에서 `Agents` 대화상자가 열린다.
 
 1. `Detect CLIs`로 `PATH`에 있는 coding agent를 찾는다.
-2. 사용할 agent의 runtime, 명령, model, provider와 worker/planner/judge 역할을 확인한다.
+2. 사용할 agent의 runtime, 명령, model, provider와 worker/planner/coordinator/judge 역할을 확인한다.
 3. 역할별 기본 순서, fallback, agent별 동시 실행 수를 정한다.
 4. `Automatic orchestration`의 worker 수와 쓰기 권한을 정하고 저장한다.
 
@@ -432,7 +432,7 @@ GitHub에서 가져와 검토를 기다리는 task와 backoff 중인 task는 실
 
 ### 5.4 Todo: 실행 경로 확정
 
-Web UI의 `Agents`는 모든 보드에서 공유할 전역 agent registry와 worker/planner/judge 기본 순서를 관리한다. 각 agent에는 runtime, 실행 명령, model, provider, 역할, fallback과 최대 동시 실행 수를 둔다. Model을 비우면 해당 CLI 기본값을 사용하며 화면과 run 이력에는 `CLI default (unpinned)`로 표시된다.
+Web UI의 `Agents`는 모든 보드에서 공유할 전역 agent registry와 worker/planner/coordinator/judge 기본 순서를 관리한다. 각 agent에는 runtime, 실행 명령, model, provider, 역할, fallback과 최대 동시 실행 수를 둔다. Model을 비우면 해당 CLI 기본값을 사용하며 화면과 run 이력에는 `CLI default (unpinned)`로 표시된다.
 
 상단 `Settings`에서 여는 `Board & orchestration`의 profile은 한 보드의 routing을 특화한다. 같은 이름의 전역 agent가 있으면 model, provider, 설명, 우선순위와 fallback을 덮어쓰거나 동시 실행 상한을 더 낮출 수 있다. 전역 runtime이나 실행 명령을 바꾸거나, 전역에서 비활성화한 agent를 다시 켜거나, 전역 상한을 높일 수는 없다. 이름이 다른 보드 전용 profile은 새로 만들 수 있다.
 

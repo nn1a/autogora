@@ -24,7 +24,7 @@ autogora init
 
 The resulting native executable embeds the TUI, Web UI, and SQLite engine, so
 it needs no separate database server or Web asset installation. Claude Code,
-Codex, Cline, and Gemini CLI are needed only for the worker, planner, or judge
+Codex, Cline, and Gemini CLI are needed only for the worker, planner, coordinator, or judge
 routes you select.
 
 Future tagged versions are expected to publish archives and `checksums.txt` on
@@ -85,28 +85,41 @@ enabling unattended work.
 The dialog and the `agents` subcommand write the same global `config.json`.
 Use `autogora agents path` to locate it. The file contains routing metadata,
 not credentials: agent ID, runtime, executable, model, provider, worker/planner/
-judge roles, fallback order, per-agent concurrency, preferred role order, and
+coordinator/judge roles, fallback order, per-agent concurrency, preferred role order, and
 supervisor settings.
 
 ```bash
+# Preview a common unpinned setup, then apply it.
+autogora agents presets
+autogora agents preset codex-claude
+autogora agents preset codex-claude --apply
+
 # Inspect first; --save adds detected CLIs to the registry.
 autogora agents detect
 autogora agents detect --save
 
 autogora agents set claude-backup \
   --runtime claude --model <model-id> \
-  --roles worker,planner,judge
+  --roles worker,planner,coordinator,judge
 autogora agents set codex-primary \
   --runtime codex --model <model-id> \
-  --roles worker,planner,judge \
+  --roles worker,planner,coordinator,judge \
   --fallbacks claude-backup --max-concurrent 2
 autogora agents defaults \
   --worker codex-primary,claude-backup \
   --planner codex-primary,claude-backup \
+  --coordinator claude-backup,codex-primary \
   --judge claude-backup,codex-primary
 autogora agents supervisor \
   --auto-start=true --max-workers 2 --allow-writes=true
 ```
+
+Built-in presets leave model and provider empty so the coding-agent CLIs choose
+their current defaults. Previewing never writes the configuration. Applying a
+preset adds missing agents and fills empty preferred-role lists without
+overwriting existing entries; `--apply --replace` is required to replace
+matching preset agents and preferred orders. CLI detection disables preset
+entries whose executables are not present on `PATH`.
 
 With `auto-start` enabled, `autogora dashboard` and `autogora tui` start the
 in-process supervisor. A separate `dispatch --watch` process is unnecessary.
@@ -586,7 +599,7 @@ it as JSON, and applies the same domain validation before any board mutation.
 Gemini planners also receive a temporary deny-all tool policy.
 
 The global agent registry is authoritative for executable availability,
-runtime, command, role eligibility, preferred worker/planner/judge order, and
+runtime, command, role eligibility, preferred worker/planner/coordinator/judge order, and
 maximum concurrency. Per-board settings may add a board-only worker profile or
 specialize a matching global profile as described above. A board-pinned planner
 model/provider takes precedence; otherwise Autogora tries the preferred global

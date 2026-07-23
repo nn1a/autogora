@@ -36,10 +36,10 @@ func TestAgentsCLIManagesRegistryDefaultsAndSupervisor(t *testing.T) {
 		t.Fatalf("initial path output = %s", pathOutput)
 	}
 
-	runApp(t, app, "agents", "set", "primary", "--runtime", "codex", "--command", "/tools/codex", "--model", "gpt-test", "--provider", "openai", "--roles", "worker,planner", "--max-concurrent", "2")
+	runApp(t, app, "agents", "set", "primary", "--runtime", "codex", "--command", "/tools/codex", "--model", "gpt-test", "--provider", "openai", "--roles", "worker,planner,coordinator", "--max-concurrent", "2")
 	runApp(t, app, "agents", "set", "backup", "--runtime", "claude", "--roles", "worker,judge")
 	runApp(t, app, "agents", "set", "primary", "--runtime", "codex", "--fallbacks", "backup")
-	runApp(t, app, "agents", "defaults", "--worker", "primary,backup", "--planner", "primary", "--judge", "backup")
+	runApp(t, app, "agents", "defaults", "--worker", "primary,backup", "--planner", "primary", "--coordinator", "primary", "--judge", "backup")
 	runApp(t, app, "agents", "supervisor", "--auto-start=true", "--max-workers", "3", "--allow-writes=true")
 	runApp(t, app, "agents", "supervisor", "--auto-start=false", "--allow-writes=false")
 	runApp(t, app, "agents", "disable", "backup")
@@ -53,7 +53,7 @@ func TestAgentsCLIManagesRegistryDefaultsAndSupervisor(t *testing.T) {
 	if !found || primary.Runtime != model.RuntimeCodex || primary.Command != "/tools/codex" || primary.Model != "gpt-test" || primary.Provider != "openai" || primary.MaxConcurrent != 2 {
 		t.Fatalf("primary agent = %#v, found=%t", primary, found)
 	}
-	if !reflect.DeepEqual(primary.Roles, []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner}) || !reflect.DeepEqual(primary.Fallbacks, []string{"backup"}) {
+	if !reflect.DeepEqual(primary.Roles, []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleCoordinator}) || !reflect.DeepEqual(primary.Fallbacks, []string{"backup"}) {
 		t.Fatalf("primary routing = %#v", primary)
 	}
 	backup, found := config.Find("backup")
@@ -63,7 +63,10 @@ func TestAgentsCLIManagesRegistryDefaultsAndSupervisor(t *testing.T) {
 	if config.Supervisor.AutoStart || config.Supervisor.AllowWrites || config.Supervisor.MaxWorkers != 3 {
 		t.Fatalf("supervisor = %#v", config.Supervisor)
 	}
-	if !reflect.DeepEqual(config.Defaults.WorkerAgents, []string{"primary", "backup"}) || !reflect.DeepEqual(config.Defaults.PlannerAgents, []string{"primary"}) || !reflect.DeepEqual(config.Defaults.JudgeAgents, []string{"backup"}) {
+	if !reflect.DeepEqual(config.Defaults.WorkerAgents, []string{"primary", "backup"}) ||
+		!reflect.DeepEqual(config.Defaults.PlannerAgents, []string{"primary"}) ||
+		!reflect.DeepEqual(config.Defaults.CoordinatorAgents, []string{"primary"}) ||
+		!reflect.DeepEqual(config.Defaults.JudgeAgents, []string{"backup"}) {
 		t.Fatalf("defaults = %#v", config.Defaults)
 	}
 
@@ -135,7 +138,7 @@ func TestAgentsDetectUsesVersionOnlyAndPreservesExistingSettings(t *testing.T) {
 		t.Fatalf("detect overwrote existing agent: %#v", codex)
 	}
 	cline, found := config.Find("cline")
-	wantRoles := []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleJudge}
+	wantRoles := []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleCoordinator, agentconfig.RoleJudge}
 	if !found || cline.Command != "/detected/cline" || !cline.Enabled || !reflect.DeepEqual(cline.Roles, wantRoles) {
 		t.Fatalf("detected cline = %#v, found=%t", cline, found)
 	}
@@ -147,6 +150,63 @@ func TestAgentsDetectUsesVersionOnlyAndPreservesExistingSettings(t *testing.T) {
 	}
 	if len(config.Agents) != 2 {
 		t.Fatalf("repeated detection duplicated agents: %#v", config.Agents)
+	}
+}
+
+func TestAgentsPresetPreviewsAndAppliesDetectedUnpinnedAgents(t *testing.T) {
+	app, configOptions := newAgentConfigTestApp(t)
+	runner := &agentDetectionRunner{paths: map[string]string{
+		"codex": "/detected/codex", "claude": "/detected/claude",
+	}}
+	app.CommandRunner = runner
+
+	catalog := runApp(t, app, "agents", "presets")
+	for _, id := range []string{"codex", "claude", "codex-claude", "claude-codex"} {
+		if !strings.Contains(catalog, `"id": "`+id+`"`) {
+			t.Fatalf("preset catalog does not contain %s: %s", id, catalog)
+		}
+	}
+
+	preview := runApp(t, app, "agents", "preset", "codex-claude")
+	if !strings.Contains(preview, `"applied": false`) ||
+		!strings.Contains(preview, `"coordinatorAgents":`) ||
+		!strings.Contains(preview, `"/detected/codex"`) ||
+		!strings.Contains(preview, `"/detected/claude"`) {
+		t.Fatalf("preset preview = %s", preview)
+	}
+	if exists, err := agentconfig.Exists(configOptions); err != nil || exists {
+		t.Fatalf("preview wrote config: exists=%t err=%v", exists, err)
+	}
+
+	applied := runApp(t, app, "agents", "preset", "codex-claude", "--apply")
+	if !strings.Contains(applied, `"applied": true`) {
+		t.Fatalf("preset apply = %s", applied)
+	}
+	config, err := agentconfig.Load(configOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex, _ := config.Find("codex")
+	claude, _ := config.Find("claude")
+	wantRoles := []agentconfig.Role{
+		agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleCoordinator, agentconfig.RoleJudge,
+	}
+	if codex.Command != "/detected/codex" || claude.Command != "/detected/claude" ||
+		codex.Model != "" || claude.Model != "" ||
+		!reflect.DeepEqual(codex.Roles, wantRoles) || !reflect.DeepEqual(claude.Roles, wantRoles) {
+		t.Fatalf("applied agents: codex=%#v claude=%#v", codex, claude)
+	}
+	if !reflect.DeepEqual(config.Defaults.CoordinatorAgents, []string{"claude", "codex"}) {
+		t.Fatalf("coordinator defaults = %#v", config.Defaults)
+	}
+	for _, call := range runner.calls {
+		if len(call) != 2 || call[1] != "--version" {
+			t.Fatalf("preset detection made unsafe call: %#v", call)
+		}
+	}
+
+	if err := app.Run(context.Background(), []string{"agents", "preset", "codex", "--replace"}); err == nil {
+		t.Fatal("--replace without --apply succeeded")
 	}
 }
 
