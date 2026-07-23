@@ -22,6 +22,7 @@ const (
 	PlannerDecompose       PlannerKind = "decompose"
 	PlannerGoalJudge       PlannerKind = "goal_judge"
 	PlannerProfileDescribe PlannerKind = "profile_describe"
+	PlannerCoordinator     PlannerKind = "coordinator"
 )
 
 type PlannerRequest struct {
