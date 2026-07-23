@@ -311,25 +311,31 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	}
 	if len(detail.Parents) > 0 {
 		lines = append(lines, "", "## Prerequisite handoffs")
+		handoffs := make(map[string]model.PrerequisiteHandoff, len(detail.PrerequisiteHandoffs))
+		for _, handoff := range detail.PrerequisiteHandoffs {
+			handoffs[handoff.PrerequisiteID] = handoff
+		}
 		for _, parent := range detail.Parents {
-			parentDetail, err := s.GetTask(ctx, parent.ID)
-			if err != nil {
-				return "", err
-			}
 			lines = append(lines, fmt.Sprintf("- %s [%s] %s", parent.ID, parent.Status, parent.Title))
-			for index := len(parentDetail.Runs) - 1; index >= 0; index-- {
-				run := parentDetail.Runs[index]
-				if run.Status != model.RunStatusCompleted {
-					continue
-				}
-				if run.Summary != nil {
-					lines = append(lines, "  Summary: "+truncate(*run.Summary, 4*1024))
-				}
-				if run.Metadata != nil {
-					encoded, _ := json.Marshal(run.Metadata)
-					lines = append(lines, "  Metadata: "+truncate(string(encoded), 4*1024))
-				}
-				break
+			handoff, found := handoffs[parent.ID]
+			if !found {
+				lines = append(lines, "  Handoff: not yet satisfied")
+				continue
+			}
+			if handoff.Run == nil {
+				lines = append(lines, "  Handoff: administrative completion (no pinned worker run)")
+				continue
+			}
+			lines = append(lines, "  Run: "+handoff.Run.ID)
+			if handoff.Run.Summary != nil {
+				lines = append(lines, "  Summary: "+truncate(*handoff.Run.Summary, 4*1024))
+			}
+			if handoff.Run.Metadata != nil {
+				encoded, _ := json.Marshal(handoff.Run.Metadata)
+				lines = append(lines, "  Metadata: "+truncate(string(encoded), 4*1024))
+			}
+			if handoff.ChangeSet != nil {
+				lines = append(lines, fmt.Sprintf("  Change set: %s (%s, %d file(s))", handoff.ChangeSet.ID, handoff.ChangeSet.State, len(handoff.ChangeSet.ChangedFiles)))
 			}
 		}
 	}

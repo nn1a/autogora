@@ -120,6 +120,13 @@ func TestPrerequisiteHandoffsPinTheSatisfyingRunAndChangeSet(t *testing.T) {
 	if pinnedEdge == nil || pinnedEdge.SatisfiedRunID == nil || *pinnedEdge.SatisfiedRunID != firstRunID {
 		t.Fatalf("graph omitted satisfying run: %+v", graph.Dependencies)
 	}
+	workerContext, err := store.BuildWorkerContext(ctx, before.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(workerContext, "first completion") || strings.Contains(workerContext, "second completion") {
+		t.Fatalf("worker context did not use the pinned handoff:\n%s", workerContext)
+	}
 }
 
 func TestSchemaMigrationBackfillsDependencySatisfyingRun(t *testing.T) {
