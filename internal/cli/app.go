@@ -36,6 +36,7 @@ Commands:
   terminate <task-id>   Signal and reclaim a task's active worker run
   stats                 Show board counts
   diagnostics           Inspect board health and active workers
+  coordination <action> Inspect Coordinator incidents and proposals
   tail <task-id>        Read or follow one task's events
   watch                 Read or follow the board event stream
   bulk <id>...          Apply a mutation with per-task results
@@ -260,6 +261,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runReadTask(ctx, command, opts)
 	case "stats", "diagnostics", "diag", "assignees":
 		return a.runStats(ctx, command, opts)
+	case "coordination":
+		return a.runCoordination(ctx, opts)
 	case "tail", "watch":
 		return a.runEvents(ctx, command, opts)
 	case "bulk":
