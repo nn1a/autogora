@@ -16,6 +16,30 @@ import (
 
 type DispatchRunner func(context.Context, dispatcher.Options) error
 
+const dispatchHelp = `autogora dispatch [--once|--watch] [options]
+
+Modes:
+  --once                Run one scheduling cycle, then exit
+  --watch               Keep scheduling until interrupted (default)
+  --dry-run             List eligible tasks without claiming them
+  --autopilot=<bool>    Follow each board's automation policy and enable Coordinator recovery
+
+Options:
+  --board <slug>        Limit scheduling to one board
+  --max-workers <n>     Maximum concurrent workers (default: 2)
+  --allow-writes=<bool> Permit coding agents to modify trusted workspaces
+  --interval-ms <ms>    Scheduling interval (default: 2000)
+  --planner-runtime <r> Override the board planner runtime
+  --planner-model <id>  Override the board planner model
+  --planner-provider <p> Override the board planner provider
+  --planner-timeout-ms <ms> Planner timeout from 1000 to 600000
+  --db <path>           Override the project-specific SQLite path
+
+Autopilot does not enable automation by itself. It applies each board's saved
+Auto Plan, Auto Execute, Coordinator, and workspace-write policy. --allow-writes
+remains the process-wide upper bound for workspace changes.
+`
+
 func (a *App) dispatcherDBPath(value string) (string, error) {
 	if value == "" {
 		return a.defaultDBPath()
@@ -95,6 +119,9 @@ func (a *App) dispatchCandidates(ctx context.Context, opts options, limit int) (
 func (a *App) runDispatch(ctx context.Context, command string, opts options) error {
 	if command == "daemon" && !opts.flags["force"] {
 		return errors.New("daemon is deprecated and requires --force; prefer dispatch --watch")
+	}
+	if command == "dispatch" && opts.flags["once"] && opts.flags["watch"] {
+		return errors.New("--once and --watch cannot be used together")
 	}
 	maxWorkers, err := numberOption(firstNonEmpty(opts.value("max"), opts.value("max-workers")), 2)
 	if err != nil || maxWorkers < 1 {
@@ -216,7 +243,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, FinalizerProfile: finalizerProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
 		PlannerModel: opts.value("planner-model"), PlannerProvider: opts.value("planner-provider"),
-		AllowWrites: opts.flags["allow-writes"], Autopilot: command == "daemon",
+		AllowWrites: opts.flags["allow-writes"], Autopilot: command == "daemon" || opts.flags["autopilot"],
 		WorkingDirectory: cwd, Getenv: a.Getenv,
 		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})
