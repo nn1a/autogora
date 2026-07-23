@@ -69,9 +69,13 @@ func TestDashboardUsesReadableAccessibleCommentPresentation(t *testing.T) {
 		`.markdown { overflow-wrap: anywhere; color: var(--text); font-size: 15px; line-height: 1.68; }`,
 		`.comment-row { font-size: 15px; line-height: 1.65; }`,
 		`.comment-form textarea { min-height: 96px; font-size: 15px; line-height: 1.6; }`,
+		`.detail-row > strong { display: block;`,
 	} {
 		if !strings.Contains(styleSource, marker) {
 			t.Fatalf("readable task content CSS marker %q is missing", marker)
 		}
+	}
+	if strings.Contains(styleSource, `.detail-row strong { display: block;`) {
+		t.Fatal("detail row title styling still forces inline Markdown emphasis onto a separate line")
 	}
 }
