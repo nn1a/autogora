@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/maintenance"
 	"github.com/nn1a/autogora/internal/model"
@@ -294,6 +295,54 @@ func resolvePlannerSettings(metadata boards.Metadata, runtime model.Runtime, mod
 	return runtime, modelName, provider
 }
 
+func supportsAgentRole(agent agentconfig.Agent, role agentconfig.Role) bool {
+	for _, candidate := range agent.Roles {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultPlannerAgent(config agentconfig.Config) (agentconfig.Agent, bool) {
+	for _, id := range config.Defaults.PlannerAgents {
+		agent, found := config.Find(id)
+		if found && agent.Enabled && supportsAgentRole(agent, agentconfig.RolePlanner) {
+			return agent, true
+		}
+	}
+	return agentconfig.Agent{}, false
+}
+
+func (s *Service) registeredPlannerSettings(metadata boards.Metadata, runtime model.Runtime, modelName, provider string) (model.Runtime, string, string, string, error) {
+	resolvedRuntime, resolvedModel, resolvedProvider := resolvePlannerSettings(metadata, runtime, modelName, provider)
+	// An explicit runtime is an ad-hoc request and must not inherit a registered
+	// command or model. A board model/provider pin likewise remains authoritative.
+	// Only an unpinned board delegates its planner choice to the global order.
+	if strings.TrimSpace(string(runtime)) != "" {
+		return resolvedRuntime, "", resolvedModel, resolvedProvider, nil
+	}
+	if strings.TrimSpace(metadata.Orchestration.PlannerModel) != "" || strings.TrimSpace(metadata.Orchestration.PlannerProvider) != "" {
+		return resolvedRuntime, "", resolvedModel, resolvedProvider, nil
+	}
+	config, err := agentconfig.Load(agentconfig.Options{Getenv: s.getenv})
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("load global agent configuration: %w", err)
+	}
+	agent, found := defaultPlannerAgent(config)
+	if !found {
+		return resolvedRuntime, "", resolvedModel, resolvedProvider, nil
+	}
+	resolvedRuntime, resolvedModel, resolvedProvider = agent.Runtime, agent.Model, agent.Provider
+	if value := strings.TrimSpace(modelName); value != "" {
+		resolvedModel = value
+	}
+	if value := strings.TrimSpace(provider); value != "" {
+		resolvedProvider = value
+	}
+	return resolvedRuntime, agent.Command, resolvedModel, resolvedProvider, nil
+}
+
 func boardProfileRoutes(profiles []boards.Profile) []orchestration.ProfileRoute {
 	routes := make([]orchestration.ProfileRoute, 0, len(profiles))
 	for _, profile := range profiles {
@@ -315,7 +364,7 @@ func decompositionProfiles(ctx context.Context, opened *store.Store, metadata bo
 	return orchestration.ResolveProfileRoutes(tasks, configured), nil
 }
 
-func (s *Service) planner(runtime model.Runtime, modelName, provider string, timeoutMS int) (orchestration.Planner, error) {
+func (s *Service) planner(runtime model.Runtime, command, modelName, provider string, timeoutMS int) (orchestration.Planner, error) {
 	if runtime == "" {
 		runtime = model.RuntimeCodex
 	}
@@ -332,7 +381,7 @@ func (s *Service) planner(runtime model.Runtime, modelName, provider string, tim
 	if err != nil {
 		return nil, err
 	}
-	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: runtime, Model: strings.TrimSpace(modelName),
+	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: runtime, Command: strings.TrimSpace(command), Model: strings.TrimSpace(modelName),
 		Provider: strings.TrimSpace(provider), CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: s.getenv})
 }
 
@@ -448,8 +497,11 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				if err != nil {
 					return nil, err
 				}
-				runtime, modelName, provider := resolvePlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
-				planner, err = s.planner(runtime, modelName, provider, input.PlannerTimeoutMS)
+				runtime, command, modelName, provider, err := s.registeredPlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
+				if err != nil {
+					return nil, err
+				}
+				planner, err = s.planner(runtime, command, modelName, provider, input.PlannerTimeoutMS)
 				if err != nil {
 					return nil, err
 				}
@@ -469,7 +521,12 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			plannerRuntime, plannerModel, plannerProvider := resolvePlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
 			var planner orchestration.Planner
 			if input.Plan == nil {
-				planner, err = s.planner(plannerRuntime, plannerModel, plannerProvider, input.PlannerTimeoutMS)
+				var plannerCommand string
+				plannerRuntime, plannerCommand, plannerModel, plannerProvider, err = s.registeredPlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
+				if err != nil {
+					return nil, err
+				}
+				planner, err = s.planner(plannerRuntime, plannerCommand, plannerModel, plannerProvider, input.PlannerTimeoutMS)
 				if err != nil {
 					return nil, err
 				}
@@ -531,7 +588,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		if plannerModel == "" && plannerRuntime == metadata.Orchestration.PlannerRuntime {
 			plannerModel, plannerProvider = metadata.Orchestration.PlannerModel, metadata.Orchestration.PlannerProvider
 		}
-		planner, err := s.planner(plannerRuntime, plannerModel, plannerProvider, input.PlannerTimeoutMS)
+		planner, err := s.planner(plannerRuntime, "", plannerModel, plannerProvider, input.PlannerTimeoutMS)
 		if err != nil {
 			return nil, err
 		}
