@@ -74,6 +74,8 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 		return s.handleHierarchy(response, request, board)
 	case "events":
 		return s.handleEvents(response, request, board)
+	case "coordination":
+		return s.handleCoordination(response, request, segments, board)
 	case "stats":
 		value, err := usingStore(request.Context(), s, board, func(opened *store.Store) (any, error) { return opened.Stats(request.Context(), board) })
 		if err == nil {
