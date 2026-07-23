@@ -44,6 +44,20 @@ func setCoordinationTestMode(
 	}
 }
 
+func setCoordinationTestEnabled(
+	t *testing.T,
+	manager *boards.Manager,
+	board string,
+	enabled bool,
+) {
+	t.Helper()
+	if _, err := manager.Update(board, boards.Update{Orchestration: &boards.OrchestrationUpdate{
+		Autopilot: &boards.AutopilotUpdate{Enabled: &enabled},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func coordinatorRuntimeConfig() agentconfig.Config {
 	return agentconfig.Normalize(agentconfig.Config{
 		SchemaVersion: agentconfig.SchemaVersion,
@@ -283,6 +297,240 @@ func TestCoordinationRuntimePolicyChangeDowngradesAutoToApproval(t *testing.T) {
 	}
 }
 
+func TestCoordinationRuntimeRevalidatesTaskAfterPaidAnalysis(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAuto)
+	var calls atomic.Int32
+	base := priorityCoordinationPlanner(fixture, &calls)
+	fixture.options.CoordinatorPlanner = func(
+		ctx context.Context,
+		request orchestration.PlannerRequest,
+	) (any, error) {
+		result, err := base(ctx, request)
+		opened, openErr := fixture.manager.OpenStore(ctx, "default")
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer opened.Close()
+		title := "changed while Coordinator was analyzing"
+		if _, updateErr := opened.UpdateTask(
+			ctx, fixture.task.ID, store.UpdateTaskInput{Title: &title},
+		); updateErr != nil {
+			return nil, updateErr
+		}
+		return result, err
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, _ := opened.GetTask(context.Background(), fixture.task.ID)
+	incident, _ := opened.GetCoordinationIncident(context.Background(), fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		context.Background(), store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || task.Task.Title != "changed while Coordinator was analyzing" ||
+		task.Task.Priority != 1 || incident.Status != model.CoordinationIncidentOpen ||
+		len(proposals) != 1 || proposals[0].Status != model.CoordinationProposalSuperseded {
+		t.Fatalf(
+			"latest task was not protected: calls=%d task=%+v incident=%+v proposals=%+v",
+			calls.Load(), task.Task, incident, proposals,
+		)
+	}
+}
+
+func TestCoordinationRuntimeLatestHealthDowngradesAutoToApproval(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAuto)
+	var calls atomic.Int32
+	base := unblockCoordinationPlanner(fixture, &calls)
+	fixture.options.CoordinatorPlanner = func(
+		ctx context.Context,
+		request orchestration.PlannerRequest,
+	) (any, error) {
+		result, err := base(ctx, request)
+		opened, openErr := fixture.manager.OpenStore(ctx, "default")
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer opened.Close()
+		if _, healthErr := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+			AgentID: "worker", Status: model.AgentHealthUnhealthy,
+		}); healthErr != nil {
+			return nil, healthErr
+		}
+		return result, err
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, _ := opened.GetTask(context.Background(), fixture.task.ID)
+	incident, _ := opened.GetCoordinationIncident(context.Background(), fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		context.Background(), store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || task.Task.Status != fixture.task.Status ||
+		incident.Status != model.CoordinationIncidentAwaitingApproval ||
+		len(proposals) != 1 ||
+		proposals[0].Status != model.CoordinationProposalAwaitingApproval {
+		t.Fatalf(
+			"latest health did not downgrade auto apply: calls=%d task=%+v incident=%+v proposals=%+v",
+			calls.Load(), task.Task, incident, proposals,
+		)
+	}
+}
+
+func TestCoordinationRuntimeLatestActionLimitSupersedesProposal(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAuto)
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = func(
+		_ context.Context,
+		_ orchestration.PlannerRequest,
+	) (any, error) {
+		calls.Add(1)
+		priority := 8
+		result := coordinator.Proposal{
+			IncidentID: fixture.incident.ID, ExpectedGraphRevision: fixture.incident.GraphRevision,
+			Summary:   "Update the recovery route and priority",
+			Rationale: "Both changes were valid against the analysis snapshot.",
+			Actions: []coordinator.Action{
+				{
+					Kind: coordinator.ActionUpdatePriority, TaskID: fixture.task.ID,
+					ExpectedUpdatedAt: fixture.task.UpdatedAt, Priority: &priority,
+					Reason: "Prioritize recovery.",
+				},
+				{
+					Kind: coordinator.ActionSetRoute, TaskID: fixture.task.ID,
+					ExpectedUpdatedAt: fixture.task.UpdatedAt,
+					Assignee:          "worker", Runtime: model.RuntimeCodex,
+					Reason: "Keep the healthy worker route.",
+				},
+			},
+		}
+		maxActions := 1
+		_, err := fixture.manager.Update("default", boards.Update{
+			Orchestration: &boards.OrchestrationUpdate{
+				Autopilot: &boards.AutopilotUpdate{
+					Coordination: &boards.CoordinationUpdate{
+						MaxActionsPerIncident: &maxActions,
+					},
+				},
+			},
+		})
+		return result, err
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, _ := opened.GetTask(context.Background(), fixture.task.ID)
+	incident, _ := opened.GetCoordinationIncident(context.Background(), fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		context.Background(), store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || task.Task.Priority != 1 ||
+		incident.Status != model.CoordinationIncidentOpen ||
+		len(proposals) != 1 || proposals[0].Status != model.CoordinationProposalSuperseded {
+		t.Fatalf(
+			"latest action limit was ignored: calls=%d task=%+v incident=%+v proposals=%+v",
+			calls.Load(), task.Task, incident, proposals,
+		)
+	}
+}
+
+func TestCoordinationRuntimeObserveChangeNeverAutoApplies(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAuto)
+	var calls atomic.Int32
+	base := priorityCoordinationPlanner(fixture, &calls)
+	fixture.options.CoordinatorPlanner = func(
+		ctx context.Context,
+		request orchestration.PlannerRequest,
+	) (any, error) {
+		result, err := base(ctx, request)
+		setCoordinationTestMode(t, fixture.manager, "default", boards.CoordinationModeObserve)
+		return result, err
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, _ := opened.GetTask(context.Background(), fixture.task.ID)
+	incident, _ := opened.GetCoordinationIncident(context.Background(), fixture.incident.ID)
+	if calls.Load() != 1 || task.Task.Priority != 1 ||
+		incident.Status != model.CoordinationIncidentAwaitingApproval {
+		t.Fatalf(
+			"Observe policy change auto-applied: calls=%d task=%+v incident=%+v",
+			calls.Load(), task.Task, incident,
+		)
+	}
+}
+
+func TestCoordinationRuntimeDisabledChangeNeverAutoApplies(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAuto)
+	var calls atomic.Int32
+	base := priorityCoordinationPlanner(fixture, &calls)
+	fixture.options.CoordinatorPlanner = func(
+		ctx context.Context,
+		request orchestration.PlannerRequest,
+	) (any, error) {
+		result, err := base(ctx, request)
+		setCoordinationTestEnabled(t, fixture.manager, "default", false)
+		return result, err
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, _ := opened.GetTask(context.Background(), fixture.task.ID)
+	incident, _ := opened.GetCoordinationIncident(context.Background(), fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		context.Background(), store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || task.Task.Priority != 1 ||
+		incident.Status != model.CoordinationIncidentOpen ||
+		len(proposals) != 1 ||
+		proposals[0].Status != model.CoordinationProposalSuperseded {
+		t.Fatalf(
+			"disabled policy change left an active proposal: calls=%d task=%+v incident=%+v proposals=%+v",
+			calls.Load(), task.Task, incident, proposals,
+		)
+	}
+}
+
 func TestCoordinationRuntimeLimitsPaidAnalysisToOneBoardPerPass(t *testing.T) {
 	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
 	ctx := context.Background()
@@ -493,7 +741,8 @@ func TestReconcilePendingCoordinationSupersedesStaleApproval(t *testing.T) {
 	}
 	metadata, _ := fixture.manager.Read("default")
 	if err := reconcilePendingCoordination(
-		ctx, opened, metadata, fixture.current.Add(2*time.Second),
+		ctx, fixture.manager, opened, metadata, fixture.options,
+		fixture.current.Add(2*time.Second),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -505,6 +754,194 @@ func TestReconcilePendingCoordinationSupersedesStaleApproval(t *testing.T) {
 		incident.GraphRevision != 1 || len(proposals) != 1 ||
 		proposals[0].Status != model.CoordinationProposalSuperseded {
 		t.Fatalf("stale approval recovery: incident=%+v proposals=%+v", incident, proposals)
+	}
+}
+
+func TestReconcilePendingCoordinationRevalidatesTaskVersions(t *testing.T) {
+	for _, approved := range []bool{false, true} {
+		name := "awaiting"
+		if approved {
+			name = "approved"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+			var calls atomic.Int32
+			fixture.options.CoordinatorPlanner = priorityCoordinationPlanner(fixture, &calls)
+			ctx := context.Background()
+			if err := runCoordinationPass(
+				ctx, fixture.manager, []string{"default"},
+				fixture.options, &coordinationRuntimeState{}, fixture.current,
+			); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := fixture.manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			proposals, err := opened.ListCoordinationProposals(
+				ctx, store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+			)
+			if err != nil || len(proposals) != 1 {
+				t.Fatalf("pending proposals = %+v, %v", proposals, err)
+			}
+			if approved {
+				revision := fixture.incident.GraphRevision
+				result, approveErr := opened.ApproveCoordinationProposal(
+					ctx, proposals[0].ID, store.ApproveCoordinationProposalInput{
+						ExpectedUpdatedAt:     proposals[0].UpdatedAt,
+						ExpectedGraphRevision: &revision,
+					},
+				)
+				if approveErr != nil {
+					t.Fatal(approveErr)
+				}
+				proposals[0] = result.Proposal
+			}
+			title := "changed before the approval decision was applied"
+			if _, err := opened.UpdateTask(
+				ctx, fixture.task.ID, store.UpdateTaskInput{Title: &title},
+			); err != nil {
+				t.Fatal(err)
+			}
+			metadata, _ := fixture.manager.Read("default")
+			if err := reconcilePendingCoordination(
+				ctx, fixture.manager, opened, metadata, fixture.options,
+				fixture.current.Add(2*time.Second),
+			); err != nil {
+				t.Fatal(err)
+			}
+			incident, _ := opened.GetCoordinationIncident(ctx, fixture.incident.ID)
+			proposals, _ = opened.ListCoordinationProposals(
+				ctx, store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+			)
+			if calls.Load() != 1 || incident.Status != model.CoordinationIncidentOpen ||
+				len(proposals) != 1 ||
+				proposals[0].Status != model.CoordinationProposalSuperseded {
+				t.Fatalf(
+					"stale %s proposal remained active: calls=%d incident=%+v proposals=%+v",
+					name, calls.Load(), incident, proposals,
+				)
+			}
+		})
+	}
+}
+
+func TestReconcilePendingCoordinationRevalidatesAgentHealth(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = func(
+		context.Context,
+		orchestration.PlannerRequest,
+	) (any, error) {
+		calls.Add(1)
+		return coordinator.Proposal{
+			IncidentID: fixture.incident.ID, ExpectedGraphRevision: fixture.incident.GraphRevision,
+			Summary:   "Keep the worker route",
+			Rationale: "The worker was healthy in the analysis snapshot.",
+			Actions: []coordinator.Action{{
+				Kind: coordinator.ActionSetRoute, TaskID: fixture.task.ID,
+				ExpectedUpdatedAt: fixture.task.UpdatedAt,
+				Assignee:          "worker", Runtime: model.RuntimeCodex,
+				Reason: "Use the configured worker.",
+			}},
+		}, nil
+	}
+	ctx := context.Background()
+	if err := runCoordinationPass(
+		ctx, fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthUnhealthy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := fixture.manager.Read("default")
+	if err := reconcilePendingCoordination(
+		ctx, fixture.manager, opened, metadata, fixture.options,
+		fixture.current.Add(2*time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	incident, _ := opened.GetCoordinationIncident(ctx, fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		ctx, store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || incident.Status != model.CoordinationIncidentOpen ||
+		len(proposals) != 1 || proposals[0].Status != model.CoordinationProposalSuperseded {
+		t.Fatalf(
+			"unhealthy route remained pending: calls=%d incident=%+v proposals=%+v",
+			calls.Load(), incident, proposals,
+		)
+	}
+}
+
+func TestCoordinationRuntimeResolvesDisappearedConditionBeforeSelectingCandidate(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = priorityCoordinationPlanner(fixture, &calls)
+	ctx := context.Background()
+	if err := runCoordinationPass(
+		ctx, fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("initial Coordinator calls = %d, want 1", calls.Load())
+	}
+	opened, err := fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := model.TaskStatusTodo
+	if _, err := opened.UpdateTask(
+		ctx, fixture.task.ID, store.UpdateTaskInput{Status: &status},
+	); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	parent, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "new graph root"})
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, parent.Task.ID, fixture.task.ID); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runCoordinationPass(
+		ctx, fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current.Add(2*time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	opened, err = fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	incident, _ := opened.GetCoordinationIncident(ctx, fixture.incident.ID)
+	proposals, _ := opened.ListCoordinationProposals(
+		ctx, store.CoordinationProposalFilter{IncidentID: fixture.incident.ID},
+	)
+	if calls.Load() != 1 || incident.Status != model.CoordinationIncidentResolved ||
+		len(proposals) != 1 || proposals[0].Status != model.CoordinationProposalSuperseded {
+		t.Fatalf(
+			"disappeared condition was selected again: calls=%d incident=%+v proposals=%+v",
+			calls.Load(), incident, proposals,
+		)
 	}
 }
 
@@ -525,7 +962,8 @@ func TestReconcilePendingCoordinationRefreshesOpenIncidentGraph(t *testing.T) {
 	}
 	metadata, _ := fixture.manager.Read("default")
 	if err := reconcilePendingCoordination(
-		ctx, opened, metadata, fixture.current.Add(time.Second),
+		ctx, fixture.manager, opened, metadata, fixture.options,
+		fixture.current.Add(time.Second),
 	); err != nil {
 		t.Fatal(err)
 	}

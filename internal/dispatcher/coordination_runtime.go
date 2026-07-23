@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -177,11 +178,13 @@ func collectCoordinationCandidates(
 		if err != nil {
 			return nil, observedBoards, err
 		}
-		_, reconcileErr := reconcileCoordinatorIncidents(
+		reconcileErr := reconcilePendingCoordination(
 			ctx, manager, opened, metadata, options, current,
 		)
 		if reconcileErr == nil {
-			reconcileErr = reconcilePendingCoordination(ctx, opened, metadata, current)
+			_, reconcileErr = reconcileCoordinatorIncidents(
+				ctx, manager, opened, metadata, options, current,
+			)
 		}
 		observedBoards = append(observedBoards, board)
 		if reconcileErr != nil {
@@ -379,17 +382,79 @@ func proposalFromRecord(value model.CoordinationProposal) (coordinator.Proposal,
 	}, nil
 }
 
+func latestCoordinatorIncidentSnapshot(
+	ctx context.Context,
+	manager *boards.Manager,
+	opened *store.Store,
+	board string,
+	options Options,
+	incident model.CoordinationIncident,
+) (boards.Metadata, coordinator.IncidentSnapshot, int64, error) {
+	var latest boards.Metadata
+	var revision int64
+	var lastErr error
+	for range 3 {
+		metadata, err := manager.Read(board)
+		if err != nil {
+			return boards.Metadata{}, coordinator.IncidentSnapshot{}, revision, err
+		}
+		state, err := opened.GetBoardGraphState(ctx, board)
+		if err != nil {
+			return metadata, coordinator.IncidentSnapshot{}, revision, err
+		}
+		latest, revision = metadata, state.Revision
+		snapshotIncident := incident
+		snapshotIncident.GraphRevision = revision
+		snapshot, err := buildCoordinatorIncidentSnapshot(
+			ctx, manager, opened, metadata, options, snapshotIncident,
+		)
+		if err == nil {
+			// Policy can change independently of graph state. Read it again
+			// after the bounded task/config/health snapshot so handoff uses the
+			// newest mode and action limit rather than the paid-call input.
+			latest, err = manager.Read(board)
+			if err != nil {
+				return latest, coordinator.IncidentSnapshot{}, revision, err
+			}
+			if metadata.Archived != latest.Archived ||
+				!reflect.DeepEqual(metadata.Orchestration, latest.Orchestration) {
+				lastErr = errors.New(
+					"board orchestration policy changed while the Coordinator snapshot was being built",
+				)
+				continue
+			}
+			return latest, snapshot, revision, nil
+		}
+		lastErr = err
+		if !errors.Is(err, store.ErrGraphRevisionConflict) {
+			return metadata, coordinator.IncidentSnapshot{}, revision, err
+		}
+	}
+	return latest, coordinator.IncidentSnapshot{}, revision, lastErr
+}
+
+func obsoleteCoordinatorSnapshot(err error) bool {
+	if errors.Is(err, store.ErrGraphRevisionConflict) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "task not found") ||
+		strings.Contains(message, "not found: task")
+}
+
 func supersedeClaimedCoordinationProposal(
 	ctx context.Context,
 	opened *store.Store,
 	proposal model.CoordinationProposal,
 	incident model.CoordinationIncident,
+	replacementRevision int64,
 	current time.Time,
 ) error {
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 	_, err := opened.SupersedeCoordinationProposal(cleanup, proposal.ID, store.SupersedeCoordinationProposalInput{
-		ExpectedUpdatedAt: proposal.UpdatedAt, ClaimToken: incident.ClaimToken, Current: current,
+		ExpectedUpdatedAt: proposal.UpdatedAt, ReplacementGraphRevision: &replacementRevision,
+		ClaimToken: incident.ClaimToken, Current: current,
 	})
 	return err
 }
@@ -505,18 +570,47 @@ func handoffCoordinationProposal(
 	candidate coordinationCandidate,
 	incident model.CoordinationIncident,
 	proposal model.CoordinationProposal,
-	validation coordinator.ValidationResult,
+	options Options,
 	current time.Time,
 ) error {
-	latest, err := manager.Read(candidate.board)
+	latest, snapshot, revision, err := latestCoordinatorIncidentSnapshot(
+		ctx, manager, opened, candidate.board, options, incident,
+	)
+	current = options.currentTime()
 	if err != nil {
+		if obsoleteCoordinatorSnapshot(err) {
+			return supersedeClaimedCoordinationProposal(
+				ctx, opened, proposal, incident, revision, current,
+			)
+		}
 		return err
 	}
+	decoded, err := proposalFromRecord(proposal)
+	if err != nil {
+		return supersedeClaimedCoordinationProposal(
+			ctx, opened, proposal, incident, revision, current,
+		)
+	}
+	validation := coordinator.ValidateAgainstSnapshot(
+		decoded, snapshot,
+		latest.Orchestration.Autopilot.Coordination.MaxActionsPerIncident,
+	)
+	if !validation.Valid {
+		return supersedeClaimedCoordinationProposal(
+			ctx, opened, proposal, incident, revision, current,
+		)
+	}
+	if latest.Archived || !latest.Orchestration.Autopilot.Enabled {
+		// A disabled or archived board will not run another reconciliation
+		// pass. Do not strand a proposal in AwaitingApproval where nobody can
+		// safely advance it; retire it while the live claim can still do so.
+		return supersedeClaimedCoordinationProposal(
+			ctx, opened, proposal, incident, revision, current,
+		)
+	}
 	auto := candidate.mode == boards.CoordinationModeAuto &&
-		latest.Orchestration.Autopilot.Enabled &&
 		latest.Orchestration.Autopilot.Coordination.Mode == boards.CoordinationModeAuto &&
 		coordinationActionsAreConditional(validation)
-	revision := incident.GraphRevision
 	if auto {
 		_, err = opened.ApplyCoordinationProposal(ctx, proposal.ID, store.ApplyCoordinationProposalInput{
 			Authorization:         store.CoordinationApplyValidatedAuto,
@@ -595,7 +689,9 @@ func coordinateIncident(
 			return err
 		}
 		if reusable.ExpectedGraphRevision != incident.GraphRevision {
-			return supersedeClaimedCoordinationProposal(ctx, opened, *reusable, incident, current)
+			return supersedeClaimedCoordinationProposal(
+				ctx, opened, *reusable, incident, incident.GraphRevision, current,
+			)
 		}
 	} else {
 		since := current.Add(-time.Hour)
@@ -629,19 +725,19 @@ func coordinateIncident(
 		)
 		if validationErr != nil {
 			return errors.Join(validationErr, supersedeClaimedCoordinationProposal(
-				ctx, opened, record, incident, current,
+				ctx, opened, record, incident, incident.GraphRevision, current,
 			))
 		}
 		if !validation.Valid {
 			if record.Status != model.CoordinationProposalFailed {
 				return supersedeClaimedCoordinationProposal(
-					ctx, opened, record, incident, current,
+					ctx, opened, record, incident, incident.GraphRevision, current,
 				)
 			}
 			return reopenClaimedCoordinationIncident(ctx, opened, incident, current)
 		}
 		return handoffCoordinationProposal(
-			ctx, manager, opened, candidate, incident, record, validation, current,
+			ctx, manager, opened, candidate, incident, record, options, current,
 		)
 	}
 
@@ -707,17 +803,19 @@ func coordinateIncident(
 	}
 	current = options.currentTime()
 	return handoffCoordinationProposal(
-		ctx, manager, opened, candidate, incident, record, validation, current,
+		ctx, manager, opened, candidate, incident, record, options, current,
 	)
 }
 
-// reconcilePendingCoordination is extended alongside the approval API. Keeping
-// the call here makes stale approval and integration recovery part of every
-// deterministic observation pass rather than a paid Coordinator call.
+// reconcilePendingCoordination revalidates human-pending work without a paid
+// Coordinator call. It runs before observation so a superseded incident can be
+// resolved in the same pass when its triggering condition has disappeared.
 func reconcilePendingCoordination(
 	ctx context.Context,
+	manager *boards.Manager,
 	opened *store.Store,
 	metadata boards.Metadata,
+	options Options,
 	current time.Time,
 ) error {
 	state, err := opened.GetBoardGraphState(ctx, metadata.Slug)
@@ -774,14 +872,35 @@ func reconcilePendingCoordination(
 				}
 				continue
 			}
-			if pending.ExpectedGraphRevision == state.Revision &&
-				incident.GraphRevision == state.Revision {
+			latest, snapshot, revision, snapshotErr := latestCoordinatorIncidentSnapshot(
+				ctx, manager, opened, metadata.Slug, options, incident,
+			)
+			stale := pending.ExpectedGraphRevision != revision ||
+				incident.GraphRevision != revision
+			if snapshotErr != nil {
+				if !obsoleteCoordinatorSnapshot(snapshotErr) {
+					return snapshotErr
+				}
+				stale = true
+			} else if !stale {
+				proposal, decodeErr := proposalFromRecord(*pending)
+				if decodeErr != nil {
+					stale = true
+				} else {
+					validation := coordinator.ValidateAgainstSnapshot(
+						proposal, snapshot,
+						latest.Orchestration.Autopilot.Coordination.MaxActionsPerIncident,
+					)
+					stale = !validation.Valid
+				}
+			}
+			if !stale {
 				continue
 			}
 			if _, err := opened.SupersedeCoordinationProposal(
 				ctx, pending.ID, store.SupersedeCoordinationProposalInput{
 					ExpectedUpdatedAt:        pending.UpdatedAt,
-					ReplacementGraphRevision: &state.Revision,
+					ReplacementGraphRevision: &revision,
 					Current:                  current,
 				},
 			); err != nil {
