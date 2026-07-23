@@ -724,6 +724,46 @@ CREATE TABLE IF NOT EXISTS task_change_sets (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS publications (
+  id TEXT PRIMARY KEY CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+  board TEXT NOT NULL CHECK (length(CAST(board AS BLOB)) BETWEEN 1 AND 128),
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+  change_set_id TEXT NOT NULL UNIQUE REFERENCES task_change_sets(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN (
+    'pending', 'awaiting_approval', 'publishing', 'published',
+    'no_change', 'failed', 'superseded'
+  )),
+  mode TEXT NOT NULL CHECK (mode IN ('manual', 'local_ff', 'pull_request')),
+  target_branch TEXT NOT NULL,
+  remote TEXT NOT NULL,
+  require_approval INTEGER NOT NULL CHECK (require_approval IN (0, 1)),
+  repository_path TEXT NOT NULL,
+  worktree_path TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  head_commit TEXT NOT NULL,
+  durable_ref TEXT NOT NULL,
+  policy_snapshot_json TEXT NOT NULL,
+  source_snapshot_json TEXT NOT NULL,
+  url TEXT,
+  error TEXT,
+  claim_token TEXT,
+  claim_expires_at TEXT,
+  approved_at TEXT,
+  published_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'publishing' AND claim_token IS NOT NULL AND claim_token <> '' AND claim_expires_at IS NOT NULL)
+    OR
+    (status <> 'publishing' AND claim_token IS NULL AND claim_expires_at IS NULL)
+  ),
+  CHECK (status <> 'failed' OR (error IS NOT NULL AND error <> '')),
+  CHECK (status <> 'superseded' OR (error IS NOT NULL AND error <> '')),
+  CHECK (status <> 'published' OR published_at IS NOT NULL),
+  CHECK (status <> 'no_change' OR published_at IS NOT NULL)
+);
+
 CREATE TRIGGER IF NOT EXISTS release_terminal_run_resources
 AFTER UPDATE OF status ON task_runs
 WHEN NEW.status <> 'running'
@@ -797,6 +837,10 @@ CREATE INDEX IF NOT EXISTS idx_global_workspace_leases_owner ON global_workspace
 CREATE INDEX IF NOT EXISTS idx_global_agent_slots_expiry ON global_agent_slots(owner_kind, expires_at);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_publications_board_status ON publications(board, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_publications_task ON publications(board, task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_publications_run ON publications(board, run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_publications_claim_due ON publications(board, status, claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
 CREATE INDEX IF NOT EXISTS idx_coordination_incidents_board_status ON coordination_incidents(board, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_coordination_incidents_task ON coordination_incidents(task_id, created_at DESC);
