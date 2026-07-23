@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/model"
@@ -47,8 +46,6 @@ Supervisor options:
 The configuration contains routing metadata only. Do not store API keys or
 other credentials in it. Detection never sends a prompt or makes a paid API call.
 `
-
-const agentVersionTimeout = 3 * time.Second
 
 type agentConfigReport struct {
 	Path       string                 `json:"path"`
@@ -364,47 +361,28 @@ func (a *App) detectAgents(ctx context.Context, save bool) error {
 	if err != nil {
 		return err
 	}
-	configured := make(map[string]bool, len(config.Agents))
-	for _, agent := range config.Agents {
-		configured[agent.ID] = true
+	commonDetections, err := agentconfig.DetectSupportedAgents(ctx, config, agentconfig.DetectOptions{
+		LookPath: runner.LookPath,
+		RunVersion: func(ctx context.Context, executable string) (string, string, error) {
+			output, runErr := runner.Run(ctx, directory, executable, "--version")
+			return output.Stdout, output.Stderr, runErr
+		},
+	})
+	if err != nil {
+		return err
 	}
-	detections := make([]agentDetection, 0, len(model.WorkerRuntimes))
-	for _, runtime := range model.WorkerRuntimes {
-		if err := ctx.Err(); err != nil {
-			return err
+	detections := make([]agentDetection, 0, len(commonDetections))
+	for _, common := range commonDetections {
+		detection := agentDetection{
+			ID: common.ID, Runtime: common.Runtime, Executable: common.Executable,
+			Version: common.Version, State: common.State, Configured: common.Configured,
+			Message: common.Message,
 		}
-		id := string(runtime)
-		detection := agentDetection{ID: id, Runtime: runtime, State: "missing", Configured: configured[id]}
-		executable, lookupErr := runner.LookPath(id)
-		if lookupErr != nil {
-			detection.Message = "CLI was not found on PATH"
-			detections = append(detections, detection)
-			continue
-		}
-		detection.Executable = executable
-		detection.State = "installed"
-		versionContext, cancel := context.WithTimeout(ctx, agentVersionTimeout)
-		output, versionErr := runner.Run(versionContext, directory, executable, "--version")
-		timedOut := errors.Is(versionContext.Err(), context.DeadlineExceeded)
-		cancel()
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		detection.Version = boundedVersion(output.Stdout, output.Stderr)
-		if versionErr != nil {
-			detection.State = "version_unavailable"
-			if timedOut {
-				detection.Message = "version check timed out"
-			} else {
-				detection.Message = "CLI was found, but --version failed"
-			}
-		}
-		if save && !configured[id] {
+		if save && !detection.Configured && detection.State != "missing" {
 			config.Agents = append(config.Agents, agentconfig.Agent{
-				ID: id, Runtime: runtime, Command: executable, Enabled: true, MaxConcurrent: 1,
+				ID: detection.ID, Runtime: detection.Runtime, Command: detection.Executable, Enabled: true, MaxConcurrent: 1,
 				Roles: []agentconfig.Role{agentconfig.RoleWorker, agentconfig.RolePlanner, agentconfig.RoleJudge},
 			})
-			configured[id] = true
 			detection.Configured = true
 			detection.Saved = true
 		}
@@ -464,21 +442,6 @@ func withoutString(values []string, removed string) []string {
 		}
 	}
 	return result
-}
-
-func boundedVersion(stdout, stderr string) string {
-	value := strings.TrimSpace(stdout)
-	if value == "" {
-		value = strings.TrimSpace(stderr)
-	}
-	if index := strings.IndexByte(value, '\n'); index >= 0 {
-		value = strings.TrimSpace(value[:index])
-	}
-	const maxBytes = 512
-	if len(value) > maxBytes {
-		value = value[:maxBytes]
-	}
-	return value
 }
 
 func rejectAgentOptions(opts options, allowedNames ...string) error {
