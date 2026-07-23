@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	setupcfg "github.com/nn1a/autogora/internal/setup"
 	"github.com/nn1a/autogora/internal/store"
@@ -451,6 +452,64 @@ func TestEffectiveAgentsIncludeBoardProfilesHealthAndActiveRuns(t *testing.T) {
 		if mapValue(t, raw)["name"] == "planner-only" {
 			t.Fatalf("planner-only agent leaked into worker profiles: %#v", profiles)
 		}
+	}
+}
+
+func TestEffectiveAgentsUseSharedHealthForGlobalProfiles(t *testing.T) {
+	server := startTestServer(t)
+	config := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"maxWorkers": 1},
+		"defaults": map[string]any{
+			"workerAgents": []string{"global-worker"}, "plannerAgents": []string{},
+			"coordinatorAgents": []string{}, "judgeAgents": []string{},
+		},
+		"agents": []any{map[string]any{
+			"id": "global-worker", "runtime": "codex", "command": "codex",
+			"enabled": true, "maxConcurrent": 1, "roles": []string{"worker"},
+		}},
+	}
+	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
+	}
+	ctx := context.Background()
+	if _, err := server.manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	alpha, err := server.manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := alpha.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "global-worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := alpha.Close(); err != nil {
+		t.Fatal(err)
+	}
+	coordination, err := server.manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordination.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "global-worker", Status: model.AgentHealthAuthRequired,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordination.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response, value := apiRequest(t, server, http.MethodGet, "/api/agents/effective?board=alpha", nil)
+	effective := mapValue(t, value)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("effective agents failed: %d %#v", response.StatusCode, effective)
+	}
+	global := namedValue(t, arrayValue(t, effective["profiles"]), "global-worker")
+	health := mapValue(t, global["health"])
+	if health["status"] != string(model.AgentHealthAuthRequired) {
+		t.Fatalf("effective agents used stale board-local health: %#v", global)
 	}
 }
 

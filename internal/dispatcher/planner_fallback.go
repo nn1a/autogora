@@ -8,6 +8,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agenthealth"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -29,17 +30,18 @@ func createRolePlannerWithSelection(
 	onSelected func(context.Context, orchestration.PlannerSelection) error,
 ) (orchestration.Planner, error) {
 	candidates := dispatcherPlannerCandidates(metadata, configured, options, role)
+	health := agenthealth.New(manager, opened)
 	plannerOptions := orchestration.FallbackPlannerOptions{
 		Candidates: candidates, CWD: cwd, Timeout: options.PlannerTimeout, Getenv: options.Getenv,
 		Available: func(ctx context.Context, candidate orchestration.PlannerCandidate) (bool, error) {
 			if !strings.HasPrefix(candidate.Source, "global_") {
 				return true, nil
 			}
-			health, err := opened.GetAgentHealth(ctx, candidate.Profile)
+			current, err := health.Get(ctx, candidate.Profile, true)
 			if err != nil {
 				return false, err
 			}
-			return !store.IsAgentUnavailable(health, time.Now()), nil
+			return !store.IsAgentUnavailable(current, time.Now()), nil
 		},
 		OnFailure: func(ctx context.Context, attempt orchestration.PlannerAttempt) error {
 			if !strings.HasPrefix(attempt.Candidate.Source, "global_") {
@@ -55,16 +57,16 @@ func createRolePlannerWithSelection(
 			}
 			until := agentCooldown(status, rateLimit, retry)
 			message := attempt.Err.Error()
-			_, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+			_, err := health.Set(ctx, store.SetAgentHealthInput{
 				AgentID: attempt.Candidate.Profile, Status: status, CooldownUntil: until, LastError: &message,
-			})
+			}, true)
 			return err
 		},
 		OnSelected: func(ctx context.Context, selection orchestration.PlannerSelection) error {
 			if strings.HasPrefix(selection.Candidate.Source, "global_") {
-				if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+				if _, err := health.Set(ctx, store.SetAgentHealthInput{
 					AgentID: selection.Candidate.Profile, Status: model.AgentHealthReady,
-				}); err != nil {
+				}, true); err != nil {
 					return err
 				}
 			}

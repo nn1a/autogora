@@ -299,6 +299,107 @@ func TestDispatcherPlannerSharesCapacityWithWorkerAcrossBoards(t *testing.T) {
 	}
 }
 
+func TestDispatcherRolePlannersUseSharedHealthAcrossBoards(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	if _, err := manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	backup := executableFixture(t, `printf '%s\n' '{"type":"run_result","text":"{\"ok\":true}"}'`)
+	roles := []agentconfig.Role{
+		agentconfig.RoleWorker, agentconfig.RolePlanner,
+		agentconfig.RoleCoordinator, agentconfig.RoleJudge,
+	}
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults: agentconfig.Defaults{
+			PlannerAgents: []string{"primary"}, CoordinatorAgents: []string{"primary"},
+			JudgeAgents: []string{"primary"},
+		},
+		Agents: []agentconfig.Agent{
+			{
+				ID: "primary", Runtime: model.RuntimeCline, Command: "/must-not-run",
+				Enabled: true, MaxConcurrent: 1, Roles: roles, Fallbacks: []string{"backup"},
+			},
+			{
+				ID: "backup", Runtime: model.RuntimeCline, Command: backup,
+				Enabled: true, MaxConcurrent: 1, Roles: roles,
+			},
+		},
+	}
+	coordination, err := manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cooldown := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := coordination.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "primary", Status: model.AgentHealthRateLimited, CooldownUntil: &cooldown,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordination.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "primary", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		role agentconfig.Role
+		kind orchestration.PlannerKind
+	}{
+		{name: "planner", role: agentconfig.RolePlanner, kind: orchestration.PlannerSpecify},
+		{name: "coordinator", role: agentconfig.RoleCoordinator, kind: orchestration.PlannerCoordinator},
+		{name: "judge", role: agentconfig.RoleJudge, kind: orchestration.PlannerGoalJudge},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			planner, err := createRolePlanner(
+				manager, opened, metadata, configuredProfileSet{Config: config},
+				Options{PlannerTimeout: 5 * time.Second, Getenv: func(string) string { return "" }},
+				test.role, t.TempDir(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, err := planner(ctx, orchestration.PlannerRequest{
+				Kind: test.kind, Prompt: "use healthy shared route",
+				Schema: map[string]any{"type": "object"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result := value.(map[string]any); result["ok"] != true {
+				t.Fatalf("planner result = %#v", value)
+			}
+		})
+	}
+	global, err := manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, getErr := global.GetAgentHealth(ctx, "primary")
+	closeErr := global.Close()
+	if getErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(getErr, closeErr))
+	}
+	if primary.Status != model.AgentHealthRateLimited {
+		t.Fatalf("shared primary health was overwritten by board-local state: %#v", primary)
+	}
+}
+
 func assertPlannerSelectionEvent(t *testing.T, opened *store.Store, taskID, role, profile, modelName, provider, fallbackFrom string) {
 	t.Helper()
 	events, err := opened.ListEvents(context.Background(), store.EventFilter{TaskID: taskID, Kinds: []string{"orchestration_agent_selected"}})

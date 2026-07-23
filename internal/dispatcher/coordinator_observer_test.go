@@ -681,6 +681,73 @@ func TestCoordinatorObserverUsesFallbackHealthAndIgnoresFullCapacity(t *testing.
 	}
 }
 
+func TestCoordinatorObserverAndSnapshotUseSharedGlobalHealth(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	if _, err := manager.Create(ctx, "alpha", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	coordination, err := manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordination.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthUnhealthy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordination.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "shared health blocks this route", Assignee: &assignee, Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata,
+		Options{AgentConfig: &config, Getenv: func(string) string { return "" }},
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exhausted := findCoordinatorIncident(incidents, model.CoordinationTriggerAgentExhausted)
+	if exhausted == nil || exhausted.TaskID == nil || *exhausted.TaskID != task.Task.ID {
+		t.Fatalf("shared unhealthy agent did not open an incident: %+v", incidents)
+	}
+	snapshot, err := buildCoordinatorIncidentSnapshot(
+		ctx, manager, opened, metadata,
+		Options{AgentConfig: &config, Getenv: func(string) string { return "" }},
+		*exhausted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.AvailableAgents) != 1 ||
+		snapshot.AvailableAgents[0].ID != "worker" ||
+		snapshot.AvailableAgents[0].Health != string(model.AgentHealthUnhealthy) {
+		t.Fatalf("snapshot ignored shared global health: %+v", snapshot.AvailableAgents)
+	}
+}
+
 func TestCoordinatorObserverGraphStalledWaitsForIdleAndReconciles(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)

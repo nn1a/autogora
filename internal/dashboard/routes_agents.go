@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agenthealth"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -261,8 +262,20 @@ func (s *Server) handleEffectiveAgents(response http.ResponseWriter, request *ht
 			return effectiveAgentsResponse{}, err
 		}
 		profiles := make([]effectiveAgentProfile, 0, len(boardContext.Profiles))
+		healthRouter := agenthealth.New(s.manager, opened)
+		if opened.Board() != "default" {
+			coordinationStore, err := s.manager.OpenCoordinationStore(request.Context())
+			if err != nil {
+				return effectiveAgentsResponse{}, err
+			}
+			defer coordinationStore.Close()
+			healthRouter = agenthealth.NewWithGlobal(s.manager, opened, coordinationStore)
+		}
 		for _, profile := range boardContext.Profiles {
-			health, err := opened.GetAgentHealth(request.Context(), profile.Name)
+			health, err := healthRouter.Get(
+				request.Context(), profile.Name,
+				configuredAgentSupportsRole(config, profile.Name, agentconfig.RoleWorker),
+			)
 			if err != nil {
 				return effectiveAgentsResponse{}, err
 			}
@@ -279,4 +292,17 @@ func (s *Server) handleEffectiveAgents(response http.ResponseWriter, request *ht
 	}
 	sendJSON(response, http.StatusOK, value)
 	return nil
+}
+
+func configuredAgentSupportsRole(config agentconfig.Config, name string, role agentconfig.Role) bool {
+	agent, found := config.Find(name)
+	if !found {
+		return false
+	}
+	for _, candidate := range agent.Roles {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
 }

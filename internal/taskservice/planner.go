@@ -8,6 +8,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agenthealth"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -26,6 +27,13 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 		return nil, fmt.Errorf("load global agent configuration: %w", err)
 	}
 	candidates := plannerCandidates(metadata, config, role)
+	var manager *boards.Manager
+	var opened *store.Store
+	if s != nil {
+		manager = s.manager
+		opened = s.Store
+	}
+	health := agenthealth.New(manager, opened)
 	options := orchestration.FallbackPlannerOptions{
 		Candidates: candidates,
 		Timeout:    interactivePlannerTimeout,
@@ -33,11 +41,11 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 			if s == nil || s.Store == nil || !strings.HasPrefix(candidate.Source, "global_") {
 				return true, nil
 			}
-			health, err := s.GetAgentHealth(ctx, candidate.Profile)
+			current, err := health.Get(ctx, candidate.Profile, true)
 			if err != nil {
 				return false, err
 			}
-			return !store.IsAgentUnavailable(health, time.Now()), nil
+			return !store.IsAgentUnavailable(current, time.Now()), nil
 		},
 		OnFailure: func(ctx context.Context, attempt orchestration.PlannerAttempt) error {
 			if s == nil || s.Store == nil || !strings.HasPrefix(attempt.Candidate.Source, "global_") {
@@ -50,9 +58,9 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 			}
 			until := time.Now().Add(cooldown).UTC().Format(time.RFC3339Nano)
 			message := attempt.Err.Error()
-			_, err := s.SetAgentHealth(ctx, store.SetAgentHealthInput{
+			_, err := health.Set(ctx, store.SetAgentHealthInput{
 				AgentID: attempt.Candidate.Profile, Status: status, CooldownUntil: &until, LastError: &message,
-			})
+			}, true)
 			return err
 		},
 		OnSelected: func(ctx context.Context, selection orchestration.PlannerSelection) error {
@@ -60,9 +68,9 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 				return nil
 			}
 			if strings.HasPrefix(selection.Candidate.Source, "global_") {
-				if _, err := s.SetAgentHealth(ctx, store.SetAgentHealthInput{
+				if _, err := health.Set(ctx, store.SetAgentHealthInput{
 					AgentID: selection.Candidate.Profile, Status: model.AgentHealthReady,
-				}); err != nil {
+				}, true); err != nil {
 					return err
 				}
 			}

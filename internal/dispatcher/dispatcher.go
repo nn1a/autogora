@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agenthealth"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/notifications"
@@ -583,8 +584,19 @@ func claimProfilePolicy(ctx context.Context, manager *boards.Manager, opened *st
 	}
 	excluded := make([]string, 0)
 	limits := map[string]int{}
+	healthRouter := agenthealth.New(manager, opened)
+	if opened.Board() != "default" {
+		coordinationStore, err := manager.OpenCoordinationStore(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer coordinationStore.Close()
+		healthRouter = agenthealth.NewWithGlobal(manager, opened, coordinationStore)
+	}
 	for _, profile := range configured.Profiles {
-		if _, available, availabilityErr := selectAvailableProfile(ctx, opened, profile.Name, configured.Profiles); availabilityErr != nil {
+		if _, available, availabilityErr := selectAvailableProfile(
+			ctx, healthRouter, opened, profile.Name, configured.Profiles, configured.Config,
+		); availabilityErr != nil {
 			return nil, nil, availabilityErr
 		} else if !available {
 			excluded = append(excluded, profile.Name)
@@ -597,7 +609,14 @@ func claimProfilePolicy(ctx context.Context, manager *boards.Manager, opened *st
 	return excluded, limits, nil
 }
 
-func selectAvailableProfile(ctx context.Context, opened *store.Store, desired string, profiles []orchestration.ProfileRoute) (orchestration.ProfileRoute, bool, error) {
+func selectAvailableProfile(
+	ctx context.Context,
+	healthRouter agenthealth.Router,
+	opened *store.Store,
+	desired string,
+	profiles []orchestration.ProfileRoute,
+	config agentconfig.Config,
+) (orchestration.ProfileRoute, bool, error) {
 	byName := make(map[string]orchestration.ProfileRoute, len(profiles))
 	for _, profile := range profiles {
 		if name := strings.TrimSpace(profile.Name); name != "" {
@@ -620,7 +639,9 @@ func selectAvailableProfile(ctx context.Context, opened *store.Store, desired st
 		if !orchestration.RunnableProfileRoute(candidate) {
 			continue
 		}
-		health, err := opened.GetAgentHealth(ctx, candidate.Name)
+		health, err := healthRouter.Get(
+			ctx, candidate.Name, registeredAgentHasRole(config, candidate.Name, agentconfig.RoleWorker),
+		)
 		if err != nil {
 			return orchestration.ProfileRoute{}, false, err
 		}
@@ -669,7 +690,9 @@ func resolveRunProfile(ctx context.Context, manager *boards.Manager, opened *sto
 	if !configuredDesired {
 		profiles = append(append([]orchestration.ProfileRoute{}, profiles...), taskRoute)
 	}
-	selected, available, err := selectAvailableProfile(ctx, opened, name, profiles)
+	selected, available, err := selectAvailableProfile(
+		ctx, agenthealth.New(manager, opened), opened, name, profiles, configured.Config,
+	)
 	if err != nil {
 		return resolvedRunProfile{}, err
 	}
@@ -709,6 +732,11 @@ func resolveRunProfile(ctx context.Context, manager *boards.Manager, opened *sto
 		resolved.FallbackFrom = &name
 	}
 	return resolved, nil
+}
+
+func registeredAgentHasRole(config agentconfig.Config, name string, role agentconfig.Role) bool {
+	agent, found := config.Find(strings.TrimSpace(name))
+	return found && hasAgentRole(agent, role)
 }
 
 func mergeDecompositionProfiles(configured configuredProfileSet, overrides []orchestration.ProfileRoute) []orchestration.ProfileRoute {
@@ -1458,9 +1486,13 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		executionSucceeded := !execution.TimedOut && execution.SpawnError == nil && execution.Code == 0 && !execution.Canceled
 		if executionSucceeded {
 			lastRunID := prepared.Run.ID
-			if _, healthErr := opened.SetAgentHealth(durable, store.SetAgentHealthInput{
+			record, healthErr := agenthealth.New(manager, opened).RecordWorker(durable, store.SetAgentHealthInput{
 				AgentID: configured.Profile, Status: model.AgentHealthReady, LastRunID: &lastRunID,
-			}); healthErr != nil {
+			}, profile.GlobalRegistered)
+			if record.AuditError != nil {
+				options.log("local agent health audit failed %s: %v", configured.Profile, record.AuditError)
+			}
+			if healthErr != nil {
 				options.log("agent health update failed %s: %v", configured.Profile, healthErr)
 			}
 		}
@@ -1517,10 +1549,14 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		case agentUnavailable:
 			lastRunID, lastError := prepared.Run.ID, detail
 			cooldownUntil := agentCooldown(availability.Status, *options.RateLimitCooldown, *options.AgentRetryCooldown)
-			if _, healthErr := opened.SetAgentHealth(durable, store.SetAgentHealthInput{
+			record, healthErr := agenthealth.New(manager, opened).RecordWorker(durable, store.SetAgentHealthInput{
 				AgentID: configured.Profile, Status: availability.Status, CooldownUntil: cooldownUntil,
 				LastError: &lastError, LastRunID: &lastRunID,
-			}); healthErr != nil {
+			}, profile.GlobalRegistered)
+			if record.AuditError != nil {
+				options.log("local agent health audit failed %s: %v", configured.Profile, record.AuditError)
+			}
+			if healthErr != nil {
 				countFailure := false
 				persistErr := failRunDurably(durable, opened, scope, "Unable to record agent availability: "+healthErr.Error(), store.FailRunOptions{
 					Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
@@ -1679,12 +1715,25 @@ func selectedBoards(ctx context.Context, manager *boards.Manager, requested stri
 }
 
 func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) error {
+	coordination, err := manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		return err
+	}
+	if _, clearErr := coordination.ClearExpiredAgentCooldowns(ctx, time.Now()); clearErr != nil {
+		return errors.Join(clearErr, coordination.Close())
+	}
+	if err := coordination.Close(); err != nil {
+		return err
+	}
 	for _, board := range boardSlugs {
 		opened, err := manager.OpenStore(ctx, board)
 		if err != nil {
 			return err
 		}
-		if _, err := opened.ClearExpiredAgentCooldowns(ctx, time.Now()); err != nil {
+		if opened.Board() != "default" {
+			_, err = opened.ClearExpiredAgentCooldowns(ctx, time.Now())
+		}
+		if err != nil {
 			opened.Close()
 			return err
 		}

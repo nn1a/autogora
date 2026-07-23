@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
+	"github.com/nn1a/autogora/internal/agenthealth"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/coordinator"
 	"github.com/nn1a/autogora/internal/model"
@@ -292,7 +293,7 @@ func reconcileCoordinatorIncidents(
 		activeByKey[key] = incident
 	}
 
-	conditions, err := detectCoordinatorConditions(ctx, opened, metadata, configured, options, active, current)
+	conditions, err := detectCoordinatorConditions(ctx, manager, opened, metadata, configured, options, active, current)
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +366,7 @@ func reconcileCoordinatorIncidents(
 
 func detectCoordinatorConditions(
 	ctx context.Context,
+	manager *boards.Manager,
 	opened *store.Store,
 	metadata boards.Metadata,
 	configured configuredProfileSet,
@@ -372,6 +374,15 @@ func detectCoordinatorConditions(
 	active []model.CoordinationIncident,
 	current time.Time,
 ) ([]coordinatorCondition, error) {
+	healthRouter := agenthealth.New(manager, opened)
+	if opened.Board() != "default" {
+		coordinationStore, err := manager.OpenCoordinationStore(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer coordinationStore.Close()
+		healthRouter = agenthealth.NewWithGlobal(manager, opened, coordinationStore)
+	}
 	tasks, err := listCoordinatorObservationTasks(ctx, opened, metadata.Slug)
 	if err != nil {
 		return nil, err
@@ -482,7 +493,7 @@ func detectCoordinatorConditions(
 		}
 
 		if coordinatorTaskNeedsAgent(task) {
-			availability, err := coordinatorWorkerAvailability(ctx, opened, metadata, configured, options, task, current)
+			availability, err := coordinatorWorkerAvailability(ctx, healthRouter, metadata, configured, options, task, current)
 			if err != nil {
 				return nil, err
 			}
@@ -532,7 +543,7 @@ func detectCoordinatorConditions(
 		if task.Status != model.TaskStatusReady || !coordinatorTaskNeedsAgent(task) {
 			continue
 		}
-		availability, err := coordinatorWorkerAvailability(ctx, opened, metadata, configured, options, task, current)
+		availability, err := coordinatorWorkerAvailability(ctx, healthRouter, metadata, configured, options, task, current)
 		if err != nil {
 			return nil, err
 		}
@@ -632,7 +643,7 @@ type coordinatorAvailability struct {
 
 func coordinatorWorkerAvailability(
 	ctx context.Context,
-	opened *store.Store,
+	healthRouter agenthealth.Router,
 	metadata boards.Metadata,
 	configured configuredProfileSet,
 	options Options,
@@ -670,7 +681,9 @@ func coordinatorWorkerAvailability(
 		}
 		queue = append(queue, profile.Fallbacks...)
 		enabled := workerRole && orchestration.RunnableProfileRoute(profile)
-		health, err := opened.GetAgentHealth(ctx, name)
+		health, err := healthRouter.Get(
+			ctx, name, registeredAgentHasRole(configured.Config, name, agentconfig.RoleWorker),
+		)
 		if err != nil {
 			return coordinatorAvailability{}, err
 		}
@@ -867,12 +880,14 @@ func buildCoordinatorAgentSnapshots(
 		return nil, err
 	}
 	defer coordinationStore.Close()
+	healthRouter := agenthealth.NewWithGlobal(manager, opened, coordinationStore)
 	result := make([]coordinator.AgentSnapshot, 0, min(len(configured.Profiles), coordinatorSnapshotAgentLimit))
 	for _, profile := range configured.Profiles {
 		if len(result) >= coordinatorSnapshotAgentLimit {
 			break
 		}
-		health, err := opened.GetAgentHealth(ctx, profile.Name)
+		globalWorker := registeredAgentHasRole(configured.Config, profile.Name, agentconfig.RoleWorker)
+		health, err := healthRouter.Get(ctx, profile.Name, globalWorker)
 		if err != nil {
 			return nil, err
 		}
@@ -885,7 +900,7 @@ func buildCoordinatorAgentSnapshots(
 			}
 		}
 		activeSlots := 0
-		if globallyConfigured && hasAgentRole(globalAgent, agentconfig.RoleWorker) {
+		if globalWorker {
 			slots, err := coordinationStore.ListGlobalAgentSlots(ctx, profile.Name)
 			if err != nil {
 				return nil, err
