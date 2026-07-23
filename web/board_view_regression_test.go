@@ -35,8 +35,9 @@ func TestDashboardPersistsAccessibleBoardViews(t *testing.T) {
 		`title="Responsive status grids with full task cards"`,
 		`title="Denser status grids with condensed task cards"`,
 		`title="Separate stage panels that emphasize workflow order"`,
+		`title="Dependency and hierarchy diagram for the current board"`,
 		`Focus shows one workflow stage at a time`,
-		`Flow separates Planning, Execution, and Archive into stage panels`,
+		`Flow separates workflow stages, and Graph diagrams task dependencies and hierarchy`,
 	} {
 		if !strings.Contains(html, marker) {
 			t.Fatalf("board view control marker %q is missing", marker)

@@ -9,7 +9,7 @@ const WORKFLOW_STAGES = [
   { id: "archive", label: "Archive", ariaLabel: "Archive workflow stage", statuses: ["archived"] },
 ];
 const BOARD_STAGE_FOCUSES = ["all", ...WORKFLOW_STAGES.map((stage) => stage.id)];
-const BOARD_VIEW_MODES = ["overview", "compact", "flow"];
+const BOARD_VIEW_MODES = ["overview", "compact", "flow", "graph"];
 const AUTOMATION_TABS = ["overview", "runs", "recovery", "publishing", "events"];
 const AUTOMATION_HELP_LANGUAGES = ["en", "ko"];
 
@@ -34,6 +34,9 @@ const state = {
     ? storedAutomationHelpLanguage
     : (navigator.language.toLowerCase().startsWith("ko") ? "ko" : "en"),
   automationData: null,
+  graph: null, graphBoard: "", graphIncludeArchived: false, graphLoading: false, graphError: "",
+  graphRequest: 0, graphZoom: 1, graphSignature: "", graphFitPending: false, graphFitMode: true,
+  graphShowDependencies: true, graphShowHierarchy: true,
   drawerDirty: false, drawerVersion: null, drawerRequest: 0,
 };
 
@@ -243,6 +246,8 @@ let automationLoadGeneration = 0;
 let automationLoadController = null;
 const automationRecoveryCache = new Map();
 let operationalStatusGeneration = 0;
+let graphLoadController = null;
+let graphResizeObserver = null;
 function toast(message, error = false) {
   const element = $("#toast");
   element.textContent = message;
@@ -281,6 +286,7 @@ async function loadBoard() {
   state.diagnostics = payload.diagnostics;
   renderFilters();
   renderBoard();
+  if (state.boardView === "graph") await loadBoardGraph({ force: true });
 }
 
 function workerProfiles() {
@@ -455,6 +461,8 @@ function setBoardView(value) {
   state.boardView = value;
   localStorage.setItem("autogora.boardView", value);
   renderBoard();
+  if (value === "graph") loadBoardGraph({ force: true }).catch((error) => toast(error.message, true));
+  else cancelGraphLoad();
 }
 
 function bindSegmentedControl(selector, buttonSelector, select) {
@@ -476,11 +484,432 @@ function bindSegmentedControl(selector, buttonSelector, select) {
   });
 }
 
+function cancelGraphLoad() {
+  state.graphRequest += 1;
+  graphLoadController?.abort();
+  graphLoadController = null;
+  graphResizeObserver?.disconnect();
+  graphResizeObserver = null;
+  state.graphLoading = false;
+}
+
+function boardGraphSignature(graph) {
+  const nodes = (graph.nodes || []).map((node) => `${node.task.id}:${node.phase}`).join("|");
+  const dependencies = (graph.dependencies || [])
+    .map((edge) => `${edge.prerequisiteId}>${edge.dependentId}`).join("|");
+  const hierarchy = (graph.hierarchy || [])
+    .map((edge) => `${edge.parentTaskId}>${edge.subtaskId}:${edge.position}`).join("|");
+  return `${graph.board}:${graph.includeArchived}:${nodes}::${dependencies}::${hierarchy}`;
+}
+
+async function loadBoardGraph(options = {}) {
+  if (state.boardView !== "graph") return false;
+  const board = state.board;
+  const includeArchived = $("#show-archived").checked || state.stageFocus === "archive";
+  if (!options.force && state.graph && state.graphBoard === board
+      && state.graphIncludeArchived === includeArchived) {
+    renderBoardGraph();
+    return true;
+  }
+  const requestID = ++state.graphRequest;
+  graphLoadController?.abort();
+  const controller = new AbortController();
+  graphLoadController = controller;
+  state.graphLoading = true;
+  state.graphError = "";
+  renderBoardGraph();
+  try {
+    const graph = await api(boardPathFor(
+      board,
+      `/api/graph?includeArchived=${includeArchived}`,
+    ), { signal: controller.signal });
+    if (controller.signal.aborted || requestID !== state.graphRequest
+        || state.board !== board || state.boardView !== "graph") return false;
+    const signature = boardGraphSignature(graph);
+    state.graphFitPending = !state.graph || state.graphBoard !== board
+      || state.graphIncludeArchived !== includeArchived || state.graphSignature !== signature;
+    state.graph = graph;
+    state.graphBoard = board;
+    state.graphIncludeArchived = includeArchived;
+    state.graphSignature = signature;
+    return true;
+  } catch (error) {
+    if (error.name === "AbortError" || controller.signal.aborted) return false;
+    if (requestID === state.graphRequest && state.board === board) {
+      state.graphError = error.message;
+    }
+    return false;
+  } finally {
+    if (requestID === state.graphRequest) {
+      state.graphLoading = false;
+      graphLoadController = null;
+      if (state.boardView === "graph") renderBoardGraph();
+    }
+  }
+}
+
+function graphTaskMatches(task) {
+  const search = $("#search").value.trim().toLowerCase();
+  const tenant = $("#tenant-filter").value;
+  const assignee = $("#assignee-filter").value;
+  const boardTask = state.tasks.find((item) => item.id === task.id);
+  const searchable = `${task.id}\n${task.title}\n${boardTask?.body || ""}`.toLowerCase();
+  const stage = WORKFLOW_STAGES.find((item) => item.id === state.stageFocus);
+  return (!search || searchable.includes(search))
+    && (!tenant || task.tenant === tenant)
+    && (!assignee || task.assignee === assignee)
+    && (!stage || stage.statuses.includes(task.status));
+}
+
+function graphTitleLines(value, width = 29, limit = 2) {
+  const words = String(value || "Untitled task").trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  for (const word of words) {
+    let remaining = word;
+    while (remaining.length > width) {
+      if (lines.length >= limit) break;
+      lines.push(remaining.slice(0, width));
+      remaining = remaining.slice(width);
+    }
+    if (lines.length >= limit) break;
+    if (!remaining) continue;
+    const current = lines[lines.length - 1];
+    if (current && `${current} ${remaining}`.length <= width) {
+      lines[lines.length - 1] = `${current} ${remaining}`;
+    } else {
+      lines.push(remaining);
+    }
+  }
+  if (!lines.length) lines.push("Untitled task");
+  const joined = lines.join(" ");
+  if (joined.length < String(value || "").trim().length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].slice(0, width - 1)}…`;
+  }
+  return lines.slice(0, limit);
+}
+
+function boardGraphLayout(graph) {
+  const nodeWidth = 224;
+  const nodeHeight = 92;
+  const columnGap = 24;
+  const phaseGap = 92;
+  const rowGap = 26;
+  const padding = 42;
+  const headingHeight = 58;
+  const nodes = [...(graph.nodes || [])].sort((left, right) => {
+    const leftPhase = left.phase < 0 ? Number.MAX_SAFE_INTEGER : left.phase;
+    const rightPhase = right.phase < 0 ? Number.MAX_SAFE_INTEGER : right.phase;
+    return leftPhase - rightPhase
+      || (left.position || 0) - (right.position || 0)
+      || String(left.task.createdAt).localeCompare(String(right.task.createdAt))
+      || left.task.id.localeCompare(right.task.id);
+  });
+  const grouped = new Map();
+  for (const node of nodes) {
+    const phase = Number.isInteger(node.phase) ? node.phase : -1;
+    if (!grouped.has(phase)) grouped.set(phase, []);
+    grouped.get(phase).push(node);
+  }
+  const phases = [...grouped.keys()].sort((left, right) => {
+    if (left < 0) return 1;
+    if (right < 0) return -1;
+    return left - right;
+  });
+  const rowsPerColumn = Math.min(24, Math.max(8, Math.ceil(Math.sqrt(Math.max(1, nodes.length) * 1.5))));
+  const positions = new Map();
+  const headings = [];
+  let x = padding;
+  let maximumRows = 1;
+  for (const phase of phases) {
+    const phaseNodes = grouped.get(phase);
+    const subcolumns = Math.max(1, Math.ceil(phaseNodes.length / rowsPerColumn));
+    const phaseWidth = subcolumns * nodeWidth + (subcolumns - 1) * columnGap;
+    headings.push({
+      phase,
+      x,
+      width: phaseWidth,
+      label: phase < 0 ? "Cycle / unresolved" : `Phase ${phase + 1}`,
+      count: phaseNodes.length,
+    });
+    phaseNodes.forEach((node, index) => {
+      const subcolumn = Math.floor(index / rowsPerColumn);
+      const row = index % rowsPerColumn;
+      positions.set(node.task.id, {
+        x: x + subcolumn * (nodeWidth + columnGap),
+        y: padding + headingHeight + row * (nodeHeight + rowGap),
+        node,
+      });
+      maximumRows = Math.max(maximumRows, row + 1);
+    });
+    x += phaseWidth + phaseGap;
+  }
+  const width = Math.max(720, x - phaseGap + padding);
+  const height = Math.max(380, padding * 2 + headingHeight + maximumRows * nodeHeight
+    + Math.max(0, maximumRows - 1) * rowGap);
+  return {
+    nodes,
+    positions,
+    headings,
+    width,
+    height,
+    nodeWidth,
+    nodeHeight,
+  };
+}
+
+function graphDependencyPath(source, target, layout) {
+  const sourceX = source.x + layout.nodeWidth;
+  const sourceY = source.y + layout.nodeHeight / 2;
+  const targetX = target.x;
+  const targetY = target.y + layout.nodeHeight / 2;
+  const distance = Math.max(44, Math.abs(targetX - sourceX) / 2);
+  return `M ${sourceX} ${sourceY} C ${sourceX + distance} ${sourceY}, ${targetX - distance} ${targetY}, ${targetX} ${targetY}`;
+}
+
+function graphHierarchyPath(parent, child, layout) {
+  const parentX = parent.x + layout.nodeWidth / 2;
+  const parentY = parent.y + layout.nodeHeight;
+  const childX = child.x + layout.nodeWidth / 2;
+  const childY = child.y;
+  const middleY = parentY + (childY - parentY) / 2;
+  return `M ${parentX} ${parentY} C ${parentX} ${middleY}, ${childX} ${middleY}, ${childX} ${childY}`;
+}
+
+function graphNodeSVG(position, layout) {
+  const task = position.node.task;
+  const lines = graphTitleLines(task.title);
+  const route = `${task.assignee || "Unassigned"} · ${task.runtime || "default"}`;
+  const phase = position.node.phase < 0 ? "Cycle or unresolved dependency" : `Phase ${position.node.phase + 1}`;
+  const dimmed = graphTaskMatches(task) ? "" : " is-dimmed";
+  const blocked = position.node.blockedBy?.length
+    ? ` · ${position.node.blockedBy.length} open prerequisite${position.node.blockedBy.length === 1 ? "" : "s"}`
+    : "";
+  const title = `${task.title} · ${STATUS_LABELS[task.status] || task.status} · ${phase}${blocked}`;
+  return `<g class="graph-node status-${escapeHtml(task.status)}${dimmed}" transform="translate(${position.x} ${position.y})"
+      role="button" tabindex="0" data-graph-task="${escapeHtml(task.id)}"
+      aria-label="${escapeHtml(title)}">
+    <title>${escapeHtml(title)}</title>
+    <rect width="${layout.nodeWidth}" height="${layout.nodeHeight}" rx="11"></rect>
+    <circle class="graph-node-status-dot" cx="14" cy="17" r="4"></circle>
+    <text class="graph-node-meta" x="25" y="20">${escapeHtml(`${STATUS_LABELS[task.status] || task.status} · ${task.workflowRole || "worker"}`)}</text>
+    <text class="graph-node-id" x="${layout.nodeWidth - 12}" y="20" text-anchor="end">${escapeHtml(task.id)}</text>
+    ${lines.map((line, index) => `<text class="graph-node-title" x="13" y="${45 + index * 17}">${escapeHtml(line)}</text>`).join("")}
+    <text class="graph-node-route" x="13" y="80">${escapeHtml(route)}</text>
+  </g>`;
+}
+
+function graphAccessibleList(layout) {
+  return `<details class="graph-task-list">
+    <summary>Accessible task list · ${layout.nodes.length} shown</summary>
+    <div>${layout.nodes.map((node) => {
+    const task = node.task;
+    const phase = node.phase < 0 ? "cycle or unresolved" : `phase ${node.phase + 1}`;
+    return `<button type="button" data-graph-task="${escapeHtml(task.id)}">
+        <strong>${escapeHtml(task.title)}</strong>
+        <span>${escapeHtml(`${STATUS_LABELS[task.status] || task.status} · ${phase} · ${task.assignee || "Unassigned"} · ${task.runtime || "default"}`)}</span>
+      </button>`;
+  }).join("")}</div>
+  </details>`;
+}
+
+function renderBoardGraph() {
+  const board = $("#board");
+  const graph = state.graphBoard === state.board
+    && state.graphIncludeArchived === ($("#show-archived").checked || state.stageFocus === "archive")
+    ? state.graph
+    : null;
+  if (!graph) {
+    const message = state.graphError
+      ? `<strong>Graph could not be loaded</strong><span>${escapeHtml(state.graphError)}</span><button type="button" data-graph-action="refresh">Retry</button>`
+      : `<strong>${state.graphLoading ? "Loading task graph…" : "Task graph is not loaded"}</strong><span>Dependencies and hierarchy will appear here.</span>`;
+    board.innerHTML = `<section class="graph-empty" role="${state.graphError ? "alert" : "status"}">${message}</section>`;
+    board.querySelector('[data-graph-action="refresh"]')?.addEventListener(
+      "click",
+      () => loadBoardGraph({ force: true }).catch((error) => toast(error.message, true)),
+    );
+    return;
+  }
+  const layout = boardGraphLayout(graph);
+  if (!layout.nodes.length) {
+    board.innerHTML = `<section class="graph-empty" role="status"><strong>No tasks to diagram</strong><span>Create a task or include archived tasks to populate this graph.</span></section>`;
+    return;
+  }
+  const dependencies = state.graphShowDependencies
+    ? (graph.dependencies || []).map((edge) => {
+      const source = layout.positions.get(edge.prerequisiteId);
+      const target = layout.positions.get(edge.dependentId);
+      if (!source || !target) return "";
+      const marker = edge.satisfiedAt ? "graph-satisfied-arrow" : "graph-dependency-arrow";
+      return `<path class="graph-edge graph-dependency${edge.satisfiedAt ? " is-satisfied" : ""}"
+        d="${graphDependencyPath(source, target, layout)}" marker-end="url(#${marker})">
+        <title>${escapeHtml(`${source.node.task.title} unlocks ${target.node.task.title}${edge.satisfiedAt ? " · satisfied" : ""}`)}</title>
+      </path>`;
+    }).join("")
+    : "";
+  const hierarchy = state.graphShowHierarchy
+    ? (graph.hierarchy || []).map((edge) => {
+      const parent = layout.positions.get(edge.parentTaskId);
+      const child = layout.positions.get(edge.subtaskId);
+      if (!parent || !child) return "";
+      return `<path class="graph-edge graph-hierarchy" d="${graphHierarchyPath(parent, child, layout)}">
+        <title>${escapeHtml(`${child.node.task.title} is a subtask of ${parent.node.task.title}`)}</title>
+      </path>`;
+    }).join("")
+    : "";
+  const matching = layout.nodes.filter((node) => graphTaskMatches(node.task)).length;
+  const truncated = graph.truncated
+    ? `<span class="graph-warning" role="status">Showing ${graph.returnedNodes} of ${graph.totalNodes} tasks · ${graph.omittedNodeCount} omitted by the ${graph.nodeLimit}-node limit</span>`
+    : "";
+  const contextNote = matching === layout.nodes.length
+    ? `${matching} tasks match the current filters`
+    : `${matching} of ${layout.nodes.length} tasks match · other nodes stay dimmed for dependency context`;
+  const headingY = 39;
+  board.innerHTML = `<section class="graph-view" aria-labelledby="graph-title">
+    <header class="graph-toolbar">
+      <div><span class="eyebrow">Board topology · revision ${graph.graphRevision}</span><h2 id="graph-title">Task dependency graph</h2><p>${escapeHtml(contextNote)}</p></div>
+      <div class="graph-actions" aria-label="Graph controls">
+        <label><input type="checkbox" data-graph-toggle="dependencies"${state.graphShowDependencies ? " checked" : ""}> Dependencies</label>
+        <label><input type="checkbox" data-graph-toggle="hierarchy"${state.graphShowHierarchy ? " checked" : ""}> Hierarchy</label>
+        <button type="button" class="ghost compact" data-graph-action="out" aria-label="Zoom out">−</button>
+        <button type="button" class="ghost compact" data-graph-action="fit">Fit</button>
+        <output class="graph-zoom" data-graph-zoom aria-live="polite">${Math.round(state.graphZoom * 100)}%</output>
+        <button type="button" class="ghost compact" data-graph-action="in" aria-label="Zoom in">+</button>
+        <button type="button" class="ghost compact" data-graph-action="refresh">Refresh</button>
+      </div>
+    </header>
+    <div class="graph-legend" aria-label="Graph legend">
+      <span><i class="dependency"></i> Prerequisite → dependent</span>
+      <span><i class="dependency satisfied"></i> Satisfied dependency</span>
+      <span><i class="hierarchy"></i> Parent / subtask</span>
+      ${truncated}
+      ${state.graphLoading ? '<span class="graph-refreshing" role="status">Refreshing…</span>' : ""}
+    </div>
+    <div class="graph-viewport" tabindex="0" aria-label="Scrollable task graph. Drag the background to pan.">
+      <svg class="graph-canvas" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}"
+        role="img" aria-labelledby="graph-title graph-description">
+        <desc id="graph-description">Tasks are arranged by dependency phase. Solid arrows point from prerequisites to dependents. Dashed lines show parent and subtask hierarchy.</desc>
+        <defs>
+          <marker id="graph-dependency-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+            <path d="M 0 0 L 9 3.5 L 0 7 z"></path>
+          </marker>
+          <marker id="graph-satisfied-arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+            <path d="M 0 0 L 9 3.5 L 0 7 z"></path>
+          </marker>
+        </defs>
+        ${layout.headings.map((heading) => `<g class="graph-phase-heading">
+          <text x="${heading.x}" y="${headingY}">${escapeHtml(heading.label)}</text>
+          <text class="graph-phase-count" x="${heading.x + heading.width}" y="${headingY}" text-anchor="end">${heading.count} ${heading.count === 1 ? "task" : "tasks"}</text>
+          <line x1="${heading.x}" x2="${heading.x + heading.width}" y1="${headingY + 12}" y2="${headingY + 12}"></line>
+        </g>`).join("")}
+        <g class="graph-edges" aria-hidden="true">${hierarchy}${dependencies}</g>
+        <g class="graph-nodes">${layout.nodes.map((node) => graphNodeSVG(layout.positions.get(node.task.id), layout)).join("")}</g>
+      </svg>
+    </div>
+    ${graphAccessibleList(layout)}
+  </section>`;
+  bindBoardGraph(layout);
+}
+
+function applyGraphZoom(layout) {
+  const canvas = $(".graph-canvas");
+  if (!canvas) return;
+  canvas.style.width = `${Math.round(layout.width * state.graphZoom)}px`;
+  canvas.style.height = `${Math.round(layout.height * state.graphZoom)}px`;
+  const output = $("[data-graph-zoom]");
+  if (output) output.textContent = `${Math.round(state.graphZoom * 100)}%`;
+}
+
+function bindBoardGraph(layout) {
+  graphResizeObserver?.disconnect();
+  graphResizeObserver = null;
+  const viewport = $(".graph-viewport");
+  const zoom = (next, keepFit = false) => {
+    state.graphFitMode = keepFit;
+    state.graphZoom = Math.min(1.8, Math.max(0.18, next));
+    applyGraphZoom(layout);
+  };
+  const fit = (behavior = "auto") => {
+    zoom(Math.min(1, (viewport.clientWidth - 24) / layout.width), true);
+    viewport.scrollTo({ left: 0, top: 0, behavior });
+  };
+  $('[data-graph-action="refresh"]')?.addEventListener(
+    "click",
+    () => loadBoardGraph({ force: true }).catch((error) => toast(error.message, true)),
+  );
+  $('[data-graph-action="in"]')?.addEventListener("click", () => zoom(state.graphZoom + 0.15));
+  $('[data-graph-action="out"]')?.addEventListener("click", () => zoom(state.graphZoom - 0.15));
+  $('[data-graph-action="fit"]')?.addEventListener("click", () => fit("smooth"));
+  $$("[data-graph-toggle]").forEach((toggle) => toggle.addEventListener("change", () => {
+    if (toggle.dataset.graphToggle === "dependencies") state.graphShowDependencies = toggle.checked;
+    else state.graphShowHierarchy = toggle.checked;
+    renderBoardGraph();
+  }));
+  $$("[data-graph-task]").forEach((element) => {
+    element.addEventListener("click", () => openDrawer(element.dataset.graphTask));
+    if (element.tagName.toLowerCase() === "button") return;
+    element.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openDrawer(element.dataset.graphTask);
+    });
+  });
+  let pan = null;
+  viewport.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest("[data-graph-task]")) return;
+    pan = {
+      x: event.clientX,
+      y: event.clientY,
+      left: viewport.scrollLeft,
+      top: viewport.scrollTop,
+      pointer: event.pointerId,
+    };
+    viewport.setPointerCapture(event.pointerId);
+    viewport.classList.add("is-panning");
+  });
+  viewport.addEventListener("pointermove", (event) => {
+    if (!pan || event.pointerId !== pan.pointer) return;
+    viewport.scrollLeft = pan.left - (event.clientX - pan.x);
+    viewport.scrollTop = pan.top - (event.clientY - pan.y);
+  });
+  const stopPan = (event) => {
+    if (!pan || event.pointerId !== pan.pointer) return;
+    pan = null;
+    viewport.classList.remove("is-panning");
+  };
+  viewport.addEventListener("pointerup", stopPan);
+  viewport.addEventListener("pointercancel", stopPan);
+  applyGraphZoom(layout);
+  if (state.graphFitPending || state.graphFitMode) {
+    const signature = state.graphSignature;
+    state.graphFitPending = false;
+    requestAnimationFrame(() => {
+      if (state.boardView !== "graph" || state.graphSignature !== signature || !viewport.isConnected) return;
+      fit();
+    });
+  }
+  if ("ResizeObserver" in window) {
+    let previousWidth = viewport.clientWidth;
+    graphResizeObserver = new ResizeObserver(() => {
+      const width = viewport.clientWidth;
+      if (!state.graphFitMode || width === previousWidth) return;
+      previousWidth = width;
+      fit();
+    });
+    graphResizeObserver.observe(viewport);
+  }
+}
+
 function renderBoard() {
   const tasks = filteredTasks();
   const board = $("#board");
   board.dataset.view = state.boardView;
   board.dataset.focus = state.stageFocus;
+  if (state.boardView === "graph") {
+    updateBoardViewControls();
+    renderBoardGraph();
+    renderBulk();
+    return;
+  }
   const showArchived = $("#show-archived").checked || state.stageFocus === "archive";
   const stages = WORKFLOW_STAGES
     .filter((stage) => stage.id !== "archive" || showArchived)
@@ -2403,6 +2832,7 @@ function bindGlobalActions() {
   bindSegmentedControl('[data-board-control="view"]', "[data-board-view]", (button) => setBoardView(button.dataset.boardView));
   $("#board-select").addEventListener("change", async (event) => {
     cancelAutomationLoad();
+    cancelGraphLoad();
     state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("autogora.board", state.board);
     await loadBoard(); connectEvents();
   });
@@ -2562,6 +2992,7 @@ async function submitBoard(event) {
       slug: data.get("slug"), name: data.get("name"), description: data.get("description"), icon: data.get("icon"),
       defaultWorkdir: data.get("defaultWorkdir") || null, switch: true,
     }) });
+    cancelGraphLoad();
     state.board = board.slug; state.cursor = 0; localStorage.setItem("autogora.board", state.board);
     $("#board-dialog").close(); await loadBoards(); await loadBoard(); connectEvents();
   } catch (error) { toast(error.message, true); }
