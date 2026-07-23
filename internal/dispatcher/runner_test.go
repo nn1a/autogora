@@ -29,6 +29,17 @@ func countArg(args []string, value string) int {
 	return count
 }
 
+func argPairValues(args []string, name string) []string {
+	values := []string{}
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == name {
+			values = append(values, args[index+1])
+			index++
+		}
+	}
+	return values
+}
+
 func claimedTask(t *testing.T, runtime model.Runtime) model.ClaimedTask {
 	t.Helper()
 	opened, err := store.Open(":memory:", "default", t.TempDir())
@@ -100,13 +111,49 @@ func TestWriteOptInAndGoalContinuations(t *testing.T) {
 	codex := claimedTask(t, model.RuntimeCodex)
 	options.Model = "gpt-test"
 	continued, err := BuildGoalContinuationCommand(codex, options, "session-1", "continue")
-	if err != nil || strings.Join(continued.Args[:2], " ") != "exec resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") || !hasArgPair(continued.Args, "--model", "gpt-test") || countArg(continued.Args, "-c") != 3 {
+	if err != nil || strings.Join(continued.Args[:4], " ") != "exec --sandbox workspace-write resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") || !hasArgPair(continued.Args, "--model", "gpt-test") || countArg(continued.Args, "-c") != 3 {
 		t.Fatalf("Codex continuation failed: %#v, %v", continued, err)
 	}
 	cline := claimedTask(t, model.RuntimeCline)
 	continued, err = BuildGoalContinuationCommand(cline, options, "", "finish the gap")
 	if err != nil || !strings.Contains(strings.Join(continued.Args, " "), "Continuation focus: finish the gap") {
 		t.Fatalf("Cline continuation failed: %#v, %v", continued, err)
+	}
+}
+
+func TestCodexGoalContinuationPreservesExecutionPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		allowWrites bool
+		sandbox     string
+	}{
+		{name: "read only", sandbox: "read-only"},
+		{name: "workspace writes", allowWrites: true, sandbox: "workspace-write"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim := claimedTask(t, model.RuntimeCodex)
+			options := RunnerOptions{
+				DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "autogora"),
+				AllowWrites: test.allowWrites, Model: "gpt-test",
+			}
+			initial, err := BuildRunnerCommand(claim, options, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			continued, err := BuildGoalContinuationCommand(claim, options, "session-1", "continue")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(continued.Args[:4], " "); got != "exec --sandbox "+test.sandbox+" resume" {
+				t.Fatalf("continuation sandbox = %q, args = %#v", got, continued.Args)
+			}
+			if got, want := argPairValues(continued.Args, "-c"), argPairValues(initial.Args, "-c"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("continuation MCP config = %#v, want %#v", got, want)
+			}
+			if !hasArgPair(continued.Args, "--model", "gpt-test") {
+				t.Fatalf("continuation model missing from %#v", continued.Args)
+			}
+		})
 	}
 }
 

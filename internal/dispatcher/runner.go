@@ -256,7 +256,17 @@ func BuildGoalContinuationCommand(claim model.ClaimedTask, options RunnerOptions
 		if sessionID == "" {
 			return RunnerCommand{}, errors.New("Codex goal continuation requires a session id")
 		}
-		args := []string{"exec", "resume", "--json", "--skip-git-repo-check"}
+		sandbox := ""
+		for index := 1; index+1 < len(initial.Args)-1; index++ {
+			if initial.Args[index] == "--sandbox" {
+				sandbox = initial.Args[index+1]
+				break
+			}
+		}
+		if sandbox == "" {
+			return RunnerCommand{}, errors.New("Codex goal continuation requires the initial sandbox policy")
+		}
+		args := []string{"exec", "--sandbox", sandbox, "resume", "--json", "--skip-git-repo-check"}
 		for index := 1; index < len(initial.Args)-1; index++ {
 			if initial.Args[index] != "-c" && initial.Args[index] != "--model" {
 				continue
