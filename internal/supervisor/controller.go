@@ -13,10 +13,12 @@ import (
 type RunFunc func(context.Context, dispatcher.Options) error
 
 type Options struct {
-	DBPath  string
-	CLIPath string
-	OnLog   func(string)
-	Run     RunFunc
+	DBPath           string
+	CLIPath          string
+	WorkingDirectory string
+	Getenv           func(string) string
+	OnLog            func(string)
+	Run              RunFunc
 }
 
 type Status struct {
@@ -76,7 +78,8 @@ func (c *Controller) Start(parent context.Context, config agentconfig.Config) bo
 		err := c.options.Run(ctx, dispatcher.Options{
 			DBPath: c.options.DBPath, CLIPath: c.options.CLIPath,
 			MaxWorkers: config.Supervisor.MaxWorkers, AllowWrites: config.Supervisor.AllowWrites,
-			AgentConfig: &config, OnLog: c.options.OnLog,
+			AgentConfig: &config, WorkingDirectory: c.options.WorkingDirectory,
+			Getenv: c.options.Getenv, OnLog: c.options.OnLog,
 		})
 		c.mu.Lock()
 		if c.generation == generation {
