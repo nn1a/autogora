@@ -2,7 +2,9 @@ package dispatcher
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -625,6 +627,223 @@ func TestCoordinationRuntimeLimitsPaidAnalysisToOneBoardPerPass(t *testing.T) {
 	}
 	if calls[fixture.task.ID] != 1 || calls[alphaTask.Task.ID] != 1 {
 		t.Fatalf("board fairness calls = %#v", calls)
+	}
+}
+
+func TestCoordinationRuntimeInvalidBoardsDoNotStarveHealthyCandidate(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	plannerErr := errors.New("temporary Coordinator failure")
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = func(
+		context.Context,
+		orchestration.PlannerRequest,
+	) (any, error) {
+		if calls.Add(1) == 1 {
+			return nil, plannerErr
+		}
+		priority := 8
+		return coordinator.Proposal{
+			IncidentID: fixture.incident.ID, ExpectedGraphRevision: fixture.incident.GraphRevision,
+			Summary:   "Raise the recovery task priority",
+			Rationale: "The healthy board remains actionable after another board fails observation.",
+			Actions: []coordinator.Action{{
+				Kind: coordinator.ActionUpdatePriority, TaskID: fixture.task.ID,
+				ExpectedUpdatedAt: fixture.task.UpdatedAt, Priority: &priority,
+				Reason: "Let the available worker retry the critical path.",
+			}},
+		}, nil
+	}
+	state := &coordinationRuntimeState{}
+	boardSlugs := []string{"INVALID!", "missing-second", "default"}
+
+	firstErr := runCoordinationPass(
+		context.Background(), fixture.manager, boardSlugs,
+		fixture.options, state, fixture.current,
+	)
+	if !errors.Is(firstErr, plannerErr) {
+		t.Fatalf("first pass error = %v, want joined planner error", firstErr)
+	}
+	if !strings.Contains(firstErr.Error(), `board "INVALID!" metadata`) ||
+		!strings.Contains(firstErr.Error(), `board "missing-second" store`) {
+		t.Fatalf("first pass did not aggregate missing boards: %v", firstErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("first pass Coordinator calls = %d, want 1", calls.Load())
+	}
+
+	secondErr := runCoordinationPass(
+		context.Background(), fixture.manager, boardSlugs,
+		fixture.options, state,
+		fixture.current.Add(coordinationRetryBackoffBase+2*time.Second),
+	)
+	if secondErr == nil ||
+		!strings.Contains(secondErr.Error(), `board "INVALID!" metadata`) ||
+		!strings.Contains(secondErr.Error(), `board "missing-second" store`) {
+		t.Fatalf("second pass did not retain aggregate board errors: %v", secondErr)
+	}
+	if errors.Is(secondErr, plannerErr) {
+		t.Fatalf("second pass unexpectedly retained the prior planner error: %v", secondErr)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("healthy board Coordinator calls = %d, want one in each pass", calls.Load())
+	}
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	incident, err := opened.GetCoordinationIncident(
+		context.Background(), fixture.incident.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incident.Status != model.CoordinationIncidentAwaitingApproval {
+		t.Fatalf("healthy board incident = %+v", incident)
+	}
+}
+
+func TestCoordinationRuntimeAdvancesCursorPastFailedBoardWithoutCandidate(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeObserve)
+	state := &coordinationRuntimeState{}
+	boardSlugs := []string{"missing", "default"}
+
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, boardSlugs,
+		fixture.options, state, fixture.current,
+	); err == nil || !strings.Contains(err.Error(), `board "missing" store`) {
+		t.Fatalf("first observation error = %v", err)
+	}
+	if state.nextBoard != "default" {
+		t.Fatalf("next board after failed first board = %q, want default", state.nextBoard)
+	}
+	if err := runCoordinationPass(
+		context.Background(), fixture.manager, boardSlugs,
+		fixture.options, state, fixture.current.Add(time.Second),
+	); err == nil || !strings.Contains(err.Error(), `board "missing" store`) {
+		t.Fatalf("second observation error = %v", err)
+	}
+	if state.nextBoard != "missing" {
+		t.Fatalf("next board after healthy first board = %q, want missing", state.nextBoard)
+	}
+}
+
+func TestCoordinationRuntimeReconcileErrorDoesNotStarveHealthyCandidate(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	ctx := context.Background()
+	if _, err := fixture.manager.Create(ctx, "broken", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	setCoordinationTestMode(t, fixture.manager, "broken", boards.CoordinationModeObserve)
+	brokenStore, err := fixture.manager.OpenStore(ctx, "broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	brokenTask, err := brokenStore.CreateTask(ctx, store.CreateTaskInput{
+		Title: "broken board repeated block", Assignee: &assignee,
+		Runtime: model.RuntimeCodex, Priority: 1,
+	})
+	if err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	block := store.BlockInput{
+		Kind: model.BlockKindCapability, Reason: "broken board compiler is unavailable",
+	}
+	if _, err := brokenStore.BlockTask(ctx, brokenTask.Task.ID, block); err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	if _, err := brokenStore.UnblockTask(ctx, brokenTask.Task.ID); err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	if _, err := brokenStore.BlockTask(ctx, brokenTask.Task.ID, block); err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	metadata, err := fixture.manager.Read("broken")
+	if err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, fixture.manager, brokenStore, metadata, fixture.options, fixture.current,
+	)
+	if err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	incident := findCoordinatorIncident(incidents, model.CoordinationTriggerRepeatedBlock)
+	if incident == nil {
+		brokenStore.Close()
+		t.Fatalf("broken board incident was not detected: %+v", incidents)
+	}
+	if _, err := brokenStore.TransitionCoordinationIncident(
+		ctx, incident.ID, store.TransitionCoordinationIncidentInput{
+			ExpectedStatus: model.CoordinationIncidentOpen,
+			Status:         model.CoordinationIncidentDismissed,
+		},
+	); err != nil {
+		brokenStore.Close()
+		t.Fatal(err)
+	}
+	if err := brokenStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	brokenPath, err := fixture.manager.DBPath("broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", brokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(
+		ctx,
+		"UPDATE coordination_incidents SET details_json = ? WHERE id = ?",
+		"{", incident.ID,
+	); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = priorityCoordinationPlanner(fixture, &calls)
+	passErr := runCoordinationPass(
+		ctx, fixture.manager, []string{"broken", "default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current.Add(time.Second),
+	)
+	if passErr == nil ||
+		!strings.Contains(passErr.Error(), `board "broken" reconciliation`) ||
+		!strings.Contains(passErr.Error(), "decode coordinator incident details") {
+		t.Fatalf("reconciliation error was not preserved: %v", passErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("healthy board Coordinator calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestCoordinationRuntimeCancellationStopsBeforeHealthyCandidate(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = priorityCoordinationPlanner(fixture, &calls)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runCoordinationPass(
+		ctx, fixture.manager, []string{"missing", "default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled pass error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("canceled pass Coordinator calls = %d, want 0", calls.Load())
 	}
 }
 

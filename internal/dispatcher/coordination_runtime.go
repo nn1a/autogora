@@ -166,17 +166,41 @@ func collectCoordinationCandidates(
 	order := rotatedBoardSlugs(boardSlugs, next)
 	candidates := make([]coordinationCandidate, 0, len(order))
 	observedBoards := make([]string, 0, len(order))
+	var observationErr error
 	for _, board := range order {
+		if err := ctx.Err(); err != nil {
+			return nil, observedBoards, err
+		}
+		// Count every board in the rotation even when its metadata or store is
+		// unavailable. A broken board must not pin the fairness cursor.
+		observedBoards = append(observedBoards, board)
 		metadata, err := manager.Read(board)
 		if err != nil {
-			return nil, observedBoards, err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, observedBoards, ctxErr
+			}
+			observationErr = errors.Join(
+				observationErr,
+				fmt.Errorf("observe coordination board %q metadata: %w", board, err),
+			)
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, observedBoards, ctxErr
 		}
 		if metadata.Archived || !metadata.Orchestration.Autopilot.Enabled {
 			continue
 		}
 		opened, err := manager.OpenStore(ctx, board)
 		if err != nil {
-			return nil, observedBoards, err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, observedBoards, ctxErr
+			}
+			observationErr = errors.Join(
+				observationErr,
+				fmt.Errorf("observe coordination board %q store: %w", board, err),
+			)
+			continue
 		}
 		reconcileErr := reconcilePendingCoordination(
 			ctx, manager, opened, metadata, options, current,
@@ -186,14 +210,49 @@ func collectCoordinationCandidates(
 				ctx, manager, opened, metadata, options, current,
 			)
 		}
-		observedBoards = append(observedBoards, board)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = opened.Close()
+			return nil, observedBoards, ctxErr
+		}
 		if reconcileErr != nil {
-			return nil, observedBoards, errors.Join(reconcileErr, opened.Close())
+			closeErr := opened.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, observedBoards, ctxErr
+			}
+			observationErr = errors.Join(
+				observationErr,
+				fmt.Errorf("observe coordination board %q reconciliation: %w", board, reconcileErr),
+			)
+			if closeErr != nil {
+				observationErr = errors.Join(
+					observationErr,
+					fmt.Errorf("observe coordination board %q close: %w", board, closeErr),
+				)
+			}
+			continue
 		}
 		if metadata.Orchestration.Autopilot.Coordination.Mode != boards.CoordinationModeObserve {
 			incidents, candidateErr := activeCoordinationCandidates(ctx, opened, metadata, current)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = opened.Close()
+				return nil, observedBoards, ctxErr
+			}
 			if candidateErr != nil {
-				return nil, observedBoards, errors.Join(candidateErr, opened.Close())
+				closeErr := opened.Close()
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, observedBoards, ctxErr
+				}
+				observationErr = errors.Join(
+					observationErr,
+					fmt.Errorf("observe coordination board %q candidates: %w", board, candidateErr),
+				)
+				if closeErr != nil {
+					observationErr = errors.Join(
+						observationErr,
+						fmt.Errorf("observe coordination board %q close: %w", board, closeErr),
+					)
+				}
+				continue
 			}
 			if len(incidents) > 0 {
 				candidates = append(candidates, coordinationCandidate{
@@ -202,11 +261,18 @@ func collectCoordinationCandidates(
 				})
 			}
 		}
-		if err := opened.Close(); err != nil {
-			return nil, observedBoards, err
+		closeErr := opened.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, observedBoards, ctxErr
+		}
+		if closeErr != nil {
+			observationErr = errors.Join(
+				observationErr,
+				fmt.Errorf("observe coordination board %q close: %w", board, closeErr),
+			)
 		}
 	}
-	return candidates, observedBoards, nil
+	return candidates, observedBoards, observationErr
 }
 
 func runCoordinationPass(
@@ -225,20 +291,24 @@ func runCoordinationPass(
 	candidates, observedBoards, err := collectCoordinationCandidates(
 		ctx, manager, boardSlugs, options, state, current,
 	)
-	if err != nil {
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	if len(candidates) == 0 {
 		if state != nil && len(observedBoards) > 0 {
 			state.nextBoard = boardAfter(observedBoards, observedBoards[0])
 		}
-		return nil
+		return err
 	}
 	candidate := candidates[0]
 	if state != nil {
 		state.nextBoard = boardAfter(observedBoards, candidate.board)
 	}
-	return coordinateIncident(ctx, manager, candidate, options, current)
+	coordinationErr := coordinateIncident(ctx, manager, candidate, options, current)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return errors.Join(err, coordinationErr)
 }
 
 func coordinatorIncidentEligible(
