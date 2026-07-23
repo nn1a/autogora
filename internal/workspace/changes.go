@@ -41,7 +41,23 @@ func (m *Manager) HasChanges(ctx context.Context, workspace model.RunWorkspace) 
 	if err != nil {
 		return false, err
 	}
-	return len(output) > 0, nil
+	if len(output) > 0 {
+		return true, nil
+	}
+	if workspace.BaseCommit == nil || strings.TrimSpace(*workspace.BaseCommit) == "" {
+		return false, errors.New("prepared worktree is missing its base commit")
+	}
+	base, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"rev-parse", "--verify", strings.TrimSpace(*workspace.BaseCommit)+"^{commit}")
+	if err != nil {
+		return false, err
+	}
+	head, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return false, err
+	}
+	return head != base, nil
 }
 
 func gitOutputWithEnv(ctx context.Context, directory string, environment map[string]string, args ...string) ([]byte, error) {
