@@ -47,9 +47,19 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 			}
 			return !store.IsAgentUnavailable(current, time.Now()), nil
 		},
+		BeginAttempt: func(ctx context.Context, _ orchestration.PlannerRequest, candidate orchestration.PlannerCandidate) (orchestration.PlannerAttemptObservation, error) {
+			if s == nil || s.Store == nil || !strings.HasPrefix(candidate.Source, "global_") {
+				return nil, nil
+			}
+			return health.Begin(ctx, candidate.Profile, true)
+		},
 		OnFailure: func(ctx context.Context, attempt orchestration.PlannerAttempt) error {
 			if s == nil || s.Store == nil || !strings.HasPrefix(attempt.Candidate.Source, "global_") {
 				return nil
+			}
+			observation, err := plannerHealthObservation(attempt.Observation, attempt.Candidate.Profile)
+			if err != nil {
+				return err
 			}
 			status := plannerFailureHealth(attempt.FailureKind)
 			cooldown := plannerRetryCooldown
@@ -58,7 +68,7 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 			}
 			until := time.Now().Add(cooldown).UTC().Format(time.RFC3339Nano)
 			message := attempt.Err.Error()
-			_, err := health.Set(ctx, store.SetAgentHealthInput{
+			_, err = health.Apply(ctx, observation, store.SetAgentHealthInput{
 				AgentID: attempt.Candidate.Profile, Status: status, CooldownUntil: &until, LastError: &message,
 			}, true)
 			return err
@@ -68,7 +78,11 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 				return nil
 			}
 			if strings.HasPrefix(selection.Candidate.Source, "global_") {
-				if _, err := health.Set(ctx, store.SetAgentHealthInput{
+				observation, err := plannerHealthObservation(selection.Observation, selection.Candidate.Profile)
+				if err != nil {
+					return err
+				}
+				if _, err := health.Apply(ctx, observation, store.SetAgentHealthInput{
 					AgentID: selection.Candidate.Profile, Status: model.AgentHealthReady,
 				}, true); err != nil {
 					return err
@@ -118,6 +132,20 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 		}
 	}
 	return orchestration.CreateFallbackPlanner(options)
+}
+
+func plannerHealthObservation(
+	raw orchestration.PlannerAttemptObservation,
+	profile string,
+) (store.AgentHealthObservation, error) {
+	observation, ok := raw.(store.AgentHealthObservation)
+	if !ok {
+		return store.AgentHealthObservation{}, fmt.Errorf(
+			"planner candidate %s is missing its agent health observation",
+			profile,
+		)
+	}
+	return observation, nil
 }
 
 func plannerCandidates(metadata boards.Metadata, config agentconfig.Config, role agentconfig.Role) []orchestration.PlannerCandidate {

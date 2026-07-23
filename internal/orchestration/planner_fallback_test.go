@@ -190,6 +190,90 @@ func TestFallbackPlannerReleasesCapacityOnRetryableFailure(t *testing.T) {
 	}
 }
 
+func TestFallbackPlannerCarriesObservationToResultCallbacks(t *testing.T) {
+	failures := make([]PlannerAttempt, 0, 1)
+	var selected PlannerSelection
+	planner, err := CreateFallbackPlanner(FallbackPlannerOptions{
+		Candidates: []PlannerCandidate{
+			{Profile: "primary", Runtime: model.RuntimeCodex, Model: "primary"},
+			{Profile: "backup", Runtime: model.RuntimeClaude, Model: "backup"},
+		},
+		Factory: func(options CLIPlannerOptions) (Planner, error) {
+			name := options.Model
+			return func(context.Context, PlannerRequest) (any, error) {
+				if name == "primary" {
+					return nil, errors.New("HTTP 429: rate limit exceeded")
+				}
+				return "ok", nil
+			}, nil
+		},
+		BeginAttempt: func(_ context.Context, _ PlannerRequest, candidate PlannerCandidate) (PlannerAttemptObservation, error) {
+			return candidate.Profile + "-observation", nil
+		},
+		OnFailure: func(_ context.Context, attempt PlannerAttempt) error {
+			failures = append(failures, attempt)
+			return nil
+		},
+		OnSelected: func(_ context.Context, selection PlannerSelection) error {
+			selected = selection
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planner(context.Background(), PlannerRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 1 || failures[0].Observation != "primary-observation" {
+		t.Fatalf("failure observation = %#v", failures)
+	}
+	if selected.Observation != "backup-observation" {
+		t.Fatalf("selection observation = %#v", selected.Observation)
+	}
+}
+
+func TestFallbackPlannerReleasesCapacityWhenBeginAttemptFails(t *testing.T) {
+	beginErr := errors.New("reserve observation")
+	released := false
+	called := false
+	planner, err := CreateFallbackPlanner(FallbackPlannerOptions{
+		Candidates: []PlannerCandidate{{Profile: "primary", Runtime: model.RuntimeCodex}},
+		Factory: func(CLIPlannerOptions) (Planner, error) {
+			return func(context.Context, PlannerRequest) (any, error) {
+				called = true
+				return nil, nil
+			}, nil
+		},
+		AcquireAttempt: func(context.Context, PlannerRequest, PlannerCandidate) (PlannerAttemptHandle, bool, error) {
+			return "observation-lease", true, nil
+		},
+		BeginAttempt: func(context.Context, PlannerRequest, PlannerCandidate) (PlannerAttemptObservation, error) {
+			return nil, beginErr
+		},
+		ReleaseAttempt: func(ctx context.Context, handle PlannerAttemptHandle) error {
+			assertDetachedBoundedReleaseContext(t, ctx)
+			if handle != "observation-lease" {
+				t.Fatalf("released handle = %#v, want observation-lease", handle)
+			}
+			released = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planner(context.Background(), PlannerRequest{}); !errors.Is(err, beginErr) {
+		t.Fatalf("planner error = %v, want %v", err, beginErr)
+	}
+	if called {
+		t.Fatal("planner ran without an observation")
+	}
+	if !released {
+		t.Fatal("capacity was not released after observation failure")
+	}
+}
+
 func TestFallbackPlannerLimitsExternalInvocationsPerRequest(t *testing.T) {
 	called := make([]string, 0, 2)
 	planner, err := CreateFallbackPlanner(FallbackPlannerOptions{

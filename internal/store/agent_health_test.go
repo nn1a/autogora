@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +113,139 @@ func TestAgentHealthValidationAndRunForeignKey(t *testing.T) {
 	}
 	if afterDelete.LastRunID != nil {
 		t.Fatalf("deleted run reference was retained: %+v", afterDelete)
+	}
+}
+
+func TestAgentHealthObservationRejectsOlderCompletion(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	older, err := opened.BeginAgentHealthObservation(ctx, " shared-agent ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := opened.BeginAgentHealthObservation(ctx, "shared-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if older.AgentID != "shared-agent" || older.Generation != 1 || newer.Generation != 2 {
+		t.Fatalf("unexpected observation generations: older=%+v newer=%+v", older, newer)
+	}
+
+	cooldown := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	message := "newer rate limit"
+	failed, err := opened.ApplyAgentHealthObservation(ctx, newer, SetAgentHealthInput{
+		AgentID: "shared-agent", Status: model.AgentHealthRateLimited,
+		CooldownUntil: &cooldown, LastError: &message,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !failed.Applied || failed.Health.Status != model.AgentHealthRateLimited {
+		t.Fatalf("newer failure was not applied: %+v", failed)
+	}
+
+	missingRun := "stale-run-reference-must-not-be-validated"
+	stale, err := opened.ApplyAgentHealthObservation(ctx, older, SetAgentHealthInput{
+		AgentID: "shared-agent", Status: model.AgentHealthReady, LastRunID: &missingRun,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.Applied {
+		t.Fatalf("older success overwrote a newer failure: %+v", stale)
+	}
+	if stale.Health.Status != model.AgentHealthRateLimited ||
+		stale.Health.CooldownUntil == nil || stale.Health.LastError == nil ||
+		*stale.Health.LastError != message {
+		t.Fatalf("stale update did not return authoritative health: %+v", stale.Health)
+	}
+}
+
+func TestAgentHealthObservationAllowsOlderResultAcrossAbandonedReservation(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	older, err := opened.BeginAgentHealthObservation(ctx, "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.BeginAgentHealthObservation(ctx, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	update, err := opened.ApplyAgentHealthObservation(ctx, older, SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !update.Applied || update.Health.Status != model.AgentHealthReady {
+		t.Fatalf("abandoned reservation blocked an in-flight result: %+v", update)
+	}
+}
+
+func TestAgentHealthObservationConcurrentCompletionKeepsNewerResult(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(filepath.Join(t.TempDir(), "autogora.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+
+	for iteration := 0; iteration < 25; iteration++ {
+		agentID := fmt.Sprintf("worker-%d", iteration)
+		older, err := opened.BeginAgentHealthObservation(ctx, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newer, err := opened.BeginAgentHealthObservation(ctx, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, applyErr := opened.ApplyAgentHealthObservation(ctx, older, SetAgentHealthInput{
+				AgentID: agentID, Status: model.AgentHealthReady,
+			})
+			errs <- applyErr
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			message := "newer failure"
+			_, applyErr := opened.ApplyAgentHealthObservation(ctx, newer, SetAgentHealthInput{
+				AgentID: agentID, Status: model.AgentHealthUnhealthy, LastError: &message,
+			})
+			errs <- applyErr
+		}()
+		close(start)
+		workers.Wait()
+		close(errs)
+		for applyErr := range errs {
+			if applyErr != nil {
+				t.Fatal(applyErr)
+			}
+		}
+		health, err := opened.GetAgentHealth(ctx, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if health.Status != model.AgentHealthUnhealthy {
+			t.Fatalf("iteration %d kept stale concurrent result: %+v", iteration, health)
+		}
 	}
 }
 

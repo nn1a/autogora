@@ -68,6 +68,70 @@ func TestRouterSharesGlobalHealthAndIsolatesBoardHealth(t *testing.T) {
 	}
 }
 
+func TestRouterRejectsOlderGlobalWorkerObservationAcrossBoards(t *testing.T) {
+	ctx := context.Background()
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, board := range []string{"alpha", "beta"} {
+		if _, err := manager.Create(ctx, board, boards.Update{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alpha, err := manager.OpenStore(ctx, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alpha.Close()
+	beta, err := manager.OpenStore(ctx, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer beta.Close()
+
+	alphaHealth := New(manager, alpha)
+	betaHealth := New(manager, beta)
+	older, err := alphaHealth.Begin(ctx, "global-worker", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := betaHealth.Begin(ctx, "global-worker", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cooldown := "2030-01-02T03:04:05Z"
+	if update, err := betaHealth.Apply(ctx, newer, store.SetAgentHealthInput{
+		AgentID: "global-worker", Status: model.AgentHealthRateLimited, CooldownUntil: &cooldown,
+	}, true); err != nil || !update.Applied {
+		t.Fatalf("apply newer global failure: update=%+v err=%v", update, err)
+	}
+
+	record, err := alphaHealth.RecordWorkerObservation(ctx, older, store.SetAgentHealthInput{
+		AgentID: "global-worker", Status: model.AgentHealthReady,
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Applied {
+		t.Fatalf("stale worker success was applied: %+v", record)
+	}
+	shared, err := betaHealth.Get(ctx, "global-worker", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shared.Status != model.AgentHealthRateLimited || shared.CooldownUntil == nil {
+		t.Fatalf("stale success replaced shared cooldown: %+v", shared)
+	}
+	local, err := alphaHealth.Get(ctx, "global-worker", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Status != model.AgentHealthUnknown {
+		t.Fatalf("stale authoritative result leaked into local audit: %+v", local)
+	}
+}
+
 func TestRouterRecordsGlobalWorkerWithoutCrossBoardRunReference(t *testing.T) {
 	ctx := context.Background()
 	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))

@@ -644,6 +644,17 @@ CREATE TABLE IF NOT EXISTS agent_health (
   updated_at TEXT NOT NULL
 );
 
+-- Availability checks can finish out of order. Reserve a generation before
+-- each check and only apply observations newer than the last applied result.
+-- Keeping reservation and application counters separate means an abandoned
+-- check does not prevent an older in-flight check from reporting its result.
+CREATE TABLE IF NOT EXISTS agent_health_observation_sequences (
+  agent_id TEXT PRIMARY KEY,
+  next_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_generation >= 0),
+  applied_generation INTEGER NOT NULL DEFAULT 0 CHECK (applied_generation >= 0),
+  CHECK (applied_generation <= next_generation)
+);
+
 CREATE TABLE IF NOT EXISTS service_leases (
   name TEXT PRIMARY KEY,
   owner TEXT NOT NULL,

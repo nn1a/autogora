@@ -108,6 +108,7 @@ type PlannerAttempt struct {
 	Request     PlannerRequest
 	Candidate   PlannerCandidate
 	Attempt     int
+	Observation PlannerAttemptObservation
 	FailureKind PlannerFailureKind
 	Err         error
 }
@@ -116,6 +117,7 @@ type PlannerSelection struct {
 	Request      PlannerRequest
 	Candidate    PlannerCandidate
 	Attempt      int
+	Observation  PlannerAttemptObservation
 	FallbackFrom *string
 }
 
@@ -125,10 +127,18 @@ type PlannerFactory func(CLIPlannerOptions) (Planner, error)
 // before a planner candidate is invoked.
 type PlannerAttemptHandle any
 
+// PlannerAttemptObservation is opaque caller-owned state reserved immediately
+// before a planner candidate is invoked and returned to its result callback.
+type PlannerAttemptObservation any
+
 // PlannerAttemptAcquire reserves capacity for one planner invocation. A false
 // acquired result without an error means the candidate is currently full and
 // should be skipped without recording a health failure.
 type PlannerAttemptAcquire func(context.Context, PlannerRequest, PlannerCandidate) (handle PlannerAttemptHandle, acquired bool, err error)
+
+// PlannerAttemptBegin reserves caller-owned causal state after capacity has
+// been acquired and immediately before the planner process is invoked.
+type PlannerAttemptBegin func(context.Context, PlannerRequest, PlannerCandidate) (PlannerAttemptObservation, error)
 
 // PlannerAttemptRelease releases a reservation returned by
 // PlannerAttemptAcquire. It receives a bounded context detached from request
@@ -144,6 +154,7 @@ type FallbackPlannerOptions struct {
 	Factory                  PlannerFactory
 	Available                func(context.Context, PlannerCandidate) (bool, error)
 	AcquireAttempt           PlannerAttemptAcquire
+	BeginAttempt             PlannerAttemptBegin
 	ReleaseAttempt           PlannerAttemptRelease
 	OnFailure                func(context.Context, PlannerAttempt) error
 	OnSelected               func(context.Context, PlannerSelection) error
@@ -238,6 +249,21 @@ func CreateFallbackPlanner(options FallbackPlannerOptions) (Planner, error) {
 					continue
 				}
 			}
+			var observation PlannerAttemptObservation
+			if options.BeginAttempt != nil {
+				var err error
+				observation, err = options.BeginAttempt(ctx, request, configured.candidate)
+				if err != nil {
+					var releaseErr error
+					if options.ReleaseAttempt != nil {
+						releaseErr = releasePlannerAttempt(ctx, handle, options.ReleaseAttempt)
+					}
+					return nil, errors.Join(
+						fmt.Errorf("begin planner candidate %s attempt: %w", configured.candidate.Profile, err),
+						releaseErr,
+					)
+				}
+			}
 			attempt++
 			value, err, releaseErr := invokePlannerAttempt(ctx, request, configured, handle, options.ReleaseAttempt)
 			if releaseErr != nil {
@@ -248,7 +274,9 @@ func CreateFallbackPlanner(options FallbackPlannerOptions) (Planner, error) {
 				return nil, wrapped
 			}
 			if err == nil {
-				selection := PlannerSelection{Request: request, Candidate: configured.candidate, Attempt: attempt}
+				selection := PlannerSelection{
+					Request: request, Candidate: configured.candidate, Attempt: attempt, Observation: observation,
+				}
 				if configured.candidate.Profile != primary {
 					selection.FallbackFrom = stringReference(primary)
 				} else if configured.candidate.FallbackFrom != nil {
@@ -268,7 +296,10 @@ func CreateFallbackPlanner(options FallbackPlannerOptions) (Planner, error) {
 			if !retry || errors.Is(err, context.Canceled) {
 				return nil, err
 			}
-			failure := PlannerAttempt{Request: request, Candidate: configured.candidate, Attempt: attempt, FailureKind: kind, Err: err}
+			failure := PlannerAttempt{
+				Request: request, Candidate: configured.candidate, Attempt: attempt,
+				Observation: observation, FailureKind: kind, Err: err,
+			}
 			if options.OnFailure != nil {
 				if recordErr := options.OnFailure(ctx, failure); recordErr != nil {
 					return nil, errors.Join(err, fmt.Errorf("record planner candidate %s failure: %w", configured.candidate.Profile, recordErr))

@@ -1393,6 +1393,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return failRunDurably(durable, opened, scope, runError, failure)
 	}
+	health := agenthealth.New(manager, opened)
 
 	for {
 		var command RunnerCommand
@@ -1421,6 +1422,24 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		modelName := configured.Model
 		if modelName == "" {
 			modelName = "CLI default (unpinned)"
+		}
+		healthObservation, observationErr := health.Begin(ctx, configured.Profile, profile.GlobalRegistered)
+		if observationErr != nil {
+			durable, cancel := durableContext()
+			countFailure := false
+			persistErr := failRunDurably(durable, opened, scope, "Unable to reserve agent availability observation: "+observationErr.Error(), store.FailRunOptions{
+				Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+				CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
+			})
+			cancel()
+			if persistErr != nil {
+				return fmt.Errorf(
+					"persist agent health observation failure for %s: %w",
+					taskID,
+					errors.Join(observationErr, persistErr),
+				)
+			}
+			return nil
 		}
 		options.log("launch %s via %s/%s profile=%s goal_turn=%d log=%s", taskID, prepared.Task.Task.Runtime, modelName, configured.Profile, turn, logPath)
 		execution := ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit)
@@ -1486,7 +1505,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		executionSucceeded := !execution.TimedOut && execution.SpawnError == nil && execution.Code == 0 && !execution.Canceled
 		if executionSucceeded {
 			lastRunID := prepared.Run.ID
-			record, healthErr := agenthealth.New(manager, opened).RecordWorker(durable, store.SetAgentHealthInput{
+			record, healthErr := health.RecordWorkerObservation(durable, healthObservation, store.SetAgentHealthInput{
 				AgentID: configured.Profile, Status: model.AgentHealthReady, LastRunID: &lastRunID,
 			}, profile.GlobalRegistered)
 			if record.AuditError != nil {
@@ -1549,7 +1568,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		case agentUnavailable:
 			lastRunID, lastError := prepared.Run.ID, detail
 			cooldownUntil := agentCooldown(availability.Status, *options.RateLimitCooldown, *options.AgentRetryCooldown)
-			record, healthErr := agenthealth.New(manager, opened).RecordWorker(durable, store.SetAgentHealthInput{
+			record, healthErr := health.RecordWorkerObservation(durable, healthObservation, store.SetAgentHealthInput{
 				AgentID: configured.Profile, Status: availability.Status, CooldownUntil: cooldownUntil,
 				LastError: &lastError, LastRunID: &lastRunID,
 			}, profile.GlobalRegistered)

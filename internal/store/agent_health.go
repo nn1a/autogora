@@ -22,6 +22,22 @@ type SetAgentHealthInput struct {
 	LastRunID     *string
 }
 
+// AgentHealthObservation identifies one availability check in its causal
+// start order. Call BeginAgentHealthObservation immediately before invoking an
+// agent, then use ApplyAgentHealthObservation when that invocation finishes.
+type AgentHealthObservation struct {
+	AgentID    string
+	Generation int64
+}
+
+// AgentHealthUpdate reports the authoritative state after an observed write.
+// Applied is false when a newer observation already won the compare-and-swap.
+type AgentHealthUpdate struct {
+	Health      model.AgentHealth
+	Observation AgentHealthObservation
+	Applied     bool
+}
+
 const agentHealthColumns = `agent_id, status, cooldown_until, last_error, last_run_id, updated_at`
 
 func scanAgentHealth(row scanner) (model.AgentHealth, error) {
@@ -76,34 +92,165 @@ func normalizeAgentHealthInput(input SetAgentHealthInput) (SetAgentHealthInput, 
 	return input, nil
 }
 
-// SetAgentHealth records the latest observation for an agent. Repeated calls
-// replace the previous observation while preserving the agent identity.
+// SetAgentHealth records an immediate observation atomically. Long-running
+// checks must reserve their causal order with BeginAgentHealthObservation and
+// finish with ApplyAgentHealthObservation instead.
 func (s *Store) SetAgentHealth(ctx context.Context, raw SetAgentHealthInput) (model.AgentHealth, error) {
 	input, err := normalizeAgentHealthInput(raw)
 	if err != nil {
 		return model.AgentHealth{}, err
 	}
-	var value model.AgentHealth
+	var update AgentHealthUpdate
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		timestamp := now()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO agent_health(
-			agent_id, status, cooldown_until, last_error, last_run_id, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(agent_id) DO UPDATE SET
-			status = excluded.status,
-			cooldown_until = excluded.cooldown_until,
-			last_error = excluded.last_error,
-			last_run_id = excluded.last_run_id,
-			updated_at = excluded.updated_at`, input.AgentID, input.Status,
-			nullableString(input.CooldownUntil), nullableString(input.LastError),
-			nullableString(input.LastRunID), timestamp); err != nil {
-			return fmt.Errorf("set agent health: %w", err)
+		observation, err := reserveAgentHealthObservation(ctx, tx, input.AgentID)
+		if err != nil {
+			return err
 		}
-		value, err = scanAgentHealth(tx.QueryRowContext(ctx, "SELECT "+agentHealthColumns+
-			" FROM agent_health WHERE agent_id = ?", input.AgentID))
+		update, err = applyAgentHealthObservation(ctx, tx, observation, input)
 		return err
 	})
-	return value, err
+	return update.Health, err
+}
+
+// BeginAgentHealthObservation reserves the next generation for an availability
+// check without changing the visible health state.
+func (s *Store) BeginAgentHealthObservation(ctx context.Context, agentID string) (AgentHealthObservation, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return AgentHealthObservation{}, errors.New("agent health observation requires an agent ID")
+	}
+	var observation AgentHealthObservation
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		var err error
+		observation, err = reserveAgentHealthObservation(ctx, tx, agentID)
+		return err
+	})
+	return observation, err
+}
+
+// ApplyAgentHealthObservation records an availability result unless a check
+// that started later has already applied its result.
+func (s *Store) ApplyAgentHealthObservation(
+	ctx context.Context,
+	observation AgentHealthObservation,
+	raw SetAgentHealthInput,
+) (AgentHealthUpdate, error) {
+	input, err := normalizeAgentHealthInput(raw)
+	if err != nil {
+		return AgentHealthUpdate{}, err
+	}
+	observation.AgentID = strings.TrimSpace(observation.AgentID)
+	if observation.AgentID == "" {
+		return AgentHealthUpdate{}, errors.New("agent health observation requires an agent ID")
+	}
+	if observation.Generation <= 0 {
+		return AgentHealthUpdate{}, errors.New("agent health observation requires a positive generation")
+	}
+	if observation.AgentID != input.AgentID {
+		return AgentHealthUpdate{}, fmt.Errorf(
+			"agent health observation belongs to %s, not %s",
+			observation.AgentID,
+			input.AgentID,
+		)
+	}
+	var update AgentHealthUpdate
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		var err error
+		update, err = applyAgentHealthObservation(ctx, tx, observation, input)
+		return err
+	})
+	return update, err
+}
+
+func reserveAgentHealthObservation(ctx context.Context, tx *sql.Tx, agentID string) (AgentHealthObservation, error) {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO agent_health_observation_sequences(agent_id, next_generation, applied_generation)
+		VALUES (?, 1, 0)
+		ON CONFLICT(agent_id) DO UPDATE SET
+			next_generation = agent_health_observation_sequences.next_generation + 1
+	`, agentID); err != nil {
+		return AgentHealthObservation{}, fmt.Errorf("reserve agent health observation: %w", err)
+	}
+	var generation int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT next_generation
+		FROM agent_health_observation_sequences
+		WHERE agent_id = ?
+	`, agentID).Scan(&generation); err != nil {
+		return AgentHealthObservation{}, fmt.Errorf("read agent health observation: %w", err)
+	}
+	return AgentHealthObservation{AgentID: agentID, Generation: generation}, nil
+}
+
+func applyAgentHealthObservation(
+	ctx context.Context,
+	tx *sql.Tx,
+	observation AgentHealthObservation,
+	input SetAgentHealthInput,
+) (AgentHealthUpdate, error) {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO agent_health_observation_sequences(agent_id, next_generation, applied_generation)
+		VALUES (?, ?, 0)
+		ON CONFLICT(agent_id) DO UPDATE SET
+			next_generation = MAX(
+				agent_health_observation_sequences.next_generation,
+				excluded.next_generation
+			)
+	`, observation.AgentID, observation.Generation); err != nil {
+		return AgentHealthUpdate{}, fmt.Errorf("register agent health observation: %w", err)
+	}
+	var appliedGeneration int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT applied_generation
+		FROM agent_health_observation_sequences
+		WHERE agent_id = ?
+	`, observation.AgentID).Scan(&appliedGeneration); err != nil {
+		return AgentHealthUpdate{}, fmt.Errorf("read applied agent health observation: %w", err)
+	}
+	if observation.Generation <= appliedGeneration {
+		health, err := scanAgentHealth(tx.QueryRowContext(ctx, "SELECT "+agentHealthColumns+
+			" FROM agent_health WHERE agent_id = ?", input.AgentID))
+		if err != nil {
+			return AgentHealthUpdate{}, fmt.Errorf("read newer agent health observation: %w", err)
+		}
+		return AgentHealthUpdate{Health: health, Observation: observation}, nil
+	}
+
+	timestamp := now()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_health(
+		agent_id, status, cooldown_until, last_error, last_run_id, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(agent_id) DO UPDATE SET
+		status = excluded.status,
+		cooldown_until = excluded.cooldown_until,
+		last_error = excluded.last_error,
+		last_run_id = excluded.last_run_id,
+		updated_at = excluded.updated_at`, input.AgentID, input.Status,
+		nullableString(input.CooldownUntil), nullableString(input.LastError),
+		nullableString(input.LastRunID), timestamp); err != nil {
+		return AgentHealthUpdate{}, fmt.Errorf("set agent health: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE agent_health_observation_sequences
+		SET applied_generation = ?
+		WHERE agent_id = ? AND applied_generation < ?
+	`, observation.Generation, observation.AgentID, observation.Generation)
+	if err != nil {
+		return AgentHealthUpdate{}, fmt.Errorf("apply agent health observation generation: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AgentHealthUpdate{}, fmt.Errorf("inspect agent health observation generation: %w", err)
+	}
+	if affected != 1 {
+		return AgentHealthUpdate{}, errors.New("agent health observation lost its transaction ordering")
+	}
+	health, err := scanAgentHealth(tx.QueryRowContext(ctx, "SELECT "+agentHealthColumns+
+		" FROM agent_health WHERE agent_id = ?", input.AgentID))
+	if err != nil {
+		return AgentHealthUpdate{}, err
+	}
+	return AgentHealthUpdate{Health: health, Observation: observation, Applied: true}, nil
 }
 
 // GetAgentHealth returns a synthesized unknown state when an agent has not
