@@ -145,7 +145,7 @@ or raise the global concurrency cap. A board may also add a board-only route.
 
 ## Set up an agent client
 
-Autogora embeds its worker and coordinator Skills and can register its stdio
+Autogora embeds its worker and orchestrator Skills and can register its stdio
 MCP server through each client's native CLI. Preview both changes, then apply
 them from the project that will own the board:
 
@@ -746,7 +746,7 @@ clarifications as comments, or terminate the run before changing its task spec.
 The portable Agent Skills are under `skills/`:
 
 - `autogora-worker`: execute and close one claimed task
-- `autogora-coordinator`: create and recover an executable dependency graph
+- `autogora-orchestrator`: turn a user goal into an executable dependency graph
 
 Install both embedded Skills into the project (the default) and inspect them:
 

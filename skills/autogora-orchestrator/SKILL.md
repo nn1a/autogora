@@ -1,9 +1,9 @@
 ---
-name: autogora-coordinator
-description: Coordinate a goal through durable Autogora tasks, assignees, runtimes, workspaces, and acyclic dependencies. Use for planning, routing, or recovering multi-step work across Claude, Codex, Cline, and Gemini workers; do not use to implement claimed worker tasks.
+name: autogora-orchestrator
+description: Turn a user goal into durable Autogora tasks, routes, workspaces, and acyclic dependencies. Use for interactive planning and task-graph authoring across Claude, Codex, Cline, and Gemini workers; do not use to implement claimed tasks or replace Autogora's runtime Coordinator.
 ---
 
-# Autogora Coordinator
+# Autogora Orchestrator
 
 Use Autogora MCP to turn a goal into a small dependency graph that workers can execute without hidden context.
 
@@ -23,13 +23,13 @@ Use Autogora MCP to turn a goal into a small dependency graph that workers can e
 
 If an administrative change must replace an active run, call `autogora_run_terminate` first. Do not move, complete, archive, or delete a running task while its worker can still modify the workspace.
 
-Do not claim or implement cards while acting as coordinator. The supervisor and dispatcher own claims and worker launch.
+Do not claim or implement cards while using this orchestration skill. The Supervisor and Dispatcher own claims and worker launch. Autogora's runtime Coordinator is a separate, bounded exception-recovery service; do not imitate it through broad task mutations.
 
 ## Routing guidelines
 
 - Route code modification and repository automation to a worker with a writable workspace.
 - Keep every graph on one board; workers are pinned to that board and cross-board links are invalid.
 - Keep research and review cards read-only when possible.
-- A dependent must be able to continue from prerequisite completion summaries and metadata; never rely on the coordinator's private conversation.
+- A dependent must be able to continue from prerequisite completion summaries and metadata; never rely on the orchestrator's private conversation.
 - Use priority to order otherwise-ready work, not to bypass dependencies.
 - If the requested assignee, runtime, or workspace is unknown, ask for it instead of inventing an unsafe target.

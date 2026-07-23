@@ -1,0 +1,10 @@
+interface:
+  display_name: "Autogora Orchestrator"
+  short_description: "Plan and route work through Autogora MCP"
+  default_prompt: "Use $autogora-orchestrator to turn this goal into assigned Autogora tasks and dependencies."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "autogora"
+      description: "Durable Autogora task-graph authoring tools"
+      transport: "stdio"

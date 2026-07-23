@@ -214,7 +214,7 @@ autogora agents supervisor \
 
 ## 5. Skill 설치와 MCP 등록
 
-Autogora는 `autogora-worker`, `autogora-coordinator` Skill을 내장한다. 별도 패키지 저장소 없이 프로젝트에서 Skill과 MCP를 함께 설정할 수 있다. 적용 전 `--dry-run`으로 변경 내용을 확인한다.
+Autogora는 `autogora-worker`, `autogora-orchestrator` Skill을 내장한다. Orchestrator Skill은 사용자의 목표를 실행 가능한 task graph로 구성하며, 예외 복구만 담당하는 runtime Coordinator와 구분한다. 별도 패키지 저장소 없이 프로젝트에서 Skill과 MCP를 함께 설정할 수 있다. 적용 전 `--dry-run`으로 변경 내용을 확인한다.
 
 ```bash
 cd /path/to/project

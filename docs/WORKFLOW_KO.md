@@ -268,7 +268,7 @@ MCP에서는 `autogora_graph`, `autogora_subtask_set`, `autogora_subtask_remove`
 - 완료 시 열리는 직접 dependent
 - 같은 workflow node의 ID, 제목, 상태, phase 요약
 
-다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. Coordinator나 관리 화면에서 전체 topology를 변경한다. worker는 자신이 claim한 node만 구현한다.
+다른 subtask의 본문, workspace, 첨부파일, 미완료 결과는 전달하지 않는다. 사용자는 Orchestrator Skill이나 관리 화면에서 전체 topology를 변경한다. worker는 자신이 claim한 node만 구현한다.
 
 연결된 graph가 500개 node를 넘어도 worker는 정상적으로 시작한다. `autogora_graph`와 Web UI는 focus task, hierarchy root, 직접 관계를 우선해 최대 500개를 보여준다. `totalConnectedNodes`, `truncated`, `omittedNodeCount`에서 생략 범위를 확인할 수 있다. worker context는 필요한 node 50개의 요약만 사용한다.
 
