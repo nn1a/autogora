@@ -14,6 +14,7 @@ import (
 
 const (
 	MaxCoordinationAttemptErrorBytes = 4 * 1024
+	MaxCoordinationAttemptCalls      = 100
 
 	maxCoordinationAttemptBoardBytes    = 128
 	maxCoordinationAttemptAgentBytes    = 128
@@ -22,6 +23,7 @@ const (
 	maxCoordinationAttemptSourceBytes   = 128
 
 	coordinationAttemptTimestampLayout = "2006-01-02T15:04:05.000000000Z"
+	coordinationLeaseExpiredError      = "coordination lease expired"
 )
 
 type StartCoordinationAttemptInput struct {
@@ -45,6 +47,25 @@ type FinishCoordinationAttemptInput struct {
 	SelectedProvider string
 	SelectedSource   string
 	Error            *string
+}
+
+type ReserveCoordinationAttemptInput struct {
+	ID                    string
+	IncidentID            string
+	Board                 string
+	ExpectedGraphRevision *int64
+	Since                 time.Time
+	Current               time.Time
+	MaxCalls              int
+	TTL                   time.Duration
+}
+
+type ReserveCoordinationAttemptResult struct {
+	Incident        model.CoordinationIncident `json:"incident"`
+	Attempt         model.CoordinationAttempt  `json:"attempt"`
+	Reserved        bool                       `json:"reserved"`
+	BudgetExhausted bool                       `json:"budgetExhausted"`
+	RetryAt         *string                    `json:"retryAt"`
 }
 
 type CoordinationAttemptFilter struct {
@@ -203,6 +224,328 @@ func coordinationAttemptNow() string {
 		return value
 	}
 	return timestamp.Format(coordinationAttemptTimestampLayout)
+}
+
+func normalizeReserveCoordinationAttempt(
+	raw ReserveCoordinationAttemptInput,
+	fallbackBoard string,
+) (ReserveCoordinationAttemptInput, time.Time, string, string, string, error) {
+	start, err := normalizeStartCoordinationAttempt(StartCoordinationAttemptInput{
+		ID: raw.ID, IncidentID: raw.IncidentID, Board: raw.Board,
+	}, fallbackBoard)
+	if err != nil {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", err
+	}
+	raw.ID, raw.IncidentID, raw.Board = start.ID, start.IncidentID, start.Board
+	if raw.ID == "" {
+		raw.ID = newID("ca")
+	}
+	if raw.ExpectedGraphRevision == nil {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt reservation requires an expected graph revision",
+		)
+	}
+	if *raw.ExpectedGraphRevision < 0 {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt graph revision cannot be negative",
+		)
+	}
+	if raw.MaxCalls < 1 || raw.MaxCalls > MaxCoordinationAttemptCalls {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", fmt.Errorf(
+			"coordination attempt max calls must be between 1 and %d",
+			MaxCoordinationAttemptCalls,
+		)
+	}
+	if raw.TTL < MinCoordinationIncidentClaimTTL || raw.TTL > MaxCoordinationIncidentClaimTTL {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", fmt.Errorf(
+			"coordination attempt reservation TTL must be between %s and %s",
+			MinCoordinationIncidentClaimTTL,
+			MaxCoordinationIncidentClaimTTL,
+		)
+	}
+	if raw.Current.IsZero() {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt reservation requires a current time",
+		)
+	}
+	current, currentTimestamp, err := normalizeCoordinationClaimTime(raw.Current)
+	if err != nil {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", err
+	}
+	if raw.Since.IsZero() {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt reservation requires a budget start time",
+		)
+	}
+	since := raw.Since.UTC()
+	if since.Year() < 0 || since.Year() > 9999 {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt budget start time must fit RFC3339",
+		)
+	}
+	if !since.Before(current) {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt budget start time must be before current time",
+		)
+	}
+	expires := current.Add(raw.TTL)
+	if expires.Year() < 0 || expires.Year() > 9999 {
+		return ReserveCoordinationAttemptInput{}, time.Time{}, "", "", "", errors.New(
+			"coordination attempt reservation expiry must fit RFC3339",
+		)
+	}
+	raw.Current = current
+	raw.Since = since
+	return raw, current, currentTimestamp,
+		since.Format(coordinationAttemptTimestampLayout),
+		expires.Format(coordinationIncidentClaimTimestampLayout),
+		nil
+}
+
+func coordinationAttemptBudget(
+	ctx context.Context,
+	q querier,
+	board, since string,
+) (int, *string, error) {
+	var count int
+	var oldest sql.NullString
+	if err := q.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(started_at)
+		FROM coordination_attempts
+		WHERE board = ? AND started_at >= ?
+	`, board, since).Scan(&count, &oldest); err != nil {
+		return 0, nil, err
+	}
+	return count, stringPointer(oldest), nil
+}
+
+func coordinationAttemptRetryAt(
+	oldest *string,
+	window time.Duration,
+) (*string, error) {
+	if oldest == nil {
+		return nil, nil
+	}
+	started, err := time.Parse(time.RFC3339Nano, *oldest)
+	if err != nil {
+		return nil, fmt.Errorf("parse oldest coordination attempt start: %w", err)
+	}
+	// Budget counting is inclusive at Since, so retry one nanosecond after
+	// the oldest call leaves the same rolling window.
+	retryAt := started.UTC().Add(window).Add(time.Nanosecond).
+		Format(coordinationAttemptTimestampLayout)
+	return &retryAt, nil
+}
+
+// ReserveCoordinationAttempt atomically enforces the rolling call budget,
+// acquires an incident lease, expires abandoned attempts, and records the new
+// logical analysis call. A live claim is observed but never stolen.
+func (s *Store) ReserveCoordinationAttempt(
+	ctx context.Context,
+	raw ReserveCoordinationAttemptInput,
+) (ReserveCoordinationAttemptResult, error) {
+	input, current, currentTimestamp, sinceTimestamp, expiresAt, err :=
+		normalizeReserveCoordinationAttempt(raw, s.board)
+	if err != nil {
+		return ReserveCoordinationAttemptResult{}, err
+	}
+
+	var result ReserveCoordinationAttemptResult
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		incident, getErr := scanCoordinationIncident(tx.QueryRowContext(
+			ctx,
+			"SELECT "+incidentColumns+" FROM coordination_incidents WHERE id = ?",
+			input.IncidentID,
+		))
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return fmt.Errorf("coordination incident not found: %s", input.IncidentID)
+		}
+		if getErr != nil {
+			return getErr
+		}
+		if incident.Board != input.Board {
+			return fmt.Errorf(
+				"coordination incident %s belongs to board %s, not %s",
+				incident.ID,
+				incident.Board,
+				input.Board,
+			)
+		}
+		state, stateErr := readBoardGraphState(ctx, tx, incident.Board)
+		if stateErr != nil {
+			return stateErr
+		}
+		expectedRevision := *input.ExpectedGraphRevision
+		if state.Revision != expectedRevision {
+			return &GraphRevisionConflictError{
+				Board: incident.Board, Expected: expectedRevision, Actual: state.Revision,
+			}
+		}
+		result.Incident = incident
+
+		existing, existingErr := scanCoordinationAttempt(tx.QueryRowContext(
+			ctx,
+			"SELECT "+coordinationAttemptColumns+" FROM coordination_attempts WHERE id = ?",
+			input.ID,
+		))
+		hasExisting := existingErr == nil
+		if hasExisting && !sameCoordinationAttemptStart(existing, StartCoordinationAttemptInput{
+			ID: input.ID, IncidentID: input.IncidentID, Board: input.Board,
+		}) {
+			return fmt.Errorf(
+				"coordination attempt id %s is already used for another attempt",
+				input.ID,
+			)
+		}
+		if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+			return existingErr
+		}
+
+		expiredClaim := false
+		switch incident.Status {
+		case model.CoordinationIncidentOpen:
+			if incident.GraphRevision != expectedRevision {
+				return &GraphRevisionConflictError{
+					Board: incident.Board, Expected: expectedRevision, Actual: incident.GraphRevision,
+				}
+			}
+			if incident.ClaimToken != "" || incident.ClaimExpiresAt != nil {
+				return fmt.Errorf("open coordination incident %s has an invalid claim", incident.ID)
+			}
+		case model.CoordinationIncidentCoordinating:
+			if incident.ClaimToken == "" || incident.ClaimExpiresAt == nil {
+				return fmt.Errorf("coordinating incident %s has no claim lease", incident.ID)
+			}
+			var expiryErr error
+			expiredClaim, expiryErr = coordinationIncidentClaimExpired(incident, current)
+			if expiryErr != nil {
+				return expiryErr
+			}
+			if !expiredClaim {
+				if hasExisting && existing.Status == model.CoordinationAttemptStarted &&
+					incident.GraphRevision == expectedRevision {
+					result.Attempt = existing
+					result.Reserved = true
+				}
+				return nil
+			}
+		default:
+			return nil
+		}
+		if hasExisting {
+			return &CoordinationStateConflictError{
+				Kind: "attempt", ID: input.ID,
+				Expected: "unused reservation id", Actual: string(existing.Status),
+			}
+		}
+
+		count, oldest, countErr := coordinationAttemptBudget(
+			ctx,
+			tx,
+			input.Board,
+			sinceTimestamp,
+		)
+		if countErr != nil {
+			return countErr
+		}
+		if count >= input.MaxCalls {
+			retryAt, retryErr := coordinationAttemptRetryAt(
+				oldest,
+				current.Sub(input.Since),
+			)
+			if retryErr != nil {
+				return retryErr
+			}
+			result.BudgetExhausted = true
+			result.RetryAt = retryAt
+			return nil
+		}
+
+		token, tokenErr := claimToken()
+		if tokenErr != nil {
+			return fmt.Errorf("generate coordination incident claim token: %w", tokenErr)
+		}
+		updatedAt := now()
+		var claimResult sql.Result
+		var claimErr error
+		if incident.Status == model.CoordinationIncidentOpen {
+			claimResult, claimErr = tx.ExecContext(ctx, `
+				UPDATE coordination_incidents
+				SET status = 'coordinating', claim_token = ?, claim_expires_at = ?, updated_at = ?
+				WHERE id = ? AND board = ? AND status = 'open' AND graph_revision = ?
+					AND claim_token IS NULL AND claim_expires_at IS NULL
+			`, token, expiresAt, updatedAt, incident.ID, incident.Board, expectedRevision)
+		} else if expiredClaim {
+			claimResult, claimErr = tx.ExecContext(ctx, `
+				UPDATE coordination_incidents
+				SET graph_revision = ?, claim_token = ?, claim_expires_at = ?, updated_at = ?
+				WHERE id = ? AND board = ? AND status = 'coordinating' AND graph_revision = ?
+					AND claim_token = ? AND claim_expires_at = ? AND claim_expires_at <= ?
+			`, expectedRevision, token, expiresAt, updatedAt,
+				incident.ID, incident.Board, incident.GraphRevision,
+				incident.ClaimToken, *incident.ClaimExpiresAt, currentTimestamp)
+		}
+		if claimErr != nil {
+			return claimErr
+		}
+		if claimResult == nil {
+			return fmt.Errorf(
+				"coordination incident %s is not claimable in status %s",
+				incident.ID,
+				incident.Status,
+			)
+		}
+		changed, err := claimResult.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			latest, latestErr := scanCoordinationIncident(tx.QueryRowContext(
+				ctx,
+				"SELECT "+incidentColumns+" FROM coordination_incidents WHERE id = ?",
+				incident.ID,
+			))
+			if latestErr != nil {
+				return latestErr
+			}
+			result.Incident = latest
+			return nil
+		}
+
+		expiredError := coordinationLeaseExpiredError
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE coordination_attempts
+			SET status = 'failed', error = ?, ended_at = ?
+			WHERE incident_id = ? AND board = ? AND status = 'started'
+				AND error IS NULL AND ended_at IS NULL
+		`, expiredError, currentTimestamp, incident.ID, incident.Board); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO coordination_attempts(
+				id, incident_id, board, status,
+				selected_agent, selected_runtime, selected_model, selected_provider, selected_source,
+				error, started_at, ended_at
+			) VALUES (?, ?, ?, 'started', '', '', '', '', '', NULL, ?, NULL)
+		`, input.ID, incident.ID, incident.Board, currentTimestamp); err != nil {
+			return err
+		}
+
+		incident.Status = model.CoordinationIncidentCoordinating
+		incident.GraphRevision = expectedRevision
+		incident.ClaimToken = token
+		incident.ClaimExpiresAt = &expiresAt
+		incident.UpdatedAt = updatedAt
+		attempt := model.CoordinationAttempt{
+			ID: input.ID, IncidentID: incident.ID, Board: incident.Board,
+			Status: model.CoordinationAttemptStarted, StartedAt: currentTimestamp,
+		}
+		result.Incident = incident
+		result.Attempt = attempt
+		result.Reserved = true
+		return nil
+	})
+	return result, err
 }
 
 // StartCoordinationAttempt persists one logical Coordinator analysis call.

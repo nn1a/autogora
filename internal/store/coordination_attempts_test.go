@@ -36,6 +36,443 @@ func createAttemptTestIncident(
 	return incident
 }
 
+func reserveAttemptInput(
+	id string,
+	incident model.CoordinationIncident,
+	revision int64,
+	current time.Time,
+) ReserveCoordinationAttemptInput {
+	return ReserveCoordinationAttemptInput{
+		ID: id, IncidentID: incident.ID, Board: incident.Board,
+		ExpectedGraphRevision: &revision,
+		Since:                 current.Add(-time.Hour), Current: current,
+		MaxCalls: 10, TTL: time.Minute,
+	}
+}
+
+func TestReserveCoordinationAttemptAtomicallyEnforcesBudgetAcrossStores(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/autogora.db"
+	seed, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIncident := createAttemptTestIncident(
+		t,
+		seed,
+		"default",
+		model.CoordinationTriggerGraphStalled,
+	)
+	secondIncident := createAttemptTestIncident(
+		t,
+		seed,
+		"default",
+		model.CoordinationTriggerAgentExhausted,
+	)
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	firstStore, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+
+	current := time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC)
+	firstInput := reserveAttemptInput("reserve-race-first", firstIncident, 0, current)
+	secondInput := reserveAttemptInput("reserve-race-second", secondIncident, 0, current)
+	firstInput.MaxCalls, secondInput.MaxCalls = 1, 1
+	type reservation struct {
+		result ReserveCoordinationAttemptResult
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan reservation, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		value, err := firstStore.ReserveCoordinationAttempt(ctx, firstInput)
+		results <- reservation{result: value, err: err}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		value, err := secondStore.ReserveCoordinationAttempt(ctx, secondInput)
+		results <- reservation{result: value, err: err}
+	}()
+	close(start)
+	workers.Wait()
+	close(results)
+
+	reserved, exhausted := 0, 0
+	var exhaustedIncident string
+	for value := range results {
+		if value.err != nil {
+			t.Fatalf("concurrent reservation: %v", value.err)
+		}
+		if value.result.Reserved {
+			reserved++
+			if value.result.Attempt.Status != model.CoordinationAttemptStarted ||
+				value.result.Incident.ClaimToken == "" {
+				t.Fatalf("invalid winning reservation: %+v", value.result)
+			}
+		}
+		if value.result.BudgetExhausted {
+			exhausted++
+			exhaustedIncident = value.result.Incident.ID
+			if value.result.RetryAt == nil {
+				t.Fatalf("budget result has no retry time: %+v", value.result)
+			}
+		}
+	}
+	if reserved != 1 || exhausted != 1 {
+		t.Fatalf("concurrent budget results: reserved=%d exhausted=%d", reserved, exhausted)
+	}
+	attempts, err := firstStore.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{})
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("budget race persisted attempts = %+v, %v", attempts, err)
+	}
+	notClaimed, err := firstStore.GetCoordinationIncident(ctx, exhaustedIncident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notClaimed.Status != model.CoordinationIncidentOpen ||
+		notClaimed.ClaimToken != "" || notClaimed.ClaimExpiresAt != nil {
+		t.Fatalf("budget loser was claimed: %+v", notClaimed)
+	}
+}
+
+func TestReserveCoordinationAttemptDoesNotStealLiveClaimAndRetriesExactID(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	incident := createAttemptTestIncident(
+		t,
+		opened,
+		"default",
+		model.CoordinationTriggerRetryExhausted,
+	)
+	current := time.Date(2030, time.April, 5, 6, 7, 8, 0, time.UTC)
+	input := reserveAttemptInput("reserve-live-owner", incident, 0, current)
+	first, err := opened.ReserveCoordinationAttempt(ctx, input)
+	if err != nil || !first.Reserved || first.Incident.ClaimToken == "" {
+		t.Fatalf("first reservation = %+v, %v", first, err)
+	}
+
+	otherInput := reserveAttemptInput(
+		"reserve-live-other",
+		incident,
+		0,
+		current.Add(time.Second),
+	)
+	other, err := opened.ReserveCoordinationAttempt(ctx, otherInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Reserved || other.BudgetExhausted ||
+		other.Incident.ClaimToken != first.Incident.ClaimToken ||
+		other.Attempt.ID != "" {
+		t.Fatalf("live claim was stolen or charged: %+v", other)
+	}
+	attempts, err := opened.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{})
+	if err != nil || len(attempts) != 1 ||
+		attempts[0].ID != first.Attempt.ID ||
+		attempts[0].Status != model.CoordinationAttemptStarted {
+		t.Fatalf("attempts after live contention = %+v, %v", attempts, err)
+	}
+
+	retryInput := input
+	retryInput.Current = current.Add(2 * time.Second)
+	retryInput.Since = retryInput.Current.Add(-time.Hour)
+	retried, err := opened.ReserveCoordinationAttempt(ctx, retryInput)
+	if err != nil || !retried.Reserved ||
+		retried.Attempt.ID != first.Attempt.ID ||
+		retried.Incident.ClaimToken != first.Incident.ClaimToken {
+		t.Fatalf("exact reservation retry = %+v, %v", retried, err)
+	}
+}
+
+func TestReserveCoordinationAttemptRejectsStaleOpenGraph(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	focus, err := opened.CreateTask(ctx, CreateTaskInput{Title: "focus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, _, err := opened.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
+		TaskID: &focus.Task.ID, Trigger: model.CoordinationTriggerRepeatedBlock,
+		Summary: "Task remains blocked", ExpectedGraphRevision: revisionPointer(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prerequisite, err := opened.CreateTask(ctx, CreateTaskInput{Title: "new prerequisite"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, prerequisite.Task.ID, focus.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	current := time.Date(2030, time.May, 6, 7, 8, 9, 0, time.UTC)
+
+	staleBoard := reserveAttemptInput("reserve-stale-board", incident, 0, current)
+	if _, err := opened.ReserveCoordinationAttempt(ctx, staleBoard); !errors.Is(
+		err,
+		ErrGraphRevisionConflict,
+	) {
+		t.Fatalf("stale board revision error = %v", err)
+	}
+	staleIncident := reserveAttemptInput("reserve-stale-incident", incident, 1, current)
+	if _, err := opened.ReserveCoordinationAttempt(ctx, staleIncident); !errors.Is(
+		err,
+		ErrGraphRevisionConflict,
+	) {
+		t.Fatalf("stale open incident revision error = %v", err)
+	}
+	refreshed, created, err := opened.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
+		TaskID: &focus.Task.ID, Trigger: model.CoordinationTriggerRepeatedBlock,
+		Summary: "Task is still blocked", ExpectedGraphRevision: revisionPointer(1),
+	})
+	if err != nil || created || refreshed.GraphRevision != 1 {
+		t.Fatalf("refresh incident: created=%v value=%+v err=%v", created, refreshed, err)
+	}
+	reserved, err := opened.ReserveCoordinationAttempt(
+		ctx,
+		reserveAttemptInput("reserve-current-graph", refreshed, 1, current),
+	)
+	if err != nil || !reserved.Reserved ||
+		reserved.Incident.GraphRevision != 1 ||
+		reserved.Attempt.Status != model.CoordinationAttemptStarted {
+		t.Fatalf("current graph reservation = %+v, %v", reserved, err)
+	}
+}
+
+func TestReserveCoordinationAttemptRebasesExpiredClaimAndCleansPriorAttempt(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	focus, err := opened.CreateTask(ctx, CreateTaskInput{Title: "focus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, _, err := opened.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
+		TaskID: &focus.Task.ID, Trigger: model.CoordinationTriggerGraphStalled,
+		Summary: "Graph is stalled", ExpectedGraphRevision: revisionPointer(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := time.Date(2030, time.June, 7, 8, 9, 10, 0, time.UTC)
+	firstInput := reserveAttemptInput("reserve-before-expiry", incident, 0, current)
+	firstInput.TTL = MinCoordinationIncidentClaimTTL
+	first, err := opened.ReserveCoordinationAttempt(ctx, firstInput)
+	if err != nil || !first.Reserved {
+		t.Fatalf("first reservation = %+v, %v", first, err)
+	}
+	prerequisite, err := opened.CreateTask(ctx, CreateTaskInput{Title: "new prerequisite"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, prerequisite.Task.ID, focus.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	liveInput := reserveAttemptInput(
+		"reserve-before-lease-boundary",
+		incident,
+		1,
+		current.Add(MinCoordinationIncidentClaimTTL-time.Nanosecond),
+	)
+	liveInput.TTL = MinCoordinationIncidentClaimTTL
+	live, err := opened.ReserveCoordinationAttempt(ctx, liveInput)
+	if err != nil || live.Reserved ||
+		live.Incident.ClaimToken != first.Incident.ClaimToken ||
+		live.Incident.GraphRevision != 0 {
+		t.Fatalf("live stale reservation was rewritten: %+v, %v", live, err)
+	}
+
+	reclaimTime := current.Add(MinCoordinationIncidentClaimTTL)
+	reclaimInput := reserveAttemptInput(
+		"reserve-after-expiry",
+		incident,
+		1,
+		reclaimTime,
+	)
+	reclaimInput.TTL = MinCoordinationIncidentClaimTTL
+	reclaimed, err := opened.ReserveCoordinationAttempt(ctx, reclaimInput)
+	if err != nil || !reclaimed.Reserved ||
+		reclaimed.Incident.ClaimToken == first.Incident.ClaimToken ||
+		reclaimed.Incident.GraphRevision != 1 {
+		t.Fatalf("expired reservation was not rebased: %+v, %v", reclaimed, err)
+	}
+	attempts, err := opened.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{
+		IncidentID: incident.ID,
+	})
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("reclaimed attempts = %+v, %v", attempts, err)
+	}
+	var expired, active *model.CoordinationAttempt
+	for index := range attempts {
+		switch attempts[index].ID {
+		case first.Attempt.ID:
+			expired = &attempts[index]
+		case reclaimed.Attempt.ID:
+			active = &attempts[index]
+		}
+	}
+	if expired == nil || expired.Status != model.CoordinationAttemptFailed ||
+		expired.Error == nil || *expired.Error != coordinationLeaseExpiredError ||
+		expired.EndedAt == nil {
+		t.Fatalf("prior attempt was not failed cleanly: %+v", expired)
+	}
+	if active == nil || active.Status != model.CoordinationAttemptStarted ||
+		active.EndedAt != nil || active.Error != nil {
+		t.Fatalf("new attempt is not active: %+v", active)
+	}
+	expectedEnd := reclaimTime.UTC().Format(coordinationAttemptTimestampLayout)
+	if *expired.EndedAt != expectedEnd {
+		t.Fatalf("expired attempt endedAt = %q, want %q", *expired.EndedAt, expectedEnd)
+	}
+}
+
+func TestReserveCoordinationAttemptBudgetCountsStartedAndFailed(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	audited := createAttemptTestIncident(
+		t,
+		opened,
+		"default",
+		model.CoordinationTriggerRetryExhausted,
+	)
+	failed, _, err := opened.StartCoordinationAttempt(ctx, StartCoordinationAttemptInput{
+		ID: "budget-failed", IncidentID: audited.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := "analysis failed"
+	if _, err := opened.FinishCoordinationAttempt(ctx, failed.ID, FinishCoordinationAttemptInput{
+		Status: model.CoordinationAttemptFailed, Error: &message,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := opened.StartCoordinationAttempt(ctx, StartCoordinationAttemptInput{
+		ID: "budget-started", IncidentID: audited.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waiting := createAttemptTestIncident(
+		t,
+		opened,
+		"default",
+		model.CoordinationTriggerAgentExhausted,
+	)
+	current := time.Now().UTC().Add(time.Minute)
+	input := reserveAttemptInput("budget-rejected", waiting, 0, current)
+	input.MaxCalls = 2
+	exhausted, err := opened.ReserveCoordinationAttempt(ctx, input)
+	if err != nil || exhausted.Reserved || !exhausted.BudgetExhausted ||
+		exhausted.RetryAt == nil {
+		t.Fatalf("budget reservation = %+v, %v", exhausted, err)
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, *exhausted.RetryAt)
+	if err != nil || !retryAt.After(current) {
+		t.Fatalf("budget retryAt = %v, %v; current=%v", retryAt, err, current)
+	}
+	attempts, err := opened.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{})
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("budget failure persisted another call: %+v, %v", attempts, err)
+	}
+	stillOpen, err := opened.GetCoordinationIncident(ctx, waiting.ID)
+	if err != nil || stillOpen.Status != model.CoordinationIncidentOpen {
+		t.Fatalf("budget failure claimed incident: %+v, %v", stillOpen, err)
+	}
+}
+
+func TestReserveCoordinationAttemptValidatesPolicyInputs(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	incident := createAttemptTestIncident(
+		t,
+		opened,
+		"default",
+		model.CoordinationTriggerGraphStalled,
+	)
+	current := time.Now().UTC()
+	valid := reserveAttemptInput("reserve-validation", incident, 0, current)
+	tests := []struct {
+		name   string
+		mutate func(*ReserveCoordinationAttemptInput)
+	}{
+		{name: "missing graph", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.ExpectedGraphRevision = nil
+		}},
+		{name: "negative graph", mutate: func(value *ReserveCoordinationAttemptInput) {
+			revision := int64(-1)
+			value.ExpectedGraphRevision = &revision
+		}},
+		{name: "zero max calls", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.MaxCalls = 0
+		}},
+		{name: "oversized max calls", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.MaxCalls = MaxCoordinationAttemptCalls + 1
+		}},
+		{name: "short ttl", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.TTL = MinCoordinationIncidentClaimTTL - time.Nanosecond
+		}},
+		{name: "long ttl", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.TTL = MaxCoordinationIncidentClaimTTL + time.Nanosecond
+		}},
+		{name: "zero current", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.Current = time.Time{}
+		}},
+		{name: "zero since", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.Since = time.Time{}
+		}},
+		{name: "future since", mutate: func(value *ReserveCoordinationAttemptInput) {
+			value.Since = value.Current.Add(time.Nanosecond)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := valid
+			test.mutate(&input)
+			if _, err := opened.ReserveCoordinationAttempt(ctx, input); err == nil {
+				t.Fatal("invalid reservation succeeded")
+			}
+		})
+	}
+	attempts, err := opened.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{})
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("invalid inputs persisted attempts: %+v, %v", attempts, err)
+	}
+}
+
 func TestCoordinationAttemptsCountFailuresAndPersistSelection(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/autogora.db"
