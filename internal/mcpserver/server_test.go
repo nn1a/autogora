@@ -3,13 +3,18 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func connectTestServer(t *testing.T, server *mcp.Server) (*mcp.ClientSession, <-chan error) {
@@ -222,6 +227,167 @@ func TestMCPExplicitSpecificationAndDecomposition(t *testing.T) {
 	toolJSON(t, session, "autogora_decompose", map[string]any{"task_id": root.Task.ID, "default_profile": map[string]any{"name": "worker", "runtime": "codex"}, "plan": plan}, &decomposed)
 	if !decomposed.Fanout || len(decomposed.Graph.ChildIDs) != 1 {
 		t.Fatalf("unexpected decomposition: %+v", decomposed)
+	}
+}
+
+func TestResolvePlannerSettingsUsesBoardDefaultsAndRequestOverrides(t *testing.T) {
+	metadata := boards.Metadata{Orchestration: boards.OrchestrationSettings{
+		PlannerRuntime:  model.RuntimeCline,
+		PlannerModel:    "board-model",
+		PlannerProvider: "board-provider",
+	}}
+	tests := []struct {
+		name         string
+		runtime      model.Runtime
+		modelName    string
+		provider     string
+		wantRuntime  model.Runtime
+		wantModel    string
+		wantProvider string
+	}{
+		{name: "board defaults", wantRuntime: model.RuntimeCline, wantModel: "board-model", wantProvider: "board-provider"},
+		{name: "request model", modelName: "request-model", wantRuntime: model.RuntimeCline, wantModel: "request-model", wantProvider: "board-provider"},
+		{name: "request provider", provider: "request-provider", wantRuntime: model.RuntimeCline, wantModel: "board-model", wantProvider: "request-provider"},
+		{name: "request runtime does not inherit board model", runtime: model.RuntimeClaude, wantRuntime: model.RuntimeClaude},
+		{name: "complete request", runtime: model.RuntimeGemini, modelName: "request-model", provider: "request-provider", wantRuntime: model.RuntimeGemini, wantModel: "request-model", wantProvider: "request-provider"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, modelName, provider := resolvePlannerSettings(metadata, test.runtime, test.modelName, test.provider)
+			if runtime != test.wantRuntime || modelName != test.wantModel || provider != test.wantProvider {
+				t.Fatalf("planner settings = %s/%q/%q, want %s/%q/%q", runtime, modelName, provider, test.wantRuntime, test.wantModel, test.wantProvider)
+			}
+		})
+	}
+}
+
+func TestMCPPlanningToolsUseBoardPlannerSettings(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	manager, err := boards.NewManager(filepath.Join(directory, "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(ctx, "default", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	plannerRuntime := model.RuntimeCline
+	plannerModel, plannerProvider := "board-model", "board-provider"
+	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
+		PlannerRuntime: &plannerRuntime, PlannerModel: &plannerModel, PlannerProvider: &plannerProvider,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(directory, "planner-args")
+	binaryPath := filepath.Join(directory, "planner-cline")
+	script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\nprintf '%s\\n' '{\"type\":\"run_result\",\"text\":\"{\\\"title\\\":\\\"Planner title\\\",\\\"body\\\":\\\"Planner body\\\"}\"}'\n"
+	if err := os.WriteFile(binaryPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server, service := New(manager, "test")
+	service.getenv = func(name string) string {
+		if name == "AUTOGORA_CLINE_BIN" {
+			return binaryPath
+		}
+		return ""
+	}
+	session, done := connectTestServer(t, server)
+	defer closeTestServer(t, session, done)
+	var rough struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "autogora_create", map[string]any{"title": "rough", "status": "triage"}, &rough)
+	var specified struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "autogora_specify", map[string]any{"task_id": rough.Task.ID}, &specified)
+	if specified.Task.Title != "Planner title" || specified.Task.Body != "Planner body" {
+		t.Fatalf("unexpected planner specification: %+v", specified.Task)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := "\n" + string(args) + "\n"
+	if !strings.Contains(arguments, "\n--model\nboard-model\n") || !strings.Contains(arguments, "\n--provider\nboard-provider\n") {
+		t.Fatalf("board planner settings were not passed to Cline:\n%s", args)
+	}
+
+	decompositionScript := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsPath) + "\nprintf '%s\\n' '{\"type\":\"run_result\",\"text\":\"{\\\"fanout\\\":false,\\\"rootTitle\\\":\\\"Planned root\\\",\\\"rootBody\\\":\\\"Planned acceptance\\\",\\\"reason\\\":\\\"single task\\\",\\\"tasks\\\":[],\\\"dependencies\\\":[] }\"}'\n"
+	if err := os.WriteFile(binaryPath, []byte(decompositionScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var roughGraph struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "autogora_create", map[string]any{"title": "rough graph", "status": "triage"}, &roughGraph)
+	var decomposed orchestration.DecompositionResult
+	toolJSON(t, session, "autogora_decompose", map[string]any{"task_id": roughGraph.Task.ID}, &decomposed)
+	if decomposed.Fanout || decomposed.Task.Task.Title != "Planned root" || decomposed.Task.Task.Assignee == nil || *decomposed.Task.Task.Assignee != "cline-worker" {
+		t.Fatalf("unexpected planner decomposition: %+v", decomposed)
+	}
+	args, err = os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments = "\n" + string(args) + "\n"
+	if !strings.Contains(arguments, "\n--model\nboard-model\n") || !strings.Contains(arguments, "\n--provider\nboard-provider\n") {
+		t.Fatalf("board planner settings were not passed to Cline decomposition:\n%s", args)
+	}
+}
+
+func TestMCPDecomposeFallsBackFromUnavailableBoardProfiles(t *testing.T) {
+	for _, configuredDefault := range []string{"disabled", "missing"} {
+		t.Run(configuredDefault, func(t *testing.T) {
+			ctx := context.Background()
+			manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Create(ctx, "default", boards.Update{}); err != nil {
+				t.Fatal(err)
+			}
+			profiles := []boards.Profile{
+				{Name: "disabled", Runtime: model.RuntimeCodex, Disabled: true, Priority: 100},
+				{Name: "worker", Runtime: model.RuntimeClaude, Priority: 10},
+			}
+			orchestrator := configuredDefault
+			if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
+				DefaultProfile:      store.OptionalString{Set: true, Value: &configuredDefault},
+				OrchestratorProfile: store.OptionalString{Set: true, Value: &orchestrator}, Profiles: &profiles,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			server, _ := New(manager, "test")
+			session, done := connectTestServer(t, server)
+			defer closeTestServer(t, session, done)
+			var root struct {
+				Task model.Task `json:"task"`
+			}
+			toolJSON(t, session, "autogora_create", map[string]any{"title": "rough graph", "status": "triage"}, &root)
+			plan := map[string]any{
+				"fanout": true, "rootTitle": "Coordinate", "rootBody": "Verify output", "reason": "parallel",
+				"tasks":        []any{map[string]any{"key": "child", "title": "Implement", "body": "Deliver", "assignee": "disabled", "runtime": "codex", "priority": 1, "skills": []any{}}},
+				"dependencies": []any{},
+			}
+			var decomposed orchestration.DecompositionResult
+			toolJSON(t, session, "autogora_decompose", map[string]any{"task_id": root.Task.ID, "plan": plan}, &decomposed)
+			if decomposed.Graph == nil || len(decomposed.Graph.ChildIDs) != 1 || decomposed.Task.Task.Assignee == nil || *decomposed.Task.Task.Assignee != "worker" {
+				t.Fatalf("board profile fallback was not selected: %+v", decomposed)
+			}
+			opened, err := manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			child, err := opened.GetTask(ctx, decomposed.Graph.ChildIDs[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if child.Task.Assignee == nil || *child.Task.Assignee != "worker" || child.Task.Runtime != model.RuntimeClaude {
+				t.Fatalf("disabled route was used for child: %+v", child.Task)
+			}
+		})
 	}
 }
 

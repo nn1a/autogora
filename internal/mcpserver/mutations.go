@@ -75,7 +75,7 @@ type decomposeInput struct {
 	Board               string                           `json:"board,omitempty"`
 	TaskID              string                           `json:"task_id"`
 	Profiles            []orchestration.ProfileRoute     `json:"profiles,omitempty"`
-	DefaultProfile      orchestration.ProfileRoute       `json:"default_profile"`
+	DefaultProfile      *orchestration.ProfileRoute      `json:"default_profile,omitempty"`
 	OrchestratorProfile *orchestration.ProfileRoute      `json:"orchestrator_profile,omitempty"`
 	AutoPromoteChildren *bool                            `json:"auto_promote_children,omitempty"`
 	Plan                *orchestration.DecompositionPlan `json:"plan,omitempty"`
@@ -277,6 +277,44 @@ func validPlannerRuntime(runtime model.Runtime) bool {
 	return runtime == model.RuntimeClaude || runtime == model.RuntimeCodex || runtime == model.RuntimeCline || runtime == model.RuntimeGemini
 }
 
+func resolvePlannerSettings(metadata boards.Metadata, runtime model.Runtime, modelName, provider string) (model.Runtime, string, string) {
+	explicitRuntime := strings.TrimSpace(string(runtime)) != ""
+	if !explicitRuntime {
+		runtime = metadata.Orchestration.PlannerRuntime
+	}
+	modelName, provider = strings.TrimSpace(modelName), strings.TrimSpace(provider)
+	if !explicitRuntime {
+		if modelName == "" {
+			modelName = metadata.Orchestration.PlannerModel
+		}
+		if provider == "" {
+			provider = metadata.Orchestration.PlannerProvider
+		}
+	}
+	return runtime, modelName, provider
+}
+
+func boardProfileRoutes(profiles []boards.Profile) []orchestration.ProfileRoute {
+	routes := make([]orchestration.ProfileRoute, 0, len(profiles))
+	for _, profile := range profiles {
+		routes = append(routes, orchestration.ProfileRoute{
+			Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider,
+			Description: profile.Description, Disabled: profile.Disabled, MaxConcurrent: profile.MaxConcurrent,
+			Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...),
+		})
+	}
+	return routes
+}
+
+func decompositionProfiles(ctx context.Context, opened *store.Store, metadata boards.Metadata, requested []orchestration.ProfileRoute) ([]orchestration.ProfileRoute, error) {
+	tasks, err := opened.ListTasks(ctx, store.ListTaskFilter{IncludeArchived: true, Limit: 500})
+	if err != nil {
+		return nil, err
+	}
+	configured := append(boardProfileRoutes(metadata.Orchestration.Profiles), requested...)
+	return orchestration.ResolveProfileRoutes(tasks, configured), nil
+}
+
 func (s *Service) planner(runtime model.Runtime, modelName, provider string, timeoutMS int) (orchestration.Planner, error) {
 	if runtime == "" {
 		runtime = model.RuntimeCodex
@@ -403,14 +441,19 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		var planner orchestration.Planner
 		if input.Title != nil {
 			explicit = &orchestration.SpecificationPlan{Title: *input.Title, Body: *input.Body}
-		} else {
-			var err error
-			planner, err = s.planner(input.PlannerRuntime, input.PlannerModel, input.PlannerProvider, input.PlannerTimeoutMS)
-			if err != nil {
-				return nil, err
-			}
 		}
-		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) {
+			if explicit == nil {
+				metadata, err := s.manager.Read(board)
+				if err != nil {
+					return nil, err
+				}
+				runtime, modelName, provider := resolvePlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
+				planner, err = s.planner(runtime, modelName, provider, input.PlannerTimeoutMS)
+				if err != nil {
+					return nil, err
+				}
+			}
 			return orchestration.SpecifyTriageTask(ctx, opened, input.TaskID, planner, explicit, input.Author)
 		})
 	})
@@ -418,29 +461,48 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		if err := s.requireAdmin(); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(input.DefaultProfile.Name) == "" || !validPlannerRuntime(input.DefaultProfile.Runtime) {
-			return nil, errors.New("default_profile requires a name and worker runtime")
-		}
-		var planner orchestration.Planner
-		if input.Plan == nil {
-			var err error
-			planner, err = s.planner(input.PlannerRuntime, input.PlannerModel, input.PlannerProvider, input.PlannerTimeoutMS)
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) {
+			metadata, err := s.manager.Read(board)
 			if err != nil {
 				return nil, err
 			}
-		}
-		return usingStore(ctx, s, input.Board, func(opened *store.Store, board string) (any, error) {
-			autoPromote := input.AutoPromoteChildren
-			if autoPromote == nil {
-				metadata, err := s.manager.Read(board)
+			plannerRuntime, plannerModel, plannerProvider := resolvePlannerSettings(metadata, input.PlannerRuntime, input.PlannerModel, input.PlannerProvider)
+			var planner orchestration.Planner
+			if input.Plan == nil {
+				planner, err = s.planner(plannerRuntime, plannerModel, plannerProvider, input.PlannerTimeoutMS)
 				if err != nil {
 					return nil, err
 				}
+			}
+			profiles, err := decompositionProfiles(ctx, opened, metadata, input.Profiles)
+			if err != nil {
+				return nil, err
+			}
+			defaultProfile, orchestratorProfile := orchestration.SelectProfileRoutes(
+				profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile, plannerRuntime,
+			)
+			if input.DefaultProfile != nil {
+				if !orchestration.RunnableProfileRoute(*input.DefaultProfile) {
+					return nil, errors.New("default_profile requires an enabled worker profile")
+				}
+				defaultProfile = *input.DefaultProfile
+				if input.OrchestratorProfile == nil {
+					orchestratorProfile = defaultProfile
+				}
+			}
+			if input.OrchestratorProfile != nil {
+				if !orchestration.RunnableProfileRoute(*input.OrchestratorProfile) {
+					return nil, errors.New("orchestrator_profile requires an enabled worker profile")
+				}
+				orchestratorProfile = *input.OrchestratorProfile
+			}
+			autoPromote := input.AutoPromoteChildren
+			if autoPromote == nil {
 				value := metadata.Orchestration.AutoPromoteChildren
 				autoPromote = &value
 			}
 			return orchestration.DecomposeTriageTask(ctx, opened, input.TaskID, orchestration.DecomposeOptions{
-				Profiles: input.Profiles, DefaultProfile: input.DefaultProfile, OrchestratorProfile: input.OrchestratorProfile,
+				Profiles: profiles, DefaultProfile: defaultProfile, OrchestratorProfile: &orchestratorProfile,
 				AutoPromoteChildren: autoPromote, Planner: planner, Plan: input.Plan,
 			})
 		})
