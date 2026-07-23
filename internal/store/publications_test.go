@@ -253,6 +253,104 @@ func TestPublicationApprovalAndSupersedeUseUpdatedAtCAS(t *testing.T) {
 	}
 }
 
+func TestPublicationExplicitRetryAndManualCompletion(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	baseTime := time.Date(2026, 7, 24, 6, 0, 0, 0, time.UTC)
+
+	_, retrySource := createPublicationSource(
+		t, opened, "explicit_retry", model.WorkflowRoleFinalizer,
+		model.TaskStatusDone, model.RunStatusCompleted, "ready",
+	)
+	retryPublication, _, err := opened.EnsurePublication(
+		ctx, publicationPolicyInput(retrySource.ID, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, claimed, err := opened.ClaimPublication(
+		ctx, retryPublication.ID, ClaimPublicationInput{
+			ExpectedUpdatedAt: retryPublication.UpdatedAt,
+			TTL:               time.Minute,
+			Current:           baseTime,
+		},
+	)
+	if err != nil || !claimed {
+		t.Fatalf("claim retry publication: claimed=%v err=%v", claimed, err)
+	}
+	failed, err := opened.FailPublication(ctx, retryPublication.ID, FailPublicationInput{
+		ExpectedUpdatedAt: claim.UpdatedAt, ClaimToken: claim.ClaimToken,
+		Current: baseTime.Add(time.Second), Error: "review the remote before retrying",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, err := opened.RetryPublication(ctx, failed.ID, RetryPublicationInput{
+		ExpectedUpdatedAt: failed.UpdatedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != model.PublicationPending || retried.Error != nil {
+		t.Fatalf("retried publication = %+v", retried)
+	}
+	if _, err := opened.RetryPublication(ctx, failed.ID, RetryPublicationInput{
+		ExpectedUpdatedAt: failed.UpdatedAt,
+	}); !errors.Is(err, ErrPublicationUpdateConflict) {
+		t.Fatalf("stale retry error = %v", err)
+	}
+
+	_, manualSource := createPublicationSource(
+		t, opened, "manual_complete", model.WorkflowRoleFinalizer,
+		model.TaskStatusDone, model.RunStatusCompleted, "ready",
+	)
+	manualInput := publicationPolicyInput(manualSource.ID, true)
+	manualInput.Mode = model.PublicationModeManual
+	manual, _, err := opened.EnsurePublication(ctx, manualInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.CompleteManualPublication(
+		ctx, manual.ID, CompleteManualPublicationInput{
+			ExpectedUpdatedAt: manual.UpdatedAt,
+		},
+	); !errors.Is(err, ErrPublicationStateConflict) {
+		t.Fatalf("unapproved manual completion error = %v", err)
+	}
+	manual, err = opened.ApprovePublication(ctx, manual.ID, ApprovePublicationInput{
+		ExpectedUpdatedAt: manual.UpdatedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "https://example.test/manual-release"
+	manual, err = opened.CompleteManualPublication(
+		ctx, manual.ID, CompleteManualPublicationInput{
+			ExpectedUpdatedAt: manual.UpdatedAt, URL: &url,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manual.Status != model.PublicationPublished ||
+		manual.URL == nil || *manual.URL != url ||
+		manual.PublishedAt == nil {
+		t.Fatalf("manual publication = %+v", manual)
+	}
+
+	if _, err := opened.CompleteManualPublication(
+		ctx, retried.ID, CompleteManualPublicationInput{
+			ExpectedUpdatedAt: retried.UpdatedAt,
+		},
+	); err == nil || !strings.Contains(err.Error(), "requires manual publication mode") {
+		t.Fatalf("automated publication manual completion error = %v", err)
+	}
+}
+
 func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 	ctx := context.Background()
 	opened, err := Open(":memory:", "default", "")

@@ -92,6 +92,15 @@ type ApprovePublicationInput struct {
 	ExpectedUpdatedAt string
 }
 
+type RetryPublicationInput struct {
+	ExpectedUpdatedAt string
+}
+
+type CompleteManualPublicationInput struct {
+	ExpectedUpdatedAt string
+	URL               *string
+}
+
 type SupersedePublicationInput struct {
 	ExpectedUpdatedAt string
 	Reason            string
@@ -618,6 +627,136 @@ func (s *Store) ApprovePublication(
 		}
 		current.Status = model.PublicationPending
 		current.ApprovedAt = &timestamp
+		current.UpdatedAt = timestamp
+		value = publicPublication(current)
+		return nil
+	})
+	return value, err
+}
+
+// RetryPublication explicitly returns one failed publication to the pending
+// lane. The Publisher never retries Failed records on its own, so an operator
+// must acknowledge the previous error through this CAS-protected transition.
+func (s *Store) RetryPublication(
+	ctx context.Context,
+	id string,
+	input RetryPublicationInput,
+) (model.Publication, error) {
+	board, err := normalizePublicationBoard("", s.board)
+	if err != nil {
+		return model.Publication{}, err
+	}
+	var value model.Publication
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		current, err := publicationForBoard(ctx, tx, id, board)
+		if err != nil {
+			return err
+		}
+		if err := requirePublicationVersion(current, input.ExpectedUpdatedAt); err != nil {
+			return err
+		}
+		if err := requirePublicationState(current, model.PublicationFailed); err != nil {
+			return err
+		}
+		timestamp := now()
+		update, err := tx.ExecContext(ctx, `
+			UPDATE publications
+			SET status = 'pending', error = NULL, updated_at = ?
+			WHERE id = ? AND board = ? AND status = 'failed' AND updated_at = ?
+				AND claim_token IS NULL AND claim_expires_at IS NULL
+		`, timestamp, current.ID, board, current.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		changed, err := update.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return &PublicationUpdateConflictError{
+				ID: current.ID, Expected: current.UpdatedAt, Actual: "unknown",
+			}
+		}
+		if err := appendEvent(ctx, tx, current.TaskID, "publication_retry_requested",
+			map[string]any{"publicationId": current.ID}, &current.RunID); err != nil {
+			return err
+		}
+		current.Status = model.PublicationPending
+		current.Error = nil
+		current.UpdatedAt = timestamp
+		value = publicPublication(current)
+		return nil
+	})
+	return value, err
+}
+
+// CompleteManualPublication records a human-controlled publication without
+// granting a host-side Git lease. Automated modes must complete through
+// ClaimPublication and CompletePublication instead.
+func (s *Store) CompleteManualPublication(
+	ctx context.Context,
+	id string,
+	input CompleteManualPublicationInput,
+) (model.Publication, error) {
+	board, err := normalizePublicationBoard("", s.board)
+	if err != nil {
+		return model.Publication{}, err
+	}
+	rawURL, err := normalizePublicationURL(input.URL)
+	if err != nil {
+		return model.Publication{}, err
+	}
+	var value model.Publication
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		current, err := publicationForBoard(ctx, tx, id, board)
+		if err != nil {
+			return err
+		}
+		if err := requirePublicationVersion(current, input.ExpectedUpdatedAt); err != nil {
+			return err
+		}
+		if current.Mode != model.PublicationModeManual {
+			return fmt.Errorf(
+				"manual completion requires manual publication mode, got %s",
+				current.Mode,
+			)
+		}
+		if err := requirePublicationState(current, model.PublicationPending); err != nil {
+			return err
+		}
+		if current.RequireApproval && current.ApprovedAt == nil {
+			return errors.New("manual publication requires approval before completion")
+		}
+		timestamp := now()
+		update, err := tx.ExecContext(ctx, `
+			UPDATE publications
+			SET status = 'published', url = ?, error = NULL, published_at = ?,
+				updated_at = ?
+			WHERE id = ? AND board = ? AND mode = 'manual' AND status = 'pending'
+				AND updated_at = ? AND claim_token IS NULL AND claim_expires_at IS NULL
+		`, nullableString(rawURL), timestamp, timestamp, current.ID, board,
+			current.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		changed, err := update.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return &PublicationUpdateConflictError{
+				ID: current.ID, Expected: current.UpdatedAt, Actual: "unknown",
+			}
+		}
+		if err := appendEvent(ctx, tx, current.TaskID, "publication_completed", map[string]any{
+			"publicationId": current.ID, "mode": current.Mode, "url": rawURL,
+		}, &current.RunID); err != nil {
+			return err
+		}
+		current.Status = model.PublicationPublished
+		current.URL = rawURL
+		current.Error = nil
+		current.PublishedAt = &timestamp
 		current.UpdatedAt = timestamp
 		value = publicPublication(current)
 		return nil
