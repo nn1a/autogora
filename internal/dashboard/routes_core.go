@@ -66,6 +66,12 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	switch segments[1] {
 	case "board":
 		return s.handleBoardSnapshot(response, request, board)
+	case "graph":
+		if len(segments) != 2 {
+			sendJSON(response, http.StatusNotFound, map[string]any{"error": "Not found"})
+			return nil
+		}
+		return s.handleBoardGraph(response, request, board)
 	case "tasks":
 		return s.handleTasks(response, request, segments, board)
 	case "links":
@@ -250,6 +256,21 @@ func (s *Server) handleBoardSnapshot(response http.ResponseWriter, request *http
 		}
 		diagnostics, err := opened.Diagnose(request.Context(), board)
 		return map[string]any{"board": boardContext.Metadata, "profiles": boardContext.Profiles, "tasks": result, "taskWindow": taskWindow, "stats": stats, "diagnostics": diagnostics}, err
+	})
+	if err == nil {
+		sendJSON(response, http.StatusOK, value)
+	}
+	return err
+}
+
+func (s *Server) handleBoardGraph(response http.ResponseWriter, request *http.Request, board string) error {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", http.MethodGet)
+		sendJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "graph endpoint requires GET"})
+		return nil
+	}
+	value, err := usingStore(request.Context(), s, board, func(opened *store.Store) (model.BoardRelationshipGraph, error) {
+		return opened.BoardRelationshipGraph(request.Context(), request.URL.Query().Get("includeArchived") == "true")
 	})
 	if err == nil {
 		sendJSON(response, http.StatusOK, value)

@@ -50,3 +50,21 @@ type RelationshipGraph struct {
 	Hierarchy           []HierarchyEdge    `json:"hierarchy"`
 	Dependencies        []DependencyEdge   `json:"dependencies"`
 }
+
+// BoardRelationshipGraph is a bounded, self-contained topology snapshot for a
+// board. Unlike RelationshipGraph it includes disconnected tasks and has no
+// focus or root node.
+type BoardRelationshipGraph struct {
+	Board            string             `json:"board"`
+	IncludeArchived  bool               `json:"includeArchived"`
+	GraphRevision    int64              `json:"graphRevision"`
+	TotalPhases      int                `json:"totalPhases"`
+	TotalNodes       int                `json:"totalNodes"`
+	ReturnedNodes    int                `json:"returnedNodes"`
+	NodeLimit        int                `json:"nodeLimit"`
+	Truncated        bool               `json:"truncated"`
+	OmittedNodeCount int                `json:"omittedNodeCount"`
+	Nodes            []RelationshipNode `json:"nodes"`
+	Hierarchy        []HierarchyEdge    `json:"hierarchy"`
+	Dependencies     []DependencyEdge   `json:"dependencies"`
+}
