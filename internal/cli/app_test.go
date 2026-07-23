@@ -111,6 +111,73 @@ func TestScopedWorkerCannotEscapeTaskOrCommandAllowlist(t *testing.T) {
 	}
 }
 
+func TestScopedCLIUsesLocalGraphAndRedactedRelatedTasks(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "autogora.db")
+	opened, err := store.Open(dbPath, "default", filepath.Join(directory, "attachments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(title, body string) model.TaskDetail {
+		detail, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: title, Body: body})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return detail
+	}
+	far := create("far", "far private body")
+	near := create("near", "near private body")
+	focus := create("focus", "focus body")
+	if _, err := opened.LinkTasks(ctx, far.Task.ID, near.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, near.Task.ID, focus.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := New(&bytes.Buffer{}, &bytes.Buffer{})
+	admin.Getenv = func(string) string { return "" }
+	var adminGraph model.RelationshipGraph
+	if err := json.Unmarshal([]byte(runApp(t, admin, "graph", focus.Task.ID, "--db", dbPath)), &adminGraph); err != nil {
+		t.Fatal(err)
+	}
+
+	environment := map[string]string{
+		"AUTOGORA_DB": dbPath, "AUTOGORA_BOARD": "default", "AUTOGORA_TASK_ID": focus.Task.ID,
+	}
+	scoped := New(&bytes.Buffer{}, &bytes.Buffer{})
+	scoped.Getenv = func(name string) string { return environment[name] }
+	var workerGraph model.RelationshipGraph
+	if err := json.Unmarshal([]byte(runApp(t, scoped, "graph", focus.Task.ID, "--db", dbPath)), &workerGraph); err != nil {
+		t.Fatal(err)
+	}
+	if len(adminGraph.Nodes) != 3 || len(workerGraph.Nodes) != 2 ||
+		workerGraph.TotalConnectedNodes != adminGraph.TotalConnectedNodes ||
+		workerGraph.GraphRevision != adminGraph.GraphRevision || !workerGraph.Truncated {
+		t.Fatalf("admin/worker graph mismatch:\nadmin=%+v\nworker=%+v", adminGraph, workerGraph)
+	}
+	for _, node := range workerGraph.Nodes {
+		if node.Task.ID == far.Task.ID {
+			t.Fatalf("scoped graph leaked second-hop task: %+v", workerGraph)
+		}
+	}
+	var shown struct {
+		model.TaskDetail
+		RelationshipGraph model.RelationshipGraph `json:"relationshipGraph"`
+	}
+	if err := json.Unmarshal([]byte(runApp(t, scoped, "show", focus.Task.ID, "--db", dbPath)), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if len(shown.Parents) != 1 || shown.Parents[0].ID != near.Task.ID || shown.Parents[0].Body != "" ||
+		shown.Task.Body != "focus body" || len(shown.RelationshipGraph.Nodes) != 2 {
+		t.Fatalf("scoped show projection = %+v", shown)
+	}
+}
+
 func TestScopedCLIBridgeCompletesClaimWithoutMCP(t *testing.T) {
 	ctx := context.Background()
 	directory := t.TempDir()

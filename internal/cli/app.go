@@ -560,7 +560,7 @@ func (a *App) runReadTask(ctx context.Context, command string, opts options) err
 	defer opened.Close()
 	switch command {
 	case "graph":
-		value, err := opened.RelationshipGraph(ctx, taskID)
+		value, err := a.relationshipGraph(ctx, opened, taskID)
 		if err != nil {
 			return err
 		}
@@ -594,11 +594,11 @@ func (a *App) runReadTask(ctx context.Context, command string, opts options) err
 		}
 		return err
 	default:
-		detail, err := opened.GetTask(ctx, taskID)
+		detail, err := a.taskDetail(ctx, opened, taskID)
 		if err != nil {
 			return err
 		}
-		graph, err := opened.RelationshipGraph(ctx, taskID)
+		graph, err := a.relationshipGraph(ctx, opened, taskID)
 		if err != nil {
 			return err
 		}
@@ -613,6 +613,20 @@ func (a *App) runReadTask(ctx context.Context, command string, opts options) err
 		}{TaskDetail: detail, RelationshipGraph: graph, WorkerContext: workerContext}
 		return writeJSON(a.Stdout, value)
 	}
+}
+
+func (a *App) relationshipGraph(ctx context.Context, opened *store.Store, taskID string) (model.RelationshipGraph, error) {
+	if a.env("AUTOGORA_TASK_ID") != "" {
+		return opened.WorkerRelationshipGraph(ctx, taskID)
+	}
+	return opened.RelationshipGraph(ctx, taskID)
+}
+
+func (a *App) taskDetail(ctx context.Context, opened *store.Store, taskID string) (model.TaskDetail, error) {
+	if a.env("AUTOGORA_TASK_ID") != "" {
+		return opened.WorkerTaskDetail(ctx, taskID)
+	}
+	return opened.GetTask(ctx, taskID)
 }
 
 func (a *App) runStats(ctx context.Context, command string, opts options) error {

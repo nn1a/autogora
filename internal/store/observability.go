@@ -268,7 +268,7 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	if err != nil {
 		return "", err
 	}
-	graph, err := s.RelationshipGraph(ctx, taskID)
+	graph, err := s.WorkerRelationshipGraph(ctx, taskID)
 	if err != nil {
 		return "", err
 	}
@@ -310,6 +310,19 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	}
 	contextNodes := make([]model.RelationshipNode, 0, min(50, len(graph.Nodes)))
 	selected := map[string]bool{}
+	appendNode := func(id string) {
+		if len(contextNodes) >= 50 || selected[id] {
+			return
+		}
+		node, found := nodesByID[id]
+		if !found {
+			return
+		}
+		selected[id] = true
+		contextNodes = append(contextNodes, node)
+	}
+	appendNode(taskID)
+	appendNode(graph.RootTaskID)
 	appendNodes := func(wantPriority bool) {
 		for _, node := range graph.Nodes {
 			if len(contextNodes) >= 50 {

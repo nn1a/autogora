@@ -207,6 +207,77 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	}
 }
 
+func TestScopedMCPUsesLocalGraphAndRedactedRelatedTasks(t *testing.T) {
+	ctx := context.Background()
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(ctx, "project", boards.Update{}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(title, body string) model.TaskDetail {
+		detail, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: title, Body: body})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return detail
+	}
+	far := create("far", "far private body")
+	near := create("near", "near private body")
+	focus := create("focus", "focus body")
+	if _, err := opened.LinkTasks(ctx, far.Task.ID, near.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, near.Task.ID, focus.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adminServer, _ := New(manager, "test")
+	adminSession, adminDone := connectTestServer(t, adminServer)
+	defer closeTestServer(t, adminSession, adminDone)
+	var adminGraph model.RelationshipGraph
+	toolJSON(t, adminSession, "autogora_graph", map[string]any{
+		"board": "project", "task_id": focus.Task.ID,
+	}, &adminGraph)
+
+	scopedServer, scopedService := New(manager, "test")
+	scopedEnvironment := map[string]string{
+		"AUTOGORA_BOARD": "project", "AUTOGORA_TASK_ID": focus.Task.ID,
+	}
+	scopedService.getenv = func(name string) string { return scopedEnvironment[name] }
+	scopedSession, scopedDone := connectTestServer(t, scopedServer)
+	defer closeTestServer(t, scopedSession, scopedDone)
+	var workerGraph model.RelationshipGraph
+	toolJSON(t, scopedSession, "autogora_graph", map[string]any{}, &workerGraph)
+	if len(adminGraph.Nodes) != 3 || len(workerGraph.Nodes) != 2 ||
+		workerGraph.TotalConnectedNodes != adminGraph.TotalConnectedNodes ||
+		workerGraph.GraphRevision != adminGraph.GraphRevision || !workerGraph.Truncated {
+		t.Fatalf("admin/worker MCP graph mismatch:\nadmin=%+v\nworker=%+v", adminGraph, workerGraph)
+	}
+	for _, node := range workerGraph.Nodes {
+		if node.Task.ID == far.Task.ID {
+			t.Fatalf("scoped MCP graph leaked second-hop task: %+v", workerGraph)
+		}
+	}
+	var shown struct {
+		model.TaskDetail
+		RelationshipGraph model.RelationshipGraph `json:"relationshipGraph"`
+	}
+	toolJSON(t, scopedSession, "autogora_show", map[string]any{}, &shown)
+	if len(shown.Parents) != 1 || shown.Parents[0].ID != near.Task.ID || shown.Parents[0].Body != "" ||
+		shown.Task.Body != "focus body" || len(shown.RelationshipGraph.Nodes) != 2 {
+		t.Fatalf("scoped MCP show projection = %+v", shown)
+	}
+}
+
 func TestMCPDirectWorktreeCompletionCapturesDurableChangeSet(t *testing.T) {
 	ctx := context.Background()
 	repository := filepath.Join(t.TempDir(), "repository")

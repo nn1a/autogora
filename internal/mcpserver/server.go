@@ -73,6 +73,20 @@ func (s *Service) scopedTaskID(requested string) (string, error) {
 	return requested, nil
 }
 
+func (s *Service) relationshipGraph(ctx context.Context, opened *store.Store, taskID string) (model.RelationshipGraph, error) {
+	if s.env("AUTOGORA_TASK_ID") != "" {
+		return opened.WorkerRelationshipGraph(ctx, taskID)
+	}
+	return opened.RelationshipGraph(ctx, taskID)
+}
+
+func (s *Service) taskDetail(ctx context.Context, opened *store.Store, taskID string) (model.TaskDetail, error) {
+	if s.env("AUTOGORA_TASK_ID") != "" {
+		return opened.WorkerTaskDetail(ctx, taskID)
+	}
+	return opened.GetTask(ctx, taskID)
+}
+
 func (s *Service) scopedRun(runID, claimToken string) (store.RunScope, error) {
 	pinnedRun := s.env("AUTOGORA_RUN_ID")
 	pinnedToken := s.env("AUTOGORA_CLAIM_TOKEN")
@@ -410,11 +424,11 @@ func (s *Service) registerCore(server *mcp.Server) {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
-			detail, err := opened.GetTask(ctx, taskID)
+			detail, err := s.taskDetail(ctx, opened, taskID)
 			if err != nil {
 				return nil, err
 			}
-			graph, err := opened.RelationshipGraph(ctx, taskID)
+			graph, err := s.relationshipGraph(ctx, opened, taskID)
 			if err != nil {
 				return nil, err
 			}
@@ -441,7 +455,9 @@ func (s *Service) registerCore(server *mcp.Server) {
 		if err != nil {
 			return nil, err
 		}
-		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) { return opened.RelationshipGraph(ctx, taskID) })
+		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
+			return s.relationshipGraph(ctx, opened, taskID)
+		})
 	})
 	addTool(server, "autogora_stats", "Get Kanban statistics", "Count board tasks by status, assignee, runtime, and tenant.", true, false, true, false, func(ctx context.Context, input boardInput) (any, error) {
 		if err := s.requireAdmin(); err != nil {
