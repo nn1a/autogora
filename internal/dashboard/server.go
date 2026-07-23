@@ -25,12 +25,13 @@ import (
 )
 
 type Options struct {
-	DBPath  string
-	CLIPath string
-	Host    string
-	Port    int
-	Token   string
-	OnLog   func(string)
+	DBPath         string
+	CLIPath        string
+	Host           string
+	Port           int
+	Token          string
+	OnLog          func(string)
+	AgentDetection agentconfig.DetectOptions
 }
 
 type Server struct {

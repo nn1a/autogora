@@ -43,8 +43,13 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	if segments[1] == "config" {
 		return s.handleAgentConfig(response, request, segments)
 	}
-	if segments[1] == "agents" && len(segments) == 3 && segments[2] == "effective" {
-		return s.handleEffectiveAgents(response, request)
+	if segments[1] == "agents" && len(segments) == 3 {
+		switch segments[2] {
+		case "effective":
+			return s.handleEffectiveAgents(response, request)
+		case "detect":
+			return s.handleDetectAgents(response, request)
+		}
 	}
 	if segments[1] == "supervisor" {
 		return s.handleSupervisor(response, request, segments)

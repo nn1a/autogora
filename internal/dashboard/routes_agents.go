@@ -24,6 +24,12 @@ type agentConfigResponse struct {
 	Config agentconfig.Config `json:"config"`
 }
 
+type agentDetectionResponse struct {
+	Path   string                  `json:"path"`
+	Exists bool                    `json:"exists"`
+	Agents []agentconfig.Detection `json:"agents"`
+}
+
 type effectiveAgentProfile struct {
 	orchestration.ProfileRoute
 	Health     model.AgentHealth `json:"health"`
@@ -119,6 +125,26 @@ func (s *Server) handleAgentConfig(response http.ResponseWriter, request *http.R
 		sendJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "config endpoint requires GET or PUT"})
 		return nil
 	}
+}
+
+func (s *Server) handleDetectAgents(response http.ResponseWriter, request *http.Request) error {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		sendJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "agent detection endpoint requires POST"})
+		return nil
+	}
+	configResponse, err := loadAgentConfigResponse()
+	if err != nil {
+		return err
+	}
+	detections, err := agentconfig.DetectSupportedAgents(request.Context(), configResponse.Config, s.options.AgentDetection)
+	if err != nil {
+		return err
+	}
+	sendJSON(response, http.StatusOK, agentDetectionResponse{
+		Path: configResponse.Path, Exists: configResponse.Exists, Agents: detections,
+	})
+	return nil
 }
 
 func (s *Server) handleSupervisor(response http.ResponseWriter, request *http.Request, segments []string) error {

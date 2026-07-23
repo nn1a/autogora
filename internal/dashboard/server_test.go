@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
 )
@@ -21,9 +23,15 @@ import (
 const testToken = "test-dashboard-token-32-characters"
 
 func startTestServer(t *testing.T) *Server {
+	return startTestServerWithOptions(t, func(*Options) {})
+}
+
+func startTestServerWithOptions(t *testing.T, configure func(*Options)) *Server {
 	t.Helper()
 	t.Setenv("AUTOGORA_CONFIG", filepath.Join(t.TempDir(), "config.json"))
-	server, err := Start(context.Background(), Options{DBPath: filepath.Join(t.TempDir(), "autogora.db"), CLIPath: "/tmp/autogora", Token: testToken})
+	options := Options{DBPath: filepath.Join(t.TempDir(), "autogora.db"), CLIPath: "/tmp/autogora", Token: testToken}
+	configure(&options)
+	server, err := Start(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +41,40 @@ func startTestServer(t *testing.T) *Server {
 		_ = server.Close(ctx)
 	})
 	return server
+}
+
+func TestAgentDetectionAPIUsesBoundedVersionChecks(t *testing.T) {
+	calls := []string{}
+	server := startTestServerWithOptions(t, func(options *Options) {
+		options.AgentDetection = agentconfig.DetectOptions{
+			LookPath: func(name string) (string, error) {
+				if name == "codex" || name == "cline" {
+					return "/tools/" + name, nil
+				}
+				return "", errors.New("missing")
+			},
+			RunVersion: func(_ context.Context, executable string) (string, string, error) {
+				calls = append(calls, executable+" --version")
+				if strings.HasSuffix(executable, "cline") {
+					return "", "cline test version", errors.New("version exit")
+				}
+				return "codex test version", "", nil
+			},
+		}
+	})
+
+	response, value := apiRequest(t, server, http.MethodPost, "/api/agents/detect", map[string]any{})
+	detected := mapValue(t, value)
+	if response.StatusCode != http.StatusOK || detected["exists"] != false || len(arrayValue(t, detected["agents"])) != len(model.WorkerRuntimes) {
+		t.Fatalf("unexpected detection response: %d %#v", response.StatusCode, detected)
+	}
+	if len(calls) != 2 || calls[0] != "/tools/codex --version" || calls[1] != "/tools/cline --version" {
+		t.Fatalf("detection made unexpected calls: %#v", calls)
+	}
+	getResponse, _ := apiRequest(t, server, http.MethodGet, "/api/agents/detect", nil)
+	if getResponse.StatusCode != http.StatusMethodNotAllowed || getResponse.Header.Get("Allow") != http.MethodPost {
+		t.Fatalf("unexpected GET detection response: %d %q", getResponse.StatusCode, getResponse.Header.Get("Allow"))
+	}
 }
 
 func apiRequest(t *testing.T, server *Server, method, path string, body any) (*http.Response, any) {
