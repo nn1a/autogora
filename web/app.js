@@ -12,6 +12,7 @@ const BOARD_STAGE_FOCUSES = ["all", ...WORKFLOW_STAGES.map((stage) => stage.id)]
 const BOARD_VIEW_MODES = ["overview", "compact", "flow", "graph"];
 const AUTOMATION_TABS = ["overview", "runs", "recovery", "publishing", "events"];
 const AUTOMATION_HELP_LANGUAGES = ["en", "ko"];
+const DRAWER_TABS = ["overview", "edit", "graph", "activity"];
 
 const storedTheme = localStorage.getItem("autogora.theme");
 const storedStageFocus = localStorage.getItem("autogora.boardStageFocus");
@@ -38,6 +39,7 @@ const state = {
   graphRequest: 0, graphZoom: 1, graphSignature: "", graphFitPending: false, graphFitMode: true,
   graphShowDependencies: true, graphShowHierarchy: true,
   drawerDirty: false, drawerVersion: null, drawerRequest: 0,
+  drawerTab: "overview",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -1086,6 +1088,7 @@ async function openDrawer(taskId, { focus = true, force = false } = {}) {
   if (!force && state.drawerDirty && state.drawerTask && state.drawerTask !== taskId
       && !confirm("Discard unsaved task changes?")) return;
   const requestID = ++state.drawerRequest;
+  const changedTask = state.drawerTask !== taskId;
   try {
     if (!state.drawerTask) drawerReturnFocus = document.activeElement;
     const detail = await api(boardPath(`/api/tasks/${taskId}`));
@@ -1097,6 +1100,7 @@ async function openDrawer(taskId, { focus = true, force = false } = {}) {
     state.drawerTask = taskId;
     state.drawerDirty = false;
     state.drawerVersion = detail.task.updatedAt;
+    if (changedTask) state.drawerTab = "overview";
     $("#drawer-refresh").classList.add("hidden");
     $("#drawer-id").textContent = taskId;
     $("#drawer-status").textContent = STATUS_LABELS[detail.task.status];
@@ -1112,7 +1116,8 @@ async function openDrawer(taskId, { focus = true, force = false } = {}) {
   }
 }
 
-function closeDrawer() {
+function closeDrawer({ discard = false } = {}) {
+  if (!discard && state.drawerDirty && !confirm("Discard unsaved task changes?")) return false;
   state.drawerRequest++;
   state.drawerTask = null;
   state.drawerDirty = false;
@@ -1123,6 +1128,7 @@ function closeDrawer() {
   document.body.classList.remove("drawer-open");
   if (drawerReturnFocus?.isConnected) drawerReturnFocus.focus({ preventScroll: true });
   drawerReturnFocus = null;
+  return true;
 }
 
 function taskOptions(excludeId) {
@@ -1137,11 +1143,97 @@ const drawerEditSelectors = [
 ];
 const drawerRunningLockedSelectors = drawerEditSelectors.filter((selector) => selector !== "#edit-priority");
 
+function drawerStatusSummary(task, detail, activeRun) {
+  const incompletePrerequisites = detail.parents.filter((parent) => parent.status !== "done");
+  switch (task.status) {
+    case "triage":
+      return {
+        label: "Planning needed",
+        title: "Clarify or decompose this task",
+        body: "Specify improves the task brief. Decompose creates a dependency graph that the Dispatcher can schedule.",
+      };
+    case "todo":
+      return incompletePrerequisites.length
+        ? {
+          label: "Waiting on prerequisites",
+          title: `${incompletePrerequisites.length} prerequisite${incompletePrerequisites.length === 1 ? "" : "s"} still open`,
+          body: "The Dispatcher will make this task ready after every direct prerequisite reaches Done.",
+        }
+        : {
+          label: "Queued",
+          title: "Ready to advance through planning",
+          body: "Promote the task manually, or let board automation move it when its scheduling rules are satisfied.",
+        };
+    case "scheduled":
+      return {
+        label: "Scheduled",
+        title: task.scheduledAt ? `Runs after ${new Date(task.scheduledAt).toLocaleString()}` : "Waiting for a schedule",
+        body: "The Dispatcher will claim it only after the scheduled time and all prerequisites are satisfied.",
+      };
+    case "ready":
+      return {
+        label: "Ready",
+        title: "Waiting for an eligible worker",
+        body: "The Dispatcher will choose a healthy enabled agent within the board concurrency limit.",
+      };
+    case "running":
+      return {
+        label: "In progress",
+        title: activeRun ? `${activeRun.workerId} is working on this task` : "The task has an active claim",
+        body: activeRun
+          ? `Last heartbeat ${relativeTime(activeRun.heartbeatAt)}. The agent and model are pinned for this run.`
+          : "Execution settings remain locked until the active claim is completed or safely reclaimed.",
+      };
+    case "blocked":
+      return {
+        label: "Needs attention",
+        title: task.blockReason || "The task is blocked",
+        body: `Block type: ${humanizeIdentifier(task.blockKind || "needs_input")}. Resolve the cause, then unblock the task.`,
+      };
+    case "review":
+      return {
+        label: "Review",
+        title: "Waiting for a review decision",
+        body: "Record review feedback as a comment or explicit follow-up task before promoting or completing this task.",
+      };
+    case "done":
+      return {
+        label: "Completed",
+        title: task.result ? "A completion result is available" : "The task reached Done",
+        body: "Done records workflow completion. Publication, when configured, is tracked separately.",
+      };
+    case "archived":
+      return {
+        label: "Archived",
+        title: "This task is outside the active workflow",
+        body: "Its history and relationships remain available for inspection.",
+      };
+    default:
+      return { label: "Task", title: STATUS_LABELS[task.status] || task.status, body: "" };
+  }
+}
+
+function setDrawerTab(tab, { focus = true, resetScroll = true } = {}) {
+  if (!DRAWER_TABS.includes(tab)) return;
+  state.drawerTab = tab;
+  $$("[data-drawer-tab]", $("#drawer-content")).forEach((button) => {
+    const selected = button.dataset.drawerTab === tab;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    if (selected && focus) button.focus({ preventScroll: true });
+  });
+  $$("[data-drawer-panel]", $("#drawer-content")).forEach((panel) => {
+    panel.hidden = panel.dataset.drawerPanel !== tab;
+  });
+  if (resetScroll) $("#drawer-content").scrollTop = 0;
+}
+
 function renderDrawer(detail) {
   const task = detail.task;
   const editLocked = task.status === "running";
   const runAgents = new Map((detail.runAgentConfigs || []).map((config) => [config.runId, config]));
-  const runRows = detail.runs.slice().reverse().map((run) => {
+  const orderedRuns = detail.runs.slice().reverse();
+  const renderRunRow = (run) => {
     const config = runAgents.get(run.id);
     const route = config ? `${config.profile} · ${config.runtime} · ${config.model || "CLI default (unpinned)"}${config.provider ? ` · ${config.provider}` : ""}` : "";
     const provenance = config ? `${String(config.source || "unknown").replaceAll("_", " ")}${config.fallbackFrom ? ` · fallback from ${config.fallbackFrom}` : ""}` : "";
@@ -1154,9 +1246,12 @@ function renderDrawer(detail) {
       ${config ? `<div>${escapeHtml(route)}</div><div class="mono">${escapeHtml(provenance)}</div>` : ""}
       ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
     </div>`;
-  }).join("");
+  };
+  const runRows = orderedRuns.map(renderRunRow).join("");
+  const activeRun = orderedRuns.find((run) => run.status === "running");
+  const currentRunRow = activeRun ? renderRunRow(activeRun) : "";
   const comments = detail.comments.map((comment) => `<article class="detail-row comment-row">
-    <header><strong>${escapeHtml(comment.author)}</strong><time class="mono" datetime="${escapeHtml(comment.createdAt)}">${escapeHtml(comment.createdAt)}</time></header>
+    <header><strong>${escapeHtml(comment.author)}</strong><time datetime="${escapeHtml(comment.createdAt)}" title="${escapeHtml(new Date(comment.createdAt).toLocaleString())}">${relativeTime(comment.createdAt)}</time></header>
     <div class="markdown comment-body">${markdown(comment.body)}</div>
   </article>`).join("");
   const attachments = detail.attachments.map((attachment) => `<div class="detail-row">
@@ -1166,7 +1261,10 @@ function renderDrawer(detail) {
   </div>`).join("");
   const events = detail.events.slice().reverse().slice(0, 30).map((event) => {
     const payload = event.payload && Object.keys(event.payload).length ? JSON.stringify(event.payload, null, 2) : "";
-    return `<div class="detail-row"><strong>${escapeHtml(event.kind)}</strong><span class="mono">#${event.id} · ${escapeHtml(event.createdAt)}</span>${payload ? `<div class="event-payload">${escapeHtml(payload)}</div>` : ""}</div>`;
+    return `<details class="detail-row event-row">
+      <summary><span><strong>${escapeHtml(humanizeIdentifier(event.kind))}</strong><span class="mono">#${event.id} · ${relativeTime(event.createdAt)}</span></span><span aria-hidden="true">⌄</span></summary>
+      ${payload ? `<pre class="event-payload">${escapeHtml(payload)}</pre>` : "<small>No additional event data</small>"}
+    </details>`;
   }).join("");
   const changeSets = (detail.changeSets || []).slice().reverse().map((change) => `<div class="detail-row">
     <strong>${escapeHtml(change.state)} change set · ${escapeHtml(change.id)}</strong>
@@ -1202,6 +1300,10 @@ function renderDrawer(detail) {
   const drawerProfileOptions = `<option value="">Custom assignment</option>${workerProfiles().map((profile) =>
     `<option value="${escapeHtml(profile.name)}"${selectedProfile?.name === profile.name ? " selected" : ""}>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)}</option>`).join("")}`;
   const routeModel = taskRoutePreview(selectedRoute);
+  const statusSummary = drawerStatusSummary(task, detail, activeRun);
+  const completePrerequisites = detail.parents.filter((parent) => parent.status === "done").length;
+  const tabButton = (id, label) => `<button id="drawer-tab-${id}" type="button" role="tab" data-drawer-tab="${id}" aria-controls="drawer-panel-${id}" aria-selected="${state.drawerTab === id}" tabindex="${state.drawerTab === id ? "0" : "-1"}">${label}</button>`;
+  const panelAttributes = (id) => `id="drawer-panel-${id}" class="drawer-panel" role="tabpanel" aria-labelledby="drawer-tab-${id}" data-drawer-panel="${id}"${state.drawerTab === id ? "" : " hidden"}`;
   $("#drawer-content").innerHTML = `
     <div class="drawer-title-block"><span class="eyebrow">Task</span><h1>${escapeHtml(task.title)}</h1></div>
     <div class="task-context">
@@ -1212,67 +1314,102 @@ function renderDrawer(detail) {
       <div><small>Effective runtime</small><strong>${escapeHtml(selectedRoute.runtime)}</strong></div>
       <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
     </div>
-    ${task.status === "blocked" ? `<div class="detail-row"><strong>Blocked · ${escapeHtml(task.blockKind || "needs_input")}</strong><div>${escapeHtml(task.blockReason || "No reason recorded")}</div></div>` : ""}
-    ${task.result ? `<div class="detail-row"><strong>Result</strong><div class="markdown">${markdown(task.result)}</div></div>` : ""}
-    ${editLocked ? '<div class="detail-row" role="note"><strong>Execution settings are locked while this task is running.</strong><div>Priority remains editable. Use comments for durable context, or terminate the run before changing the task specification.</div></div>' : ""}
-    <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
-    <div class="drawer-grid drawer-routing-grid">
-      <label>Board profile<select id="edit-profile">${drawerProfileOptions}</select></label>
-      <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
-      <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === selectedRoute.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
-      <label>Current route model<input id="edit-model-preview" value="${escapeHtml(routeModel)}" readonly></label>
-      <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
-      <label>Tenant<input id="edit-tenant" value="${escapeHtml(task.tenant || "")}"></label>
-      <label>Workspace kind<select id="edit-workspace-kind">${["scratch", "dir", "worktree"].map((item) => `<option ${item === task.workspaceKind ? "selected" : ""}>${item}</option>`).join("")}</select></label>
-      <label>Workspace path<input id="edit-workspace" value="${escapeHtml(task.workspace || "")}" placeholder="automatic"></label>
-      <label>Branch<input id="edit-branch" value="${escapeHtml(task.branch || "")}"></label>
-      <label>Run after<input id="edit-scheduled-at" type="datetime-local" value="${task.scheduledAt ? localDateTimeValue(task.scheduledAt) : ""}"></label>
-      <label>Max runtime (seconds)<input id="edit-max-runtime" type="number" min="1" value="${task.maxRuntimeSeconds || ""}"></label>
-      <label>Max retries<input id="edit-max-retries" type="number" min="1" value="${task.maxRetries || 2}"></label>
+    <div class="drawer-tabs" role="tablist" aria-label="Task detail sections">
+      ${tabButton("overview", "Overview")}
+      ${tabButton("edit", "Edit")}
+      ${tabButton("graph", "Graph")}
+      ${tabButton("activity", "Activity")}
     </div>
-    <label>Description<textarea id="edit-body" rows="9">${escapeHtml(task.body)}</textarea></label>
-    <label>Skills<input id="edit-skills" value="${escapeHtml((task.skills || []).join(", "))}" placeholder="comma-separated"></label>
-    <div class="drawer-grid"><label class="inline"><input id="edit-goal-mode" type="checkbox"${task.goalMode ? " checked" : ""}> Goal mode</label><label>Goal max turns<input id="edit-goal-turns" type="number" min="1" value="${task.goalMaxTurns || 20}"></label></div>
-    <button id="save-task" class="primary">${editLocked ? "Save priority" : "Save changes"}</button>
-    <div class="action-row">
-      ${task.status === "triage" ? '<button data-action="specify">Specify</button><button data-action="decompose">Decompose</button>' : ""}
-      ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
-      ${task.status === "ready" ? '<button data-action="dispatch" class="primary">Run task</button>' : ""}
-      ${["todo", "scheduled", "blocked", "triage", "review"].includes(task.status) ? '<button data-action="promote">Promote</button>' : ""}
-      ${!["running", "done", "archived"].includes(task.status) ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
-      ${!["running", "archived"].includes(task.status) ? '<button data-action="archive">Archive</button>' : ""}
-      ${task.status !== "running" ? '<button data-action="delete" class="danger">Delete</button>' : '<span class="action-note">Terminate the active run below before completing, blocking, archiving, or deleting.</span>'}
-    </div>
-    <h3>Rendered description</h3><div class="markdown">${markdown(task.body || "(empty)")}</div>
-    <h3>Execution order</h3>
-    <div class="detail-row"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>Claims are allowed only after every direct prerequisite handoff is satisfied.</div></div>
-    <div class="detail-list">${graphLimitNotice}${graphRows}</div>
-    <h3>Task hierarchy</h3>
-    <small>Hierarchy records parent/subtask ownership. It does not control execution order.</small>
-    <div class="detail-list">${parentTask}</div>
-    <form id="set-parent-task" class="link-form"><select required><option value="">Set parent task…</option>${taskOptions(task.id)}</select><button>Set</button></form>
-    <div class="detail-list">${subtasks || '<small>No subtasks</small>'}</div>
-    <form id="add-subtask" class="link-form"><select required><option value="">Add subtask…</option>${taskOptions(task.id)}</select><button>Add</button></form>
-    <h3>Execution dependencies</h3>
-    <small>Prerequisites must reach Done before this task can be claimed.</small>
-    <h4>Prerequisites</h4>
-    <div class="detail-list">${detail.parents.map(dependency).join("") || '<small>No parents</small>'}</div>
-    <form id="add-parent" class="link-form"><select required><option value="">Add prerequisite…</option>${taskOptions(task.id)}</select><button>Add</button></form>
-    <h4>Dependents</h4>
-    <div class="detail-list">${detail.children.map(dependency).join("") || '<small>No children</small>'}</div>
-    <form id="add-child" class="link-form"><select required><option value="">Add dependent…</option>${taskOptions(task.id)}</select><button>Add</button></form>
-    <h3>Comments</h3><div class="detail-list">${comments || '<small>No comments</small>'}</div>
-    <form id="comment-form" class="comment-form">
-      <label class="sr-only" for="comment-body">Comment</label>
-      <textarea id="comment-body" name="comment" rows="3" required placeholder="Add durable context…"></textarea>
-      <button>Comment</button>
-    </form>
-    <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
-    <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
-    <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
-    <h3>Change results</h3><div class="detail-list">${changeSets || '<small>No change sets</small>'}</div>
-    <h3>Run workspaces</h3><div class="detail-list">${workspaces || '<small>No prepared workspaces</small>'}</div>
-    <h3>Recent events</h3><div class="detail-list">${events}</div>`;
+
+    <section ${panelAttributes("overview")}>
+      <div class="task-now status-${escapeHtml(task.status)}">
+        <span class="eyebrow">${escapeHtml(statusSummary.label)}</span>
+        <strong>${escapeHtml(statusSummary.title)}</strong>
+        <p>${escapeHtml(statusSummary.body)}</p>
+      </div>
+      ${task.status === "blocked" ? `<div class="detail-row attention-row"><strong>What is blocking this task</strong><div>${escapeHtml(task.blockReason || "No reason recorded")}</div></div>` : ""}
+      ${task.result ? `<div class="detail-row result-row"><strong>Completion result</strong><div class="markdown">${markdown(task.result)}</div></div>` : ""}
+      <div class="action-row" aria-label="Task actions">
+        ${task.status === "triage" ? '<button data-action="specify">Specify</button><button data-action="decompose">Decompose</button>' : ""}
+        ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
+        ${task.status === "ready" ? '<button data-action="dispatch" class="primary">Run task</button>' : ""}
+        ${["todo", "scheduled", "blocked", "triage", "review"].includes(task.status) ? '<button data-action="promote">Promote</button>' : ""}
+        ${!["running", "done", "archived"].includes(task.status) ? '<button data-action="complete">Complete</button><button data-action="block">Block</button>' : ""}
+        ${!["running", "archived"].includes(task.status) ? '<button data-action="archive">Archive</button>' : ""}
+        ${task.status !== "running" ? '<button data-action="delete" class="danger">Delete</button>' : '<span class="action-note">Terminate the active run before completing, blocking, archiving, or deleting this task.</span>'}
+      </div>
+      <h3>Description</h3>
+      <div class="markdown drawer-description">${markdown(task.body || "(empty)")}</div>
+      <h3>At a glance</h3>
+      <div class="task-glance">
+        <div><small>Execution phase</small><strong>${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} / ${graph.totalPhases}</strong><span>Dependency order</span></div>
+        <div><small>Prerequisites</small><strong>${completePrerequisites} / ${detail.parents.length}</strong><span>Direct tasks done</span></div>
+        <div><small>Subtasks</small><strong>${task.subtasksDone || 0} / ${task.subtasksTotal || 0}</strong><span>Owned work complete</span></div>
+      </div>
+      ${currentRunRow ? `<h3>Current execution</h3><div class="detail-list">${currentRunRow}</div>` : ""}
+      <div class="section-heading drawer-section-heading"><div><h3>Discussion</h3><small>Comments remain with the task across agent runs.</small></div><span class="count">${detail.comments.length}</span></div>
+      <div class="detail-list">${comments || '<small>No comments yet</small>'}</div>
+      <form id="comment-form" class="comment-form">
+        <label class="sr-only" for="comment-body">Comment</label>
+        <textarea id="comment-body" name="comment" rows="3" required placeholder="Add durable context…"></textarea>
+        <button>Comment</button>
+      </form>
+    </section>
+
+    <section ${panelAttributes("edit")}>
+      ${editLocked ? '<div class="detail-row attention-row" role="note"><strong>Execution settings are locked while this task is running.</strong><div>Priority remains editable. Add context in Discussion, or terminate the run before changing the task specification.</div></div>' : ""}
+      <h3>Task specification</h3>
+      <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
+      <div class="drawer-grid drawer-routing-grid">
+        <label>Board profile<select id="edit-profile">${drawerProfileOptions}</select></label>
+        <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
+        <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === selectedRoute.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+        <label>Current route model<input id="edit-model-preview" value="${escapeHtml(routeModel)}" readonly></label>
+        <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
+        <label>Tenant<input id="edit-tenant" value="${escapeHtml(task.tenant || "")}"></label>
+        <label>Workspace kind<select id="edit-workspace-kind">${["scratch", "dir", "worktree"].map((item) => `<option ${item === task.workspaceKind ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+        <label>Workspace path<input id="edit-workspace" value="${escapeHtml(task.workspace || "")}" placeholder="automatic"></label>
+        <label>Branch<input id="edit-branch" value="${escapeHtml(task.branch || "")}"></label>
+        <label>Run after<input id="edit-scheduled-at" type="datetime-local" value="${task.scheduledAt ? localDateTimeValue(task.scheduledAt) : ""}"></label>
+        <label>Max runtime (seconds)<input id="edit-max-runtime" type="number" min="1" value="${task.maxRuntimeSeconds || ""}"></label>
+        <label>Max retries<input id="edit-max-retries" type="number" min="1" value="${task.maxRetries || 2}"></label>
+      </div>
+      <label>Description<textarea id="edit-body" rows="9">${escapeHtml(task.body)}</textarea></label>
+      <label>Skills<input id="edit-skills" value="${escapeHtml((task.skills || []).join(", "))}" placeholder="comma-separated"></label>
+      <div class="drawer-grid"><label class="inline"><input id="edit-goal-mode" type="checkbox"${task.goalMode ? " checked" : ""}> Goal mode</label><label>Goal max turns<input id="edit-goal-turns" type="number" min="1" value="${task.goalMaxTurns || 20}"></label></div>
+      <button id="save-task" class="primary">${editLocked ? "Save priority" : "Save changes"}</button>
+    </section>
+
+    <section ${panelAttributes("graph")}>
+      <div class="section-heading drawer-section-heading">
+        <div><h3>Execution graph</h3><small>Prerequisites control execution. Hierarchy only groups related work.</small></div>
+        <button type="button" class="ghost compact" data-open-board-graph>Open board graph</button>
+      </div>
+      <div class="detail-row relationship-summary"><strong>Phase ${focusNode?.phase >= 0 ? focusNode.phase + 1 : "?"} of ${graph.totalPhases}</strong><span class="mono">Hierarchy root · ${escapeHtml(graph.rootTaskId)}</span><div>The Dispatcher claims this task only after every direct prerequisite handoff is satisfied.</div></div>
+      <div class="detail-list">${graphLimitNotice}${graphRows}</div>
+      <h3>Task hierarchy</h3>
+      <small>Hierarchy records parent and subtask ownership without changing execution order.</small>
+      <div class="detail-list">${parentTask}</div>
+      <form id="set-parent-task" class="link-form"><select required><option value="">Set parent task…</option>${taskOptions(task.id)}</select><button>Set</button></form>
+      <div class="detail-list">${subtasks || '<small>No subtasks</small>'}</div>
+      <form id="add-subtask" class="link-form"><select required><option value="">Add subtask…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+      <h3>Execution dependencies</h3>
+      <h4>Prerequisites</h4>
+      <div class="detail-list">${detail.parents.map(dependency).join("") || '<small>No prerequisites</small>'}</div>
+      <form id="add-parent" class="link-form"><select required><option value="">Add prerequisite…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+      <h4>Dependents</h4>
+      <div class="detail-list">${detail.children.map(dependency).join("") || '<small>No dependents</small>'}</div>
+      <form id="add-child" class="link-form"><select required><option value="">Add dependent…</option>${taskOptions(task.id)}</select><button>Add</button></form>
+    </section>
+
+    <section ${panelAttributes("activity")}>
+      <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
+      <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
+      <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
+      <h3>Change results</h3><div class="detail-list">${changeSets || '<small>No change sets</small>'}</div>
+      <h3>Run workspaces</h3><div class="detail-list">${workspaces || '<small>No prepared workspaces</small>'}</div>
+      <h3>Recent events</h3><div class="detail-list">${events || '<small>No events</small>'}</div>
+    </section>`;
   if (editLocked) {
     drawerRunningLockedSelectors.forEach((selector) => {
       const control = $(selector);
@@ -1284,6 +1421,29 @@ function renderDrawer(detail) {
 
 function bindDrawer(detail) {
   const taskId = detail.task.id;
+  const tabButtons = $$("[data-drawer-tab]", $("#drawer-content"));
+  tabButtons.forEach((button, index) => {
+    button.addEventListener("click", () => setDrawerTab(button.dataset.drawerTab));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex = index;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % tabButtons.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabButtons.length) % tabButtons.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = tabButtons.length - 1;
+      else return;
+      event.preventDefault();
+      setDrawerTab(tabButtons[nextIndex].dataset.drawerTab);
+    });
+  });
+  $("[data-open-board-graph]", $("#drawer-content"))?.addEventListener("click", () => {
+    if (!closeDrawer()) return;
+    if (state.boardView === "graph") {
+      loadBoardGraph({ force: true }).catch((error) => toast(error.message, true));
+    } else {
+      setBoardView("graph");
+    }
+    $("#board").scrollIntoView({ block: "start", behavior: "smooth" });
+  });
   const markDirty = () => {
     state.drawerDirty = true;
   };
@@ -1408,13 +1568,14 @@ async function drawerAction(taskId, action) {
   const actionButtons = $$('[data-action]', $("#drawer-content"));
   const expectedUpdatedAt = state.drawerVersion;
   try {
+    if (state.drawerDirty && !confirm("Discard unsaved task changes and continue?")) return;
     actionButtons.forEach((button) => { button.disabled = true; });
     if (action === "delete") {
       if (!confirm("Permanently delete this task?")) return;
       await api(boardPath(`/api/tasks/${taskId}`), {
         method: "DELETE", body: JSON.stringify({ expectedUpdatedAt }),
       });
-      closeDrawer();
+      closeDrawer({ discard: true });
     } else if (action === "complete") {
       const summary = prompt("Completion summary:"); if (!summary) return;
       await api(boardPath(`/api/tasks/${taskId}/complete`), {
@@ -1440,12 +1601,13 @@ async function drawerAction(taskId, action) {
       await api(boardPath(`/api/tasks/${taskId}/archive`), {
         method: "POST", body: JSON.stringify({ expectedUpdatedAt }),
       });
-      closeDrawer();
+      closeDrawer({ discard: true });
     } else {
       await api(boardPath(`/api/tasks/${taskId}/${action}`), {
         method: "POST", body: JSON.stringify({ expectedUpdatedAt }),
       });
     }
+    state.drawerDirty = false;
     await loadBoard(); if (state.drawerTask) await openDrawer(taskId);
   } catch (error) {
     toast(error.message, true);
@@ -2850,8 +3012,10 @@ function bindGlobalActions() {
   });
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer").addEventListener("cancel", (event) => { event.preventDefault(); closeDrawer(); });
-  $("#drawer-refresh").addEventListener("click", () => state.drawerTask && openDrawer(state.drawerTask, { focus: false, force: true }));
-  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.drawerTask) closeDrawer(); });
+  $("#drawer-refresh").addEventListener("click", () => {
+    if (!state.drawerTask || (state.drawerDirty && !confirm("Discard unsaved changes and load the latest task?"))) return;
+    openDrawer(state.drawerTask, { focus: false, force: true });
+  });
   $("#bulk-clear").addEventListener("click", () => { state.selected.clear(); renderBoard(); });
   $("#bulk-status").addEventListener("change", (event) => { if (event.target.value) bulkMutation({ status: event.target.value }); });
   $("#bulk-assign").addEventListener("click", () => bulkMutation({ assignee: $("#bulk-assignee").value || null }));

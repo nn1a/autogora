@@ -73,6 +73,49 @@ func TestTaskDrawerBoundsAndWrapsLongContent(t *testing.T) {
 	}
 }
 
+func TestTaskDrawerLeadsWithStatusAndSeparatesTechnicalDetails(t *testing.T) {
+	javascript, err := Files.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := Files.ReadFile("styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	javascriptSource := string(javascript)
+	styleSource := string(styles)
+
+	for _, marker := range []string{
+		`const DRAWER_TABS = ["overview", "edit", "graph", "activity"]`,
+		`function drawerStatusSummary(task, detail, activeRun)`,
+		`function setDrawerTab(tab, { focus = true, resetScroll = true } = {})`,
+		`class="drawer-tabs" role="tablist" aria-label="Task detail sections"`,
+		`${tabButton("overview", "Overview")}`,
+		`${tabButton("edit", "Edit")}`,
+		`${tabButton("graph", "Graph")}`,
+		`${tabButton("activity", "Activity")}`,
+		`class="task-now status-${escapeHtml(task.status)}"`,
+		`class="task-glance"`,
+		`<details class="detail-row event-row">`,
+	} {
+		if !strings.Contains(javascriptSource, marker) {
+			t.Fatalf("status-first drawer marker %q is missing", marker)
+		}
+	}
+	for _, marker := range []string{
+		`.drawer-tabs {`,
+		`grid-template-columns: repeat(4, minmax(0, 1fr));`,
+		`.drawer-panel[hidden] { display: none; }`,
+		`.task-now {`,
+		`.task-glance {`,
+		`.event-row summary {`,
+	} {
+		if !strings.Contains(styleSource, marker) {
+			t.Fatalf("task drawer presentation marker %q is missing", marker)
+		}
+	}
+}
+
 func TestTaskDrawerRefreshCannotOverwriteNewDirtyEdits(t *testing.T) {
 	javascript, err := Files.ReadFile("app.js")
 	if err != nil {

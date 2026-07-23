@@ -63,11 +63,12 @@ func TestDashboardUsesReadableAccessibleCommentPresentation(t *testing.T) {
 	}
 	for _, marker := range []string{
 		`.card-summary {`,
-		`font-size: 13px;`,
+		`color: var(--text);`,
+		`font-size: 14px;`,
 		`-webkit-line-clamp: 3;`,
-		`.markdown { overflow-wrap: anywhere; color: var(--text-subtle); font-size: 14px; line-height: 1.65; }`,
-		`.comment-row { font-size: 14px; line-height: 1.55; }`,
-		`.comment-form textarea { min-height: 82px; line-height: 1.55; }`,
+		`.markdown { overflow-wrap: anywhere; color: var(--text); font-size: 15px; line-height: 1.68; }`,
+		`.comment-row { font-size: 15px; line-height: 1.65; }`,
+		`.comment-form textarea { min-height: 96px; font-size: 15px; line-height: 1.6; }`,
 	} {
 		if !strings.Contains(styleSource, marker) {
 			t.Fatalf("readable task content CSS marker %q is missing", marker)
