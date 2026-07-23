@@ -1230,7 +1230,7 @@ func TestLatestSchemaRecreatesCoordinationAttemptTableWithoutVersionChange(t *te
 		raw.Close()
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = 19"); err != nil {
+	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = 20"); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -1247,8 +1247,8 @@ func TestLatestSchemaRecreatesCoordinationAttemptTableWithoutVersionChange(t *te
 	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 19 || version != schemaVersion {
-		t.Fatalf("schema version = constant:%d database:%d, want 19", schemaVersion, version)
+	if schemaVersion != 20 || version != schemaVersion {
+		t.Fatalf("schema version = constant:%d database:%d, want 20", schemaVersion, version)
 	}
 	incident := createAttemptTestIncident(
 		t,

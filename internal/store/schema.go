@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 19
+const schemaVersion = 20
 
 type Store struct {
 	db              *sql.DB
@@ -655,6 +655,26 @@ CREATE TABLE IF NOT EXISTS agent_health_observation_sequences (
   CHECK (applied_generation <= next_generation)
 );
 
+-- Auto-planning is a bounded scheduler operation, not part of an interactive
+-- Specify or Decompose request. Persist its claim and retry budget so process
+-- restarts and concurrent one-shot dispatchers cannot duplicate model calls.
+CREATE TABLE IF NOT EXISTS auto_decompose_state (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  task_updated_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 32),
+  max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 32),
+  next_attempt_at TEXT,
+  claim_token TEXT,
+  claim_expires_at TEXT,
+  last_error TEXT CHECK (last_error IS NULL OR length(CAST(last_error AS BLOB)) <= 2000),
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (claim_token IS NULL AND claim_expires_at IS NULL)
+    OR
+    (claim_token IS NOT NULL AND claim_token <> '' AND claim_expires_at IS NOT NULL)
+  )
+);
+
 CREATE TABLE IF NOT EXISTS service_leases (
   name TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -876,6 +896,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_id, configured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_health_due ON agent_health(status, cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_auto_decompose_due ON auto_decompose_state(next_attempt_at, claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_service_leases_expiry ON service_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_global_workspace_leases_owner ON global_workspace_leases(board, run_id);

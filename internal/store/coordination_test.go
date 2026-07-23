@@ -642,8 +642,8 @@ func TestSchema18MigrationAddsCoordinationPersistenceAndGraphState(t *testing.T)
 	if err := migrated.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 19 {
-		t.Fatalf("schema version = %d, want 19", version)
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
 	}
 	var agentSlotDefinition string
 	if err := migrated.db.QueryRowContext(ctx,

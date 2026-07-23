@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -736,6 +737,16 @@ func TestAutoDecomposeBackoffCandidateDoesNotConsumePlanningQuota(t *testing.T) 
 	actionable, err := opened.CreateTask(ctx, store.CreateTaskInput{
 		Title: "Actionable planner task", Status: model.TaskStatusTriage, Priority: 0,
 	})
+	current := time.Now().UTC()
+	coolingDecision, err := opened.ClaimAutoDecompose(
+		ctx, cooling.Task.ID, store.AutoDecomposeMaxAttempts, time.Minute, current,
+	)
+	if err != nil || coolingDecision.Claim == nil {
+		t.Fatalf("claim cooling task: decision=%+v err=%v", coolingDecision, err)
+	}
+	if _, err := opened.FailAutoDecompose(ctx, *coolingDecision.Claim, "planner cooling down", current); err != nil {
+		t.Fatal(err)
+	}
 	if closeErr := opened.Close(); err != nil || closeErr != nil {
 		t.Fatal(errors.Join(err, closeErr))
 	}
@@ -748,7 +759,6 @@ func TestAutoDecomposeBackoffCandidateDoesNotConsumePlanningQuota(t *testing.T) 
 		}, nil
 	}
 	diagnostics := &autoDecomposeDiagnostics{}
-	diagnostics.recordAutoDecomposeFailure("default", cooling.Task.ID)
 	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
 	decomposeBoardTriage(ctx, manager, []string{"default"}, Options{
 		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
@@ -756,6 +766,95 @@ func TestAutoDecomposeBackoffCandidateDoesNotConsumePlanningQuota(t *testing.T) 
 	}, diagnostics)
 	if len(plannerCalls) != 1 || plannerCalls[0] != actionable.Task.ID {
 		t.Fatalf("planner calls = %v, want only actionable task %s", plannerCalls, actionable.Task.ID)
+	}
+}
+
+func TestConcurrentAutoDecomposePassesInvokePlannerOnce(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Shared scheduler task", Status: model.TaskStatusTriage,
+	})
+	if closeErr := opened.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+
+	var calls atomic.Int32
+	plannerStarted := make(chan struct{})
+	releasePlanner := make(chan struct{})
+	defer func() {
+		select {
+		case <-releasePlanner:
+		default:
+			close(releasePlanner)
+		}
+	}()
+	planner := func(_ context.Context, request orchestration.PlannerRequest) (any, error) {
+		if calls.Add(1) == 1 {
+			close(plannerStarted)
+		}
+		<-releasePlanner
+		return map[string]any{
+			"fanout": false, "rootTitle": "Specified once",
+			"rootBody": "Acceptance: one scheduler owns the model call.",
+			"reason":   "one worker", "tasks": []any{}, "dependencies": []any{},
+		}, nil
+	}
+	profile := orchestration.ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex}
+	options := Options{
+		AutoDecompose: boolValue(true), AutoDecomposePerTick: 1,
+		DecompositionPlanner: planner, DefaultProfile: &profile,
+	}
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		decomposeBoardTriage(ctx, manager, []string{"default"}, options, &autoDecomposeDiagnostics{})
+	}()
+	select {
+	case <-plannerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first scheduler did not invoke Planner")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		decomposeBoardTriage(ctx, manager, []string{"default"}, options, &autoDecomposeDiagnostics{})
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second scheduler did not skip the durable in-flight claim")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("concurrent planner calls = %d, want 1", calls.Load())
+	}
+	close(releasePlanner)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first scheduler did not finish")
+	}
+
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := check.GetAutoDecomposeState(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status == model.TaskStatusTriage || state != nil {
+		t.Fatalf("single scheduler result was not finalized: task=%+v state=%+v", detail.Task, state)
 	}
 }
 

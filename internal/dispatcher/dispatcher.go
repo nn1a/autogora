@@ -808,10 +808,8 @@ func judgeConfiguration(metadata boards.Metadata, configured configuredProfileSe
 
 type autoDecomposeDiagnostics struct {
 	skippedGitHubImports map[string]struct{}
-	failures             map[string]autoDecomposeFailure
 	triageCursors        map[string]store.TaskListCursor
 	nextPlanningBoard    string
-	now                  func() time.Time
 }
 
 func isGitHubImportedTask(task model.Task) bool {
@@ -833,7 +831,7 @@ func (d *autoDecomposeDiagnostics) reportGitHubImportSkip(options Options, board
 	if _, reported := d.skippedGitHubImports[key]; reported {
 		return
 	}
-	if len(d.skippedGitHubImports) >= autoDecomposeBackoffEntries {
+	if len(d.skippedGitHubImports) >= autoDecomposeDiagnosticEntries {
 		for candidate := range d.skippedGitHubImports {
 			delete(d.skippedGitHubImports, candidate)
 			break
@@ -935,9 +933,21 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 				if isRepeatedBlockTriage(task) {
 					continue
 				}
-				if !diagnostics.allowAutoDecompose(board, task.ID) {
+				decision, claimErr := opened.ClaimAutoDecompose(
+					ctx,
+					task.ID,
+					store.AutoDecomposeMaxAttempts,
+					autoDecomposeClaimTTL(options),
+					options.currentTime(),
+				)
+				if claimErr != nil {
+					options.log("auto-decompose claim failed %s: %v", task.ID, claimErr)
 					continue
 				}
+				if decision.Claim == nil {
+					continue
+				}
+				planningClaim := *decision.Claim
 				// The board roster is intentionally bounded. Include the current
 				// candidate so a task beyond that snapshot keeps its explicit route.
 				taskRoster := make([]model.Task, len(discovered)+1)
@@ -973,18 +983,39 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 					Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &finalizer, AutoPromoteChildren: &value, Planner: planner,
 				})
 				if err != nil {
+					persistCtx := ctx
+					cancelPersist := func() {}
+					if ctx.Err() != nil {
+						persistCtx, cancelPersist = context.WithTimeout(context.Background(), 2*time.Second)
+					}
+					failure, failureErr := opened.FailAutoDecompose(persistCtx, planningClaim, err.Error(), options.currentTime())
+					cancelPersist()
+					switch {
+					case failureErr != nil:
+						options.log("auto-decompose failure persistence failed %s: %v", task.ID, failureErr)
+					case failure.Eligibility == store.AutoDecomposeInvalidated:
+						options.log("auto-decompose result ignored %s because the Triage task changed", task.ID)
+					case failure.Eligibility == store.AutoDecomposeExhausted:
+						options.log(
+							"auto-decompose exhausted %s after %d/%d attempts: %v",
+							task.ID, failure.Attempt, failure.MaxAttempts, err,
+						)
+					case failure.RetryAt != nil:
+						options.log(
+							"auto-decompose failed %s (attempt %d/%d, retry after %s): %v",
+							task.ID, failure.Attempt, failure.MaxAttempts, *failure.RetryAt, err,
+						)
+					default:
+						options.log("auto-decompose failed %s: %v", task.ID, err)
+					}
 					if ctx.Err() != nil {
 						opened.Close()
 						return
 					}
-					attempt, retryAt := diagnostics.recordAutoDecomposeFailure(board, task.ID)
-					eventErr := opened.RecordAutoDecomposeFailure(ctx, task.ID, err.Error(), attempt, retryAt)
-					options.log("auto-decompose failed %s (attempt %d, retry after %s): %v", task.ID, attempt, retryAt.Format(time.RFC3339), err)
-					if eventErr != nil {
-						options.log("auto-decompose diagnostic event failed %s: %v", task.ID, eventErr)
-					}
 				} else {
-					diagnostics.clearAutoDecomposeFailure(board, task.ID)
+					if _, completeErr := opened.CompleteAutoDecompose(ctx, planningClaim); completeErr != nil {
+						options.log("auto-decompose completion persistence failed %s: %v", task.ID, completeErr)
+					}
 					action := "specified"
 					if result.Fanout {
 						action = "decomposed"

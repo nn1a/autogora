@@ -11,74 +11,25 @@ import (
 )
 
 const (
-	autoDecomposeBackoffBase        = 5 * time.Second
-	autoDecomposeBackoffLimit       = 5 * time.Minute
-	autoDecomposeBackoffEntries     = 2048
+	autoDecomposeDiagnosticEntries  = 2048
 	autoDecomposeCandidatePageSize  = 100
 	autoDecomposeCandidateScanLimit = 1000
+	autoDecomposeClaimGrace         = 30 * time.Second
 )
 
-type autoDecomposeFailure struct {
-	attempt int
-	retryAt time.Time
-}
-
-func autoDecomposeKey(board, taskID string) string { return board + "\x00" + taskID }
-
-func (d *autoDecomposeDiagnostics) currentTime() time.Time {
-	if d != nil && d.now != nil {
-		return d.now()
+func autoDecomposeClaimTTL(options Options) time.Duration {
+	timeout := options.PlannerTimeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
 	}
-	return time.Now()
-}
-
-func (d *autoDecomposeDiagnostics) allowAutoDecompose(board, taskID string) bool {
-	if d == nil || d.failures == nil {
-		return true
+	ttl := timeout + autoDecomposeClaimGrace
+	if ttl < time.Second {
+		return time.Second
 	}
-	failure, found := d.failures[autoDecomposeKey(board, taskID)]
-	return !found || !d.currentTime().Before(failure.retryAt)
-}
-
-func autoDecomposeDelay(attempt int) time.Duration {
-	delay := autoDecomposeBackoffBase
-	for step := 1; step < attempt && delay < autoDecomposeBackoffLimit; step++ {
-		if delay > autoDecomposeBackoffLimit/2 {
-			return autoDecomposeBackoffLimit
-		}
-		delay *= 2
+	if ttl > 15*time.Minute {
+		return 15 * time.Minute
 	}
-	return min(delay, autoDecomposeBackoffLimit)
-}
-
-func (d *autoDecomposeDiagnostics) recordAutoDecomposeFailure(board, taskID string) (int, time.Time) {
-	now := d.currentTime()
-	if d == nil {
-		return 1, now.Add(autoDecomposeBackoffBase)
-	}
-	if d.failures == nil {
-		d.failures = make(map[string]autoDecomposeFailure)
-	}
-	key := autoDecomposeKey(board, taskID)
-	previous, found := d.failures[key]
-	if !found && len(d.failures) >= autoDecomposeBackoffEntries {
-		// The state is an optimization, not lifecycle data. Keep its memory
-		// bounded if tasks are promoted or removed while they are cooling down.
-		for candidate := range d.failures {
-			delete(d.failures, candidate)
-			break
-		}
-	}
-	attempt := min(previous.attempt+1, 32)
-	retryAt := now.Add(autoDecomposeDelay(attempt))
-	d.failures[key] = autoDecomposeFailure{attempt: attempt, retryAt: retryAt}
-	return attempt, retryAt
-}
-
-func (d *autoDecomposeDiagnostics) clearAutoDecomposeFailure(board, taskID string) {
-	if d != nil && d.failures != nil {
-		delete(d.failures, autoDecomposeKey(board, taskID))
-	}
+	return ttl
 }
 
 type planningPass struct {
