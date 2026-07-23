@@ -229,6 +229,123 @@ func TestControllerRestartsAfterTwoFailures(t *testing.T) {
 	}
 }
 
+func TestControllerRestartsAfterUnexpectedNilExit(t *testing.T) {
+	var count atomic.Int32
+	attempts := make(chan int, 2)
+	controller := New(Options{
+		RestartMinDelay: 20 * time.Millisecond,
+		RestartMaxDelay: 20 * time.Millisecond,
+		Run: func(ctx context.Context, _ dispatcher.Options) error {
+			attempt := int(count.Add(1))
+			attempts <- attempt
+			if attempt == 1 {
+				return nil
+			}
+			<-ctx.Done()
+			return nil
+		},
+	})
+	if !controller.Start(context.Background(), agentconfig.Default()) {
+		t.Fatal("supervisor did not start")
+	}
+	if attempt := receiveAttempt(t, attempts); attempt != 1 {
+		t.Fatalf("first dispatcher attempt = %d", attempt)
+	}
+	status := waitForStatus(t, controller, func(status Status) bool {
+		return status.Desired && !status.Running && status.RestartCount == 1 &&
+			status.NextAttemptAt != ""
+	})
+	if status.LastError != errUnexpectedDispatcherExit.Error() {
+		t.Fatalf("unexpected nil exit status = %#v", status)
+	}
+	if attempt := receiveAttempt(t, attempts); attempt != 2 {
+		t.Fatalf("restarted dispatcher attempt = %d", attempt)
+	}
+	status = waitForStatus(t, controller, func(status Status) bool {
+		return status.Desired && status.Running && status.RestartCount == 1
+	})
+	if status.NextAttemptAt != "" || status.LastError != errUnexpectedDispatcherExit.Error() {
+		t.Fatalf("restarted status = %#v", status)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.Stop(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case attempt := <-attempts:
+		t.Fatalf("dispatcher restarted after stop with attempt %d", attempt)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestControllerCancellationWithNilExitDoesNotRestart(t *testing.T) {
+	t.Run("explicit stop", func(t *testing.T) {
+		attempts := make(chan int, 2)
+		controller := New(Options{
+			RestartMinDelay: 5 * time.Millisecond,
+			RestartMaxDelay: 5 * time.Millisecond,
+			Run: func(ctx context.Context, _ dispatcher.Options) error {
+				attempts <- 1
+				<-ctx.Done()
+				return nil
+			},
+		})
+		if !controller.Start(context.Background(), agentconfig.Default()) {
+			t.Fatal("supervisor did not start")
+		}
+		receiveAttempt(t, attempts)
+		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := controller.Stop(stopCtx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-attempts:
+			t.Fatal("dispatcher restarted after explicit stop")
+		case <-time.After(30 * time.Millisecond):
+		}
+		status := controller.Status()
+		if status.Running || status.Desired || status.RestartCount != 0 ||
+			status.LastError != "" || status.StoppedAt == "" {
+			t.Fatalf("explicit stop status = %#v", status)
+		}
+	})
+
+	t.Run("parent cancellation", func(t *testing.T) {
+		attempts := make(chan int, 2)
+		controller := New(Options{
+			RestartMinDelay: 5 * time.Millisecond,
+			RestartMaxDelay: 5 * time.Millisecond,
+			Run: func(ctx context.Context, _ dispatcher.Options) error {
+				attempts <- 1
+				<-ctx.Done()
+				return nil
+			},
+		})
+		parent, cancel := context.WithCancel(context.Background())
+		if !controller.Start(parent, agentconfig.Default()) {
+			cancel()
+			t.Fatal("supervisor did not start")
+		}
+		receiveAttempt(t, attempts)
+		cancel()
+		status := waitForStatus(t, controller, func(status Status) bool {
+			return !status.Running && !status.Desired && status.StoppedAt != ""
+		})
+		select {
+		case <-attempts:
+			t.Fatal("dispatcher restarted after parent cancellation")
+		case <-time.After(30 * time.Millisecond):
+		}
+		if status.RestartCount != 0 || status.LastError != "" ||
+			status.NextAttemptAt != "" {
+			t.Fatalf("parent cancellation status = %#v", status)
+		}
+	})
+}
+
 func TestControllerStopInterruptsRestartBackoff(t *testing.T) {
 	attempts := make(chan int, 2)
 	controller := New(Options{

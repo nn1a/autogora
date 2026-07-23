@@ -52,6 +52,8 @@ const (
 	defaultStableRunWindow = 30 * time.Second
 )
 
+var errUnexpectedDispatcherExit = errors.New("dispatcher exited unexpectedly without an error")
+
 func New(options Options) *Controller {
 	if options.Run == nil {
 		options.Run = dispatcher.Run
@@ -152,9 +154,12 @@ func (c *Controller) runGeneration(ctx context.Context, generation uint64, confi
 		started := time.Now()
 		err := c.options.Run(ctx, options)
 		runDuration := time.Since(started)
-		if ctx.Err() != nil || err == nil || errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			c.finishGeneration(generation)
 			return
+		}
+		if err == nil {
+			err = errUnexpectedDispatcherExit
 		}
 		if runDuration >= c.options.StableRunWindow {
 			failures = 0
