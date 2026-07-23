@@ -20,6 +20,7 @@ import (
 	"github.com/nn1a/autogora/internal/notifications"
 	"github.com/nn1a/autogora/internal/orchestration"
 	"github.com/nn1a/autogora/internal/processidentity"
+	"github.com/nn1a/autogora/internal/publisher"
 	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 	"github.com/nn1a/autogora/internal/workspace"
@@ -61,6 +62,9 @@ type Options struct {
 	PlanningShutdownGrace    time.Duration
 	DecompositionPlanner     orchestration.Planner
 	CoordinatorPlanner       orchestration.Planner
+	PublicationExecutor      PublicationExecutor
+	PublicationTimeout       time.Duration
+	PublicationClaimTTL      time.Duration
 	AllowWrites              bool
 	Autopilot                bool
 	ClineApprovalDir         string
@@ -115,6 +119,26 @@ func (o *Options) normalize() {
 	}
 	if o.PlanningShutdownGrace <= 0 {
 		o.PlanningShutdownGrace = 2 * time.Second
+	}
+	if o.PublicationTimeout <= 0 {
+		o.PublicationTimeout = 2 * time.Minute
+	}
+	maxPublicationTimeout := store.MaxPublicationClaimTTL - publicationClaimGrace
+	if o.PublicationTimeout > maxPublicationTimeout {
+		o.PublicationTimeout = maxPublicationTimeout
+	}
+	minimumPublicationClaimTTL := o.PublicationTimeout + publicationClaimGrace
+	if minimumPublicationClaimTTL < store.MinPublicationClaimTTL {
+		minimumPublicationClaimTTL = store.MinPublicationClaimTTL
+	}
+	if o.PublicationClaimTTL < minimumPublicationClaimTTL {
+		o.PublicationClaimTTL = minimumPublicationClaimTTL
+	}
+	if o.PublicationClaimTTL > store.MaxPublicationClaimTTL {
+		o.PublicationClaimTTL = store.MaxPublicationClaimTTL
+	}
+	if o.PublicationExecutor == nil {
+		o.PublicationExecutor = publisher.Execute
 	}
 	if o.Getenv == nil {
 		o.Getenv = os.Getenv
@@ -1724,6 +1748,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	generatedClineApprovalDir := ""
 	planning := startPlanningQueue(ctx, manager, options)
 	coordination := startCoordinationQueue(ctx, manager, options)
+	publication := startPublicationQueue(ctx, manager, options)
 	oncePlanningWaited := false
 	onceCoordinationWaited := false
 	nextClaimBoard := ""
@@ -1739,6 +1764,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		}
 		if !coordination.Wait(options.PlanningShutdownGrace) {
 			options.log("Coordinator did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
+		}
+		if !publication.Wait(options.PlanningShutdownGrace) {
+			options.log("Publisher did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
 		}
 		leader.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
@@ -1778,6 +1806,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		}
 		if !options.Once {
 			coordination.Enqueue(boardSlugs)
+			publication.Enqueue(boardSlugs)
 		}
 		launched := false
 		foundInPass := true
@@ -1904,6 +1933,14 @@ func Run(ctx context.Context, options Options) (runErr error) {
 					}
 				}
 				onceCoordinationWaited = true
+			}
+			publicationDone := publication.Enqueue(boardSlugs)
+			if publicationDone != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-publicationDone:
+				}
 			}
 			deliverBoardNotifications(ctx, manager, boardSlugs, options)
 			return nil
