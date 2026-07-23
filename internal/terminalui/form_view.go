@@ -12,6 +12,7 @@ func formFieldLabel(field formField) string {
 		fieldTitle: "Title", fieldBody: "Description", fieldStatus: "Status", fieldPriority: "Priority",
 		fieldProfile: "Board profile", fieldAssignee: "Assignee", fieldRuntime: "Runtime", fieldSkills: "Skills",
 		fieldTenant: "Tenant", fieldWorkspaceKind: "Workspace kind", fieldWorkspace: "Workspace path", fieldGoalMode: "Goal mode", fieldScheduledAt: "Run after (RFC3339)",
+		fieldBranch: "Branch", fieldMaxRuntime: "Max runtime (seconds)", fieldMaxRetries: "Max retries", fieldGoalMaxTurns: "Goal max turns",
 	}
 	return labels[field]
 }

@@ -29,7 +29,11 @@ const (
 	fieldTenant
 	fieldWorkspaceKind
 	fieldWorkspace
+	fieldBranch
+	fieldMaxRuntime
+	fieldMaxRetries
 	fieldGoalMode
+	fieldGoalMaxTurns
 )
 
 type formAction int
@@ -90,6 +94,8 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 			fieldScheduledAt: newTextInput("", "RFC3339, for example 2026-07-23T18:00:00+09:00", 80),
 			fieldAssignee:    newTextInput("", "profile or worker name", 200), fieldSkills: newTextInput("", "comma-separated", 1000),
 			fieldTenant: newTextInput("", "optional", 200), fieldWorkspace: newTextInput("", "absolute path or empty", 2000),
+			fieldBranch: newTextInput("", "optional base branch", 500), fieldMaxRuntime: newTextInput("", "seconds or empty", 12),
+			fieldMaxRetries: newTextInput("2", "2", 6), fieldGoalMaxTurns: newTextInput("20", "20", 6),
 		},
 	}
 	form.body = textarea.New()
@@ -119,7 +125,13 @@ func editTaskForm(board string, profiles []orchestration.ProfileRoute, task mode
 	form.setInputValue(fieldSkills, strings.Join(task.Skills, ", "))
 	form.setInputValue(fieldTenant, pointer(task.Tenant, ""))
 	form.setInputValue(fieldWorkspace, pointer(task.Workspace, ""))
+	form.setInputValue(fieldBranch, pointer(task.Branch, ""))
 	form.setInputValue(fieldScheduledAt, pointer(task.ScheduledAt, ""))
+	if task.MaxRuntimeSeconds != nil {
+		form.setInputValue(fieldMaxRuntime, strconv.Itoa(*task.MaxRuntimeSeconds))
+	}
+	form.setInputValue(fieldMaxRetries, strconv.Itoa(task.MaxRetries))
+	form.setInputValue(fieldGoalMaxTurns, strconv.Itoa(task.GoalMaxTurns))
 	form.body.SetValue(task.Body)
 	form.runtimeIndex = optionIndex(formRuntimes, string(task.Runtime))
 	form.workspaceIndex = optionIndex(formWorkspaceKinds, string(task.WorkspaceKind))
@@ -152,9 +164,9 @@ func optionIndex(options []string, value string) int {
 
 func (f *taskForm) fields() []formField {
 	if f.mode == "create" {
-		return []formField{fieldTitle, fieldBody, fieldStatus, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
+		return []formField{fieldTitle, fieldBody, fieldStatus, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldBranch, fieldMaxRuntime, fieldMaxRetries, fieldGoalMode, fieldGoalMaxTurns}
 	}
-	return []formField{fieldTitle, fieldBody, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
+	return []formField{fieldTitle, fieldBody, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldBranch, fieldMaxRuntime, fieldMaxRetries, fieldGoalMode, fieldGoalMaxTurns}
 }
 
 func (f *taskForm) stepFields() [][]formField {
@@ -165,7 +177,7 @@ func (f *taskForm) stepFields() [][]formField {
 	return [][]formField{
 		task,
 		{fieldProfile, fieldAssignee, fieldRuntime, fieldSkills},
-		{fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode},
+		{fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldBranch, fieldMaxRuntime, fieldMaxRetries, fieldGoalMode, fieldGoalMaxTurns},
 	}
 }
 
@@ -185,7 +197,7 @@ func (f *taskForm) locked(field formField) bool {
 		return false
 	}
 	switch field {
-	case fieldProfile, fieldAssignee, fieldRuntime, fieldWorkspaceKind, fieldWorkspace:
+	case fieldProfile, fieldAssignee, fieldRuntime, fieldWorkspaceKind, fieldWorkspace, fieldBranch:
 		return true
 	default:
 		return false
@@ -361,6 +373,18 @@ func (f *taskForm) validate() error {
 	if _, err := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value())); err != nil {
 		return errors.New("priority must be an integer")
 	}
+	if value := strings.TrimSpace(f.inputs[fieldMaxRuntime].Value()); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds < 1 {
+			return errors.New("max runtime must be a positive number of seconds")
+		}
+	}
+	for field, label := range map[formField]string{fieldMaxRetries: "max retries", fieldGoalMaxTurns: "goal max turns"} {
+		value, err := strconv.Atoi(strings.TrimSpace(f.inputs[field].Value()))
+		if err != nil || value < 1 {
+			return errors.New(label + " must be a positive integer")
+		}
+	}
 	if f.runtimeIndex < 0 || f.runtimeIndex >= len(formRuntimes) {
 		return errors.New("select a valid runtime")
 	}
@@ -400,24 +424,41 @@ func optionalValue(value string) *string {
 
 func (f *taskForm) createInput() store.CreateTaskInput {
 	priority, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value()))
+	maxRetries, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldMaxRetries].Value()))
+	goalMaxTurns, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldGoalMaxTurns].Value()))
+	var maxRuntime *int
+	if value := strings.TrimSpace(f.inputs[fieldMaxRuntime].Value()); value != "" {
+		seconds, _ := strconv.Atoi(value)
+		maxRuntime = &seconds
+	}
 	return store.CreateTaskInput{
 		Title: strings.TrimSpace(f.inputs[fieldTitle].Value()), Body: f.body.Value(), Board: f.board,
 		Status: model.TaskStatus(formStatuses[f.statusIndex]), Assignee: optionalValue(f.inputs[fieldAssignee].Value()),
 		Runtime: model.Runtime(formRuntimes[f.runtimeIndex]), Priority: priority, Tenant: optionalValue(f.inputs[fieldTenant].Value()),
 		WorkspaceKind: model.WorkspaceKind(formWorkspaceKinds[f.workspaceIndex]), Workspace: optionalValue(f.inputs[fieldWorkspace].Value()),
-		ScheduledAt: optionalValue(f.inputs[fieldScheduledAt].Value()), Skills: splitSkills(f.inputs[fieldSkills].Value()), GoalMode: f.goalMode,
+		Branch: optionalValue(f.inputs[fieldBranch].Value()), ScheduledAt: optionalValue(f.inputs[fieldScheduledAt].Value()), MaxRuntimeSeconds: maxRuntime,
+		MaxRetries: maxRetries, Skills: splitSkills(f.inputs[fieldSkills].Value()), GoalMode: f.goalMode, GoalMaxTurns: goalMaxTurns,
 	}
 }
 
 func (f *taskForm) updateInput() store.UpdateTaskInput {
 	priority, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value()))
+	maxRetries, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldMaxRetries].Value()))
+	goalMaxTurns, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldGoalMaxTurns].Value()))
+	var maxRuntime *int
+	if value := strings.TrimSpace(f.inputs[fieldMaxRuntime].Value()); value != "" {
+		seconds, _ := strconv.Atoi(value)
+		maxRuntime = &seconds
+	}
 	title, body := strings.TrimSpace(f.inputs[fieldTitle].Value()), f.body.Value()
 	runtime, kind, skills, goal := model.Runtime(formRuntimes[f.runtimeIndex]), model.WorkspaceKind(formWorkspaceKinds[f.workspaceIndex]), splitSkills(f.inputs[fieldSkills].Value()), f.goalMode
 	return store.UpdateTaskInput{
 		Title: &title, Body: &body, Priority: &priority, Runtime: &runtime, WorkspaceKind: &kind, Skills: &skills, GoalMode: &goal,
+		MaxRuntimeSeconds: store.OptionalInt{Set: true, Value: maxRuntime}, MaxRetries: &maxRetries, GoalMaxTurns: &goalMaxTurns,
 		Assignee:    store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldAssignee].Value())},
 		Tenant:      store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldTenant].Value())},
 		Workspace:   store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldWorkspace].Value())},
+		Branch:      store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldBranch].Value())},
 		ScheduledAt: store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldScheduledAt].Value())},
 	}
 }

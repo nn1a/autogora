@@ -55,7 +55,11 @@ func TestTaskFormBuildsCompleteCreateInput(t *testing.T) {
 	form.setInputValue(fieldTenant, "product")
 	form.workspaceIndex = optionIndex(formWorkspaceKinds, "worktree")
 	form.setInputValue(fieldWorkspace, "/workspace/repo")
+	form.setInputValue(fieldBranch, "feature/tui")
+	form.setInputValue(fieldMaxRuntime, "900")
+	form.setInputValue(fieldMaxRetries, "4")
 	form.goalMode = true
+	form.setInputValue(fieldGoalMaxTurns, "12")
 
 	if err := form.validate(); err != nil {
 		t.Fatal(err)
@@ -67,8 +71,11 @@ func TestTaskFormBuildsCompleteCreateInput(t *testing.T) {
 	if input.Assignee == nil || *input.Assignee != "implementer" || input.Tenant == nil || *input.Tenant != "product" || input.Workspace == nil || *input.Workspace != "/workspace/repo" {
 		t.Fatalf("optional fields missing: %#v", input)
 	}
-	if input.WorkspaceKind != model.WorkspaceWorktree || len(input.Skills) != 2 || !input.GoalMode {
+	if input.WorkspaceKind != model.WorkspaceWorktree || len(input.Skills) != 2 || !input.GoalMode || input.Branch == nil || *input.Branch != "feature/tui" {
 		t.Fatalf("execution fields missing: %#v", input)
+	}
+	if input.MaxRuntimeSeconds == nil || *input.MaxRuntimeSeconds != 900 || input.MaxRetries != 4 || input.GoalMaxTurns != 12 {
+		t.Fatalf("execution limits missing: %#v", input)
 	}
 }
 

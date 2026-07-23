@@ -40,6 +40,10 @@ type CreateTaskInput struct {
 }
 
 type UpdateTaskInput struct {
+	// ExpectedUpdatedAt enables optimistic concurrency for interactive editors.
+	// When set, UpdateTask rejects a stale snapshot instead of overwriting a
+	// newer task update that arrived while the user was editing.
+	ExpectedUpdatedAt  *string
 	Title              *string
 	Body               *string
 	Assignee           OptionalString
@@ -51,6 +55,7 @@ type UpdateTaskInput struct {
 	Branch             OptionalString
 	ScheduledAt        OptionalString
 	MaxRuntimeSeconds  OptionalInt
+	MaxRetries         *int
 	Skills             *[]string
 	GoalMode           *bool
 	GoalMaxTurns       *int
@@ -84,10 +89,11 @@ type ListTaskFilter struct {
 }
 
 type EventFilter struct {
-	TaskID  string
-	SinceID *int64
-	Kinds   []string
-	Limit   int
+	TaskID      string
+	SinceID     *int64
+	Kinds       []string
+	Limit       int
+	NewestFirst bool
 }
 
 type Stats struct {
@@ -811,8 +817,12 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]model.Tas
 	}
 	limit = max(1, min(limit, 2000))
 	values = append(values, limit)
+	order := "ASC"
+	if filter.NewestFirst {
+		order = "DESC"
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT e.id, e.task_id, e.run_id, e.kind, e.payload_json, e.created_at
-		FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE `+strings.Join(clauses, " AND ")+" ORDER BY e.id ASC LIMIT ?", values...)
+		FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE `+strings.Join(clauses, " AND ")+" ORDER BY e.id "+order+" LIMIT ?", values...)
 	if err != nil {
 		return nil, err
 	}

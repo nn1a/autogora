@@ -434,6 +434,9 @@ func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskI
 		if err != nil {
 			return err
 		}
+		if input.ExpectedUpdatedAt != nil && strings.TrimSpace(*input.ExpectedUpdatedAt) != task.UpdatedAt {
+			return fmt.Errorf("task update conflict: %s changed at %s; refresh before saving", taskID, task.UpdatedAt)
+		}
 		if input.Status != nil && *input.Status == model.TaskStatusRunning && task.Status != model.TaskStatusRunning {
 			return errors.New("tasks enter running only through an atomic claim")
 		}
@@ -502,6 +505,12 @@ func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskI
 				return errors.New("maxRuntimeSeconds must be a positive integer")
 			}
 			add("max_runtime_seconds", nullableInt(input.MaxRuntimeSeconds.Value))
+		}
+		if input.MaxRetries != nil {
+			if *input.MaxRetries < 1 {
+				return errors.New("maxRetries must be a positive integer")
+			}
+			add("max_retries", *input.MaxRetries)
 		}
 		if input.Skills != nil {
 			encoded, _ := jsonMarshal(normalizeSkills(*input.Skills))
