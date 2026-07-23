@@ -157,12 +157,12 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		}
 		for position, node := range input.Nodes {
 			value := position
-			if err := setSubtask(ctx, tx, root.ID, tasksByKey[node.Key], &value); err != nil {
+			if _, err := setSubtask(ctx, tx, root.ID, tasksByKey[node.Key], &value); err != nil {
 				return err
 			}
 		}
 		for _, dependency := range input.Dependencies {
-			if err := linkTasks(ctx, tx, tasksByKey[dependency.Parent], tasksByKey[dependency.Child]); err != nil {
+			if _, err := linkTasks(ctx, tx, tasksByKey[dependency.Parent], tasksByKey[dependency.Child]); err != nil {
 				return err
 			}
 		}
@@ -188,9 +188,12 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 			return err
 		}
 		for _, leafID := range leafIDs {
-			if err := linkTasks(ctx, tx, leafID, root.ID); err != nil {
+			if _, err := linkTasks(ctx, tx, leafID, root.ID); err != nil {
 				return err
 			}
+		}
+		if _, err := bumpBoardGraphRevision(ctx, tx, root.Board); err != nil {
+			return err
 		}
 		autoPromote := input.AutoPromoteChildren == nil || *input.AutoPromoteChildren
 		subtasks := make([]map[string]any, 0, len(input.Nodes))
@@ -323,9 +326,12 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 		all := append(append([]string{}, result.WorkerIDs...), result.VerifierID, result.SynthesizerID)
 		for position, taskID := range all {
 			value := position
-			if err := setSubtask(ctx, tx, rootID, taskID, &value); err != nil {
+			if _, err := setSubtask(ctx, tx, rootID, taskID, &value); err != nil {
 				return err
 			}
+		}
+		if _, err := bumpBoardGraphRevision(ctx, tx, root.Board); err != nil {
+			return err
 		}
 		return appendEvent(ctx, tx, rootID, "swarm_created", map[string]any{
 			"workerIds": result.WorkerIDs, "verifierId": result.VerifierID, "synthesizerId": result.SynthesizerID,

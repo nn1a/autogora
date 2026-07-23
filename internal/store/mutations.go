@@ -90,26 +90,26 @@ func assertHierarchyAcyclic(ctx context.Context, q querier, parentID, childID st
 	return nil
 }
 
-func setSubtask(ctx context.Context, q querier, parentID, childID string, position *int) error {
+func setSubtask(ctx context.Context, q querier, parentID, childID string, position *int) (bool, error) {
 	parent, err := requireTask(ctx, q, parentID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	child, err := requireTask(ctx, q, childID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if parent.Board != child.Board {
-		return errors.New("cross-board task hierarchy is not allowed")
+		return false, errors.New("cross-board task hierarchy is not allowed")
 	}
 	if err := assertHierarchyAcyclic(ctx, q, parentID, childID); err != nil {
-		return err
+		return false, err
 	}
 	var existingParent sql.NullString
 	var existingPosition sql.NullInt64
 	err = q.QueryRowContext(ctx, "SELECT parent_id, position FROM task_hierarchy WHERE child_id = ?", childID).Scan(&existingParent, &existingPosition)
 	if err != nil && err != sql.ErrNoRows {
-		return err
+		return false, err
 	}
 	resolved := 0
 	if position != nil {
@@ -117,31 +117,45 @@ func setSubtask(ctx context.Context, q querier, parentID, childID string, positi
 	} else if existingParent.Valid && existingParent.String == parentID {
 		resolved = int(existingPosition.Int64)
 	} else if err := q.QueryRowContext(ctx, "SELECT COALESCE(MAX(position) + 1, 0) FROM task_hierarchy WHERE parent_id = ?", parentID).Scan(&resolved); err != nil {
-		return err
+		return false, err
 	}
 	if resolved < 0 {
-		return errors.New("subtask position must be a non-negative integer")
+		return false, errors.New("subtask position must be a non-negative integer")
 	}
 	if existingParent.Valid && existingParent.String == parentID && int(existingPosition.Int64) == resolved {
-		return nil
+		return false, nil
 	}
 	if _, err := q.ExecContext(ctx, `
 		INSERT INTO task_hierarchy(parent_id, child_id, position) VALUES (?, ?, ?)
 		ON CONFLICT(child_id) DO UPDATE SET parent_id = excluded.parent_id, position = excluded.position
 	`, parentID, childID, resolved); err != nil {
-		return err
+		return false, err
 	}
 	var previous any
 	if existingParent.Valid {
 		previous = existingParent.String
 	}
-	return appendEvent(ctx, q, childID, "subtask_linked", map[string]any{
+	if err := appendEvent(ctx, q, childID, "subtask_linked", map[string]any{
 		"parentTaskId": parentID, "position": resolved, "previousParentTaskId": previous,
-	}, nil)
+	}, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) SetSubtaskParent(ctx context.Context, parentID, childID string, position *int) (model.TaskDetail, error) {
-	err := s.withWrite(ctx, func(tx *sql.Tx) error { return setSubtask(ctx, tx, parentID, childID, position) })
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		changed, err := setSubtask(ctx, tx, parentID, childID, position)
+		if err != nil || !changed {
+			return err
+		}
+		parent, err := requireTask(ctx, tx, parentID)
+		if err != nil {
+			return err
+		}
+		_, err = bumpBoardGraphRevision(ctx, tx, parent.Board)
+		return err
+	})
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
@@ -150,7 +164,8 @@ func (s *Store) SetSubtaskParent(ctx context.Context, parentID, childID string, 
 
 func (s *Store) RemoveSubtask(ctx context.Context, parentID, childID string) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := requireTask(ctx, tx, parentID); err != nil {
+		parent, err := requireTask(ctx, tx, parentID)
+		if err != nil {
 			return err
 		}
 		if _, err := requireTask(ctx, tx, childID); err != nil {
@@ -162,7 +177,11 @@ func (s *Store) RemoveSubtask(ctx context.Context, parentID, childID string) (mo
 		}
 		changes, _ := result.RowsAffected()
 		if changes > 0 {
-			return appendEvent(ctx, tx, childID, "subtask_unlinked", map[string]any{"parentTaskId": parentID}, nil)
+			if err := appendEvent(ctx, tx, childID, "subtask_unlinked", map[string]any{"parentTaskId": parentID}, nil); err != nil {
+				return err
+			}
+			_, err = bumpBoardGraphRevision(ctx, tx, parent.Board)
+			return err
 		}
 		return nil
 	})
@@ -173,7 +192,18 @@ func (s *Store) RemoveSubtask(ctx context.Context, parentID, childID string) (mo
 }
 
 func (s *Store) LinkTasks(ctx context.Context, parentID, childID string) (model.TaskDetail, error) {
-	err := s.withWrite(ctx, func(tx *sql.Tx) error { return linkTasks(ctx, tx, parentID, childID) })
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		changed, err := linkTasks(ctx, tx, parentID, childID)
+		if err != nil || !changed {
+			return err
+		}
+		parent, err := requireTask(ctx, tx, parentID)
+		if err != nil {
+			return err
+		}
+		_, err = bumpBoardGraphRevision(ctx, tx, parent.Board)
+		return err
+	})
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
@@ -182,7 +212,8 @@ func (s *Store) LinkTasks(ctx context.Context, parentID, childID string) (model.
 
 func (s *Store) UnlinkTasks(ctx context.Context, parentID, childID string) (model.TaskDetail, error) {
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := requireTask(ctx, tx, parentID); err != nil {
+		parent, err := requireTask(ctx, tx, parentID)
+		if err != nil {
 			return err
 		}
 		child, err := requireTask(ctx, tx, childID)
@@ -206,6 +237,9 @@ func (s *Store) UnlinkTasks(ctx context.Context, parentID, childID string) (mode
 		changes, _ := result.RowsAffected()
 		if changes > 0 {
 			if err := appendEvent(ctx, tx, childID, "unlinked", map[string]any{"parentId": parentID}, nil); err != nil {
+				return err
+			}
+			if _, err := bumpBoardGraphRevision(ctx, tx, parent.Board); err != nil {
 				return err
 			}
 		}
@@ -311,6 +345,14 @@ func (s *Store) DeleteTaskWithVersion(ctx context.Context, taskID string, expect
 		if task.CurrentRunID != nil {
 			return errors.New("cannot delete a running task; terminate the active run first")
 		}
+		var topologyEdges int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM task_links WHERE parent_id = ? OR child_id = ?) +
+				(SELECT COUNT(*) FROM task_hierarchy WHERE parent_id = ? OR child_id = ?)
+		`, taskID, taskID, taskID, taskID).Scan(&topologyEdges); err != nil {
+			return err
+		}
 		rows, err := tx.QueryContext(ctx, `SELECT link.child_id, child.status
 			FROM task_links link JOIN tasks child ON child.id = link.child_id
 			WHERE link.parent_id = ?`, taskID)
@@ -334,6 +376,11 @@ func (s *Store) DeleteTaskWithVersion(ctx context.Context, taskID string, expect
 		rows.Close()
 		if _, err := tx.ExecContext(ctx, "DELETE FROM tasks WHERE id = ?", taskID); err != nil {
 			return err
+		}
+		if topologyEdges > 0 {
+			if _, err := bumpBoardGraphRevision(ctx, tx, task.Board); err != nil {
+				return err
+			}
 		}
 		for _, dependent := range dependents {
 			if err := recomputeReady(ctx, tx, dependent); err != nil {

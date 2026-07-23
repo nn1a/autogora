@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -24,6 +25,36 @@ type dependencyRow struct {
 }
 
 func (s *Store) RelationshipGraph(ctx context.Context, taskID string) (model.RelationshipGraph, error) {
+	focus, err := requireTask(ctx, s.db, taskID)
+	if err != nil {
+		return model.RelationshipGraph{}, err
+	}
+	// Topology writes and the revision bump commit in one transaction. Reading
+	// the revision before and after the graph gives callers a consistent
+	// optimistic-concurrency token without holding a write transaction while
+	// constructing a potentially large graph.
+	for range 5 {
+		before, err := s.GetBoardGraphState(ctx, focus.Board)
+		if err != nil {
+			return model.RelationshipGraph{}, err
+		}
+		graph, err := s.relationshipGraph(ctx, taskID)
+		if err != nil {
+			return model.RelationshipGraph{}, err
+		}
+		after, err := s.GetBoardGraphState(ctx, focus.Board)
+		if err != nil {
+			return model.RelationshipGraph{}, err
+		}
+		if before.Revision == after.Revision {
+			graph.GraphRevision = after.Revision
+			return graph, nil
+		}
+	}
+	return model.RelationshipGraph{}, errors.New("graph changed repeatedly while it was being read")
+}
+
+func (s *Store) relationshipGraph(ctx context.Context, taskID string) (model.RelationshipGraph, error) {
 	focus, err := requireTask(ctx, s.db, taskID)
 	if err != nil {
 		return model.RelationshipGraph{}, err

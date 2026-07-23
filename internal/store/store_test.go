@@ -966,7 +966,7 @@ func TestWorkerContextBoundsLargeGraphsAndExcludesRelatedBodies(t *testing.T) {
 				return err
 			}
 			position := index
-			if err := setSubtask(ctx, tx, root.Task.ID, childID, &position); err != nil {
+			if _, err := setSubtask(ctx, tx, root.Task.ID, childID, &position); err != nil {
 				return err
 			}
 		}

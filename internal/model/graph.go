@@ -41,6 +41,7 @@ type DependencyEdge struct {
 type RelationshipGraph struct {
 	FocusTaskID         string             `json:"focusTaskId"`
 	RootTaskID          string             `json:"rootTaskId"`
+	GraphRevision       int64              `json:"graphRevision"`
 	TotalPhases         int                `json:"totalPhases"`
 	TotalConnectedNodes int                `json:"totalConnectedNodes"`
 	Truncated           bool               `json:"truncated"`

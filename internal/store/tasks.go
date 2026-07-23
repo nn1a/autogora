@@ -359,66 +359,69 @@ func assertDependencyAcyclic(ctx context.Context, q querier, parentID, childID s
 	return nil
 }
 
-func linkTasks(ctx context.Context, q querier, parentID, childID string) error {
+func linkTasks(ctx context.Context, q querier, parentID, childID string) (bool, error) {
 	parent, err := requireTask(ctx, q, parentID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	child, err := requireTask(ctx, q, childID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if parent.Board != child.Board {
-		return errors.New("cross-board dependencies are not allowed")
+		return false, errors.New("cross-board dependencies are not allowed")
 	}
 	if child.Status == model.TaskStatusRunning {
 		var existing int
 		if err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?", parentID, childID).Scan(&existing); err != nil {
-			return err
+			return false, err
 		}
 		if existing > 0 {
-			return nil
+			return false, nil
 		}
-		return errors.New("cannot add a prerequisite while the dependent task is running; terminate or finish its active run first")
+		return false, errors.New("cannot add a prerequisite while the dependent task is running; terminate or finish its active run first")
 	}
 	if err := assertDependencyAcyclic(ctx, q, parentID, childID); err != nil {
-		return err
+		return false, err
 	}
 	satisfaction, err := dependencySatisfactionForParent(ctx, q, parentID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := validateSatisfyingRun(ctx, q, parentID, satisfaction.runID); err != nil {
-		return err
+		return false, err
 	}
 	result, err := q.ExecContext(ctx,
 		"INSERT OR IGNORE INTO task_links(parent_id, child_id, satisfied_at, satisfied_run_id) VALUES (?, ?, ?, ?)",
 		parentID, childID, nullableString(satisfaction.at), nullableString(satisfaction.runID),
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	changes, _ := result.RowsAffected()
 	if changes == 0 {
-		return nil
+		return false, nil
 	}
 	if err := appendEvent(ctx, q, childID, "linked", map[string]any{
 		"parentId": parentID, "satisfiedAt": satisfaction.at, "satisfiedRunId": satisfaction.runID,
 	}, nil); err != nil {
-		return err
+		return false, err
 	}
 	if satisfaction.at == nil && child.Status == model.TaskStatusDone {
 		if _, err := q.ExecContext(ctx, `
 			UPDATE tasks SET status = 'todo', block_kind = NULL, block_reason = NULL,
 			block_recurrences = 0, updated_at = ? WHERE id = ?
 		`, now(), childID); err != nil {
-			return err
+			return false, err
 		}
 		if err := appendEvent(ctx, q, childID, "reopened_for_dependency", map[string]any{"parentId": parentID}, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return recomputeReady(ctx, q, childID)
+	if err := recomputeReady(ctx, q, childID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) createTask(ctx context.Context, q querier, input CreateTaskInput) (string, error) {
@@ -530,7 +533,7 @@ func (s *Store) createTask(ctx context.Context, q querier, input CreateTaskInput
 		return "", err
 	}
 	for _, parentID := range input.Parents {
-		if err := linkTasks(ctx, q, parentID, taskID); err != nil {
+		if _, err := linkTasks(ctx, q, parentID, taskID); err != nil {
 			return "", err
 		}
 	}
@@ -572,6 +575,9 @@ func (s *Store) CreateTaskWithDisposition(ctx context.Context, input CreateTaskI
 		}
 		var err error
 		taskID, err = s.createTask(ctx, tx, input)
+		if err == nil && len(input.Parents) > 0 {
+			_, err = bumpBoardGraphRevision(ctx, tx, orFallback(input.Board, s.board))
+		}
 		return err
 	})
 	if err != nil {

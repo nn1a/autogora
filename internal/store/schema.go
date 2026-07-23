@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 18
+const schemaVersion = 19
 
 type Store struct {
 	db              *sql.DB
@@ -140,8 +140,21 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensureDependencySatisfaction(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureBoardGraphState(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureBoardGraphState(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO board_graph_state(board, revision, updated_at)
+		SELECT board, 0, COALESCE(MAX(updated_at), '') FROM tasks GROUP BY board
+	`); err != nil {
+		return fmt.Errorf("backfill board graph state: %w", err)
 	}
 	return nil
 }
@@ -470,6 +483,51 @@ CREATE TABLE IF NOT EXISTS task_hierarchy (
   CHECK (parent_id <> child_id)
 );
 
+CREATE TABLE IF NOT EXISTS board_graph_state (
+  board TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coordination_incidents (
+  id TEXT PRIMARY KEY,
+  board TEXT NOT NULL,
+  root_task_id TEXT,
+  task_id TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('repeated_block', 'retry_exhausted', 'graph_stalled', 'integration_conflict', 'agent_exhausted')),
+  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+  status TEXT NOT NULL CHECK (status IN ('open', 'coordinating', 'awaiting_approval', 'applying', 'resolved', 'dismissed', 'failed')),
+  graph_revision INTEGER NOT NULL CHECK (graph_revision >= 0),
+  summary TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  claim_token TEXT,
+  claim_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'coordinating' AND claim_token IS NOT NULL AND claim_token <> '' AND claim_expires_at IS NOT NULL)
+    OR
+    (status <> 'coordinating' AND claim_token IS NULL AND claim_expires_at IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS coordination_proposals (
+  id TEXT PRIMARY KEY,
+  incident_id TEXT NOT NULL REFERENCES coordination_incidents(id) ON DELETE CASCADE,
+  coordinator_agent TEXT NOT NULL,
+  coordinator_model TEXT NOT NULL DEFAULT '',
+  coordinator_provider TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN ('draft', 'validating', 'validated', 'awaiting_approval', 'approved', 'rejected', 'superseded', 'applying', 'applied', 'failed')),
+  expected_graph_revision INTEGER NOT NULL CHECK (expected_graph_revision >= 0),
+  summary TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  actions_json TEXT NOT NULL DEFAULT '[]',
+  validation_errors_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  applied_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -717,6 +775,14 @@ CREATE INDEX IF NOT EXISTS idx_global_agent_slots_expiry ON global_agent_slots(o
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_board_status ON coordination_incidents(board, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_task ON coordination_incidents(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_root ON coordination_incidents(root_task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_incidents_claim_due ON coordination_incidents(status, claim_expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_incidents_active_dedupe
+  ON coordination_incidents(board, trigger, IFNULL(root_task_id, ''), IFNULL(task_id, ''))
+  WHERE status IN ('open', 'coordinating', 'awaiting_approval', 'applying');
+CREATE INDEX IF NOT EXISTS idx_coordination_proposals_incident ON coordination_proposals(incident_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_subscriptions_task ON notification_subscriptions(task_id, platform, chat_id);

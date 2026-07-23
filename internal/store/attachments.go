@@ -219,6 +219,11 @@ func (s *Store) CreateTaskWithURLSource(ctx context.Context, input CreateTaskInp
 			if err != nil {
 				return err
 			}
+			if len(input.Parents) > 0 {
+				if _, err := bumpBoardGraphRevision(ctx, tx, orFallback(input.Board, s.board)); err != nil {
+					return err
+				}
+			}
 		}
 		var existing int
 		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_attachments WHERE task_id = ? AND kind = 'url' AND url = ?", taskID, normalized).Scan(&existing); err != nil {
