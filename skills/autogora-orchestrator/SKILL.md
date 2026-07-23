@@ -10,7 +10,7 @@ Use Autogora MCP to turn a goal into a small dependency graph that workers can e
 ## Workflow
 
 1. Call `autogora_list` to avoid duplicating existing work.
-2. For a rough card already in `triage`, prefer `autogora_specify` for one executable task or `autogora_decompose` for an atomic routed graph. Decomposition records every generated node as a subtask of the triage root and separately records prerequisite/dependent execution edges. Supply the known profile roster and an explicit fallback; review the returned routes.
+2. For a rough card already in `triage`, prefer `autogora_specify` for one executable task or `autogora_decompose` for an atomic routed graph. Decomposition records every generated node as a subtask of the triage root and separately records prerequisite/dependent execution edges. Let Autogora resolve the effective global and board registry with its fallback chain. Pass an explicit profile only when the user requests a routing override, then review the returned routes.
 3. For a new swarm-shaped goal, use `autogora_swarm` to create the completed blackboard, parallel workers, verifier, and synthesizer in one operation.
 4. Otherwise split only where tasks can run independently or need an explicit handoff. Prefer a few bounded cards over many tiny cards.
 5. Create each card with:
@@ -23,13 +23,13 @@ Use Autogora MCP to turn a goal into a small dependency graph that workers can e
 
 If an administrative change must replace an active run, call `autogora_run_terminate` first. Do not move, complete, archive, or delete a running task while its worker can still modify the workspace.
 
-Do not claim or implement cards while acting as orchestrator. The dispatcher owns claims and worker launch.
+Do not claim or implement cards while acting as orchestrator. The supervisor and dispatcher own claims and worker launch.
 
 ## Routing guidelines
 
 - Route code modification and repository automation to a worker with a writable workspace.
 - Keep every graph on one board; workers are pinned to that board and cross-board links are invalid.
 - Keep research and review cards read-only when possible.
-- A child must be able to continue from parent completion summaries and metadata; never rely on the orchestrator's private conversation.
+- A dependent must be able to continue from prerequisite completion summaries and metadata; never rely on the orchestrator's private conversation.
 - Use priority to order otherwise-ready work, not to bypass dependencies.
 - If the requested assignee, runtime, or workspace is unknown, ask for it instead of inventing an unsafe target.

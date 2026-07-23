@@ -38,11 +38,11 @@ autogora dashboard
 
 `codex` 대신 실제 사용하는 `claude` 또는 `gemini`를 지정한다. MCP를 비활성화한 수정 Cline은 `setup`을 건너뛰고 dispatcher의 CLI 브리지를 사용한다.
 
-`dashboard`가 출력한 URL을 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL의 일회용 토큰을 HTTP-only 세션 쿠키로 교환한다. 전역 agent 설정 파일이 없으면 첫 화면에서 `Agents` 대화상자가 열린다.
+`dashboard`가 출력한 URL을 연다. 기본 주소는 `127.0.0.1:8420`이다. 브라우저는 URL 토큰을 HTTP-only, `SameSite=Strict` 세션 쿠키로 저장한 뒤 토큰 없는 URL로 이동한다. 전역 agent 설정 파일이 없으면 첫 화면에서 `Agents` 대화상자가 열린다.
 
 1. `Detect CLIs`로 `PATH`에 있는 coding agent를 찾는다.
 2. 사용할 agent의 runtime, 명령, model, provider와 worker/planner/judge 역할을 확인한다.
-3. role별 기본 순서, fallback, agent별 동시 실행 수를 정한다.
+3. 역할별 기본 순서, fallback, agent별 동시 실행 수를 정한다.
 4. `Automatic orchestration`의 worker 수와 쓰기 권한을 정하고 저장한다.
 
 탐지는 각 CLI에 `--version`만 실행한다. prompt나 유료 API를 호출하지 않지만 로그인, 구독 한도, quota도 확인하지 않는다. 자동 실행 전에 각 CLI에서 실제 사용 가능 여부를 점검한다. API 키나 로그인 토큰은 Autogora 설정에 넣지 않는다.
@@ -60,7 +60,7 @@ autogora agents defaults --worker codex --planner codex --judge codex
 autogora agents supervisor --auto-start=true --max-workers 2 --allow-writes=true
 ```
 
-`allow-writes`는 agent의 파일 수정과 shell 실행을 허용한다. 구현이 필요한 작업에서만 신뢰하는 저장소를 대상으로 켠다. 일회성 실행이나 자동 실행 전 후보 확인에는 `dispatch --once`, `dispatch --dry-run`을 사용할 수 있다.
+`allow-writes`는 agent의 파일 수정과 shell 실행을 허용한다. 구현이 필요한 작업에서만 신뢰하는 저장소를 대상으로 켠다. `dispatch --dry-run`으로 후보를 확인하고, `dispatch --once`로 한 작업을 실행한다.
 
 브라우저 없이 운영하려면 `autogora tui`를 실행한다. 전역 설정의 `auto-start`와 쓰기 정책을 그대로 사용한다.
 
@@ -72,6 +72,8 @@ autogora boards create product-web \
   --default-workdir "$PWD" \
   --switch
 ```
+
+보드를 보관하거나 영구 삭제할 때는 먼저 활성 run과 agent·workspace lease를 끝내고 해당 보드를 연 TUI나 다른 client를 닫는다. Autogora는 제거 중 새 claim과 쓰기를 막고, 실행·lease·열린 store가 남으면 `boards rm`을 거부한다. 보관된 slug는 새 보드 생성이 끝날 때까지 예약된다.
 
 Git 저장소를 보드의 기본 작업 디렉터리로 지정하고 작업별 경로를 생략하면 run마다 분리된 detached worktree를 준비한다. task에는 workspace 설정만 유지하고 실제 경로와 기준 commit은 run 이력에 기록한다. worker가 끝나면 임시 Git index로 최종 tree를 스냅샷하고 `refs/autogora/runs/<run-id>`에 보존한다. 사용자 checkout, branch, index는 바꾸지 않는다. 현재 디렉터리를 직접 수정해야 한다면 작업 생성 시 `--workspace "$PWD" --workspace-kind dir`를 명시한다.
 
@@ -111,22 +113,41 @@ autogora github import \
   --board product-web
 ```
 
-가져온 task는 `Triage`에서 시작한다. 본문과 URL 첨부에 원본 issue 주소가 남는다. 같은 issue를 다시 가져오면 활성 task를 중복 생성하지 않는다. dispatcher의 auto-decompose가 켜져 있으면 다음 tick에서 해당 task를 구체화한다.
+Web UI에서는 상단의 `Import issues`를 열어 같은 조건을 입력한다. `Preview`로 대상과 중복 여부를 확인하고 `Import to Triage`를 누른다. 일부 issue만 실패하면 성공한 항목과 실패 원인을 함께 보여준다.
+
+가져온 task는 `Triage`에서 시작한다. 본문과 URL 첨부에 원본 issue 주소가 남고, 같은 issue를 다시 가져와도 활성 task를 중복 생성하지 않는다. Issue 제목과 본문은 신뢰하지 않는 외부 입력으로 취급하며 자동 분해하지 않는다. 내용을 확인한 뒤 `Specify`, `Decompose`, `Promote` 중 하나를 직접 선택한다.
+
+![GitHub와 GitHub Enterprise issue를 가져오는 실제 화면](images/workflow-00-github-import.png)
+
+*`Preview`로 대상과 중복 여부를 확인하고 외부 입력 검토 경계를 읽은 뒤 `Triage`로 가져온다.*
 
 ### Web UI에서 한 작업을 끝내는 순서
 
 보드는 `Triage`~`Ready`를 Planning, `Running`~`Done`을 Execution으로 묶어 각각 네 컬럼을 한 줄에 보여준다. 페이지 전체를 가로로 스크롤하지 않아도 흐름을 비교할 수 있으며, 좁은 화면에서는 두 컬럼이나 한 컬럼으로 자동 전환한다. Archived는 필요할 때만 별도 구간에 표시한다.
+
+Web UI는 한 번에 최대 500개 task를 그린다. 전체가 더 많으면 상단에 `500 shown`과 전체 수를 표시한다. 화면 밖의 task는 CLI `list`, MCP `autogora_list` 또는 `/api/tasks`의 tenant·assignee·status·search 필터로 찾는다.
 
 1. `Triage` 컬럼 제목의 `+`를 눌러 요청을 등록한다.
 2. 생성된 카드를 눌러 상세 패널을 연다.
 3. 한 작업이면 `Specify`, 여러 역할로 나눌 일이면 `Decompose`를 누른다.
 4. `Todo` 카드에서 Assignee, Runtime, Priority와 Description을 확인한 뒤 `Save changes`를 누른다. 실행 조건을 충족하면 `Ready`로 전환된다.
 5. 여전히 `Todo`이고 `Promote` 버튼이 보일 때만 승격한다. 승격 후에도 `Todo`라면 미완료 dependency나 빠진 담당자를 확인한다.
-6. supervisor가 꺼져 있다면 읽기·분석 작업은 상단의 `Dispatch now`로 한 번 실행할 수 있다.
-7. 카드가 `Running`이면 상세 화면의 Run history와 Recent events를 확인한다.
-8. 성공한 작업은 `Done`에서, 사람의 결정이 필요한 작업은 `Blocked`에서 확인한다.
+6. supervisor가 꺼져 있다면 상단의 `Run now`로 한 번 실행할 수 있다.
+7. `Automation & activity`에서 supervisor, agent 상태, 실행 중인 run, 최근 오류를 확인한다.
+8. 카드가 `Running`이면 상세 화면의 Run history와 Recent events를 확인한다.
+9. 성공한 작업은 `Done`에서, 사람의 결정이 필요한 작업은 `Blocked`에서 확인한다.
 
-Web UI의 `Dispatch now`는 읽기 전용 1회 실행이다. 코드나 문서를 수정할 task는 `Agents`에서 `Allow workspace changes`를 켜고 supervisor를 시작한다. Supervisor를 쓰지 않는 일회성 작업은 CLI에서 명시적으로 쓰기를 허용할 수 있다.
+Web UI의 `Run now`는 `Agents`에 저장한 `Allow workspace changes` 정책으로 한 번 실행한다. 버튼을 누른 뒤 `Automation & activity`에서 read-only/write-enabled 모드와 성공·실패 결과를 확인한다. Supervisor를 쓰지 않고 CLI에서 구현 작업을 실행할 때는 쓰기 권한을 명시한다.
+
+Web UI는 task의 마지막 수정 시각을 함께 보내 동시 편집 충돌을 막는다. 다른 창이나 자동화가 먼저 바꾼 task의 저장, drag/drop, 완료·차단·보관·삭제는 최신 내용을 덮어쓰지 않고 새로고침을 안내한다. 일괄 변경은 충돌하지 않은 항목만 적용하고 실패한 항목을 선택한 상태로 남긴다.
+
+`Automation & activity`에는 supervisor 상태와 재시작 오류, agent health와 cooldown, 활성 run의 heartbeat·lease, Web UI에서 시작한 일회성 실행, 진단 결과와 최근 이벤트가 모인다. 자동 실행이 멈추거나 카드가 오래 `Running`에 머물면 이 화면부터 확인한다.
+
+![자동화와 실행 상태를 모아 보여주는 실제 Automation & activity 화면](images/workflow-03-activity.png)
+
+*Event stream, supervisor, 활성 run, agent, 일회성 실행, 보드 진단과 최근 이벤트를 한 화면에서 확인한다.*
+
+다음 예제는 `product-web` 보드의 구현 작업 한 건을 쓰기 가능 모드로 실행한다.
 
 ```bash
 autogora dispatch --once --allow-writes --board product-web
@@ -156,15 +177,15 @@ autogora dispatch --once --allow-writes --board product-web
 
 | 섹션 | 필드 |
 | --- | --- |
-| Task | Title, Description, Status, Priority |
+| Task | Title, Description, Priority. 생성 시 Status와 Run after 추가 |
 | Agent | Board profile과 모델 표시, Assignee, Runtime, Skills |
-| Execution | Tenant, Workspace kind/path, Goal mode |
+| Execution | Tenant, Workspace kind/path, Branch, 최대 실행 시간, 최대 재시도, Goal mode와 최대 turn |
 
-`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. Status, Board profile, Runtime, Workspace kind에 포커스한 뒤 `↑/↓`로 값을 선택하고, Goal mode는 `Space`로 전환한다. 폼에도 현재 필드의 조작 키가 표시된다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile 목록은 Web UI와 같은 전역 agent, board profile, 기존 task route를 합친 결과다. Profile을 선택하면 Assignee와 Runtime이 함께 설정되고 선택한 model도 표시된다. 비활성 Profile은 목록에서 제외된다.
+`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. 생성 폼의 Status와 Board profile, Runtime, Workspace kind에 포커스한 뒤 `↑/↓`로 값을 선택하고, Goal mode는 `Space`로 전환한다. 기존 task의 상태 변경과 예약은 action palette에서 실행한다. 폼에도 현재 필드의 조작 키가 표시된다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile 목록은 Web UI와 같은 전역 agent, board profile, 기존 task route를 합친 결과다. Profile을 선택하면 Assignee와 Runtime이 함께 설정되고 선택한 model도 표시된다. 비활성 Profile은 목록에서 제외된다.
 
 `Space` action palette에서는 Specify, Decompose, Promote, Unblock, 선택 작업 실행, 활성 run 종료, Schedule, Block, Complete, hierarchy와 dependency 편집, 첨부, Archive, Delete를 실행할 수 있다. 메뉴 항목이나 관계 대상이 많으면 메뉴 안에서 `/`를 눌러 검색한다.
 
-Planner action과 중요한 상태 변경은 확인창에 표시된 task ID를 기준으로 실행한다. 확인하는 동안 자동 갱신이나 선택 변경이 일어나도 다른 task에 적용되지 않는다. `Running` task에서는 Title, Description, Priority처럼 소유권과 무관한 필드만 수정할 수 있다. Assignee, Runtime, Workspace, Status를 바꾸려면 action palette에서 활성 run을 먼저 종료한다.
+Planner action과 중요한 상태 변경은 확인창에 표시된 task ID를 기준으로 실행한다. 확인하는 동안 자동 갱신이나 선택 변경이 일어나도 다른 task에 적용되지 않는다. `Running` task의 편집 폼에서는 Priority만 수정할 수 있다. Title, Description, Tenant, Assignee, Runtime, Workspace, Status를 비롯한 실행 명세를 바꾸려면 action palette에서 활성 run을 먼저 종료한다.
 
 TUI와 Web UI는 같은 task service, SQLite DB, 유효 profile, planner 설정을 사용한다. 한 화면에서 저장한 변경은 다른 화면의 다음 갱신에 나타난다. 여러 task 일괄 변경, board와 전역 agent 설정, swarm 생성, supervisor 제어는 Web UI나 CLI를 사용한다.
 
@@ -405,11 +426,17 @@ autogora link <prerequisite-id> <dependent-id>
 autogora unlink <prerequisite-id> <dependent-id>
 ```
 
+새 보드는 dispatcher가 보드를 한 번 확인할 때 최대 세 개의 일반 `Triage` 카드를 자동으로 구체화한다. Planner는 worker 실행 흐름과 분리되어 있어 느리거나 실패해도 상태 정리, 중단된 run 복구와 `Ready` claim은 계속된다. 실패하면 `auto_decompose_failed` 이벤트를 남기고 task별 대기 시간을 5초부터 최대 5분까지 늘린다.
+
+GitHub에서 가져와 검토를 기다리는 task와 backoff 중인 task는 실제 planning 횟수를 소모하지 않는다. 후보를 나눠 읽으므로 대량 import 뒤의 일반 task도 처리한다. 취소를 무시하는 planner에는 제한된 종료 유예만 주고 dispatcher 종료를 계속한다.
+
 ### 5.4 Todo: 실행 경로 확정
 
 Web UI의 `Agents`는 모든 보드에서 공유할 전역 agent registry와 worker/planner/judge 기본 순서를 관리한다. 각 agent에는 runtime, 실행 명령, model, provider, 역할, fallback과 최대 동시 실행 수를 둔다. Model을 비우면 해당 CLI 기본값을 사용하며 화면과 run 이력에는 `CLI default (unpinned)`로 표시된다.
 
-`Board settings`의 profile은 한 보드의 routing을 특화한다. 같은 이름의 전역 agent가 있으면 model, provider, 설명, 우선순위와 fallback을 덮어쓰거나 동시 실행 상한을 더 낮출 수 있다. 전역 runtime이나 실행 명령을 바꾸거나, 전역에서 비활성화한 agent를 다시 켜거나, 전역 상한을 높일 수는 없다. 이름이 다른 보드 전용 profile은 새로 만들 수 있다. 보드에 planner model/provider를 명시하면 그 값을 사용하고, 비어 있으면 전역 planner 기본 순서의 첫 번째 활성 agent를 사용한다. Goal mode의 judge는 전역 judge 기본값을 우선하고 없으면 planner 설정을 사용한다.
+상단 `Settings`에서 여는 `Board & orchestration`의 profile은 한 보드의 routing을 특화한다. 같은 이름의 전역 agent가 있으면 model, provider, 설명, 우선순위와 fallback을 덮어쓰거나 동시 실행 상한을 더 낮출 수 있다. 전역 runtime이나 실행 명령을 바꾸거나, 전역에서 비활성화한 agent를 다시 켜거나, 전역 상한을 높일 수는 없다. 이름이 다른 보드 전용 profile은 새로 만들 수 있다.
+
+보드에 planner model/provider를 명시하면 그 설정을 사용한다. 그렇지 않으면 전역 planner 기본 순서와 각 agent의 fallback을 차례로 확인하고, 사용할 수 없거나 동시 실행 상한에 도달한 agent는 건너뛴다. Goal mode의 judge도 전역 judge 기본 순서와 fallback을 사용하며, judge를 설정하지 않았을 때만 planner 경로를 사용한다. 선택한 역할, profile, model, 설정 출처와 fallback 원본은 이벤트에 남는다.
 
 환경변수로 프로세스 기본 모델을 정할 수도 있다.
 
@@ -457,7 +484,7 @@ autogora promote <task-id>
 
 ### 5.5 Ready와 Running: supervisor에 실행 위임
 
-전역 설정에서 `auto-start`를 켰다면 Web UI나 TUI를 연 상태에서 `Ready` 작업을 자동으로 claim한다. 별도 명령은 필요 없다. supervisor 상태와 최근 오류는 Web UI의 `Agents`에서 확인한다.
+전역 설정에서 `auto-start`를 켰다면 Web UI나 TUI를 연 상태에서 `Ready` 작업을 자동으로 claim한다. 별도 명령은 필요 없다. Supervisor 제어는 Web UI의 `Agents`에서, 현재 상태와 최근 오류는 `Automation & activity`에서 확인한다.
 
 명시적으로 실행할 때는 후보를 먼저 확인할 수 있다.
 
@@ -482,11 +509,19 @@ autogora dispatch --watch \
   --board product-web
 ```
 
-supervisor와 dispatcher는 같은 실행 kernel을 사용해 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. 비활성 Profile은 claim하지 않고 전역·board·전체 worker 동시 실행 제한을 함께 적용한다. 실행 직전에 해석한 Profile, Runtime, Model, Provider, 설정 출처와 fallback 원본을 run 이력에 고정한다. 설정을 나중에 바꿔도 이전 기록은 바뀌지 않는다.
+supervisor와 dispatcher는 같은 실행 kernel을 사용해 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. 비활성 Profile은 claim하지 않는다. 전역 agent의 `maxConcurrent`는 같은 데이터 루트를 사용하는 모든 보드와 Autogora 프로세스의 worker, planner, judge 실행을 합산한다. 상한에 도달한 worker는 실패 횟수를 늘리지 않고 다시 예약하고, planner와 judge는 다음 fallback을 확인한다. Board profile 상한과 전체 worker 상한도 별도로 적용한다.
+
+실행 직전에 해석한 Profile, Runtime, Model, Provider, 설정 출처와 fallback 원본을 run 이력에 고정하므로 설정을 바꿔도 이전 기록은 유지된다.
+
+여러 보드를 함께 감시할 때는 worker claim과 planning을 시작할 보드를 주기마다 순환한다. 따라서 `default` 보드에 작업이 몰려도 다른 보드가 계속 실행 기회를 얻는다.
 
 Worktree run은 worker를 시작하기 전에 고정된 prerequisite change set을 자동으로 fan-in한다. merge가 충돌하면 충돌 파일과 이유를 남기고 `Blocked`로 전환하며 worker를 시작하거나 실패 횟수를 늘리지 않는다. 성공하면 parent head를 포함하는 새 기준점 위에서 작업하므로 child change set은 child가 추가한 변경만 보고한다.
 
+쓰기 가능한 `dir` workspace는 symlink와 Git 하위 경로를 실제 저장소 루트로 정규화해 배타 lease를 잡는다. 이 lease도 같은 데이터 루트의 모든 보드가 공유한다. 다른 run이 같은 경로를 사용 중이면 실패 횟수를 늘리지 않고 다시 예약하며, 읽기 전용 run은 병렬로 실행한다.
+
 실행 파일 누락, 인증 실패, rate limit을 실제 worker 실행에서 확인하면 agent health를 기록하고 fallback chain의 다음 agent로 다시 예약한다. Rate limit은 실패 횟수를 늘리지 않는다. 다만 실패·timeout·취소 전에 workspace 변경이나 commit이 생겼다면 fallback이나 자동 재시도를 중단하고 workspace 경로를 보존한 채 `Blocked`로 보낸다. 서로 다른 agent가 같은 미완료 변경 위에 덮어쓰지 않게 하는 규칙이다.
+
+종료 상태 저장은 일시적인 SQLite lock을 제한된 횟수만큼 다시 시도한다. 정상 완료를 확정할 수 없을 때는 run 종료와 task의 `Blocked` 전환을 한 트랜잭션에 기록해 lease 해제 직후 다른 worker가 task를 가져가는 틈을 막는다. 끝내 저장하지 못하면 dispatcher가 오류를 반환하며 성공한 것처럼 보고하지 않는다.
 
 worker는 시작할 때 카드와 고정된 직접 prerequisite handoff를 읽고, 오래 걸리는 작업 중에는 heartbeat를 남겨야 한다. 전체 graph의 모든 본문과 첨부파일을 받지는 않는다.
 
@@ -506,7 +541,7 @@ autogora terminate <task-id> --reason "관리자 수정 전 실행 종료"
 
 ![실행 이력과 heartbeat가 표시된 실제 화면](images/workflow-03-running-history.png)
 
-*Run history에서 실제 profile, runtime, model/provider, 설정 출처와 fallback 여부를 확인하고 Recent events에서 claim과 heartbeat를 추적한다.*
+*Run history에서 worker, run ID, claim·heartbeat·lease, workspace와 로그를 확인하고 Recent events에서 실행 흐름을 추적한다.*
 
 ### 5.6 Blocked: 막힌 이유와 다음 행동을 분리
 
@@ -547,7 +582,7 @@ autogora edit <task-id> --status review
 ```bash
 autogora complete <task-id> \
   --summary "요구사항과 테스트 결과를 확인했고 배포 가능한 상태입니다" \
-  --metadata '{"verification":["npm test","manual review"],"residual_risk":[]}'
+  --metadata '{"verification":["project test suite","manual review"],"residual_risk":[]}'
 ```
 
 재작업이 필요하면 comment를 남기고 다시 실행 대기열로 보낸다.
@@ -559,9 +594,9 @@ autogora comment <task-id> \
 autogora promote <task-id>
 ```
 
-`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `autogora_run_terminate`로 활성 worker에 종료 신호를 보낸다. PID에 신호를 보냈다면 dispatcher는 프로세스 종료를 확인할 때까지 카드를 `Running`에 두고 응답에 `pending: true`를 표시한다. 이 과정이 기존 worker와 대체 worker의 중복 실행을 막는다. PID가 없거나 프로세스가 이미 끝났다면 즉시 run을 회수한다.
+`Running` 카드를 바로 `Review`, `Done`, `Blocked`, `Archived`로 바꾸거나 삭제할 수는 없다. 먼저 Web UI의 Run history, CLI `terminate`, 또는 MCP `autogora_run_terminate`로 종료를 요청한다. Autogora는 spawn할 때 기록한 OS 프로세스 시작 식별자까지 일치할 때만 PID에 신호를 보낸다. 관리 중인 run은 프로세스가 이미 없더라도 dispatcher가 안전한 종료 상태를 판단할 때까지 `Running`과 `pending: true`를 유지한다. 쓰기 workspace에 변경분이 있거나 shared `dir`의 변경 귀속을 확인할 수 없으면 `Blocked`로 보존한다. 분리된 쓰기 workspace에 변경이 없거나 read-only run이면 다시 실행할 수 있게 회수한다. 이 과정이 무관한 프로세스 종료, 기존 worker와 대체 worker의 중복 실행, 부분 작업 유실을 막는다.
 
-실행 중에는 제목·본문·우선순위 설명만 보완할 수 있으며 assignee, runtime, workspace, branch는 바꿀 수 없다. 필수 코드 리뷰에는 별도 리뷰 카드를 사용한다.
+실행 중에는 priority만 바꿀 수 있다. 요구사항은 comment로 남기거나 run을 종료한 뒤 제목, 본문, tenant를 비롯한 실행 설정을 수정한다. 필수 코드 리뷰에는 별도 리뷰 카드를 사용한다.
 
 ### 5.8 Done: 결과보다 검증 가능한 handoff를 남김
 
@@ -574,7 +609,7 @@ CLI `claim`이나 MCP `autogora_claim`으로 dispatcher 없이 가져간 worktre
   "summary": "CSV 내보내기와 빈 결과 헤더 처리를 구현했습니다.",
   "metadata": {
     "changed_files": ["web/export.js", "test/export.test.ts"],
-    "verification": ["npm test", "manual browser export"],
+    "verification": ["project test suite", "manual browser export"],
     "residual_risk": []
   },
   "artifacts": []
@@ -590,7 +625,7 @@ autogora runs <task-id>
 
 ![Blocked, Review, Done 상태의 실제 보드](images/workflow-04-outcome-states.png)
 
-*Blocked에서는 해결할 원인을, Review에서는 검토 담당자를, Done에서는 완료 결과를 확인한다.*
+*Execution 레인에서 Running, Blocked, Review, Done 상태와 담당자를 비교하고 Archived는 별도 영역에서 확인한다.*
 
 `Done`은 결과와 검증 근거를 남긴 완료 상태다. 카드를 숨길 목적으로 `Done`으로 바꾸지 않는다. 이미 완료한 카드는 필요할 때 `Archive`로 보관한다.
 
@@ -751,7 +786,7 @@ ANALYSIS_ID=<분석-task-id>
 
 ```bash
 autogora create "API 타임아웃 처리 개선" \
-  --body "선행 분석 결과를 기반으로 최소 변경을 구현한다. timeout과 retry의 상호작용을 테스트하고 npm test를 통과시킨다. 변경 파일, 테스트, 잔여 위험을 완료 metadata에 남긴다." \
+  --body "선행 분석 결과를 기반으로 최소 변경을 구현한다. timeout과 retry의 상호작용을 검증하고 프로젝트 테스트를 통과시킨다. 변경 파일, 테스트, 잔여 위험을 완료 metadata에 남긴다." \
   --assignee implementer --runtime codex \
   --workspace-kind worktree \
   --parent "$ANALYSIS_ID"
@@ -885,7 +920,7 @@ autogora log <task-id>
 autogora diagnostics
 ```
 
-heartbeat, worker PID, claim 만료 시각과 로그를 확인한다. Web UI의 Run history에서 활성 run을 종료할 수도 있다.
+`Automation & activity`와 카드의 Run history에서 heartbeat, lease·claim 만료 시각과 로그를 확인한다. PID는 CLI `runs`나 `diagnostics`에서 확인한다. Run history에서는 활성 run을 종료할 수도 있다.
 
 ```bash
 autogora terminate <task-id> --reason "heartbeat 정지로 관리자 종료"
@@ -893,11 +928,11 @@ autogora terminate <task-id> --reason "heartbeat 정지로 관리자 종료"
 
 `diagnostics`의 `terminal_prerequisite`는 완료하지 않은 선행 task를 보관했다는 뜻이다. 해당 선행 작업이 더 이상 필요 없다면 dependency를 unlink한다. 여전히 필요하다면 prerequisite를 다시 열어 완료한다. `stalled_prerequisite`는 선행 task가 `Blocked`, `Triage`, `Review`에서 사람의 처리를 기다린다는 뜻이다.
 
-Web UI 상단의 `Needs attention (N)` 칩에서 진단 원인과 task ID를 최대 20개까지 확인할 수 있다.
+Web UI 상단의 `Board attention (N)`을 누르면 `Automation & activity`의 Board checks에서 현재 진단 원인과 task ID를 확인할 수 있다.
 
 ### Detect CLIs는 성공했지만 실행할 수 없음
 
-`Detect CLIs`와 `autogora agents detect`는 `PATH`와 `--version`만 확인한다. 인증, 구독 상태, 남은 quota는 확인하지 않는다. 해당 coding agent CLI에서 로그인과 간단한 요청을 직접 확인한 뒤 다시 실행한다. 실제 실행이 인증 실패나 rate limit으로 끝나면 Run history의 agent health와 `fallbackFrom`을 확인한다.
+`Detect CLIs`와 `autogora agents detect`는 `PATH`와 `--version`만 확인한다. 인증, 구독 상태, 남은 quota는 확인하지 않는다. 해당 coding agent CLI에서 로그인과 간단한 요청을 직접 확인한 뒤 다시 실행한다. 실제 실행이 인증 실패나 rate limit으로 끝나면 `Automation & activity`의 Agents에서 health를, Run history에서 profile과 `fallbackFrom`을 확인한다.
 
 ### Prerequisite fan-in에서 Blocked됨
 

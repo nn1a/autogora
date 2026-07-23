@@ -1,6 +1,10 @@
 # Autogora
 
-A local, durable agent work control plane for Claude Code, Codex, Cline, and Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline builds and isolated Gemini worker runs use a scoped CLI bridge. Autogora provides SQLite-backed tasks, dependencies, comments, atomic claims, scoped claim tokens, heartbeat, completion/blocking, bounded retries, planning, a dispatcher, a terminal board, and an authenticated Web UI.
+A local, durable agent work control plane for Claude Code, Codex, Cline, and
+Gemini CLI. Claude and Codex use dispatcher-injected MCP; MCP-disabled Cline
+builds and isolated Gemini workers use a scoped CLI bridge. Autogora combines
+SQLite-backed task orchestration, atomic worker ownership, a terminal board,
+and an authenticated Web UI in one executable.
 
 Korean documentation: [installation and upgrades](docs/INSTALL_KO.md) · [practical workflow from Triage to Done](docs/WORKFLOW_KO.md)
 
@@ -18,10 +22,10 @@ autogora version
 autogora init
 ```
 
-The resulting native executable embeds the TUI, Web UI, and SQLite engine. It
-does not require Node.js, npm, Bun, a separate database server, or separately
-installed Web assets at runtime. Claude Code, Codex, Cline, and Gemini CLI are
-needed only for the worker, planner, or judge routes you select.
+The resulting native executable embeds the TUI, Web UI, and SQLite engine, so
+it needs no separate database server or Web asset installation. Claude Code,
+Codex, Cline, and Gemini CLI are needed only for the worker, planner, or judge
+routes you select.
 
 Future tagged versions are expected to publish archives and `checksums.txt` on
 [GitHub Releases](https://github.com/nn1a/autogora/releases). The release build
@@ -31,11 +35,10 @@ depend on glibc or musl. Until a release exists, use the source build above.
 See the [Korean install guide](docs/INSTALL_KO.md) for verification, data
 locations, and the release build procedure.
 
-Release builds trim source/VCS paths, strip debug and symbol tables, omit the
-Go build ID, enforce a 16 MiB binary-size budget, and use maximum gzip
-compression without gzip timestamp/name metadata. UPX and global inlining
-suppression are intentionally not used because their runtime and operational
-costs outweigh the small raw-binary savings for this SQLite-backed service.
+Release builds strip paths, symbols, and the Go build ID; selectively suppress
+inlining in the internal, Charmbracelet, MCP, and JSON Schema package trees;
+enforce a 16 MiB binary budget; and use `gzip -9n` so gzip headers contain no
+source name or timestamp. They do not use UPX or global inlining suppression.
 
 ## Project data location
 
@@ -108,8 +111,13 @@ autogora agents supervisor \
 With `auto-start` enabled, `autogora dashboard` and `autogora tui` start the
 in-process supervisor. A separate `dispatch --watch` process is unnecessary.
 The dashboard can also start or stop its supervisor from the Agents dialog.
-Use `dispatch --once`, `dispatch --watch`, or `dispatch --dry-run` when an
-explicit CLI-runner lifecycle is preferable.
+Use `dispatch --once`, `dispatch --watch`, or `dispatch --dry-run` when you need
+a separate CLI-managed runner.
+
+The dashboard's **Run now** action follows the saved **Allow workspace
+changes** policy (`allowWrites`). **Automation & activity** shows the 20 most
+recent Web UI dispatch operations. The server retains every in-flight operation
+and up to 100 terminal results until that dashboard process stops.
 
 Board profiles refine the global registry for one board. A matching board
 profile can pin a different model or provider, describe and prioritize the
@@ -224,15 +232,16 @@ and activity, and `a` to include archived tasks. Press `?` for the complete key
 map. When the global supervisor has `autoStart` enabled, opening the TUI also
 starts orchestration with its configured worker and write limits.
 
-The create and edit form has Task, Agent, and Execution sections. It covers the
-Web form's title, description, status, priority, assignee, runtime, tenant,
-workspace, skills, and goal-mode fields. Its profile list uses the same
-effective global and board routes as the Web API; choosing one fills assignee
-and runtime and shows its pinned model or `CLI default`. Use `tab` and
-`shift+tab` between fields, `ctrl+left/right` between sections, and the up/down
-arrows to change Status, Board profile, Runtime, and Workspace kind. Press
-`space` to toggle Goal mode and `ctrl+s` to validate and save. The focused
-selection field repeats the relevant key hint.
+The create and edit form has Task, Agent, and Execution sections. Task creation
+includes Status and Run after; editing keeps status and scheduling in the action
+palette. Both forms cover title, description, priority, assignee, runtime,
+tenant, workspace kind/path, branch, skills, maximum runtime and retries, and
+goal-mode turn limit. The profile list uses the same effective global and board
+routes as the Web API; choosing one fills assignee and runtime and shows its
+pinned model or `CLI default`. Use `tab` and `shift+tab` between fields,
+`ctrl+left/right` between sections, and the up/down arrows to change selection
+fields. Press `space` to toggle Goal mode and `ctrl+s` to validate and save. The
+focused selection field repeats the relevant key hint.
 
 Press `space` for the searchable task action palette. It includes status moves,
 Specify, Decompose, Promote, Unblock, targeted dispatcher runs, active-run termination,
@@ -251,12 +260,12 @@ autogora dashboard
 ```
 
 The command binds to `127.0.0.1:8420` and prints a bootstrap URL containing a
-random 256-bit token. Opening it once exchanges the query token for a strict,
-HTTP-only session cookie and redirects to a clean URL. Every static asset, REST
-request, attachment download, and event-stream connection requires that cookie or an
-`Authorization: Bearer <token>` header. Use `--host`, `--port`, or `--token` to
-override the defaults; do not expose a non-loopback bind without an external
-TLS/reverse-proxy boundary.
+random 256-bit token. Opening it once exchanges the query token for an
+HTTP-only session cookie with `SameSite=Strict`, then redirects to a clean URL.
+Every static asset, REST request, attachment download, and event-stream
+connection requires that cookie or an `Authorization: Bearer <token>` header.
+Use `--host`, `--port`, or `--token` to override the defaults; do not expose a
+non-loopback bind without an external TLS/reverse-proxy boundary.
 
 The dashboard includes:
 
@@ -267,13 +276,20 @@ The dashboard includes:
   one column on narrower screens;
 - search, tenant/assignee filters, archived visibility, and optional
   per-profile Running lanes;
+- bounded 500-task board snapshots with a returned/total warning and a filtered
+  task-list API for larger boards;
 - first-run coding-agent setup, safe PATH/`--version` detection, effective
   profile and health views, and supervisor start/stop controls;
+- GitHub and GitHub Enterprise issue preview/import through the authenticated
+  `gh` CLI, with duplicate protection and partial-result reporting;
+- an Automation & activity view for supervisor state, agent cooldowns, active-run heartbeat
+  and lease age, one-shot dispatch operations, diagnostics, and durable events;
 - create/edit drawers, safe Markdown rendering, dependencies, comments, run
-  history and termination, attachments, and recent events;
+  history and termination, attachments, recent events, complete execution
+  settings, and optimistic conflict detection for edits and lifecycle actions;
 - progress/comment/link badges, drag/drop transitions, targeted dispatcher runs,
-  a guarded trash target, and partial-failure bulk move, assign, archive, and
-  delete actions;
+  a guarded trash target, and version-checked, partial-failure bulk move, assign,
+  archive, and delete actions;
 - isolated board switching/creation/settings, persisted profile routing and
   opt-in auxiliary profile descriptions, automatic decomposition settings,
   manual specify/decompose, swarm creation, and dispatcher nudging;
@@ -310,6 +326,10 @@ autogora dispatch --once
 Import open GitHub issues directly into Triage through the authenticated `gh`
 CLI. Repeating an import returns the existing active task instead of creating a
 duplicate; the source URL is retained in both the task body and attachments.
+Imported titles and bodies remain untrusted external input and are never
+automatically decomposed. Review each card, then choose Specify, Decompose, or
+Promote. The dashboard's **Import issues** dialog provides the same preview and
+import flow.
 
 ```bash
 autogora github import --repo nn1a/autogora --label bug --limit 20
@@ -345,7 +365,16 @@ Long-running dispatchers persist claim TTLs, heartbeats, worker PIDs, and task
 runtime limits. They recover dead or stale workers, terminate tasks that exceed
 `max_runtime_seconds`, and treat exit code 75 as a retry-neutral provider rate
 limit. Optional `--max-in-progress` and `--max-per-assignee` caps coordinate
-multiple dispatcher processes through the database.
+multiple dispatcher processes through the database. A registered agent's
+`maxConcurrent` cap is shared by workers, planners, and judges on every board,
+and by every Autogora process using the same data root. A capacity-full worker
+is requeued without consuming a retry; a planner or judge tries its next
+configured fallback. This prevents separate dashboards and dispatchers from
+overcommitting one subscription or CLI.
+
+When one dispatcher watches multiple boards, worker-claim and planning passes
+rotate their starting board. A backlog on the default board therefore cannot
+starve another board.
 
 Worker launch and output can mark a profile `missing`, `auth_required`, or
 `rate_limited`. The dispatcher skips an unavailable profile and
@@ -401,7 +430,12 @@ autogora boards rm project-api       # recoverable archive
 ```
 
 Use `boards rm <slug> --delete` only when permanent removal is intended. The
-`default` board cannot be removed.
+`default` board cannot be removed. Archive and hard delete both refuse a board
+that still owns a running task, agent slot, or local/global workspace lease.
+Close any TUI or other client that still has the board store open before
+retrying. Removal barriers prevent a concurrent claim or write during the
+filesystem move. An archived slug keeps a coordination tombstone until a new
+board with that slug has been fully created.
 
 ## Workspaces
 
@@ -409,8 +443,9 @@ Use `boards rm <slug> --delete` only when permanent removal is intended. The
   after successful completion and artifact capture.
 - `dir:/absolute/path`: uses and preserves an existing trusted directory.
   Writable runs take an exclusive SQLite lease on its canonical path, or on the
-  containing Git repository, until the run ends. A competing run is rescheduled
-  without consuming a retry; read-only runs remain concurrent.
+  containing Git repository, until the run ends. This lease is shared across
+  every board that uses the same Autogora data root. A competing run is
+  rescheduled without consuming a retry; read-only runs remain concurrent.
 - `worktree`: creates and preserves a detached Git worktree per run under the
   board workspace root. Set a board `default-workdir` to the source repository.
   `--branch` selects an existing starting ref when available and remains the
@@ -421,11 +456,12 @@ Relative `dir:` and explicit worktree paths are rejected. Dispatcher runs record
 their resolved path, repository, base commit, worker PID, and log path without
 overwriting the task's workspace configuration.
 
-After a managed worktree process exits, the dispatcher snapshots its final tree
-with a temporary Git index. It does not stage the worker index or move the user
-checkout. The snapshot is retained at `refs/autogora/runs/<run-id>` and recorded
-in task details under `changeSets` with base/head commits and changed files. A
-managed worktree cannot become Done until this durable handoff exists.
+Before finalizing a successful managed worktree completion, the dispatcher
+snapshots its final tree with a temporary Git index. It does not stage the
+worker index or move the user checkout. The snapshot is retained at
+`refs/autogora/runs/<run-id>` and recorded in task details under `changeSets`
+with base/head commits and changed files. A managed worktree cannot become Done
+until this durable handoff exists.
 
 Each satisfied prerequisite edge pins the exact completion run and change set
 that the dependent must consume. Before starting a dependent in an isolated
@@ -551,12 +587,13 @@ Gemini planners also receive a temporary deny-all tool policy.
 
 The global agent registry is authoritative for executable availability,
 runtime, command, role eligibility, preferred worker/planner/judge order, and
-maximum concurrency. Board settings may add a board-only worker profile or
+maximum concurrency. Per-board settings may add a board-only worker profile or
 specialize a matching global profile as described above. A board-pinned planner
-model/provider takes precedence; otherwise the first enabled preferred global
-planner supplies its runtime, command, model, and provider. Goal mode uses the
-preferred global judge and falls back to the resolved planner when no judge is
-configured.
+model/provider takes precedence; otherwise Autogora tries the preferred global
+planner order and each configured fallback. It skips unhealthy or capacity-full
+agents and records the selected route. Goal mode applies the same behavior to
+the preferred global judges, then uses the resolved planner configuration when
+no judge is configured.
 
 Leaving a model blank is an intentional `CLI default (unpinned)` choice. The
 dispatcher snapshots the resolved profile, runtime, requested model, provider,
@@ -577,10 +614,18 @@ autogora decompose <triage-id> \
 ```
 
 For deterministic automation, `specify` accepts `--title` plus `--body`, and
-`decompose` accepts a validated `--plan-json`. New boards enable bounded
-automatic triage processing by default, capped at three cards per dispatcher
-tick. Change it in the board's dashboard settings; command-line dispatcher
-overrides include `--auto-decompose` and `--auto-decompose-per-tick`.
+`decompose` accepts a validated `--plan-json`. New boards enable bounded,
+asynchronous triage processing by default, capped at three cards per dispatcher
+tick. Planning runs outside the worker lifecycle loop, so a slow planner does
+not stop maintenance or Ready claims. Failures emit `auto_decompose_failed` and
+use per-task exponential backoff from five seconds to five minutes. Imported
+GitHub issues are excluded until a person explicitly reviews them. Review-gated
+or cooling-down cards do not consume the planning quota, and paginated scans
+continue to eligible cards behind a large import backlog. A planner that ignores
+cancellation receives a bounded shutdown grace period instead of holding the
+dispatcher open indefinitely. Change the policy in the board's dashboard
+settings; command-line dispatcher overrides include `--auto-decompose` and
+`--auto-decompose-per-tick`.
 Boards can also disable automatic child promotion so every newly decomposed
 leaf remains in `todo` for a human routing review.
 
@@ -631,6 +676,12 @@ worker process to exit successfully, captures the final artifacts, and only then
 finalizes the run and unlocks dependents in one transaction. Pending and
 finalized requests are visible in task details as `terminalRequests`. Goal-mode
 completion requests are discarded until the independent judge accepts the goal.
+Terminal writes retry transient SQLite lock failures and propagate any remaining
+error instead of reporting success. Recovery writes the terminal run outcome and
+the task's `blocked` state in one transaction, avoiding a briefly claimable task
+after lease release. If a failed, timed-out, or canceled run already changed or
+committed files, Autogora preserves its workspace for review and does not start
+a retry or fallback on top of the partial work.
 
 Autogora keeps two relation types separate:
 
@@ -662,12 +713,15 @@ counts, keeps the focus/root/direct neighborhood, and marks the response as
 
 Administrative completion, blocking, archiving, deletion, and ownership or
 workspace moves reject a task with an active run. Use
-`autogora terminate <task-id>` or `autogora_run_terminate` first; this signals the recorded worker PID
-and reclaims the run. A live PID returns `pending: true` and remains `running`
-until the dispatcher observes process exit, preventing an old and a replacement
-worker from overlapping. A missing or already-dead PID is reclaimed immediately.
-Title, body, and priority clarifications remain editable during a run, while
-workspace and branch identity stay fixed.
+`autogora terminate <task-id>` or `autogora_run_terminate` first. Autogora
+persists the request and signals a PID only when its OS process-start identity
+still matches the worker recorded at spawn. A managed run returns `pending:
+true` and remains `running` until the dispatcher observes process exit and
+checks its workspace, including when the process is already missing. This
+prevents overlap and preserves partial changes. A direct, unmanaged claim with
+no live process can be reclaimed immediately. Execution settings are locked
+during a run; only priority remains editable. Add durable
+clarifications as comments, or terminate the run before changing its task spec.
 
 ## Skills
 
