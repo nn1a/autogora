@@ -134,6 +134,21 @@ type RunWorkspace struct {
 	PreparedAt     string        `json:"preparedAt"`
 }
 
+// RunAgentConfig is the immutable execution configuration selected for a run.
+// Keeping it separate from the task preserves the actual agent choice when
+// profiles or global defaults change later.
+type RunAgentConfig struct {
+	RunID        string  `json:"runId"`
+	TaskID       string  `json:"taskId"`
+	Profile      string  `json:"profile"`
+	Runtime      Runtime `json:"runtime"`
+	Model        string  `json:"model"`
+	Provider     string  `json:"provider"`
+	Source       string  `json:"source"`
+	FallbackFrom *string `json:"fallbackFrom"`
+	ConfiguredAt string  `json:"configuredAt"`
+}
+
 type TerminalRequest struct {
 	RunID       string         `json:"runId"`
 	Kind        string         `json:"kind"`
@@ -202,6 +217,7 @@ type TaskDetail struct {
 	Comments         []Comment         `json:"comments"`
 	Attachments      []Attachment      `json:"attachments"`
 	Runs             []Run             `json:"runs"`
+	RunAgentConfigs  []RunAgentConfig  `json:"runAgentConfigs"`
 	RunWorkspaces    []RunWorkspace    `json:"runWorkspaces"`
 	TerminalRequests []TerminalRequest `json:"terminalRequests"`
 	ChangeSets       []ChangeSet       `json:"changeSets"`

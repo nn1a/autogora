@@ -33,10 +33,12 @@ type PlannerRequest struct {
 type Planner func(context.Context, PlannerRequest) (any, error)
 
 type CLIPlannerOptions struct {
-	Runtime model.Runtime
-	CWD     string
-	Timeout time.Duration
-	Getenv  func(string) string
+	Runtime  model.Runtime
+	Model    string
+	Provider string
+	CWD      string
+	Timeout  time.Duration
+	Getenv   func(string) string
 }
 
 const plannerOutputLimit = 2 * 1024 * 1024
@@ -190,6 +192,13 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
+	prefix := "AUTOGORA_" + strings.ToUpper(string(options.Runtime))
+	if strings.TrimSpace(options.Model) == "" {
+		options.Model = strings.TrimSpace(getenv(prefix + "_MODEL"))
+	}
+	if strings.TrimSpace(options.Provider) == "" {
+		options.Provider = strings.TrimSpace(getenv(prefix + "_PROVIDER"))
+	}
 
 	return func(ctx context.Context, request PlannerRequest) (any, error) {
 		directory, err := os.MkdirTemp("", "autogora-planner-")
@@ -210,11 +219,16 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 		var value any
 		switch options.Runtime {
 		case model.RuntimeCodex:
-			_, _, err = runPlannerProcess(ctx, binary, []string{
+			args := []string{
 				"exec", "--ephemeral", "--color", "never", "--sandbox", "read-only",
 				"--skip-git-repo-check", "-C", resolved, "--output-schema", schemaPath,
-				"--output-last-message", outputPath, request.Prompt,
-			}, resolved, timeout)
+				"--output-last-message", outputPath,
+			}
+			if selected := strings.TrimSpace(options.Model); selected != "" {
+				args = append(args, "--model", selected)
+			}
+			args = append(args, request.Prompt)
+			_, _, err = runPlannerProcess(ctx, binary, args, resolved, timeout)
 			if err == nil {
 				var output []byte
 				output, err = os.ReadFile(outputPath)
@@ -224,8 +238,16 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 			}
 		case model.RuntimeCline:
 			prompt := request.Prompt + "\n\nDo not call tools. Return exactly one JSON object and no prose or Markdown.\nThe JSON object must conform to this schema: " + string(schema)
+			args := []string{"--json", "--auto-approve", "false", "--cwd", resolved}
+			if selected := strings.TrimSpace(options.Provider); selected != "" {
+				args = append(args, "--provider", selected)
+			}
+			if selected := strings.TrimSpace(options.Model); selected != "" {
+				args = append(args, "--model", selected)
+			}
+			args = append(args, prompt)
 			var stdout string
-			stdout, _, err = runPlannerProcess(ctx, binary, []string{"--json", "--auto-approve", "false", "--cwd", resolved, prompt}, resolved, timeout)
+			stdout, _, err = runPlannerProcess(ctx, binary, args, resolved, timeout)
 			if err == nil {
 				value, err = clineOutput(stdout)
 			}
@@ -235,7 +257,12 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 			if err == nil {
 				prompt := request.Prompt + "\n\nDo not call tools. Return exactly one JSON object and no prose or Markdown.\nThe JSON object must conform to this schema: " + string(schema)
 				var stdout string
-				stdout, _, err = runPlannerProcess(ctx, binary, []string{"--output-format", "json", "--approval-mode", "default", "--policy", policyPath, "--skip-trust", "-e", "none", "-p", prompt}, resolved, timeout)
+				args := []string{"--output-format", "json", "--approval-mode", "default", "--policy", policyPath, "--skip-trust", "-e", "none"}
+				if selected := strings.TrimSpace(options.Model); selected != "" {
+					args = append(args, "--model", selected)
+				}
+				args = append(args, "-p", prompt)
+				stdout, _, err = runPlannerProcess(ctx, binary, args, resolved, timeout)
 				if err == nil {
 					var envelope map[string]any
 					if err = json.Unmarshal([]byte(stdout), &envelope); err == nil {
@@ -249,8 +276,12 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 				}
 			}
 		case model.RuntimeClaude:
+			args := []string{"-p", request.Prompt, "--output-format", "json", "--json-schema", string(schema), "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"}
+			if selected := strings.TrimSpace(options.Model); selected != "" {
+				args = append(args, "--model", selected)
+			}
 			var stdout string
-			stdout, _, err = runPlannerProcess(ctx, binary, []string{"-p", request.Prompt, "--output-format", "json", "--json-schema", string(schema), "--permission-mode", "dontAsk", "--tools", "", "--no-session-persistence"}, resolved, timeout)
+			stdout, _, err = runPlannerProcess(ctx, binary, args, resolved, timeout)
 			if err == nil {
 				err = json.Unmarshal([]byte(stdout), &value)
 			}

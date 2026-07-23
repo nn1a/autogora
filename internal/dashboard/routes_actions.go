@@ -405,10 +405,13 @@ func (s *Server) handleProfiles(response http.ResponseWriter, request *http.Requ
 		}
 		name := segments[2]
 		runtime := runtimeValue(body["runtime"])
-		existingDescription := ""
+		existing := orchestration.ProfileRoute{Name: name, Runtime: runtime}
 		for _, profile := range metadata.Orchestration.Profiles {
 			if profile.Name == name {
-				runtime, existingDescription = profile.Runtime, profile.Description
+				existing = orchestration.ProfileRoute{Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model,
+					Provider: profile.Provider, Description: profile.Description, Disabled: profile.Disabled,
+					MaxConcurrent: profile.MaxConcurrent, Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...)}
+				runtime = profile.Runtime
 			}
 		}
 		if runtime == "" || runtime == model.RuntimeManual {
@@ -424,11 +427,12 @@ func (s *Server) handleProfiles(response http.ResponseWriter, request *http.Requ
 		for _, task := range tasks {
 			evidence = append(evidence, orchestration.ProfileEvidence{Title: task.Title, Body: task.Body, Skills: task.Skills})
 		}
-		planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: metadata.Orchestration.PlannerRuntime, Timeout: 120 * time.Second})
+		planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: metadata.Orchestration.PlannerRuntime,
+			Model: metadata.Orchestration.PlannerModel, Provider: metadata.Orchestration.PlannerProvider, Timeout: 120 * time.Second})
 		if err != nil {
 			return err
 		}
-		described, err := orchestration.DescribeProfileRoute(ctx, orchestration.ProfileRoute{Name: name, Runtime: runtime, Description: existingDescription}, evidence, planner)
+		described, err := orchestration.DescribeProfileRoute(ctx, existing, evidence, planner)
 		if err != nil {
 			return err
 		}
@@ -438,7 +442,9 @@ func (s *Server) handleProfiles(response http.ResponseWriter, request *http.Requ
 				profiles = append(profiles, profile)
 			}
 		}
-		profiles = append(profiles, boards.Profile{Name: described.Name, Runtime: described.Runtime, Description: described.Description})
+		profiles = append(profiles, boards.Profile{Name: described.Name, Runtime: described.Runtime, Model: described.Model,
+			Provider: described.Provider, Description: described.Description, Disabled: described.Disabled,
+			MaxConcurrent: described.MaxConcurrent, Priority: described.Priority, Fallbacks: append([]string{}, described.Fallbacks...)})
 		if _, err := s.manager.Update(board, boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
 			return err
 		}
@@ -454,7 +460,10 @@ func profileRoute(value any) (orchestration.ProfileRoute, error) {
 	if !ok {
 		return orchestration.ProfileRoute{}, errors.New("profile route must be an object")
 	}
-	route := orchestration.ProfileRoute{Name: strings.TrimSpace(stringValue(record["name"])), Runtime: runtimeValue(record["runtime"]), Description: stringValue(record["description"])}
+	route := orchestration.ProfileRoute{Name: strings.TrimSpace(stringValue(record["name"])), Runtime: runtimeValue(record["runtime"]),
+		Model: stringValue(record["model"]), Provider: stringValue(record["provider"]), Description: stringValue(record["description"]),
+		Disabled: boolValue(record["disabled"], false), MaxConcurrent: intValue(record["maxConcurrent"], 0),
+		Priority: intValue(record["priority"], 0), Fallbacks: stringArray(record["fallbacks"])}
 	if route.Name == "" || route.Runtime == "" || route.Runtime == model.RuntimeManual {
 		return orchestration.ProfileRoute{}, errors.New("profile route requires name and a worker runtime")
 	}

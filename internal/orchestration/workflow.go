@@ -13,9 +13,15 @@ import (
 )
 
 type ProfileRoute struct {
-	Name        string        `json:"name"`
-	Runtime     model.Runtime `json:"runtime"`
-	Description string        `json:"description,omitempty"`
+	Name          string        `json:"name"`
+	Runtime       model.Runtime `json:"runtime"`
+	Model         string        `json:"model,omitempty"`
+	Provider      string        `json:"provider,omitempty"`
+	Description   string        `json:"description,omitempty"`
+	Disabled      bool          `json:"disabled,omitempty"`
+	MaxConcurrent int           `json:"maxConcurrent,omitempty"`
+	Priority      int           `json:"priority,omitempty"`
+	Fallbacks     []string      `json:"fallbacks,omitempty"`
 }
 
 type SpecificationPlan struct {
@@ -191,11 +197,18 @@ func specificationPrompt(task model.TaskDetail) string {
 func decompositionPrompt(task model.TaskDetail, profiles []ProfileRoute) string {
 	roster := make([]string, 0, len(profiles))
 	for _, profile := range profiles {
+		if profile.Disabled {
+			continue
+		}
 		description := strings.TrimSpace(profile.Description)
 		if description == "" {
 			description = "no description"
 		}
-		roster = append(roster, fmt.Sprintf("- %s [%s]: %s", profile.Name, profile.Runtime, description))
+		execution := string(profile.Runtime)
+		if profile.Model != "" {
+			execution += "/" + profile.Model
+		}
+		roster = append(roster, fmt.Sprintf("- %s [%s]: %s", profile.Name, execution, description))
 	}
 	if len(roster) == 0 {
 		roster = append(roster, "(empty)")
@@ -267,9 +280,15 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 	if task.Task.Status != model.TaskStatusTriage {
 		return DecompositionResult{}, fmt.Errorf("task is not in triage: %s", taskID)
 	}
+	if !RunnableProfileRoute(options.DefaultProfile) {
+		return DecompositionResult{}, errors.New("decomposition requires an enabled worker profile")
+	}
 	profiles := make([]ProfileRoute, 0, len(options.Profiles)+1)
 	byName := map[string]ProfileRoute{}
 	for _, profile := range append(append([]ProfileRoute{}, options.Profiles...), options.DefaultProfile) {
+		if !RunnableProfileRoute(profile) {
+			continue
+		}
 		if _, exists := byName[profile.Name]; !exists {
 			byName[profile.Name] = profile
 			profiles = append(profiles, profile)

@@ -215,6 +215,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		AutoDecompose: autoDecompose, AutoDecomposePerTick: autoPerTick,
 		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, OrchestratorProfile: orchestratorProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
+		PlannerModel: opts.value("planner-model"), PlannerProvider: opts.value("planner-provider"),
 		AllowWrites: opts.flags["allow-writes"], WorkingDirectory: cwd, Getenv: a.Getenv,
 		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})

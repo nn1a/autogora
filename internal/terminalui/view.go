@@ -190,6 +190,17 @@ func (m *Model) detailBody(width int) string {
 		for index := len(m.detail.Runs) - 1; index >= 0; index-- {
 			run := m.detail.Runs[index]
 			lines = append(lines, "", fmt.Sprintf("Run %s · %s", run.Status, run.WorkerID), lipgloss.NewStyle().Foreground(colorMuted).Render(run.ID))
+			for _, config := range m.detail.RunAgentConfigs {
+				if config.RunID != run.ID {
+					continue
+				}
+				modelName := config.Model
+				if modelName == "" {
+					modelName = "CLI default (unpinned)"
+				}
+				lines = append(lines, lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s · %s · %s", config.Profile, config.Runtime, modelName)))
+				break
+			}
 		}
 		for index := len(m.detail.Events) - 1; index >= 0 && index >= len(m.detail.Events)-10; index-- {
 			event := m.detail.Events[index]

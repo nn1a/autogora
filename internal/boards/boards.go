@@ -19,9 +19,15 @@ import (
 var boardSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 type Profile struct {
-	Name        string        `json:"name"`
-	Runtime     model.Runtime `json:"runtime"`
-	Description string        `json:"description"`
+	Name          string        `json:"name"`
+	Runtime       model.Runtime `json:"runtime"`
+	Model         string        `json:"model,omitempty"`
+	Provider      string        `json:"provider,omitempty"`
+	Description   string        `json:"description"`
+	Disabled      bool          `json:"disabled,omitempty"`
+	MaxConcurrent int           `json:"maxConcurrent,omitempty"`
+	Priority      int           `json:"priority,omitempty"`
+	Fallbacks     []string      `json:"fallbacks,omitempty"`
 }
 
 type OrchestrationSettings struct {
@@ -29,6 +35,8 @@ type OrchestrationSettings struct {
 	AutoDecomposePerTick int           `json:"autoDecomposePerTick"`
 	AutoPromoteChildren  bool          `json:"autoPromoteChildren"`
 	PlannerRuntime       model.Runtime `json:"plannerRuntime"`
+	PlannerModel         string        `json:"plannerModel,omitempty"`
+	PlannerProvider      string        `json:"plannerProvider,omitempty"`
 	DefaultProfile       *string       `json:"defaultProfile"`
 	OrchestratorProfile  *string       `json:"orchestratorProfile"`
 	Profiles             []Profile     `json:"profiles"`
@@ -65,6 +73,8 @@ type OrchestrationUpdate struct {
 	AutoDecomposePerTick *int
 	AutoPromoteChildren  *bool
 	PlannerRuntime       *model.Runtime
+	PlannerModel         *string
+	PlannerProvider      *string
 	DefaultProfile       store.OptionalString
 	OrchestratorProfile  store.OptionalString
 	Profiles             *[]Profile
@@ -130,6 +140,22 @@ func normalizeOrchestration(value OrchestrationSettings) OrchestrationSettings {
 	seen := map[string]bool{}
 	for _, profile := range value.Profiles {
 		profile.Name = strings.TrimSpace(profile.Name)
+		profile.Model = strings.TrimSpace(profile.Model)
+		profile.Provider = strings.TrimSpace(profile.Provider)
+		profile.Description = strings.TrimSpace(profile.Description)
+		if profile.MaxConcurrent < 0 {
+			profile.MaxConcurrent = 0
+		}
+		fallbacks := make([]string, 0, len(profile.Fallbacks))
+		fallbackSeen := map[string]bool{}
+		for _, fallback := range profile.Fallbacks {
+			fallback = strings.TrimSpace(fallback)
+			if fallback != "" && fallback != profile.Name && !fallbackSeen[fallback] {
+				fallbackSeen[fallback] = true
+				fallbacks = append(fallbacks, fallback)
+			}
+		}
+		profile.Fallbacks = fallbacks
 		if profile.Name != "" && validWorkerRuntime(profile.Runtime) && !seen[profile.Name] {
 			seen[profile.Name] = true
 			profiles = append(profiles, profile)
@@ -286,6 +312,12 @@ func applyOrchestration(current OrchestrationSettings, update *OrchestrationUpda
 	}
 	if update.PlannerRuntime != nil {
 		current.PlannerRuntime = *update.PlannerRuntime
+	}
+	if update.PlannerModel != nil {
+		current.PlannerModel = strings.TrimSpace(*update.PlannerModel)
+	}
+	if update.PlannerProvider != nil {
+		current.PlannerProvider = strings.TrimSpace(*update.PlannerProvider)
 	}
 	if update.DefaultProfile.Set {
 		current.DefaultProfile = update.DefaultProfile.Value

@@ -69,9 +69,13 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 	if opts.flags["all"] && opts.present("title") {
 		return errors.New("an explicit specification cannot be reused with --all")
 	}
-	plannerRuntime, err := requirePlannerRuntime(opts.value("planner-runtime"))
-	if err != nil {
-		return err
+	plannerRuntime := model.Runtime("")
+	var err error
+	if opts.present("planner-runtime") {
+		plannerRuntime, err = requirePlannerRuntime(opts.value("planner-runtime"))
+		if err != nil {
+			return err
+		}
 	}
 	timeoutMS, err := numberOption(opts.value("planner-timeout-ms"), 120_000)
 	if err != nil || timeoutMS < 1_000 || timeoutMS > 600_000 {
@@ -85,6 +89,16 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 	metadata, err := manager.Read(board)
 	if err != nil {
 		return err
+	}
+	if plannerRuntime == "" {
+		plannerRuntime = metadata.Orchestration.PlannerRuntime
+	}
+	plannerModel, plannerProvider := opts.value("planner-model"), opts.value("planner-provider")
+	if plannerModel == "" && !opts.present("planner-runtime") {
+		plannerModel = metadata.Orchestration.PlannerModel
+	}
+	if plannerProvider == "" && !opts.present("planner-runtime") {
+		plannerProvider = metadata.Orchestration.PlannerProvider
 	}
 	taskIDs := []string{requestedID}
 	if opts.flags["all"] {
@@ -101,7 +115,8 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 	if err != nil {
 		return err
 	}
-	planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: plannerRuntime, CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: a.Getenv})
+	planner, err := orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: plannerRuntime, Model: plannerModel,
+		Provider: plannerProvider, CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: a.Getenv})
 	if err != nil {
 		return err
 	}

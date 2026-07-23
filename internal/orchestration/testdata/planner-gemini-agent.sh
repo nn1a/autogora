@@ -5,6 +5,7 @@ output_format=
 approval_mode=
 policy_path=
 prompt=
+model=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format)
@@ -23,13 +24,17 @@ while [ "$#" -gt 0 ]; do
       prompt=$2
       shift 2
       ;;
+    --model)
+      model=$2
+      shift 2
+      ;;
     *)
       shift
       ;;
   esac
 done
 
-if [ "$output_format" != json ] || [ "$approval_mode" != default ]; then
+if [ "$output_format" != json ] || [ "$approval_mode" != default ] || [ "$model" != "gemini-test" ]; then
   echo "Gemini planner must use constrained JSON headless mode" >&2
   exit 2
 fi

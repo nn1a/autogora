@@ -306,12 +306,19 @@ printf '%s\n' 'after terminal request' >> "$AUTOGORA_WORKSPACE/feature.txt"`)
 func TestDispatcherRunsClineThroughGoCLIBridge(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
+	profiles := []boards.Profile{{Name: "cline-worker", Runtime: model.RuntimeCline, Model: "cline-test-model", Provider: "test-provider"}}
+	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
+		t.Fatal(err)
+	}
 	cliPath := buildAutogora(t)
 	opened, _ := manager.OpenStore(ctx, "default")
 	assignee := "cline-worker"
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Cline bridge", Assignee: &assignee, Runtime: model.RuntimeCline})
 	opened.Close()
 	fixture := executableFixture(t, `
+test "$AUTOGORA_AGENT_PROFILE" = "cline-worker"
+test "$AUTOGORA_MODEL" = "cline-test-model"
+test "$AUTOGORA_PROVIDER" = "test-provider"
 "$AUTOGORA_CLI" show "$AUTOGORA_TASK_ID" >/dev/null
 "$AUTOGORA_CLI" heartbeat "$AUTOGORA_TASK_ID" --note "running" >/dev/null
 "$AUTOGORA_CLI" comment "$AUTOGORA_TASK_ID" "Cline used the Go CLI bridge" --author cline >/dev/null
@@ -328,8 +335,34 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	check, _ := manager.OpenStore(ctx, "default")
 	defer check.Close()
 	detail, _ := check.GetTask(ctx, task.Task.ID)
-	if detail.Task.Status != model.TaskStatusDone || len(detail.Comments) != 1 || detail.Runs[0].Summary == nil || *detail.Runs[0].Summary != "completed through Go CLI" {
+	if detail.Task.Status != model.TaskStatusDone || len(detail.Comments) != 1 || detail.Runs[0].Summary == nil || *detail.Runs[0].Summary != "completed through Go CLI" ||
+		len(detail.RunAgentConfigs) != 1 || detail.RunAgentConfigs[0].Profile != "cline-worker" || detail.RunAgentConfigs[0].Model != "cline-test-model" ||
+		detail.RunAgentConfigs[0].Provider != "test-provider" || detail.RunAgentConfigs[0].Source != "board_profile" {
 		t.Fatalf("unexpected Cline result: %#v", detail)
+	}
+}
+
+func TestDispatcherSkipsDisabledProfiles(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	profiles := []boards.Profile{{Name: "paused", Runtime: model.RuntimeCodex, Disabled: true}}
+	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, _ := manager.OpenStore(ctx, "default")
+	assignee := "paused"
+	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "must stay queued", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	opened.Close()
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, AutoDecompose: boolValue(false), Getenv: func(string) string {
+		return ""
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	check, _ := manager.OpenStore(ctx, "default")
+	defer check.Close()
+	detail, _ := check.GetTask(ctx, task.Task.ID)
+	if detail.Task.Status != model.TaskStatusReady || len(detail.Runs) != 0 {
+		t.Fatalf("disabled profile was dispatched: %#v", detail)
 	}
 }
 

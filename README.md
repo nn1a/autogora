@@ -139,6 +139,9 @@ inherits `AUTOGORA_TASK_ID`, `AUTOGORA_RUN_ID`,
 `AUTOGORA_CLAIM_TOKEN`, `AUTOGORA_BOARD`, and `AUTOGORA_DB`;
 lifecycle commands validate that scope before changing state. The Cline build
 therefore needs shell-command support, but it does not need an MCP client.
+Profiles may also pin Cline's model and provider. A modified build must accept
+the standard `--model` and `--provider` arguments before it can use those
+fields.
 
 Gemini dispatcher runs do not modify `.gemini/settings.json`. Set a custom
 binary when necessary, create a routed task, and dispatch it normally:
@@ -176,7 +179,8 @@ The create and edit form has Task, Agent, and Execution sections. It covers the
 Web form's title, description, status, priority, assignee, runtime, tenant,
 workspace, skills, and goal-mode fields. Board profiles come from the same
 board metadata and observed task routes as the Web API; choosing one fills both
-assignee and runtime. Press `ctrl+s` to validate and save the form.
+assignee and runtime and shows its pinned model or `CLI default`. Press `ctrl+s`
+to validate and save the form.
 Use the up and down arrow keys to change Status, Board profile, Runtime, and
 Workspace kind; press `space` to toggle Goal mode. The form also shows these
 controls next to the focused selection field.
@@ -461,8 +465,17 @@ final `run_result`/`done` NDJSON text or Gemini's headless JSON `response`, pars
 it as JSON, and applies the same domain validation before any board mutation.
 Gemini planners also receive a temporary deny-all tool policy.
 
+Board settings can pin a planner model and configure each worker profile's
+runtime, model, optional Cline provider, enabled state, priority, concurrency
+limit, and explicit fallback list. Leaving a model blank is an intentional
+`CLI default (unpinned)` choice. The dispatcher snapshots the resolved profile,
+runtime, requested model, provider, and configuration source for every run, so
+later profile edits do not rewrite execution history. The same values are
+available to workers as `AUTOGORA_AGENT_PROFILE`, `AUTOGORA_MODEL`, and
+`AUTOGORA_PROVIDER`.
+
 ```bash
-autogora specify <triage-id> --planner-runtime codex
+autogora specify <triage-id> --planner-runtime codex --planner-model <model-id>
 autogora specify <triage-id> --planner-runtime cline
 autogora specify <triage-id> --planner-runtime gemini
 autogora decompose <triage-id> \
@@ -480,6 +493,13 @@ tick. Change it in the board's dashboard settings; command-line dispatcher
 overrides include `--auto-decompose` and `--auto-decompose-per-tick`.
 Boards can also disable automatic child promotion so every newly decomposed
 leaf remains in `todo` for a human routing review.
+
+`AUTOGORA_CODEX_MODEL`, `AUTOGORA_CLAUDE_MODEL`,
+`AUTOGORA_CLINE_MODEL`, and `AUTOGORA_GEMINI_MODEL` provide process-level
+defaults when a matching board profile does not pin a model. Cline also reads
+`AUTOGORA_CLINE_PROVIDER`. A disabled profile is excluded from automatic
+decomposition and dispatch; its queued cards remain visible in `Ready` until
+the profile is enabled or the cards are reassigned.
 
 The swarm helper creates a completed structured blackboard, parallel worker
 cards, a verifier gated on every worker, and a synthesizer gated on the

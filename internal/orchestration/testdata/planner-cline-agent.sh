@@ -3,15 +3,31 @@ set -eu
 
 json_mode=false
 prompt=
-for argument in "$@"; do
-  if [ "$argument" = "--json" ]; then
-    json_mode=true
-  fi
-  prompt=$argument
+model=
+provider=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json)
+      json_mode=true
+      shift
+      ;;
+    --model)
+      model=$2
+      shift 2
+      ;;
+    --provider)
+      provider=$2
+      shift 2
+      ;;
+    *)
+      prompt=$1
+      shift
+      ;;
+  esac
 done
 
-if [ "$json_mode" != true ]; then
-  echo "Cline planner did not receive JSON mode" >&2
+if [ "$json_mode" != true ] || [ "$model" != "cline-test" ] || [ "$provider" != "openrouter" ]; then
+  echo "Cline planner did not receive JSON mode, model, and provider" >&2
   exit 2
 fi
 case "$prompt" in

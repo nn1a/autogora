@@ -155,7 +155,8 @@ func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
 	if !ok {
 		return nil, nil
 	}
-	update := &boards.OrchestrationUpdate{AutoDecompose: boolPointerFrom(body, "autoDecompose"), AutoDecomposePerTick: intPointerFrom(body, "autoDecomposePerTick"), AutoPromoteChildren: boolPointerFrom(body, "autoPromoteChildren")}
+	update := &boards.OrchestrationUpdate{AutoDecompose: boolPointerFrom(body, "autoDecompose"), AutoDecomposePerTick: intPointerFrom(body, "autoDecomposePerTick"), AutoPromoteChildren: boolPointerFrom(body, "autoPromoteChildren"),
+		PlannerModel: stringPointerFrom(body, "plannerModel"), PlannerProvider: stringPointerFrom(body, "plannerProvider")}
 	if raw, exists := body["plannerRuntime"]; exists {
 		runtime := runtimeValue(raw)
 		if runtime == "" || runtime == model.RuntimeManual {
@@ -180,7 +181,9 @@ func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
 			if name == "" || runtime == "" || runtime == model.RuntimeManual {
 				return nil, errors.New("profile route requires name and a worker runtime")
 			}
-			profiles = append(profiles, boards.Profile{Name: name, Runtime: runtime, Description: stringValue(record["description"])})
+			profiles = append(profiles, boards.Profile{Name: name, Runtime: runtime, Model: stringValue(record["model"]), Provider: stringValue(record["provider"]),
+				Description: stringValue(record["description"]), Disabled: boolValue(record["disabled"], false),
+				MaxConcurrent: intValue(record["maxConcurrent"], 0), Priority: intValue(record["priority"], 0), Fallbacks: stringArray(record["fallbacks"])})
 		}
 		update.Profiles = &profiles
 	}

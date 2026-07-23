@@ -67,8 +67,10 @@
       <label>Description<textarea name="body" rows="7"></textarea></label>
       <div class="form-grid">
         <label>Status<select name="status"></select></label>
+        <label>Board profile<select name="profile"><option value="">Custom assignment</option></select></label>
         <label>Assignee<input name="assignee" placeholder="profile name"></label>
         <label>Runtime<select name="runtime"><option>manual</option><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
+        <label>Resolved model<input name="modelPreview" value="Manual task" readonly></label>
         <label>Priority<input name="priority" type="number" value="0"></label>
         <label>Tenant<input name="tenant"></label>
         <label>Workspace kind<select name="workspaceKind"><option>scratch</option><option>dir</option><option>worktree</option></select></label>
@@ -106,11 +108,19 @@
       <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
       <div class="form-grid">
         <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
+        <label>Planner model<input name="plannerModel" placeholder="CLI default (unpinned)"></label>
+        <label>Cline planner provider<input name="plannerProvider" placeholder="optional"></label>
         <label>Per tick<input name="autoDecomposePerTick" type="number" min="1" max="100" value="3"></label>
         <label>Default profile<input name="defaultProfile"></label>
         <label>Orchestrator profile<input name="orchestratorProfile"></label>
       </div>
-      <label>Profiles <small>one per line: name:runtime:description</small><textarea name="profiles" rows="6"></textarea></label>
+      <section class="profile-editor" aria-labelledby="profile-editor-title">
+        <div class="profile-editor-header">
+          <div><strong id="profile-editor-title">Worker profiles</strong><small>Model left blank uses the CLI default and is recorded as unpinned.</small></div>
+          <button id="add-profile" type="button">Add profile</button>
+        </div>
+        <div id="profile-list"></div>
+      </section>
       <button id="auto-describe-profiles" type="button">Auto-describe blank profiles</button>
       <footer>
         <button id="archive-board" value="cancel" class="danger">Archive board</button>

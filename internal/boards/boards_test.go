@@ -92,3 +92,30 @@ func TestBoardSlugAndEnvironmentSelection(t *testing.T) {
 		t.Fatal("invalid slug was accepted")
 	}
 }
+
+func TestBoardPersistsExplicitAgentModelsAndAvailability(t *testing.T) {
+	ctx := context.Background()
+	manager, err := NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerModel, plannerProvider := "planner-model", "openrouter"
+	profiles := []Profile{{Name: "implementer", Runtime: model.RuntimeCline, Model: "worker-model", Provider: "openrouter",
+		Description: "implements changes", MaxConcurrent: 2, Priority: 10, Fallbacks: []string{"backup", "backup", "implementer"}},
+		{Name: "backup", Runtime: model.RuntimeClaude, Disabled: true}}
+	if _, err := manager.Create(ctx, "default", Update{Orchestration: &OrchestrationUpdate{
+		PlannerModel: &plannerModel, PlannerProvider: &plannerProvider, Profiles: &profiles,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Orchestration.PlannerModel != plannerModel || loaded.Orchestration.PlannerProvider != plannerProvider ||
+		len(loaded.Orchestration.Profiles) != 2 || loaded.Orchestration.Profiles[0].Model != "worker-model" ||
+		loaded.Orchestration.Profiles[0].MaxConcurrent != 2 || len(loaded.Orchestration.Profiles[0].Fallbacks) != 1 ||
+		loaded.Orchestration.Profiles[1].Disabled != true {
+		t.Fatalf("agent settings were not normalized and persisted: %#v", loaded.Orchestration)
+	}
+}

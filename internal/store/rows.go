@@ -115,6 +115,21 @@ func scanRun(row scanner) (model.Run, error) {
 	return run, nil
 }
 
+func scanRunAgentConfig(row scanner) (model.RunAgentConfig, error) {
+	var value model.RunAgentConfig
+	var runtime string
+	var fallbackFrom sql.NullString
+	if err := row.Scan(
+		&value.RunID, &value.TaskID, &value.Profile, &runtime, &value.Model,
+		&value.Provider, &value.Source, &fallbackFrom, &value.ConfiguredAt,
+	); err != nil {
+		return model.RunAgentConfig{}, err
+	}
+	value.Runtime = model.Runtime(runtime)
+	value.FallbackFrom = stringPointer(fallbackFrom)
+	return value, nil
+}
+
 func scanComment(row scanner) (model.Comment, error) {
 	var comment model.Comment
 	err := row.Scan(&comment.ID, &comment.TaskID, &comment.Author, &comment.Body, &comment.CreatedAt)

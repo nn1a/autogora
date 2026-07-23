@@ -54,13 +54,21 @@ type specifyInput struct {
 	Body             *string       `json:"body,omitempty"`
 	Author           string        `json:"author,omitempty"`
 	PlannerRuntime   model.Runtime `json:"planner_runtime,omitempty"`
+	PlannerModel     string        `json:"planner_model,omitempty"`
+	PlannerProvider  string        `json:"planner_provider,omitempty"`
 	PlannerTimeoutMS int           `json:"planner_timeout_ms,omitempty"`
 }
 
 type profileRoute struct {
-	Name        string        `json:"name"`
-	Runtime     model.Runtime `json:"runtime"`
-	Description string        `json:"description,omitempty"`
+	Name          string        `json:"name"`
+	Runtime       model.Runtime `json:"runtime"`
+	Model         string        `json:"model,omitempty"`
+	Provider      string        `json:"provider,omitempty"`
+	Description   string        `json:"description,omitempty"`
+	Disabled      bool          `json:"disabled,omitempty"`
+	MaxConcurrent int           `json:"maxConcurrent,omitempty"`
+	Priority      int           `json:"priority,omitempty"`
+	Fallbacks     []string      `json:"fallbacks,omitempty"`
 }
 
 type decomposeInput struct {
@@ -72,6 +80,8 @@ type decomposeInput struct {
 	AutoPromoteChildren *bool                            `json:"auto_promote_children,omitempty"`
 	Plan                *orchestration.DecompositionPlan `json:"plan,omitempty"`
 	PlannerRuntime      model.Runtime                    `json:"planner_runtime,omitempty"`
+	PlannerModel        string                           `json:"planner_model,omitempty"`
+	PlannerProvider     string                           `json:"planner_provider,omitempty"`
 	PlannerTimeoutMS    int                              `json:"planner_timeout_ms,omitempty"`
 }
 
@@ -80,6 +90,8 @@ type profileDescribeInput struct {
 	Name             string        `json:"name"`
 	Runtime          model.Runtime `json:"runtime"`
 	PlannerRuntime   model.Runtime `json:"planner_runtime,omitempty"`
+	PlannerModel     string        `json:"planner_model,omitempty"`
+	PlannerProvider  string        `json:"planner_provider,omitempty"`
 	PlannerTimeoutMS int           `json:"planner_timeout_ms,omitempty"`
 }
 
@@ -265,7 +277,7 @@ func validPlannerRuntime(runtime model.Runtime) bool {
 	return runtime == model.RuntimeClaude || runtime == model.RuntimeCodex || runtime == model.RuntimeCline || runtime == model.RuntimeGemini
 }
 
-func (s *Service) planner(runtime model.Runtime, timeoutMS int) (orchestration.Planner, error) {
+func (s *Service) planner(runtime model.Runtime, modelName, provider string, timeoutMS int) (orchestration.Planner, error) {
 	if runtime == "" {
 		runtime = model.RuntimeCodex
 	}
@@ -282,7 +294,8 @@ func (s *Service) planner(runtime model.Runtime, timeoutMS int) (orchestration.P
 	if err != nil {
 		return nil, err
 	}
-	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: runtime, CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: s.getenv})
+	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: runtime, Model: strings.TrimSpace(modelName),
+		Provider: strings.TrimSpace(provider), CWD: cwd, Timeout: time.Duration(timeoutMS) * time.Millisecond, Getenv: s.getenv})
 }
 
 func (s *Service) registerMutations(server *mcp.Server) {
@@ -392,7 +405,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			explicit = &orchestration.SpecificationPlan{Title: *input.Title, Body: *input.Body}
 		} else {
 			var err error
-			planner, err = s.planner(input.PlannerRuntime, input.PlannerTimeoutMS)
+			planner, err = s.planner(input.PlannerRuntime, input.PlannerModel, input.PlannerProvider, input.PlannerTimeoutMS)
 			if err != nil {
 				return nil, err
 			}
@@ -411,7 +424,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		var planner orchestration.Planner
 		if input.Plan == nil {
 			var err error
-			planner, err = s.planner(input.PlannerRuntime, input.PlannerTimeoutMS)
+			planner, err = s.planner(input.PlannerRuntime, input.PlannerModel, input.PlannerProvider, input.PlannerTimeoutMS)
 			if err != nil {
 				return nil, err
 			}
@@ -452,7 +465,11 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		if plannerRuntime == "" {
 			plannerRuntime = metadata.Orchestration.PlannerRuntime
 		}
-		planner, err := s.planner(plannerRuntime, input.PlannerTimeoutMS)
+		plannerModel, plannerProvider := input.PlannerModel, input.PlannerProvider
+		if plannerModel == "" && plannerRuntime == metadata.Orchestration.PlannerRuntime {
+			plannerModel, plannerProvider = metadata.Orchestration.PlannerModel, metadata.Orchestration.PlannerProvider
+		}
+		planner, err := s.planner(plannerRuntime, plannerModel, plannerProvider, input.PlannerTimeoutMS)
 		if err != nil {
 			return nil, err
 		}
@@ -461,10 +478,12 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return nil, err
 		}
 		defer opened.Close()
-		existingDescription := ""
+		existing := orchestration.ProfileRoute{Name: input.Name, Runtime: input.Runtime}
 		for _, profile := range metadata.Orchestration.Profiles {
 			if profile.Name == input.Name {
-				existingDescription = profile.Description
+				existing = orchestration.ProfileRoute{Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model,
+					Provider: profile.Provider, Description: profile.Description, Disabled: profile.Disabled,
+					MaxConcurrent: profile.MaxConcurrent, Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...)}
 				break
 			}
 		}
@@ -476,7 +495,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 		for _, task := range tasks {
 			evidence = append(evidence, orchestration.ProfileEvidence{Title: task.Title, Body: task.Body, Skills: task.Skills})
 		}
-		described, err := orchestration.DescribeProfileRoute(ctx, orchestration.ProfileRoute{Name: input.Name, Runtime: input.Runtime, Description: existingDescription}, evidence, planner)
+		described, err := orchestration.DescribeProfileRoute(ctx, existing, evidence, planner)
 		if err != nil {
 			return nil, err
 		}
@@ -486,7 +505,9 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				profiles = append(profiles, profile)
 			}
 		}
-		profiles = append(profiles, boards.Profile{Name: described.Name, Runtime: described.Runtime, Description: described.Description})
+		profiles = append(profiles, boards.Profile{Name: described.Name, Runtime: described.Runtime, Model: described.Model,
+			Provider: described.Provider, Description: described.Description, Disabled: described.Disabled,
+			MaxConcurrent: described.MaxConcurrent, Priority: described.Priority, Fallbacks: append([]string{}, described.Fallbacks...)})
 		if _, err := s.manager.Update(board, boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
 			return nil, err
 		}

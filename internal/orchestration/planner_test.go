@@ -26,10 +26,10 @@ func testSchema() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{"title": map[string]any{"type": "string"}, "body": map[string]any{"type": "string"}}, "required": []string{"title", "body"}}
 }
 
-func plannerResult(t *testing.T, runtime model.Runtime, envName, fixture string) map[string]any {
+func plannerResult(t *testing.T, runtime model.Runtime, envName, fixture, selectedModel, provider string) map[string]any {
 	t.Helper()
 	planner, err := CreateCLIPlanner(CLIPlannerOptions{
-		Runtime: runtime, CWD: t.TempDir(), Timeout: 5 * time.Second,
+		Runtime: runtime, Model: selectedModel, Provider: provider, CWD: t.TempDir(), Timeout: 5 * time.Second,
 		Getenv: func(name string) string {
 			if name == envName {
 				return fixturePath(t, fixture)
@@ -53,22 +53,29 @@ func plannerResult(t *testing.T, runtime model.Runtime, envName, fixture string)
 }
 
 func TestCodexCLIPlannerUsesStrictSchema(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCodex, "AUTOGORA_CODEX_BIN", "planner-agent.sh")
+	value := plannerResult(t, model.RuntimeCodex, "AUTOGORA_CODEX_BIN", "planner-agent.sh", "gpt-test", "")
 	if value["title"] != "Planner-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestClineCLIPlannerReadsFinalNDJSONResult(t *testing.T) {
-	value := plannerResult(t, model.RuntimeCline, "AUTOGORA_CLINE_BIN", "planner-cline-agent.sh")
+	value := plannerResult(t, model.RuntimeCline, "AUTOGORA_CLINE_BIN", "planner-cline-agent.sh", "cline-test", "openrouter")
 	if value["title"] != "Cline-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }
 
 func TestGeminiCLIPlannerUsesDenyAllPolicy(t *testing.T) {
-	value := plannerResult(t, model.RuntimeGemini, "AUTOGORA_GEMINI_BIN", "planner-gemini-agent.sh")
+	value := plannerResult(t, model.RuntimeGemini, "AUTOGORA_GEMINI_BIN", "planner-gemini-agent.sh", "gemini-test", "")
 	if value["title"] != "Gemini-generated task specification" {
+		t.Fatalf("unexpected result: %#v", value)
+	}
+}
+
+func TestClaudeCLIPlannerPassesConfiguredModel(t *testing.T) {
+	value := plannerResult(t, model.RuntimeClaude, "AUTOGORA_CLAUDE_BIN", "planner-claude-agent.sh", "claude-test", "")
+	if value["title"] != "Claude-generated task specification" {
 		t.Fatalf("unexpected result: %#v", value)
 	}
 }

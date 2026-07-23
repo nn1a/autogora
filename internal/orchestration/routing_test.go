@@ -24,7 +24,18 @@ func TestResolveAndSelectProfileRoutes(t *testing.T) {
 
 func TestSelectProfileRoutesSuppliesRunnableEmptyBoardFallback(t *testing.T) {
 	fallback, orchestrator := SelectProfileRoutes(nil, nil, nil, model.RuntimeCline)
-	if fallback.Name != "cline-worker" || fallback.Runtime != model.RuntimeCline || orchestrator != fallback {
+	if fallback.Name != "cline-worker" || fallback.Runtime != model.RuntimeCline || orchestrator.Name != fallback.Name || orchestrator.Runtime != fallback.Runtime {
 		t.Fatalf("fallback routes = %#v %#v", fallback, orchestrator)
+	}
+}
+
+func TestSelectProfileRoutesSkipsDisabledAndUsesPriority(t *testing.T) {
+	disabled := ProfileRoute{Name: "disabled", Runtime: model.RuntimeCodex, Disabled: true, Priority: 100}
+	backup := ProfileRoute{Name: "backup", Runtime: model.RuntimeClaude, Priority: 5}
+	primary := ProfileRoute{Name: "primary", Runtime: model.RuntimeGemini, Priority: 10}
+	profiles := ResolveProfileRoutes(nil, []ProfileRoute{disabled, backup, primary})
+	fallback, orchestrator := SelectProfileRoutes(profiles, nil, nil, model.RuntimeCodex)
+	if fallback.Name != "primary" || orchestrator.Name != "primary" || profiles[0].Name != "disabled" || profiles[1].Name != "primary" {
+		t.Fatalf("unexpected profile selection: profiles=%#v fallback=%#v orchestrator=%#v", profiles, fallback, orchestrator)
 	}
 }

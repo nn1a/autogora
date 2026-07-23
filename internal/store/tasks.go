@@ -638,6 +638,10 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (model.TaskDetail, e
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
+	runAgentConfigs, err := s.ListTaskRunAgentConfigs(ctx, taskID)
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
 	workspaces, err := s.listRunWorkspaces(ctx, taskID)
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -657,7 +661,7 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (model.TaskDetail, e
 	return model.TaskDetail{
 		Task: task, Parents: parents, Children: children, Prerequisites: parents,
 		Dependents: children, ParentTask: parentTask, Subtasks: subtasks,
-		Comments: comments, Attachments: attachments, Runs: runs, RunWorkspaces: workspaces,
+		Comments: comments, Attachments: attachments, Runs: runs, RunAgentConfigs: runAgentConfigs, RunWorkspaces: workspaces,
 		TerminalRequests: terminalRequests, ChangeSets: changeSets, Events: events,
 	}, nil
 }

@@ -160,6 +160,8 @@ type boardOrchestrationInput struct {
 	AutoDecomposePerTick   *int            `json:"autoDecomposePerTick,omitempty"`
 	AutoPromoteChildren    *bool           `json:"autoPromoteChildren,omitempty"`
 	PlannerRuntime         *model.Runtime  `json:"plannerRuntime,omitempty"`
+	PlannerModel           *string         `json:"plannerModel,omitempty"`
+	PlannerProvider        *string         `json:"plannerProvider,omitempty"`
 	DefaultProfile         *string         `json:"defaultProfile,omitempty"`
 	OrchestratorProfile    *string         `json:"orchestratorProfile,omitempty"`
 	Profiles               *[]profileRoute `json:"profiles,omitempty"`
@@ -474,6 +476,7 @@ func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.Orchestra
 	update := &boards.OrchestrationUpdate{
 		AutoDecompose: input.AutoDecompose, AutoDecomposePerTick: input.AutoDecomposePerTick,
 		AutoPromoteChildren: input.AutoPromoteChildren, PlannerRuntime: input.PlannerRuntime,
+		PlannerModel: input.PlannerModel, PlannerProvider: input.PlannerProvider,
 	}
 	if input.defaultProfileSet {
 		update.DefaultProfile = store.OptionalString{Set: true, Value: input.DefaultProfile}
@@ -491,7 +494,9 @@ func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.Orchestra
 			if profile.Name == "" || !validPlannerRuntime(profile.Runtime) {
 				return nil, errors.New("profile requires a name and worker runtime")
 			}
-			profiles = append(profiles, boards.Profile{Name: profile.Name, Runtime: profile.Runtime, Description: profile.Description})
+			profiles = append(profiles, boards.Profile{Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model,
+				Provider: profile.Provider, Description: profile.Description, Disabled: profile.Disabled,
+				MaxConcurrent: profile.MaxConcurrent, Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...)})
 		}
 		update.Profiles = &profiles
 	}

@@ -143,10 +143,10 @@ autogora dispatch --once --allow-writes --board product-web
 | 섹션 | 필드 |
 | --- | --- |
 | Task | Title, Description, Status, Priority |
-| Agent | Board profile, Assignee, Runtime, Skills |
+| Agent | Board profile과 모델 표시, Assignee, Runtime, Skills |
 | Execution | Tenant, Workspace kind/path, Goal mode |
 
-`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. Status, Board profile, Runtime, Workspace kind에 포커스한 뒤 `↑/↓`로 값을 선택하고, Goal mode는 `Space`로 전환한다. 폼에도 현재 필드의 조작 키가 표시된다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile은 Web API와 같은 board metadata 및 기존 task route에서 읽는다. Profile을 선택하면 Assignee와 Runtime이 함께 설정된다.
+`Tab`과 `Shift+Tab`으로 필드를 이동하고, `Ctrl+←/→`로 섹션을 바꾼다. Status, Board profile, Runtime, Workspace kind에 포커스한 뒤 `↑/↓`로 값을 선택하고, Goal mode는 `Space`로 전환한다. 폼에도 현재 필드의 조작 키가 표시된다. `Ctrl+S`로 저장하고 `Esc`로 취소한다. Board profile은 Web API와 같은 board metadata 및 기존 task route에서 읽는다. Profile을 선택하면 Assignee와 Runtime이 함께 설정되고 선택한 모델도 표시된다. 비활성 Profile은 선택 목록에서 제외된다.
 
 `Space` action palette에서는 Specify, Decompose, Promote, Unblock, 선택 작업 실행, 활성 run 종료, Schedule, Block, Complete, hierarchy와 dependency 편집, 첨부, Archive, Delete를 실행할 수 있다. 메뉴 항목이나 관계 대상이 많으면 메뉴 안에서 `/`를 눌러 검색한다.
 
@@ -391,6 +391,18 @@ autogora unlink <prerequisite-id> <dependent-id>
 
 ### 5.4 Todo: 실행 경로 확정
 
+Web UI의 Board settings에서 worker profile을 행 단위로 관리한다. Profile마다 Runtime, Model, Cline Provider, Enabled, 동시 실행 제한, 우선순위와 fallback 목록을 지정할 수 있다. Model을 비워 두면 해당 CLI의 기본값을 사용하며 화면과 run 이력에는 `CLI default (unpinned)`로 표시된다. Planner도 Runtime과 Model을 따로 지정한다.
+
+환경변수로 프로세스 기본 모델을 정할 수도 있다.
+
+```bash
+export AUTOGORA_CODEX_MODEL=<model-id>
+export AUTOGORA_CLINE_MODEL=<model-id>
+export AUTOGORA_CLINE_PROVIDER=<provider-id>
+```
+
+보드 Profile의 모델이 환경변수보다 우선한다. 인증 토큰은 board metadata에 저장하지 않고 각 coding agent의 로그인 또는 기존 환경변수를 사용한다.
+
 `Todo`에서 다음 항목을 확인한다.
 
 - 누가 실행하는가: `assignee`
@@ -444,7 +456,7 @@ autogora dispatch --watch \
   --board product-web
 ```
 
-dispatcher는 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. worker는 시작할 때 카드와 prerequisite handoff를 읽고, 오래 걸리는 작업 중에는 heartbeat를 남겨야 한다.
+dispatcher는 claim, workspace 준비, worker 실행, heartbeat lease, 제한 시간, 재시도와 종료 상태를 관리한다. 비활성 Profile은 claim하지 않고, Profile별 동시 실행 제한도 적용한다. 실행 직전에 해석한 Profile, Runtime, Model, Provider와 설정 출처는 run 이력에 고정한다. 설정을 나중에 바꿔도 이전 실행 기록은 바뀌지 않는다. worker는 시작할 때 카드와 prerequisite handoff를 읽고, 오래 걸리는 작업 중에는 heartbeat를 남겨야 한다.
 
 ![Running 카드의 실제 상세 화면](images/workflow-03-running-detail.png)
 

@@ -70,8 +70,10 @@ func (s *Service) ProfileRoutes(ctx context.Context, metadata boards.Metadata) (
 
 func (s *Service) planner(metadata boards.Metadata) (orchestration.Planner, error) {
 	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{
-		Runtime: metadata.Orchestration.PlannerRuntime,
-		Timeout: 120 * time.Second,
+		Runtime:  metadata.Orchestration.PlannerRuntime,
+		Model:    metadata.Orchestration.PlannerModel,
+		Provider: metadata.Orchestration.PlannerProvider,
+		Timeout:  120 * time.Second,
 	})
 }
 
@@ -90,7 +92,9 @@ func (s *Service) SpecifyTask(ctx context.Context, taskID string, explicit *orch
 func profileRoutes(values []boards.Profile) []orchestration.ProfileRoute {
 	result := make([]orchestration.ProfileRoute, 0, len(values))
 	for _, value := range values {
-		result = append(result, orchestration.ProfileRoute{Name: value.Name, Runtime: value.Runtime, Description: value.Description})
+		result = append(result, orchestration.ProfileRoute{Name: value.Name, Runtime: value.Runtime, Model: value.Model, Provider: value.Provider,
+			Description: value.Description, Disabled: value.Disabled, MaxConcurrent: value.MaxConcurrent, Priority: value.Priority,
+			Fallbacks: append([]string{}, value.Fallbacks...)})
 	}
 	return result
 }

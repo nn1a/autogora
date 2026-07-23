@@ -1,10 +1,15 @@
 package orchestration
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/nn1a/autogora/internal/model"
 )
+
+func RunnableProfileRoute(profile ProfileRoute) bool {
+	return !profile.Disabled && strings.TrimSpace(profile.Name) != "" && profile.Runtime != model.RuntimeManual && model.ValidRuntime(profile.Runtime)
+}
 
 // ResolveProfileRoutes merges routes observed on existing tasks with the board
 // configuration. Configured routes win so every UI and dispatcher uses the
@@ -34,6 +39,9 @@ func ResolveProfileRoutes(tasks []model.Task, configured []ProfileRoute) []Profi
 			profiles = append(profiles, route)
 		}
 	}
+	sort.SliceStable(profiles, func(left, right int) bool {
+		return profiles[left].Priority > profiles[right].Priority
+	})
 	return profiles
 }
 
@@ -42,23 +50,28 @@ func ResolveProfileRoutes(tasks []model.Task, configured []ProfileRoute) []Profi
 func SelectProfileRoutes(profiles []ProfileRoute, defaultName, orchestratorName *string, plannerRuntime model.Runtime) (ProfileRoute, ProfileRoute) {
 	fallback := ProfileRoute{}
 	for _, profile := range profiles {
-		if defaultName != nil && profile.Name == *defaultName {
+		if defaultName != nil && profile.Name == *defaultName && RunnableProfileRoute(profile) {
 			fallback = profile
 			break
 		}
 	}
-	if fallback.Name == "" && len(profiles) > 0 {
-		fallback = profiles[0]
+	if fallback.Name == "" {
+		for _, profile := range profiles {
+			if RunnableProfileRoute(profile) {
+				fallback = profile
+				break
+			}
+		}
 	}
 	if plannerRuntime == model.RuntimeManual || !model.ValidRuntime(plannerRuntime) {
 		plannerRuntime = model.RuntimeCodex
 	}
-	if fallback.Name == "" {
+	if fallback.Name == "" && len(profiles) == 0 {
 		fallback = ProfileRoute{Name: string(plannerRuntime) + "-worker", Runtime: plannerRuntime}
 	}
 	orchestrator := fallback
 	for _, profile := range profiles {
-		if orchestratorName != nil && profile.Name == *orchestratorName {
+		if orchestratorName != nil && profile.Name == *orchestratorName && RunnableProfileRoute(profile) {
 			orchestrator = profile
 			break
 		}

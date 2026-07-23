@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,8 @@ type Options struct {
 	DefaultProfile           *orchestration.ProfileRoute
 	OrchestratorProfile      *orchestration.ProfileRoute
 	PlannerRuntime           model.Runtime
+	PlannerModel             string
+	PlannerProvider          string
 	PlannerTimeout           time.Duration
 	DecompositionPlanner     orchestration.Planner
 	AllowWrites              bool
@@ -189,9 +192,85 @@ func deliverBoardNotifications(ctx context.Context, manager *boards.Manager, boa
 func boardProfiles(configured []boards.Profile) []orchestration.ProfileRoute {
 	result := make([]orchestration.ProfileRoute, 0, len(configured))
 	for _, profile := range configured {
-		result = append(result, orchestration.ProfileRoute{Name: profile.Name, Runtime: profile.Runtime, Description: profile.Description})
+		result = append(result, orchestration.ProfileRoute{Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider,
+			Description: profile.Description, Disabled: profile.Disabled, MaxConcurrent: profile.MaxConcurrent, Priority: profile.Priority,
+			Fallbacks: append([]string{}, profile.Fallbacks...)})
 	}
 	return result
+}
+
+func configuredProfiles(manager *boards.Manager, board string, options Options) ([]orchestration.ProfileRoute, error) {
+	metadata, err := manager.Read(board)
+	if err != nil {
+		return nil, err
+	}
+	profiles := boardProfiles(metadata.Orchestration.Profiles)
+	if options.DecompositionProfiles != nil {
+		profiles = append([]orchestration.ProfileRoute{}, options.DecompositionProfiles...)
+	}
+	return profiles, nil
+}
+
+func claimProfilePolicy(manager *boards.Manager, board string, options Options) ([]string, map[string]int, error) {
+	profiles, err := configuredProfiles(manager, board, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	excluded := make([]string, 0)
+	limits := map[string]int{}
+	for _, profile := range profiles {
+		if profile.Disabled {
+			excluded = append(excluded, profile.Name)
+			continue
+		}
+		if profile.MaxConcurrent > 0 {
+			limits[profile.Name] = profile.MaxConcurrent
+		}
+	}
+	return excluded, limits, nil
+}
+
+func resolveRunProfile(manager *boards.Manager, task model.Task, options Options) (orchestration.ProfileRoute, string, error) {
+	name := string(task.Runtime) + "-worker"
+	if task.Assignee != nil && strings.TrimSpace(*task.Assignee) != "" {
+		name = strings.TrimSpace(*task.Assignee)
+	}
+	resolved := orchestration.ProfileRoute{Name: name, Runtime: task.Runtime}
+	source := "task_route"
+	profiles, err := configuredProfiles(manager, task.Board, options)
+	if err != nil {
+		return orchestration.ProfileRoute{}, "", err
+	}
+	for _, profile := range profiles {
+		if profile.Name != name {
+			continue
+		}
+		if profile.Disabled {
+			return orchestration.ProfileRoute{}, "", fmt.Errorf("worker profile is disabled: %s", name)
+		}
+		if profile.Runtime == task.Runtime {
+			resolved, source = profile, "board_profile"
+		}
+		break
+	}
+	getenv := options.Getenv
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	prefix := "AUTOGORA_" + strings.ToUpper(string(task.Runtime))
+	if strings.TrimSpace(resolved.Model) == "" {
+		resolved.Model = strings.TrimSpace(getenv(prefix + "_MODEL"))
+		if resolved.Model != "" {
+			source = "environment"
+		}
+	}
+	if strings.TrimSpace(resolved.Provider) == "" {
+		resolved.Provider = strings.TrimSpace(getenv(prefix + "_PROVIDER"))
+	}
+	if resolved.Model == "" && source == "task_route" {
+		source = "cli_default"
+	}
+	return resolved, source, nil
 }
 
 func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) {
@@ -223,9 +302,17 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 		if plannerRuntime == "" {
 			plannerRuntime = metadata.Orchestration.PlannerRuntime
 		}
+		plannerModel, plannerProvider := strings.TrimSpace(options.PlannerModel), strings.TrimSpace(options.PlannerProvider)
+		if plannerModel == "" && options.PlannerRuntime == "" {
+			plannerModel = metadata.Orchestration.PlannerModel
+		}
+		if plannerProvider == "" && options.PlannerRuntime == "" {
+			plannerProvider = metadata.Orchestration.PlannerProvider
+		}
 		planner := options.DecompositionPlanner
 		if planner == nil {
-			planner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: plannerRuntime, CWD: options.WorkingDirectory, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
+			planner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: plannerRuntime, Model: plannerModel,
+				Provider: plannerProvider, CWD: options.WorkingDirectory, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
 			if err != nil {
 				options.log("auto-decompose planner failed %s: %v", board, err)
 				continue
@@ -335,6 +422,25 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		_, _ = opened.FailRun(durable, scope, "Unable to register dispatcher ownership: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
 		return
 	}
+	profile, configSource, err := resolveRunProfile(manager, claim.Task.Task, options)
+	if err != nil {
+		durable, cancel := durableContext()
+		defer cancel()
+		countFailure := false
+		_, _ = opened.FailRun(durable, scope, "Agent profile resolution failed: "+err.Error(), store.FailRunOptions{
+			Outcome: model.RunStatusReclaimed, CountFailure: &countFailure, CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
+		})
+		return
+	}
+	configured, err := opened.RecordRunAgentConfig(ctx, scope, store.RecordRunAgentConfigInput{
+		Profile: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider, Source: configSource,
+	})
+	if err != nil {
+		durable, cancel := durableContext()
+		defer cancel()
+		_, _ = opened.FailRun(durable, scope, "Unable to pin agent configuration: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
+		return
+	}
 	workspaces := workspace.New(manager)
 	workspaces.SetAllowWrites(options.AllowWrites)
 	if options.WorkingDirectory != "" {
@@ -371,7 +477,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return
 	}
 	logPath := filepath.Join(logsRoot, prepared.Task.Task.ID+"-"+prepared.Run.ID+".log")
-	runnerOptions := RunnerOptions{DBPath: options.DBPath, CLIPath: options.CLIPath, AllowWrites: options.AllowWrites,
+	runnerOptions := RunnerOptions{DBPath: options.DBPath, CLIPath: options.CLIPath, Profile: configured.Profile,
+		Model: configured.Model, Provider: configured.Provider, AllowWrites: options.AllowWrites,
 		WorkspaceRoot: workspaceRoot, AttachmentsRoot: attachmentsRoot, LogsRoot: logsRoot,
 		ClineApprovalDir: clineApprovalDir, Getenv: options.Getenv}
 	taskID := prepared.Task.Task.ID
@@ -388,7 +495,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		if prepared.Workspace != nil {
 			plannerCWD = prepared.Workspace.Path
 		}
-		goalPlanner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: prepared.Task.Task.Runtime, CWD: plannerCWD, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
+		goalPlanner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: prepared.Task.Task.Runtime,
+			Model: configured.Model, Provider: configured.Provider, CWD: plannerCWD, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
 		if err != nil {
 			durable, cancel := durableContext()
 			defer cancel()
@@ -431,7 +539,11 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			value := time.Duration(*prepared.Task.Task.MaxRuntimeSeconds)*time.Second - time.Since(runStarted)
 			runtimeLimit = &value
 		}
-		options.log("launch %s via %s goal_turn=%d log=%s", taskID, prepared.Task.Task.Runtime, turn, logPath)
+		modelName := configured.Model
+		if modelName == "" {
+			modelName = "CLI default (unpinned)"
+		}
+		options.log("launch %s via %s/%s profile=%s goal_turn=%d log=%s", taskID, prepared.Task.Task.Runtime, modelName, configured.Profile, turn, logPath)
 		execution := ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit)
 		durable, cancel := durableContext()
 		currentDetail, getErr := opened.GetTask(durable, taskID)
@@ -642,12 +754,17 @@ func Run(ctx context.Context, options Options) error {
 				if ctx.Err() != nil || int(active.Load()) >= options.MaxWorkers {
 					break
 				}
+				excluded, profileLimits, err := claimProfilePolicy(manager, board, options)
+				if err != nil {
+					return err
+				}
 				opened, err := manager.OpenStore(ctx, board)
 				if err != nil {
 					return err
 				}
 				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
-					ClaimTTLSeconds: options.ClaimTTLSeconds, MaxInProgress: options.MaxInProgress, MaxInProgressPerAssignee: options.MaxInProgressPerAssignee})
+					ClaimTTLSeconds: options.ClaimTTLSeconds, MaxInProgress: options.MaxInProgress, MaxInProgressPerAssignee: options.MaxInProgressPerAssignee,
+					MaxInProgressByAssignee: profileLimits, ExcludedAssignees: excluded})
 				if err != nil {
 					opened.Close()
 					return err

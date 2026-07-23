@@ -28,6 +28,8 @@ type ClaimOptions struct {
 	ClaimTTLSeconds          int
 	MaxInProgress            int
 	MaxInProgressPerAssignee int
+	MaxInProgressByAssignee  map[string]int
+	ExcludedAssignees        []string
 }
 
 type RunScope struct {
@@ -192,6 +194,23 @@ func (s *Store) ClaimTask(ctx context.Context, input ClaimOptions) (*model.Claim
 		if input.ExcludeManual {
 			clauses = append(clauses, "runtime <> 'manual'")
 		}
+		excluded := make([]string, 0, len(input.ExcludedAssignees))
+		seenExcluded := map[string]bool{}
+		for _, assignee := range input.ExcludedAssignees {
+			assignee = strings.TrimSpace(assignee)
+			if assignee != "" && !seenExcluded[assignee] {
+				seenExcluded[assignee] = true
+				excluded = append(excluded, assignee)
+			}
+		}
+		if len(excluded) > 0 {
+			placeholders := make([]string, len(excluded))
+			for index, assignee := range excluded {
+				placeholders[index] = "?"
+				values = append(values, assignee)
+			}
+			clauses = append(clauses, "(assignee IS NULL OR assignee NOT IN ("+strings.Join(placeholders, ",")+"))")
+		}
 		rows, err := tx.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE "+strings.Join(clauses, " AND ")+" ORDER BY priority DESC, created_at ASC LIMIT 50", values...)
 		if err != nil {
 			return err
@@ -221,12 +240,18 @@ func (s *Store) ClaimTask(ctx context.Context, input ClaimOptions) (*model.Claim
 				}
 				continue
 			}
-			if input.MaxInProgressPerAssignee > 0 && candidate.Assignee != nil {
+			assigneeLimit := input.MaxInProgressPerAssignee
+			if candidate.Assignee != nil {
+				if configured := input.MaxInProgressByAssignee[*candidate.Assignee]; configured > 0 && (assigneeLimit <= 0 || configured < assigneeLimit) {
+					assigneeLimit = configured
+				}
+			}
+			if assigneeLimit > 0 && candidate.Assignee != nil {
 				var running int
 				if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE board = ? AND status = 'running' AND assignee = ?", board, *candidate.Assignee).Scan(&running); err != nil {
 					return err
 				}
-				if running >= max(1, input.MaxInProgressPerAssignee) {
+				if running >= max(1, assigneeLimit) {
 					continue
 				}
 			}

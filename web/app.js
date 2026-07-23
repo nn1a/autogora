@@ -295,7 +295,23 @@ function openTaskDialog(status = "todo") {
   const form = $("#task-form");
   form.reset();
   form.elements.status.value = status;
+  const profiles = (state.metadata?.orchestration?.profiles || []).filter((profile) => !profile.disabled);
+  form.elements.profile.innerHTML = `<option value="">Custom assignment</option>${profiles.map((profile) =>
+    `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)} · ${escapeHtml(profile.model || "CLI default")}</option>`).join("")}`;
+  updateTaskModelPreview();
   $("#task-dialog").showModal();
+}
+
+function updateTaskModelPreview() {
+  const form = $("#task-form");
+  const profile = (state.metadata?.orchestration?.profiles || []).find((item) => item.name === form.elements.profile.value);
+  if (profile) {
+    form.elements.assignee.value = profile.name;
+    form.elements.runtime.value = profile.runtime;
+    form.elements.modelPreview.value = profile.model || "CLI default (unpinned)";
+    return;
+  }
+  form.elements.modelPreview.value = form.elements.runtime.value === "manual" ? "Manual task" : "CLI default (unpinned)";
 }
 
 async function openDrawer(taskId) {
@@ -330,11 +346,13 @@ function taskOptions(excludeId) {
 
 function renderDrawer(detail) {
   const task = detail.task;
+  const runAgents = new Map((detail.runAgentConfigs || []).map((config) => [config.runId, config]));
   const runRows = detail.runs.slice().reverse().map((run) => `<div class="detail-row">
     ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger compact">Terminate</button>` : ""}
     <strong>${escapeHtml(run.workerId)}</strong>
     <span class="detail-status">${escapeHtml(run.status)}</span>
     <span class="mono">${escapeHtml(run.id)} · ${relativeTime(run.claimedAt)}</span>
+    ${runAgents.has(run.id) ? `<div>${escapeHtml(runAgents.get(run.id).profile)} · ${escapeHtml(runAgents.get(run.id).runtime)} · ${escapeHtml(runAgents.get(run.id).model || "CLI default (unpinned)")}${runAgents.get(run.id).provider ? ` · ${escapeHtml(runAgents.get(run.id).provider)}` : ""}</div>` : ""}
     ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
   </div>`).join("");
   const comments = detail.comments.map((comment) => `<div class="detail-row"><strong>${escapeHtml(comment.author)}</strong>${markdown(comment.body)}<div class="mono">${escapeHtml(comment.createdAt)}</div></div>`).join("");
@@ -520,6 +538,46 @@ function parseRoute(value) {
   return { name, runtime, description: description.join(":") };
 }
 
+function profileEditorRow(profile = {}) {
+  const runtime = ["codex", "claude", "cline", "gemini"].includes(profile.runtime) ? profile.runtime : "codex";
+  const options = ["codex", "claude", "cline", "gemini"].map((value) =>
+    `<option value="${value}"${value === runtime ? " selected" : ""}>${value}</option>`).join("");
+  return `<article class="profile-row">
+    <div class="profile-row-head">
+      <label>Name<input data-profile="name" value="${escapeHtml(profile.name || "")}" placeholder="implementer" required></label>
+      <label>Runtime<select data-profile="runtime">${options}</select></label>
+      <label>Model<input data-profile="model" value="${escapeHtml(profile.model || "")}" placeholder="CLI default"></label>
+      <label>Provider<input data-profile="provider" value="${escapeHtml(profile.provider || "")}" placeholder="Cline only"></label>
+      <button type="button" class="ghost profile-remove" aria-label="Remove profile">Remove</button>
+    </div>
+    <label>Description<textarea data-profile="description" rows="2">${escapeHtml(profile.description || "")}</textarea></label>
+    <div class="profile-row-options">
+      <label class="inline"><input data-profile="enabled" type="checkbox"${profile.disabled ? "" : " checked"}> Enabled</label>
+      <label>Max running<input data-profile="maxConcurrent" type="number" min="0" value="${Number(profile.maxConcurrent) || 0}"></label>
+      <label>Priority<input data-profile="priority" type="number" value="${Number(profile.priority) || 0}"></label>
+      <label>Fallback profiles<input data-profile="fallbacks" value="${escapeHtml((profile.fallbacks || []).join(", "))}" placeholder="claude-backup, local-cline"></label>
+    </div>
+  </article>`;
+}
+
+function renderProfileEditor(profiles = []) {
+  $("#profile-list").innerHTML = profiles.map(profileEditorRow).join("");
+}
+
+function readProfileEditor() {
+  return $$(".profile-row", $("#profile-list")).map((row) => {
+    const get = (name) => $(`[data-profile=${name}]`, row);
+    const name = get("name").value.trim();
+    if (!name) throw new Error("Every worker profile needs a name");
+    return {
+      name, runtime: get("runtime").value, model: get("model").value.trim(), provider: get("provider").value.trim(),
+      description: get("description").value.trim(), disabled: !get("enabled").checked,
+      maxConcurrent: Number(get("maxConcurrent").value) || 0, priority: Number(get("priority").value) || 0,
+      fallbacks: get("fallbacks").value.split(",").map((value) => value.trim()).filter(Boolean),
+    };
+  });
+}
+
 function connectEvents() {
   state.socket?.close();
   const socket = new EventSource(`/api/events/stream?board=${encodeURIComponent(state.board)}&since=${state.cursor}`);
@@ -575,9 +633,20 @@ function bindGlobalActions() {
   $("#theme-toggle").addEventListener("click", () => setTheme(activeTheme === "dark" ? "light" : "dark"));
   $("#board-settings").addEventListener("click", openSettings);
   $("#task-form").addEventListener("submit", submitTask);
+  $("#task-form [name=profile]").addEventListener("change", updateTaskModelPreview);
+  $("#task-form [name=runtime]").addEventListener("change", () => {
+    $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
+  });
   $("#board-form").addEventListener("submit", submitBoard);
   $("#settings-form").addEventListener("submit", submitSettings);
   $("#auto-describe-profiles").addEventListener("click", autoDescribeProfiles);
+  $("#add-profile").addEventListener("click", () => {
+    $("#profile-list").insertAdjacentHTML("beforeend", profileEditorRow());
+    $(".profile-row:last-child [data-profile=name]", $("#profile-list"))?.focus();
+  });
+  $("#profile-list").addEventListener("click", (event) => {
+    if (event.target.closest(".profile-remove")) event.target.closest(".profile-row").remove();
+  });
   $("#swarm-form").addEventListener("submit", submitSwarm);
   $("#archive-board").addEventListener("click", archiveBoard);
 }
@@ -614,8 +683,9 @@ function openSettings() {
   form.elements.defaultWorkdir.value = metadata.defaultWorkdir || ""; form.elements.autoDecompose.checked = settings.autoDecompose;
   form.elements.autoPromoteChildren.checked = settings.autoPromoteChildren;
   form.elements.plannerRuntime.value = settings.plannerRuntime; form.elements.autoDecomposePerTick.value = settings.autoDecomposePerTick;
+  form.elements.plannerModel.value = settings.plannerModel || ""; form.elements.plannerProvider.value = settings.plannerProvider || "";
   form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.orchestratorProfile.value = settings.orchestratorProfile || "";
-  form.elements.profiles.value = settings.profiles.map((profile) => `${profile.name}:${profile.runtime}:${profile.description || ""}`).join("\n");
+  renderProfileEditor(settings.profiles || []);
   $("#archive-board").classList.toggle("hidden", state.board === "default");
   $("#settings-dialog").showModal();
 }
@@ -623,10 +693,11 @@ function openSettings() {
 async function submitSettings(event) {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
-    const profiles = String(data.get("profiles") || "").split("\n").map((line) => line.trim()).filter(Boolean).map(parseRoute);
+    const profiles = readProfileEditor();
     await api(`/api/boards/${encodeURIComponent(state.board)}`, { method: "PATCH", body: JSON.stringify({
       name: data.get("name"), description: data.get("description"), color: data.get("color"), defaultWorkdir: data.get("defaultWorkdir") || null,
       orchestration: { autoDecompose: data.get("autoDecompose") === "on", autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
+        plannerModel: data.get("plannerModel"), plannerProvider: data.get("plannerProvider"),
         autoDecomposePerTick: Number(data.get("autoDecomposePerTick")), defaultProfile: data.get("defaultProfile") || null,
         orchestratorProfile: data.get("orchestratorProfile") || null, profiles },
     }) });
@@ -637,8 +708,7 @@ async function submitSettings(event) {
 async function autoDescribeProfiles() {
   const button = $("#auto-describe-profiles");
   try {
-    const textarea = $("#settings-form [name=profiles]");
-    const profiles = String(textarea.value || "").split("\n").map((line) => line.trim()).filter(Boolean).map(parseRoute);
+    const profiles = readProfileEditor();
     const blank = profiles.filter((profile) => !profile.description?.trim());
     if (!blank.length) { toast("Every configured profile already has a description"); return; }
     button.disabled = true; button.textContent = `Describing 0/${blank.length}…`;
@@ -650,7 +720,7 @@ async function autoDescribeProfiles() {
       });
       profile.description = described.description;
     }
-    textarea.value = profiles.map((profile) => `${profile.name}:${profile.runtime}:${profile.description || ""}`).join("\n");
+    renderProfileEditor(profiles);
     await loadBoard(); toast(`${blank.length} profile description${blank.length === 1 ? "" : "s"} generated`);
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Auto-describe blank profiles"; }

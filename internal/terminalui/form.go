@@ -75,8 +75,14 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 	if status == "" || status == model.TaskStatusRunning || status == model.TaskStatusArchived {
 		status = model.TaskStatusTriage
 	}
+	runnableProfiles := make([]orchestration.ProfileRoute, 0, len(profiles))
+	for _, profile := range profiles {
+		if orchestration.RunnableProfileRoute(profile) {
+			runnableProfiles = append(runnableProfiles, profile)
+		}
+	}
 	form := &taskForm{
-		mode: "create", board: board, profiles: append([]orchestration.ProfileRoute{}, profiles...),
+		mode: "create", board: board, profiles: runnableProfiles,
 		inputs: map[formField]textinput.Model{
 			fieldTitle: newTextInput("", "Task title", 300), fieldPriority: newTextInput("0", "0", 12),
 			fieldAssignee: newTextInput("", "profile or worker name", 200), fieldSkills: newTextInput("", "comma-separated", 1000),

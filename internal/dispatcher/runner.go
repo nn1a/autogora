@@ -33,6 +33,9 @@ type RunnerCommand struct {
 type RunnerOptions struct {
 	DBPath           string
 	CLIPath          string
+	Profile          string
+	Model            string
+	Provider         string
 	AllowWrites      bool
 	WorkspaceRoot    string
 	AttachmentsRoot  string
@@ -120,7 +123,8 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 		"AUTOGORA_RUN_ID": run.ID, "AUTOGORA_CLAIM_TOKEN": claim.ClaimToken, "AUTOGORA_WORKER_ID": run.WorkerID,
 		"AUTOGORA_TENANT": tenant, "AUTOGORA_WORKSPACE": cwd, "AUTOGORA_WORKSPACES_ROOT": options.WorkspaceRoot,
 		"AUTOGORA_ATTACHMENTS_ROOT": options.AttachmentsRoot, "AUTOGORA_LOGS_ROOT": options.LogsRoot,
-		"AUTOGORA_CLI": options.CLIPath,
+		"AUTOGORA_CLI":           options.CLIPath,
+		"AUTOGORA_AGENT_PROFILE": options.Profile, "AUTOGORA_MODEL": options.Model, "AUTOGORA_PROVIDER": options.Provider,
 	}
 }
 
@@ -159,12 +163,17 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 		if options.AllowWrites {
 			sandbox = "workspace-write"
 		}
-		return RunnerCommand{Command: workerBinary(options, task.Runtime), CWD: cwd, Env: env, Args: []string{
+		args := []string{
 			"exec", "--json", "--color", "never", "--skip-git-repo-check", "--sandbox", sandbox, "-C", cwd,
 			"-c", "mcp_servers.autogora.command=" + string(commandJSON),
 			"-c", "mcp_servers.autogora.args=" + string(argsJSON),
-			"-c", "mcp_servers.autogora.required=true", prompt,
-		}}, nil
+			"-c", "mcp_servers.autogora.required=true",
+		}
+		if selected := strings.TrimSpace(options.Model); selected != "" {
+			args = append(args, "--model", selected)
+		}
+		args = append(args, prompt)
+		return RunnerCommand{Command: workerBinary(options, task.Runtime), CWD: cwd, Env: env, Args: args}, nil
 	case model.RuntimeClaude:
 		config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"autogora": map[string]any{"type": "stdio", "command": cliPath, "args": serverArgs}}})
 		lifecycle := []string{"mcp__autogora__autogora_show", "mcp__autogora__autogora_comment", "mcp__autogora__autogora_heartbeat", "mcp__autogora__autogora_complete", "mcp__autogora__autogora_block"}
@@ -174,6 +183,9 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 			builtins, permission = []string{"Read", "Edit", "Write", "Glob", "Grep", "Bash", "Skill"}, "acceptEdits"
 		}
 		args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--mcp-config", string(config), "--permission-mode", permission, "--allowedTools", strings.Join(append(builtins, lifecycle...), ",")}
+		if selected := strings.TrimSpace(options.Model); selected != "" {
+			args = append(args, "--model", selected)
+		}
 		if sessionID != "" {
 			args = append(args, "--session-id", sessionID)
 		}
@@ -192,14 +204,25 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 			env["CLINE_TOOL_APPROVAL_DIR"] = options.ClineApprovalDir
 			approval = &ToolApproval{Directory: options.ClineApprovalDir, CommandPrefix: commandPrefix}
 		}
+		args := []string{"--json", "--auto-approve", autoApprove, "--cwd", cwd}
+		if selected := strings.TrimSpace(options.Provider); selected != "" {
+			args = append(args, "--provider", selected)
+		}
+		if selected := strings.TrimSpace(options.Model); selected != "" {
+			args = append(args, "--model", selected)
+		}
+		args = append(args, prompt)
 		return RunnerCommand{Command: workerBinary(options, task.Runtime), CWD: cwd, Env: env,
-			Args: []string{"--json", "--auto-approve", autoApprove, "--cwd", cwd, prompt}, ToolApproval: approval}, nil
+			Args: args, ToolApproval: approval}, nil
 	case model.RuntimeGemini:
 		approval := "default"
 		if options.AllowWrites {
 			approval = "yolo"
 		}
 		args := []string{"--output-format", "stream-json", "--approval-mode", approval, "--skip-trust", "-e", "none"}
+		if selected := strings.TrimSpace(options.Model); selected != "" {
+			args = append(args, "--model", selected)
+		}
 		var policy *PolicyFile
 		if !options.AllowWrites {
 			logsRoot := options.LogsRoot
@@ -233,7 +256,17 @@ func BuildGoalContinuationCommand(claim model.ClaimedTask, options RunnerOptions
 		if sessionID == "" {
 			return RunnerCommand{}, errors.New("Codex goal continuation requires a session id")
 		}
-		initial.Args = []string{"exec", "resume", "--json", "--skip-git-repo-check", sessionID, prompt}
+		args := []string{"exec", "resume", "--json", "--skip-git-repo-check"}
+		for index := 1; index < len(initial.Args)-1; index++ {
+			if initial.Args[index] != "-c" && initial.Args[index] != "--model" {
+				continue
+			}
+			if index+1 < len(initial.Args)-1 {
+				args = append(args, initial.Args[index], initial.Args[index+1])
+				index++
+			}
+		}
+		initial.Args = append(args, sessionID, prompt)
 	case model.RuntimeClaude:
 		if sessionID == "" {
 			return RunnerCommand{}, errors.New("Claude goal continuation requires a session id")

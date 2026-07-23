@@ -25,7 +25,11 @@ func (f *taskForm) selectValue(field formField) string {
 			return "Custom"
 		}
 		profile := f.profiles[f.profileIndex-1]
-		return fmt.Sprintf("%s · %s", profile.Name, profile.Runtime)
+		model := strings.TrimSpace(profile.Model)
+		if model == "" {
+			model = "CLI default"
+		}
+		return fmt.Sprintf("%s · %s · %s", profile.Name, profile.Runtime, model)
 	case fieldRuntime:
 		return formRuntimes[f.runtimeIndex]
 	case fieldWorkspaceKind:
@@ -118,7 +122,11 @@ func (m *Model) renderTaskForm(width, height int) string {
 		}
 	}
 	if f.focus == fieldProfile && f.profileIndex > 0 {
-		description := strings.TrimSpace(f.profiles[f.profileIndex-1].Description)
+		profile := f.profiles[f.profileIndex-1]
+		description := strings.TrimSpace(profile.Description)
+		if profile.Provider != "" {
+			description = strings.TrimSpace(description + " · provider " + profile.Provider)
+		}
 		if description != "" {
 			lines = append(lines, lipgloss.NewStyle().Width(innerWidth).Foreground(colorMuted).Render(description), "")
 		}

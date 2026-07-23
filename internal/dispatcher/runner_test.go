@@ -10,6 +10,25 @@ import (
 	"github.com/nn1a/autogora/internal/store"
 )
 
+func hasArgPair(args []string, name, value string) bool {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == name && args[index+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func countArg(args []string, value string) int {
+	count := 0
+	for _, argument := range args {
+		if argument == value {
+			count++
+		}
+	}
+	return count
+}
+
 func claimedTask(t *testing.T, runtime model.Runtime) model.ClaimedTask {
 	t.Helper()
 	opened, err := store.Open(":memory:", "default", t.TempDir())
@@ -46,6 +65,9 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 				t.Fatal("claim token leaked into argv")
 			}
 			joined := strings.Join(command.Args, " ")
+			if countArg(command.Args, "--model") != 0 {
+				t.Fatalf("unpinned model unexpectedly added a model flag: %#v", command.Args)
+			}
 			switch runtime {
 			case model.RuntimeCline:
 				if command.ToolApproval == nil || !strings.Contains(joined, "--auto-approve false") || strings.Contains(joined, "mcpServers") || !strings.Contains(joined, "scoped Autogora CLI bridge") || !strings.Contains(joined, "$AUTOGORA_TASK_ID") {
@@ -76,14 +98,46 @@ func TestWriteOptInAndGoalContinuations(t *testing.T) {
 		t.Fatalf("write opt-in failed: %#v, %v", command, err)
 	}
 	codex := claimedTask(t, model.RuntimeCodex)
+	options.Model = "gpt-test"
 	continued, err := BuildGoalContinuationCommand(codex, options, "session-1", "continue")
-	if err != nil || strings.Join(continued.Args[:2], " ") != "exec resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") {
+	if err != nil || strings.Join(continued.Args[:2], " ") != "exec resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") || !hasArgPair(continued.Args, "--model", "gpt-test") || countArg(continued.Args, "-c") != 3 {
 		t.Fatalf("Codex continuation failed: %#v, %v", continued, err)
 	}
 	cline := claimedTask(t, model.RuntimeCline)
 	continued, err = BuildGoalContinuationCommand(cline, options, "", "finish the gap")
 	if err != nil || !strings.Contains(strings.Join(continued.Args, " "), "Continuation focus: finish the gap") {
 		t.Fatalf("Cline continuation failed: %#v, %v", continued, err)
+	}
+}
+
+func TestRunnerCommandsPassConfiguredModelAndClineProvider(t *testing.T) {
+	tests := []struct {
+		runtime  model.Runtime
+		model    string
+		provider string
+	}{
+		{runtime: model.RuntimeCodex, model: "gpt-test"},
+		{runtime: model.RuntimeClaude, model: "claude-test"},
+		{runtime: model.RuntimeCline, model: "cline-test", provider: "openrouter"},
+		{runtime: model.RuntimeGemini, model: "gemini-test"},
+	}
+	for _, test := range tests {
+		t.Run(string(test.runtime), func(t *testing.T) {
+			claim := claimedTask(t, test.runtime)
+			command, err := BuildRunnerCommand(claim, RunnerOptions{
+				DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "autogora"),
+				AllowWrites: true, Model: test.model, Provider: test.provider,
+			}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasArgPair(command.Args, "--model", test.model) {
+				t.Fatalf("model flag missing from %#v", command.Args)
+			}
+			if test.runtime == model.RuntimeCline && !hasArgPair(command.Args, "--provider", test.provider) {
+				t.Fatalf("provider flag missing from %#v", command.Args)
+			}
+		})
 	}
 }
 

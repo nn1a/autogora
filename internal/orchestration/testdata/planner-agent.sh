@@ -3,6 +3,7 @@ set -eu
 
 output_path=
 schema_path=
+model=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-last-message)
@@ -13,13 +14,17 @@ while [ "$#" -gt 0 ]; do
       schema_path=$2
       shift 2
       ;;
+    --model)
+      model=$2
+      shift 2
+      ;;
     *)
       shift
       ;;
   esac
 done
 
-if [ -z "$output_path" ] || [ -z "$schema_path" ]; then
+if [ -z "$output_path" ] || [ -z "$schema_path" ] || [ "$model" != "gpt-test" ]; then
   exit 2
 fi
 
