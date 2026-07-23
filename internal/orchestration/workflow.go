@@ -71,32 +71,46 @@ var specificationSchema = map[string]any{
 	"required": []string{"title", "body"},
 }
 
-var decompositionSchema = map[string]any{
-	"type": "object", "additionalProperties": false,
-	"properties": map[string]any{
-		"fanout":    map[string]any{"type": "boolean"},
-		"rootTitle": map[string]any{"type": "string"},
-		"rootBody":  map[string]any{"type": "string"},
-		"reason":    map[string]any{"type": "string"},
-		"tasks": map[string]any{"type": "array", "maxItems": 100, "items": map[string]any{
-			"type": "object", "additionalProperties": false,
-			"properties": map[string]any{
-				"key": map[string]any{"type": "string", "minLength": 1}, "title": map[string]any{"type": "string", "minLength": 1},
-				"body": map[string]any{"type": "string", "minLength": 1}, "assignee": map[string]any{"type": "string", "minLength": 1},
-				"runtime":      map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
-				"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
-				"priority":     map[string]any{"type": "integer"}, "skills": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-			},
-			"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority", "skills"},
-		}},
-		"dependencies": map[string]any{"type": "array", "items": map[string]any{
-			"type": "object", "additionalProperties": false,
-			"properties": map[string]any{
-				"parent": map[string]any{"type": "string", "minLength": 1}, "child": map[string]any{"type": "string", "minLength": 1},
-			}, "required": []string{"parent", "child"},
-		}},
-	},
-	"required": []string{"fanout", "rootTitle", "rootBody", "reason", "tasks", "dependencies"},
+var decompositionSchema = decompositionSchemaForSkills(nil)
+
+func decompositionSchemaForSkills(rootSkills []string) map[string]any {
+	allowedSkills := normalizeSkillIDs(rootSkills)
+	skills := map[string]any{
+		"type":  "array",
+		"items": map[string]any{"type": "string"},
+	}
+	if len(allowedSkills) == 0 {
+		skills["maxItems"] = 0
+	} else {
+		skills["items"].(map[string]any)["enum"] = allowedSkills
+	}
+	return map[string]any{
+		"type": "object", "additionalProperties": false,
+		"properties": map[string]any{
+			"fanout":    map[string]any{"type": "boolean"},
+			"rootTitle": map[string]any{"type": "string"},
+			"rootBody":  map[string]any{"type": "string"},
+			"reason":    map[string]any{"type": "string"},
+			"tasks": map[string]any{"type": "array", "maxItems": 100, "items": map[string]any{
+				"type": "object", "additionalProperties": false,
+				"properties": map[string]any{
+					"key": map[string]any{"type": "string", "minLength": 1}, "title": map[string]any{"type": "string", "minLength": 1},
+					"body": map[string]any{"type": "string", "minLength": 1}, "assignee": map[string]any{"type": "string", "minLength": 1},
+					"runtime":      map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
+					"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
+					"priority":     map[string]any{"type": "integer"}, "skills": skills,
+				},
+				"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority", "skills"},
+			}},
+			"dependencies": map[string]any{"type": "array", "items": map[string]any{
+				"type": "object", "additionalProperties": false,
+				"properties": map[string]any{
+					"parent": map[string]any{"type": "string", "minLength": 1}, "child": map[string]any{"type": "string", "minLength": 1},
+				}, "required": []string{"parent", "child"},
+			}},
+		},
+		"required": []string{"fanout", "rootTitle", "rootBody", "reason", "tasks", "dependencies"},
+	}
 }
 
 var goalJudgeSchema = map[string]any{
@@ -133,7 +147,57 @@ func validateSpecification(plan *SpecificationPlan) error {
 	return nil
 }
 
-func validateDecomposition(plan *DecompositionPlan) error {
+func normalizeSkillIDs(skills []string) []string {
+	unique := map[string]bool{}
+	normalized := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		skill = strings.TrimSpace(skill)
+		if skill != "" && !unique[skill] {
+			unique[skill] = true
+			normalized = append(normalized, skill)
+		}
+	}
+	return normalized
+}
+
+const (
+	maxRootTaskSkills          = 100
+	maxRootTaskSkillBytes      = 128
+	maxRootTaskSkillTotalBytes = 8192
+)
+
+func normalizeAndValidateRootSkills(skills []string) ([]string, error) {
+	normalized := normalizeSkillIDs(skills)
+	if len(normalized) > maxRootTaskSkills {
+		return nil, fmt.Errorf("root task has %d unique skills; maximum is %d", len(normalized), maxRootTaskSkills)
+	}
+	totalBytes := 0
+	for index, skill := range normalized {
+		if !utf8.ValidString(skill) {
+			return nil, fmt.Errorf("root task skill %d is not valid UTF-8", index+1)
+		}
+		skillBytes := len(skill)
+		if skillBytes > maxRootTaskSkillBytes {
+			return nil, fmt.Errorf(
+				"root task skill %q is %d bytes; maximum is %d",
+				skill,
+				skillBytes,
+				maxRootTaskSkillBytes,
+			)
+		}
+		totalBytes += skillBytes
+		if totalBytes > maxRootTaskSkillTotalBytes {
+			return nil, fmt.Errorf(
+				"root task skills total %d bytes; maximum is %d",
+				totalBytes,
+				maxRootTaskSkillTotalBytes,
+			)
+		}
+	}
+	return normalized, nil
+}
+
+func validateDecomposition(plan *DecompositionPlan, rootSkills []string) error {
 	plan.RootTitle, plan.RootBody, plan.Reason = strings.TrimSpace(plan.RootTitle), strings.TrimSpace(plan.RootBody), strings.TrimSpace(plan.Reason)
 	if plan.RootTitle == "" || plan.RootBody == "" {
 		return errors.New("decomposition root title and body must be non-empty")
@@ -143,6 +207,14 @@ func validateDecomposition(plan *DecompositionPlan) error {
 	}
 	if plan.Fanout && len(plan.Tasks) == 0 {
 		return errors.New("a fanout decomposition must include tasks")
+	}
+	normalizedRootSkills, err := normalizeAndValidateRootSkills(rootSkills)
+	if err != nil {
+		return err
+	}
+	allowedSkills := map[string]bool{}
+	for _, skill := range normalizedRootSkills {
+		allowedSkills[skill] = true
 	}
 	seen := map[string]bool{}
 	for index := range plan.Tasks {
@@ -167,7 +239,14 @@ func validateDecomposition(plan *DecompositionPlan) error {
 		unique := map[string]bool{}
 		cleaned := make([]string, 0, len(task.Skills))
 		for _, skill := range task.Skills {
-			if skill = strings.TrimSpace(skill); skill != "" && !unique[skill] {
+			skill = strings.TrimSpace(skill)
+			if skill == "" {
+				continue
+			}
+			if !allowedSkills[skill] {
+				return fmt.Errorf("decomposition task %q uses skill %q that is not configured on the root task", task.Key, skill)
+			}
+			if !unique[skill] {
 				unique[skill] = true
 				cleaned = append(cleaned, skill)
 			}
@@ -235,6 +314,12 @@ func decompositionPrompt(task model.TaskDetail, profiles []ProfileRoute) string 
 	if task.Task.Tenant != nil {
 		tenant = *task.Task.Tenant
 	}
+	allowedSkills := normalizeSkillIDs(task.Task.Skills)
+	skillContract := "The root task configures no skills. Set skills=[] for every generated task."
+	if len(allowedSkills) > 0 {
+		encoded, _ := json.Marshal(allowedSkills)
+		skillContract = "Allowed child task skill IDs (exact JSON array): " + string(encoded) + ". Select only relevant IDs from this list; use [] when none apply."
+	}
 	lines := []string{
 		"You are an Autogora graph decomposer.",
 		"Decide whether this triage idea benefits from independent parallel or sequential specialist tasks.",
@@ -243,6 +328,8 @@ func decompositionPrompt(task model.TaskDetail, profiles []ProfileRoute) string 
 		"Dependencies control execution only: dependency parent is the prerequisite and child waits for parent.",
 		"Do not add dependency edges to the root; Autogora automatically makes the root wait for every terminal subtask so it can perform final coordination or verification.",
 		"Use only assignee names from the profile roster. Every task needs a complete handoff-ready body.",
+		skillContract,
+		"Never invent or infer skill IDs from the task title, body, technology, or profile descriptions.",
 		"Return only the requested structured object.",
 	}
 	if task.Task.IdempotencyKey != nil && strings.HasPrefix(*task.Task.IdempotencyKey, "github-issue:") {
@@ -314,6 +401,11 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 	if options.ExpectedUpdatedAt != nil && strings.TrimSpace(*options.ExpectedUpdatedAt) != task.Task.UpdatedAt {
 		return DecompositionResult{}, fmt.Errorf("task update conflict: %s changed at %s; refresh before planning", taskID, task.Task.UpdatedAt)
 	}
+	rootSkills, err := normalizeAndValidateRootSkills(task.Task.Skills)
+	if err != nil {
+		return DecompositionResult{}, fmt.Errorf("invalid root task skills: %w", err)
+	}
+	task.Task.Skills = rootSkills
 	plannedVersion := task.Task.UpdatedAt
 	if !RunnableProfileRoute(options.DefaultProfile) {
 		return DecompositionResult{}, errors.New("decomposition requires an enabled worker profile")
@@ -336,7 +428,12 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 		if options.Planner == nil {
 			return DecompositionResult{}, errors.New("a planner or explicit decomposition plan is required")
 		}
-		value, err := options.Planner(ctx, PlannerRequest{TaskID: taskID, Kind: PlannerDecompose, Prompt: decompositionPrompt(task, profiles), Schema: decompositionSchema})
+		value, err := options.Planner(ctx, PlannerRequest{
+			TaskID: taskID,
+			Kind:   PlannerDecompose,
+			Prompt: decompositionPrompt(task, profiles),
+			Schema: decompositionSchemaForSkills(task.Task.Skills),
+		})
 		if err != nil {
 			return DecompositionResult{}, err
 		}
@@ -344,7 +441,7 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 			return DecompositionResult{}, fmt.Errorf("invalid decomposition plan: %w", err)
 		}
 	}
-	if err := validateDecomposition(&plan); err != nil {
+	if err := validateDecomposition(&plan, task.Task.Skills); err != nil {
 		return DecompositionResult{}, err
 	}
 	if !plan.Fanout {

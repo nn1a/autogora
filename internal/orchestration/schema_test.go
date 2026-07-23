@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/nn1a/autogora/internal/model"
@@ -35,7 +36,7 @@ func TestLegacyNullableDecompositionWorkflowRoleKeepsWorkerDefault(t *testing.T)
 	if err := decodePlan(raw, &plan); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateDecomposition(&plan); err != nil {
+	if err := validateDecomposition(&plan, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Tasks) != 1 ||
@@ -51,6 +52,35 @@ func TestDecompositionSchemaRequiresExplicitWorkflowRole(t *testing.T) {
 	if role["type"] != "string" {
 		t.Fatalf("workflowRole type = %#v, want string", role["type"])
 	}
+}
+
+func TestDecompositionSchemaConstrainsSkillsToRootAllowlist(t *testing.T) {
+	withoutSkills := decompositionSkillsSchema(t, decompositionSchemaForSkills(nil))
+	if withoutSkills["maxItems"] != 0 {
+		t.Fatalf("skills maxItems = %#v, want 0 when root has no configured skills", withoutSkills["maxItems"])
+	}
+	if _, exists := withoutSkills["items"].(map[string]any)["enum"]; exists {
+		t.Fatal("empty root skill schema has an enum; maxItems=0 should require []")
+	}
+
+	withSkills := decompositionSkillsSchema(t, decompositionSchemaForSkills([]string{
+		" go ", "accessibility", "go", "",
+	}))
+	if _, exists := withSkills["maxItems"]; exists {
+		t.Fatalf("configured skill schema unexpectedly limits the array to zero: %#v", withSkills)
+	}
+	got, ok := withSkills["items"].(map[string]any)["enum"].([]string)
+	if !ok || !reflect.DeepEqual(got, []string{"go", "accessibility"}) {
+		t.Fatalf("skill enum = %#v, want normalized root skill IDs", withSkills["items"].(map[string]any)["enum"])
+	}
+	assertStrictObjectSchema(t, "$", decompositionSchemaForSkills([]string{"go"}))
+}
+
+func decompositionSkillsSchema(t *testing.T, schema map[string]any) map[string]any {
+	t.Helper()
+	tasks := schema["properties"].(map[string]any)["tasks"].(map[string]any)
+	item := tasks["items"].(map[string]any)
+	return item["properties"].(map[string]any)["skills"].(map[string]any)
 }
 
 func assertStrictObjectSchema(t *testing.T, path string, value any) {

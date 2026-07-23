@@ -32,6 +32,114 @@ func TestImportedIssuePromptsDeclareUntrustedBoundary(t *testing.T) {
 	}
 }
 
+func TestDecompositionPromptConstrainsChildSkillsToRootConfiguration(t *testing.T) {
+	profiles := []ProfileRoute{{Name: "worker", Runtime: model.RuntimeCodex}}
+
+	withoutSkills := decompositionPrompt(model.TaskDetail{Task: model.Task{
+		ID: "t_none", Title: "Build game",
+	}}, profiles)
+	if !strings.Contains(withoutSkills, "Set skills=[] for every generated task.") ||
+		!strings.Contains(withoutSkills, "Never invent or infer skill IDs") {
+		t.Fatalf("prompt does not prohibit inferred skills when the root has none:\n%s", withoutSkills)
+	}
+
+	withSkills := decompositionPrompt(model.TaskDetail{Task: model.Task{
+		ID: "t_allowed", Title: "Build game",
+		Skills: []string{" go ", "accessibility", "go", ""},
+	}}, profiles)
+	if !strings.Contains(withSkills, `Allowed child task skill IDs (exact JSON array): ["go","accessibility"]`) ||
+		!strings.Contains(withSkills, "Select only relevant IDs from this list") {
+		t.Fatalf("prompt does not expose the normalized root skill allowlist:\n%s", withSkills)
+	}
+}
+
+func TestDecompositionRejectsSkillNotConfiguredOnRoot(t *testing.T) {
+	for name, rootSkills := range map[string][]string{
+		"root has no skills":         nil,
+		"root has a different skill": {"go"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			opened := openMemoryStore(t)
+			root, err := opened.CreateTask(ctx, store.CreateTaskInput{
+				Title: "Build game", Status: model.TaskStatusTriage, Skills: rootSkills,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = DecomposeTriageTask(ctx, opened, root.Task.ID, DecomposeOptions{
+				DefaultProfile: ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex},
+				Plan: &DecompositionPlan{
+					Fanout: true, RootTitle: "Coordinate game", RootBody: "Verify the result.",
+					Tasks: []DecompositionTask{{
+						Key: "engine", Title: "Implement engine", Body: "Build deterministic rules.",
+						Assignee: "worker", Runtime: model.RuntimeCodex, Skills: []string{"game-engine"},
+					}},
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), `skill "game-engine"`) ||
+				!strings.Contains(err.Error(), "not configured on the root task") {
+				t.Fatalf("invented skill validation error = %v", err)
+			}
+			unchanged, getErr := opened.GetTask(ctx, root.Task.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if unchanged.Task.Status != model.TaskStatusTriage || len(unchanged.Subtasks) != 0 {
+				t.Fatalf("invalid decomposition mutated the root: %+v", unchanged)
+			}
+		})
+	}
+}
+
+func TestDecompositionPreservesConfiguredSkillDistribution(t *testing.T) {
+	ctx := context.Background()
+	opened := openMemoryStore(t)
+	root, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "Build game", Status: model.TaskStatusTriage,
+		Skills: []string{"go", "accessibility"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := DecomposeTriageTask(ctx, opened, root.Task.ID, DecomposeOptions{
+		DefaultProfile: ProfileRoute{Name: "worker", Runtime: model.RuntimeCodex},
+		Plan: &DecompositionPlan{
+			Fanout: true, RootTitle: "Coordinate game", RootBody: "Verify the result.",
+			Tasks: []DecompositionTask{
+				{
+					Key: "server", Title: "Implement server", Body: "Build the Go server.",
+					Assignee: "worker", Runtime: model.RuntimeCodex, Skills: []string{"go", "go"},
+				},
+				{
+					Key: "ui", Title: "Review accessibility", Body: "Audit keyboard interaction.",
+					Assignee: "worker", Runtime: model.RuntimeCodex, Skills: []string{"accessibility"},
+				},
+				{
+					Key: "docs", Title: "Document controls", Body: "Document the controls.",
+					Assignee: "worker", Runtime: model.RuntimeCodex, Skills: []string{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string][]string{
+		"server": {"go"},
+		"ui":     {"accessibility"},
+		"docs":   {},
+	} {
+		child, getErr := opened.GetTask(ctx, result.Graph.TasksByKey[key])
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if strings.Join(child.Task.Skills, ",") != strings.Join(want, ",") {
+			t.Errorf("%s skills = %#v, want %#v", key, child.Task.Skills, want)
+		}
+	}
+}
+
 func TestSpecifyAndDecomposeTriageTasks(t *testing.T) {
 	ctx := context.Background()
 	opened := openMemoryStore(t)
@@ -153,7 +261,7 @@ func TestDecompositionRejectsSystemOwnedChildRoles(t *testing.T) {
 					Runtime: model.RuntimeCodex, WorkflowRole: role,
 				}},
 			}
-			if err := validateDecomposition(&plan); err == nil || !strings.Contains(err.Error(), "use worker or reviewer") {
+			if err := validateDecomposition(&plan, nil); err == nil || !strings.Contains(err.Error(), "use worker or reviewer") {
 				t.Fatalf("role %q validation error = %v", role, err)
 			}
 		})
