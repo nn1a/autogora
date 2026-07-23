@@ -46,6 +46,9 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	if segments[1] == "agents" && len(segments) == 3 && segments[2] == "effective" {
 		return s.handleEffectiveAgents(response, request)
 	}
+	if segments[1] == "supervisor" {
+		return s.handleSupervisor(response, request, segments)
+	}
 	board, err := s.boardFrom(request)
 	if err != nil {
 		return err

@@ -18,7 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/supervisor"
 	webui "github.com/nn1a/autogora/web"
 )
 
@@ -32,15 +34,16 @@ type Options struct {
 }
 
 type Server struct {
-	HTTP     *http.Server
-	Listener net.Listener
-	Token    string
-	URL      string
-	manager  *boards.Manager
-	options  Options
-	ctx      context.Context
-	cancel   context.CancelFunc
-	workers  sync.WaitGroup
+	HTTP       *http.Server
+	Listener   net.Listener
+	Token      string
+	URL        string
+	manager    *boards.Manager
+	options    Options
+	ctx        context.Context
+	cancel     context.CancelFunc
+	workers    sync.WaitGroup
+	supervisor *supervisor.Controller
 }
 
 func randomToken() (string, error) {
@@ -74,6 +77,7 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 	}
 	serverContext, cancelServer := context.WithCancel(ctx)
 	service := &Server{Token: token, manager: manager, options: options, ctx: serverContext, cancel: cancelServer}
+	service.supervisor = supervisor.New(supervisor.Options{DBPath: options.DBPath, CLIPath: options.CLIPath, OnLog: options.OnLog})
 	service.HTTP = &http.Server{Handler: service, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	listener, err := net.Listen("tcp", net.JoinHostPort(options.Host, strconv.Itoa(options.Port)))
 	if err != nil {
@@ -82,6 +86,13 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 	service.Listener = listener
 	host := listener.Addr().String()
 	service.URL = "http://" + host
+	if config, configErr := agentconfig.Load(agentconfig.Options{}); configErr != nil {
+		if options.OnLog != nil {
+			options.OnLog("global agent configuration was not loaded: " + configErr.Error())
+		}
+	} else if config.Supervisor.AutoStart {
+		service.supervisor.Start(serverContext, config)
+	}
 	go func() {
 		if err := service.HTTP.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && options.OnLog != nil {
 			options.OnLog("dashboard server failed: " + err.Error())
@@ -98,9 +109,10 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 
 func (s *Server) Close(ctx context.Context) error {
 	s.cancel()
+	supervisorErr := s.supervisor.Stop(ctx)
 	err := s.HTTP.Shutdown(ctx)
 	s.workers.Wait()
-	return err
+	return errors.Join(supervisorErr, err)
 }
 
 func securityHeaders(response http.ResponseWriter) {

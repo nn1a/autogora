@@ -2,11 +2,13 @@ package dashboard
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
@@ -101,6 +103,11 @@ func (s *Server) handleAgentConfig(response http.ResponseWriter, request *http.R
 		if err := agentconfig.Save(agentconfig.Options{}, config); err != nil {
 			return err
 		}
+		reconcile, cancel := context.WithTimeout(request.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.supervisor.Apply(reconcile, s.ctx, config); err != nil {
+			return fmt.Errorf("apply supervisor configuration: %w", err)
+		}
 		value, err := loadAgentConfigResponse()
 		if err != nil {
 			return err
@@ -112,6 +119,36 @@ func (s *Server) handleAgentConfig(response http.ResponseWriter, request *http.R
 		sendJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "config endpoint requires GET or PUT"})
 		return nil
 	}
+}
+
+func (s *Server) handleSupervisor(response http.ResponseWriter, request *http.Request, segments []string) error {
+	if len(segments) == 2 && request.Method == http.MethodGet {
+		sendJSON(response, http.StatusOK, s.supervisor.Status())
+		return nil
+	}
+	if len(segments) != 3 || request.Method != http.MethodPost {
+		sendJSON(response, http.StatusNotFound, map[string]any{"error": "Not found"})
+		return nil
+	}
+	switch segments[2] {
+	case "start":
+		config, err := agentconfig.Load(agentconfig.Options{})
+		if err != nil {
+			return err
+		}
+		s.supervisor.Start(s.ctx, config)
+	case "stop":
+		stop, cancel := context.WithTimeout(request.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.supervisor.Stop(stop); err != nil {
+			return err
+		}
+	default:
+		sendJSON(response, http.StatusNotFound, map[string]any{"error": "Not found"})
+		return nil
+	}
+	sendJSON(response, http.StatusOK, s.supervisor.Status())
+	return nil
 }
 
 func (s *Server) handleEffectiveAgents(response http.ResponseWriter, request *http.Request) error {

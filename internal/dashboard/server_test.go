@@ -164,6 +164,15 @@ func TestGlobalAgentConfigAPIStartsEmptyAndPersistsValidatedConfig(t *testing.T)
 	if mapValue(t, savedConfig["supervisor"])["maxWorkers"] != float64(3) || len(arrayValue(t, savedConfig["agents"])) != 2 {
 		t.Fatalf("saved config was not returned: %#v", savedConfig)
 	}
+	statusResponse, statusValue := apiRequest(t, server, http.MethodGet, "/api/supervisor", nil)
+	status := mapValue(t, statusValue)
+	if statusResponse.StatusCode != http.StatusOK || status["running"] != true || status["desired"] != true || status["maxWorkers"] != float64(3) {
+		t.Fatalf("saved auto-start config did not start supervisor: %d %#v", statusResponse.StatusCode, status)
+	}
+	stoppedResponse, stoppedValue := apiRequest(t, server, http.MethodPost, "/api/supervisor/stop", map[string]any{})
+	if stoppedResponse.StatusCode != http.StatusOK || mapValue(t, stoppedValue)["running"] != false {
+		t.Fatalf("supervisor did not stop: %d %#v", stoppedResponse.StatusCode, stoppedValue)
+	}
 
 	invalid := map[string]any{
 		"schemaVersion": 1,
