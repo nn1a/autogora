@@ -381,7 +381,11 @@ func (s *Store) ReserveCoordinationAttempt(
 				Board: incident.Board, Expected: expectedRevision, Actual: state.Revision,
 			}
 		}
+		// A non-winning reservation may expose incident state, but never the
+		// current owner's capability token. Exact retries and new winners
+		// overwrite this scrubbed value below.
 		result.Incident = incident
+		result.Incident.ClaimToken = ""
 
 		existing, existingErr := scanCoordinationAttempt(tx.QueryRowContext(
 			ctx,
@@ -424,6 +428,7 @@ func (s *Store) ReserveCoordinationAttempt(
 			if !expiredClaim {
 				if hasExisting && existing.Status == model.CoordinationAttemptStarted &&
 					incident.GraphRevision == expectedRevision {
+					result.Incident = incident
 					result.Attempt = existing
 					result.Reserved = true
 				}
@@ -509,6 +514,7 @@ func (s *Store) ReserveCoordinationAttempt(
 				return latestErr
 			}
 			result.Incident = latest
+			result.Incident.ClaimToken = ""
 			return nil
 		}
 

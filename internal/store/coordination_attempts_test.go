@@ -180,9 +180,13 @@ func TestReserveCoordinationAttemptDoesNotStealLiveClaimAndRetriesExactID(t *tes
 		t.Fatal(err)
 	}
 	if other.Reserved || other.BudgetExhausted ||
-		other.Incident.ClaimToken != first.Incident.ClaimToken ||
+		other.Incident.ClaimToken != "" ||
 		other.Attempt.ID != "" {
 		t.Fatalf("live claim was stolen or charged: %+v", other)
+	}
+	stored, err := opened.GetCoordinationIncident(ctx, incident.ID)
+	if err != nil || stored.ClaimToken != first.Incident.ClaimToken {
+		t.Fatalf("live owner changed in storage: %+v, %v", stored, err)
 	}
 	attempts, err := opened.ListCoordinationAttempts(ctx, CoordinationAttemptFilter{})
 	if err != nil || len(attempts) != 1 ||
@@ -303,7 +307,7 @@ func TestReserveCoordinationAttemptRebasesExpiredClaimAndCleansPriorAttempt(t *t
 	liveInput.TTL = MinCoordinationIncidentClaimTTL
 	live, err := opened.ReserveCoordinationAttempt(ctx, liveInput)
 	if err != nil || live.Reserved ||
-		live.Incident.ClaimToken != first.Incident.ClaimToken ||
+		live.Incident.ClaimToken != "" ||
 		live.Incident.GraphRevision != 0 {
 		t.Fatalf("live stale reservation was rewritten: %+v, %v", live, err)
 	}
