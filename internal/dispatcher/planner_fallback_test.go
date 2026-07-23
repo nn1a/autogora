@@ -47,7 +47,15 @@ printf '%s\n' '{"type":"run_result","text":"{\"ok\":true}"}'`)
 		t.Fatal(err)
 	}
 	options := Options{PlannerTimeout: 5 * time.Second, RateLimitCooldown: durationValue(time.Hour), AgentRetryCooldown: durationValue(time.Hour), Getenv: func(string) string { return "" }}
-	planner, err := createRolePlanner(manager, opened, metadata, configuredProfileSet{Config: config}, options, agentconfig.RolePlanner, t.TempDir())
+	var selected orchestration.PlannerSelection
+	planner, err := createRolePlannerWithSelection(
+		manager, opened, metadata, configuredProfileSet{Config: config}, options,
+		agentconfig.RolePlanner, t.TempDir(),
+		func(_ context.Context, selection orchestration.PlannerSelection) error {
+			selected = selection
+			return nil
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +72,11 @@ printf '%s\n' '{"type":"run_result","text":"{\"ok\":true}"}'`)
 	}
 	if primaryHealth.Status != model.AgentHealthRateLimited || primaryHealth.CooldownUntil == nil {
 		t.Fatalf("primary health = %#v", primaryHealth)
+	}
+	if selected.Candidate.Profile != "backup" || selected.Candidate.Model != "backup-model" ||
+		selected.Candidate.Provider != "backup-provider" || selected.FallbackFrom == nil ||
+		*selected.FallbackFrom != "primary" {
+		t.Fatalf("selection callback = %#v", selected)
 	}
 	assertPlannerSelectionEvent(t, opened, task.Task.ID, "planner", "backup", "backup-model", "backup-provider", "primary")
 }

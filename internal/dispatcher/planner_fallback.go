@@ -15,6 +15,19 @@ import (
 )
 
 func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata boards.Metadata, configured configuredProfileSet, options Options, role agentconfig.Role, cwd string) (orchestration.Planner, error) {
+	return createRolePlannerWithSelection(manager, opened, metadata, configured, options, role, cwd, nil)
+}
+
+func createRolePlannerWithSelection(
+	manager *boards.Manager,
+	opened *store.Store,
+	metadata boards.Metadata,
+	configured configuredProfileSet,
+	options Options,
+	role agentconfig.Role,
+	cwd string,
+	onSelected func(context.Context, orchestration.PlannerSelection) error,
+) (orchestration.Planner, error) {
 	candidates := dispatcherPlannerCandidates(metadata, configured, options, role)
 	plannerOptions := orchestration.FallbackPlannerOptions{
 		Candidates: candidates, CWD: cwd, Timeout: options.PlannerTimeout, Getenv: options.Getenv,
@@ -55,14 +68,19 @@ func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata bo
 					return err
 				}
 			}
-			if strings.TrimSpace(selection.Request.TaskID) == "" {
-				return nil
+			if strings.TrimSpace(selection.Request.TaskID) != "" {
+				if err := opened.RecordOrchestrationAgentSelection(ctx, selection.Request.TaskID, store.RecordOrchestrationAgentSelectionInput{
+					Kind: string(selection.Request.Kind), Role: string(role), Profile: selection.Candidate.Profile,
+					Runtime: selection.Candidate.Runtime, Model: selection.Candidate.Model, Provider: selection.Candidate.Provider,
+					Source: selection.Candidate.Source, FallbackFrom: selection.FallbackFrom, Attempt: selection.Attempt,
+				}); err != nil {
+					return err
+				}
 			}
-			return opened.RecordOrchestrationAgentSelection(ctx, selection.Request.TaskID, store.RecordOrchestrationAgentSelectionInput{
-				Kind: string(selection.Request.Kind), Role: string(role), Profile: selection.Candidate.Profile,
-				Runtime: selection.Candidate.Runtime, Model: selection.Candidate.Model, Provider: selection.Candidate.Provider,
-				Source: selection.Candidate.Source, FallbackFrom: selection.FallbackFrom, Attempt: selection.Attempt,
-			})
+			if onSelected != nil {
+				return onSelected(ctx, selection)
+			}
+			return nil
 		},
 	}
 	if manager != nil {
