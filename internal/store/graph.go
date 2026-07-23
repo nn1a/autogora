@@ -172,7 +172,7 @@ func (s *Store) RelationshipGraph(ctx context.Context, taskID string) (model.Rel
 		unlocks := append([]string{}, downstream[id]...)
 		nodes = append(nodes, model.RelationshipNode{
 			Task: model.RelationshipTask{ID: task.ID, Board: task.Board, Tenant: task.Tenant, Title: task.Title,
-				Assignee: task.Assignee, Runtime: task.Runtime, Status: task.Status, Priority: task.Priority,
+				Assignee: task.Assignee, Runtime: task.Runtime, Status: task.Status, WorkflowRole: task.WorkflowRole, Priority: task.Priority,
 				CreatedAt: task.CreatedAt, UpdatedAt: task.UpdatedAt},
 			ParentTaskID: parentID, SubtaskIDs: subtaskIDs, HierarchyDepth: hierarchyDepth(id), Position: position,
 			Phase: phases[id], BlockedBy: blockedBy, Unlocks: unlocks,

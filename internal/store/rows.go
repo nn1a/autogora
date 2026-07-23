@@ -17,14 +17,14 @@ id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
 priority, workspace, workspace_kind, branch, current_run_id, result, scheduled_at,
 max_runtime_seconds, skills_json, goal_mode, goal_max_turns, workflow_template_id,
 current_step_key, block_kind, block_reason, block_recurrences, failure_count,
-max_retries, created_at, updated_at`
+max_retries, created_at, updated_at, workflow_role`
 
 const taskColumnsT = `
 t.id, t.board, t.tenant, t.idempotency_key, t.title, t.body, t.assignee, t.runtime, t.status,
 t.priority, t.workspace, t.workspace_kind, t.branch, t.current_run_id, t.result, t.scheduled_at,
 t.max_runtime_seconds, t.skills_json, t.goal_mode, t.goal_max_turns, t.workflow_template_id,
 t.current_step_key, t.block_kind, t.block_reason, t.block_recurrences, t.failure_count,
-t.max_retries, t.created_at, t.updated_at`
+t.max_retries, t.created_at, t.updated_at, t.workflow_role`
 
 const runColumns = `
 id, task_id, worker_id, runtime, status, claimed_at, claim_expires_at, heartbeat_at,
@@ -36,7 +36,7 @@ func scanTask(row scanner) (model.Task, error) {
 	var result, scheduledAt, workflowTemplateID, currentStepKey sql.NullString
 	var blockKind, blockReason sql.NullString
 	var maxRuntimeSeconds sql.NullInt64
-	var runtime, status, workspaceKind string
+	var runtime, status, workspaceKind, workflowRole string
 	var skillsJSON string
 	var goalMode int
 	if err := row.Scan(
@@ -45,7 +45,7 @@ func scanTask(row scanner) (model.Task, error) {
 		&branch, &currentRunID, &result, &scheduledAt, &maxRuntimeSeconds, &skillsJSON,
 		&goalMode, &task.GoalMaxTurns, &workflowTemplateID, &currentStepKey, &blockKind,
 		&blockReason, &task.BlockRecurrences, &task.FailureCount, &task.MaxRetries,
-		&task.CreatedAt, &task.UpdatedAt,
+		&task.CreatedAt, &task.UpdatedAt, &workflowRole,
 	); err != nil {
 		return model.Task{}, err
 	}
@@ -54,6 +54,7 @@ func scanTask(row scanner) (model.Task, error) {
 	task.Assignee = stringPointer(assignee)
 	task.Runtime = model.Runtime(runtime)
 	task.Status = model.TaskStatus(status)
+	task.WorkflowRole = model.WorkflowRole(workflowRole)
 	task.Workspace = stringPointer(workspace)
 	task.WorkspaceKind = model.WorkspaceKind(workspaceKind)
 	task.Branch = stringPointer(branch)

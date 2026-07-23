@@ -29,6 +29,7 @@ type CreateTaskInput struct {
 	WorkspaceKind      model.WorkspaceKind
 	Branch             *string
 	Status             model.TaskStatus
+	WorkflowRole       model.WorkflowRole
 	ScheduledAt        *string
 	MaxRuntimeSeconds  *int
 	Skills             []string
@@ -63,6 +64,7 @@ type UpdateTaskInput struct {
 	WorkflowTemplateID OptionalString
 	CurrentStepKey     OptionalString
 	Status             *model.TaskStatus
+	WorkflowRole       *model.WorkflowRole
 }
 
 type OptionalString struct {
@@ -437,6 +439,13 @@ func (s *Store) createTask(ctx context.Context, q querier, input CreateTaskInput
 	if input.Status == model.TaskStatusRunning {
 		return "", errors.New("tasks enter running only through an atomic claim")
 	}
+	workflowRole := input.WorkflowRole
+	if workflowRole == "" {
+		workflowRole = model.WorkflowRoleWorker
+	}
+	if !model.ValidWorkflowRole(workflowRole) {
+		return "", fmt.Errorf("invalid workflow role: %s", workflowRole)
+	}
 	scheduledAt, err := normalizeISO(input.ScheduledAt, "scheduledAt")
 	if err != nil {
 		return "", err
@@ -501,21 +510,22 @@ func (s *Store) createTask(ctx context.Context, q querier, input CreateTaskInput
 			priority, workspace, workspace_kind, branch, current_run_id, result,
 			scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
 			workflow_template_id, current_step_key, block_kind, block_reason,
-			block_recurrences, failure_count, max_retries, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?, ?)
+			block_recurrences, failure_count, max_retries, created_at, updated_at,
+			workflow_role
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?, ?, ?)
 	`, taskID, board, nullableString(normalizedPointer(input.Tenant)), nullableString(idempotencyKey),
 		title, input.Body, nullableString(input.Assignee), runtime, status, input.Priority,
 		nullableString(input.Workspace), resolveWorkspaceKind(input.Workspace, input.WorkspaceKind),
 		nullableString(input.Branch), nullableString(scheduledAt), nullableInt(input.MaxRuntimeSeconds),
 		string(skillsJSON), goalMode, goalMaxTurns, nullableString(input.WorkflowTemplateID),
-		nullableString(input.CurrentStepKey), maxRetries, timestamp, timestamp,
+		nullableString(input.CurrentStepKey), maxRetries, timestamp, timestamp, workflowRole,
 	)
 	if err != nil {
 		return "", err
 	}
 	if err := appendEvent(ctx, q, taskID, "created", map[string]any{
 		"runtime": runtime, "assignee": input.Assignee, "tenant": input.Tenant,
-		"status": status, "parents": input.Parents,
+		"status": status, "workflowRole": workflowRole, "parents": input.Parents,
 	}, nil); err != nil {
 		return "", err
 	}

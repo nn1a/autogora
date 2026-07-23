@@ -12,6 +12,7 @@ func TestTaskJSONUsesExistingContractNames(t *testing.T) {
 		Title:         "Port Autogora",
 		Runtime:       RuntimeCodex,
 		Status:        TaskStatusReady,
+		WorkflowRole:  WorkflowRoleReviewer,
 		WorkspaceKind: WorkspaceScratch,
 		Skills:        []string{},
 	}
@@ -25,7 +26,7 @@ func TestTaskJSONUsesExistingContractNames(t *testing.T) {
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"id", "currentRunId", "workspaceKind", "goalMaxTurns", "createdAt"} {
+	for _, key := range []string{"id", "currentRunId", "workspaceKind", "workflowRole", "goalMaxTurns", "createdAt"} {
 		if _, ok := value[key]; !ok {
 			t.Fatalf("JSON contract is missing %q: %s", key, encoded)
 		}
@@ -38,5 +39,8 @@ func TestStatusAndRuntimeValidation(t *testing.T) {
 	}
 	if !ValidRuntime(RuntimeGemini) || ValidRuntime("unknown") {
 		t.Fatal("runtime validation does not match the public contract")
+	}
+	if !ValidWorkflowRole(WorkflowRoleControl) || ValidWorkflowRole("coordinator") {
+		t.Fatal("workflow role validation does not match the public contract")
 	}
 }

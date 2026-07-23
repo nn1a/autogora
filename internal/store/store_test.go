@@ -504,7 +504,7 @@ func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.
 		FinalizerAssignee: "finalizer", FinalizerRuntime: model.RuntimeCodex,
 		Nodes: []TaskGraphNode{
 			{Key: "research", Title: "Research", Body: "Collect evidence", Assignee: worker, Runtime: model.RuntimeCodex},
-			{Key: "report", Title: "Report", Body: "Write report", Assignee: worker, Runtime: model.RuntimeClaude},
+			{Key: "report", Title: "Report", Body: "Write report", Assignee: worker, Runtime: model.RuntimeClaude, WorkflowRole: model.WorkflowRoleReviewer},
 		},
 		Dependencies: []TaskGraphDependency{{Parent: "research", Child: "report"}},
 	})
@@ -514,11 +514,32 @@ func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.
 	if len(result.ChildIDs) != 2 || len(result.LeafIDs) != 1 || result.LeafIDs[0] != result.TasksByKey["report"] {
 		t.Fatalf("unexpected graph result: %+v", result)
 	}
-	if result.Root.Task.Status != model.TaskStatusTodo || result.Root.Task.Assignee == nil || *result.Root.Task.Assignee != "finalizer" {
+	if result.Root.Task.Status != model.TaskStatusTodo || result.Root.Task.Assignee == nil || *result.Root.Task.Assignee != "finalizer" ||
+		result.Root.Task.WorkflowRole != model.WorkflowRoleFinalizer {
 		t.Fatalf("root was not converted into finalizer: %+v", result.Root.Task)
+	}
+	research, err := store.GetTask(ctx, result.TasksByKey["research"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := store.GetTask(ctx, result.TasksByKey["report"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if research.Task.WorkflowRole != model.WorkflowRoleWorker || report.Task.WorkflowRole != model.WorkflowRoleReviewer {
+		t.Fatalf("graph workflow roles: research=%q report=%q", research.Task.WorkflowRole, report.Task.WorkflowRole)
 	}
 	if result.RelationshipGraph.TotalPhases != 3 || len(result.Root.Subtasks) != 2 {
 		t.Fatalf("graph topology mismatch: %+v", result.RelationshipGraph)
+	}
+	roles := map[string]model.WorkflowRole{}
+	for _, node := range result.RelationshipGraph.Nodes {
+		roles[node.Task.ID] = node.Task.WorkflowRole
+	}
+	if roles[result.Root.Task.ID] != model.WorkflowRoleFinalizer ||
+		roles[result.TasksByKey["research"]] != model.WorkflowRoleWorker ||
+		roles[result.TasksByKey["report"]] != model.WorkflowRoleReviewer {
+		t.Fatalf("relationship graph omitted workflow roles: %#v", roles)
 	}
 
 	cyclic, err := store.CreateTask(ctx, CreateTaskInput{Title: "bad graph", Status: model.TaskStatusTriage})
@@ -566,7 +587,8 @@ func TestCreateSwarmBuildsParallelWorkersAndOrderedReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Root.Task.Status != model.TaskStatusDone || len(result.Root.Comments) != 1 || len(result.Root.Subtasks) != 4 {
+	if result.Root.Task.Status != model.TaskStatusDone || result.Root.Task.WorkflowRole != model.WorkflowRoleControl ||
+		len(result.Root.Comments) != 1 || len(result.Root.Subtasks) != 4 {
 		t.Fatalf("invalid swarm root: %+v", result.Root)
 	}
 	for _, workerID := range result.WorkerIDs {
@@ -574,7 +596,8 @@ func TestCreateSwarmBuildsParallelWorkersAndOrderedReview(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if worker.Task.Status != model.TaskStatusReady || worker.ParentTask == nil || worker.ParentTask.ID != result.Root.Task.ID {
+		if worker.Task.Status != model.TaskStatusReady || worker.Task.WorkflowRole != model.WorkflowRoleWorker ||
+			worker.ParentTask == nil || worker.ParentTask.ID != result.Root.Task.ID {
 			t.Fatalf("worker is not immediately runnable: %+v", worker)
 		}
 	}
@@ -582,14 +605,16 @@ func TestCreateSwarmBuildsParallelWorkersAndOrderedReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verifier.Task.Status != model.TaskStatusTodo || len(verifier.Parents) != len(result.WorkerIDs) {
+	if verifier.Task.Status != model.TaskStatusTodo || verifier.Task.WorkflowRole != model.WorkflowRoleReviewer ||
+		len(verifier.Parents) != len(result.WorkerIDs) {
 		t.Fatalf("verifier dependencies mismatch: %+v", verifier)
 	}
 	synthesizer, err := store.GetTask(ctx, result.SynthesizerID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if synthesizer.Task.Status != model.TaskStatusTodo || len(synthesizer.Parents) != 1 || synthesizer.Parents[0].ID != result.VerifierID {
+	if synthesizer.Task.Status != model.TaskStatusTodo || synthesizer.Task.WorkflowRole != model.WorkflowRoleFinalizer ||
+		len(synthesizer.Parents) != 1 || synthesizer.Parents[0].ID != result.VerifierID {
 		t.Fatalf("synthesizer dependency mismatch: %+v", synthesizer)
 	}
 }

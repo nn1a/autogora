@@ -57,7 +57,7 @@ func TestSpecifyAndDecomposeTriageTasks(t *testing.T) {
 			Tasks: []DecompositionTask{
 				{Key: "na", Title: "Research NA", Body: "Find sources", Assignee: "researcher", Runtime: model.RuntimeCodex, Priority: 2},
 				{Key: "eu", Title: "Research EU", Body: "Find sources", Assignee: "unknown", Runtime: model.RuntimeClaude, Priority: 2},
-				{Key: "report", Title: "Write report", Body: "Synthesize", Assignee: "writer", Runtime: model.RuntimeClaude, Priority: 3},
+				{Key: "report", Title: "Write report", Body: "Synthesize", Assignee: "writer", Runtime: model.RuntimeClaude, WorkflowRole: model.WorkflowRoleReviewer, Priority: 3},
 			},
 			Dependencies: []store.TaskGraphDependency{{Parent: "na", Child: "report"}, {Parent: "eu", Child: "report"}},
 		},
@@ -65,15 +65,17 @@ func TestSpecifyAndDecomposeTriageTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Fanout || result.Graph == nil || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "finalizer" {
+	if !result.Fanout || result.Graph == nil || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "finalizer" ||
+		result.Task.Task.WorkflowRole != model.WorkflowRoleFinalizer {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 	eu, err := opened.GetTask(ctx, result.Graph.TasksByKey["eu"])
-	if err != nil || eu.Task.Assignee == nil || *eu.Task.Assignee != "fallback" || eu.Task.Runtime != model.RuntimeCodex {
+	if err != nil || eu.Task.Assignee == nil || *eu.Task.Assignee != "fallback" || eu.Task.Runtime != model.RuntimeCodex ||
+		eu.Task.WorkflowRole != model.WorkflowRoleWorker {
 		t.Fatalf("fallback routing failed: %#v, %v", eu.Task, err)
 	}
 	report, _ := opened.GetTask(ctx, result.Graph.TasksByKey["report"])
-	if len(report.Parents) != 2 || report.Task.Status != model.TaskStatusTodo {
+	if len(report.Parents) != 2 || report.Task.Status != model.TaskStatusTodo || report.Task.WorkflowRole != model.WorkflowRoleReviewer {
 		t.Fatalf("dependency graph failed: %#v", report)
 	}
 }
@@ -138,6 +140,23 @@ func TestCyclicDecompositionIsAtomic(t *testing.T) {
 	after, _ := opened.GetTask(ctx, root.Task.ID)
 	if after.Task.Status != model.TaskStatusTriage || len(after.Subtasks) != 0 {
 		t.Fatalf("graph application was not atomic: %#v", after)
+	}
+}
+
+func TestDecompositionRejectsSystemOwnedChildRoles(t *testing.T) {
+	for _, role := range []model.WorkflowRole{model.WorkflowRoleFinalizer, model.WorkflowRoleControl} {
+		t.Run(string(role), func(t *testing.T) {
+			plan := DecompositionPlan{
+				Fanout: true, RootTitle: "Root", RootBody: "Root body",
+				Tasks: []DecompositionTask{{
+					Key: "child", Title: "Child", Body: "Child body", Assignee: "worker",
+					Runtime: model.RuntimeCodex, WorkflowRole: role,
+				}},
+			}
+			if err := validateDecomposition(&plan); err == nil || !strings.Contains(err.Error(), "use worker or reviewer") {
+				t.Fatalf("role %q validation error = %v", role, err)
+			}
+		})
 	}
 }
 

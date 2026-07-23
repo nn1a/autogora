@@ -28,6 +28,22 @@ var TaskStatuses = []TaskStatus{
 	TaskStatusArchived,
 }
 
+type WorkflowRole string
+
+const (
+	WorkflowRoleWorker    WorkflowRole = "worker"
+	WorkflowRoleReviewer  WorkflowRole = "reviewer"
+	WorkflowRoleFinalizer WorkflowRole = "finalizer"
+	WorkflowRoleControl   WorkflowRole = "control"
+)
+
+var WorkflowRoles = []WorkflowRole{
+	WorkflowRoleWorker,
+	WorkflowRoleReviewer,
+	WorkflowRoleFinalizer,
+	WorkflowRoleControl,
+}
+
 type Runtime string
 
 const (
@@ -103,6 +119,7 @@ type Task struct {
 	Assignee           *string       `json:"assignee"`
 	Runtime            Runtime       `json:"runtime"`
 	Status             TaskStatus    `json:"status"`
+	WorkflowRole       WorkflowRole  `json:"workflowRole"`
 	Priority           int           `json:"priority"`
 	Workspace          *string       `json:"workspace"`
 	WorkspaceKind      WorkspaceKind `json:"workspaceKind"`
@@ -287,6 +304,15 @@ func ValidTaskStatus(value TaskStatus) bool {
 
 func ValidRuntime(value Runtime) bool {
 	for _, candidate := range Runtimes {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidWorkflowRole(value WorkflowRole) bool {
+	for _, candidate := range WorkflowRoles {
 		if candidate == value {
 			return true
 		}

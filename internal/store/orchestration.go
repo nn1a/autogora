@@ -12,13 +12,14 @@ import (
 )
 
 type TaskGraphNode struct {
-	Key      string        `json:"key"`
-	Title    string        `json:"title"`
-	Body     string        `json:"body"`
-	Assignee string        `json:"assignee"`
-	Runtime  model.Runtime `json:"runtime"`
-	Priority *int          `json:"priority,omitempty"`
-	Skills   []string      `json:"skills,omitempty"`
+	Key          string             `json:"key"`
+	Title        string             `json:"title"`
+	Body         string             `json:"body"`
+	Assignee     string             `json:"assignee"`
+	Runtime      model.Runtime      `json:"runtime"`
+	WorkflowRole model.WorkflowRole `json:"workflowRole,omitempty"`
+	Priority     *int               `json:"priority,omitempty"`
+	Skills       []string           `json:"skills,omitempty"`
 }
 
 type TaskGraphDependency struct {
@@ -87,6 +88,12 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		if !model.ValidRuntime(node.Runtime) {
 			return TaskGraphResult{}, fmt.Errorf("invalid task graph runtime: %s", node.Runtime)
 		}
+		if node.WorkflowRole == "" {
+			node.WorkflowRole = model.WorkflowRoleWorker
+		}
+		if !model.ValidWorkflowRole(node.WorkflowRole) {
+			return TaskGraphResult{}, fmt.Errorf("invalid task graph workflow role: %s", node.WorkflowRole)
+		}
 		node.Assignee = strings.TrimSpace(node.Assignee)
 		if node.Assignee == "" {
 			return TaskGraphResult{}, fmt.Errorf("task graph node %s has no assignee", node.Key)
@@ -140,7 +147,7 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 				Assignee: &node.Assignee, Runtime: node.Runtime, Priority: priority,
 				Workspace: workspace, WorkspaceKind: root.WorkspaceKind,
 				MaxRuntimeSeconds: root.MaxRuntimeSeconds, Skills: node.Skills,
-				MaxRetries: root.MaxRetries, Status: status,
+				MaxRetries: root.MaxRetries, Status: status, WorkflowRole: node.WorkflowRole,
 			})
 			if err != nil {
 				return err
@@ -175,7 +182,7 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		if body == "" {
 			body = root.Body
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET title = ?, body = ?, assignee = ?, runtime = ?, status = 'todo',
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET title = ?, body = ?, assignee = ?, runtime = ?, workflow_role = 'finalizer', status = 'todo',
 			block_kind = NULL, block_reason = NULL, updated_at = ? WHERE id = ?`,
 			title, body, input.FinalizerAssignee, input.FinalizerRuntime, now(), root.ID); err != nil {
 			return err
@@ -245,6 +252,7 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 			Title: "Swarm blackboard: " + goal, Body: goal, Tenant: input.Tenant,
 			Status: model.TaskStatusTodo, Runtime: model.RuntimeManual,
 			Workspace: workspace, WorkspaceKind: input.WorkspaceKind,
+			WorkflowRole: model.WorkflowRoleControl,
 		})
 		if err != nil {
 			return err
@@ -283,6 +291,7 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 				Body:   "Work independently on this swarm goal. Read the blackboard parent and leave a structured handoff.\n\n" + goal,
 				Tenant: input.Tenant, Assignee: &assignee, Runtime: worker.Runtime,
 				Workspace: workspace, WorkspaceKind: input.WorkspaceKind, Parents: []string{rootID},
+				WorkflowRole: model.WorkflowRoleWorker,
 			})
 			if err != nil {
 				return err
@@ -295,6 +304,7 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 			Body:   "Review every worker handoff against the shared goal. Identify gaps and provide a clear verification decision.",
 			Tenant: input.Tenant, Assignee: &verifierAssignee, Runtime: input.Verifier.Runtime,
 			Workspace: workspace, WorkspaceKind: input.WorkspaceKind, Parents: result.WorkerIDs,
+			WorkflowRole: model.WorkflowRoleReviewer,
 		})
 		if err != nil {
 			return err
@@ -305,6 +315,7 @@ func (s *Store) CreateSwarm(ctx context.Context, input SwarmInput) (SwarmResult,
 			Body:   "Produce the final deliverable using the verified swarm handoffs and verification decision.",
 			Tenant: input.Tenant, Assignee: &synthesizerAssignee, Runtime: input.Synthesizer.Runtime,
 			Workspace: workspace, WorkspaceKind: input.WorkspaceKind, Parents: []string{result.VerifierID},
+			WorkflowRole: model.WorkflowRoleFinalizer,
 		})
 		if err != nil {
 			return err

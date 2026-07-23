@@ -1,16 +1,17 @@
 package model
 
 type RelationshipTask struct {
-	ID        string     `json:"id"`
-	Board     string     `json:"board"`
-	Tenant    *string    `json:"tenant"`
-	Title     string     `json:"title"`
-	Assignee  *string    `json:"assignee"`
-	Runtime   Runtime    `json:"runtime"`
-	Status    TaskStatus `json:"status"`
-	Priority  int        `json:"priority"`
-	CreatedAt string     `json:"createdAt"`
-	UpdatedAt string     `json:"updatedAt"`
+	ID           string       `json:"id"`
+	Board        string       `json:"board"`
+	Tenant       *string      `json:"tenant"`
+	Title        string       `json:"title"`
+	Assignee     *string      `json:"assignee"`
+	Runtime      Runtime      `json:"runtime"`
+	Status       TaskStatus   `json:"status"`
+	WorkflowRole WorkflowRole `json:"workflowRole"`
+	Priority     int          `json:"priority"`
+	CreatedAt    string       `json:"createdAt"`
+	UpdatedAt    string       `json:"updatedAt"`
 }
 
 type RelationshipNode struct {

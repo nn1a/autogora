@@ -49,6 +49,7 @@ func TestUpdateTaskLocksExecutionSettingsWhileRunning(t *testing.T) {
 	newGoalMode, newGoalTurns := true, 12
 	newWorkflow, newStep := "replacement", "review"
 	newStatus := model.TaskStatusReview
+	newWorkflowRole := model.WorkflowRoleReviewer
 	metadataPriority := 99
 
 	tests := []struct {
@@ -72,6 +73,7 @@ func TestUpdateTaskLocksExecutionSettingsWhileRunning(t *testing.T) {
 		{name: "workflow", input: UpdateTaskInput{WorkflowTemplateID: OptionalString{Set: true, Value: &newWorkflow}}},
 		{name: "workflow step", input: UpdateTaskInput{CurrentStepKey: OptionalString{Set: true, Value: &newStep}}},
 		{name: "status", input: UpdateTaskInput{Status: &newStatus}},
+		{name: "workflow role", input: UpdateTaskInput{WorkflowRole: &newWorkflowRole}},
 		{name: "mixed metadata and execution", input: UpdateTaskInput{Priority: &metadataPriority, Title: &newTitle}},
 	}
 	for _, test := range tests {

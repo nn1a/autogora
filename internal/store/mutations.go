@@ -490,7 +490,8 @@ func requestsRunningExecutionUpdate(input UpdateTaskInput) bool {
 		input.GoalMaxTurns != nil ||
 		input.WorkflowTemplateID.Set ||
 		input.CurrentStepKey.Set ||
-		input.Status != nil
+		input.Status != nil ||
+		input.WorkflowRole != nil
 }
 
 func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskInput) (model.TaskDetail, error) {
@@ -608,6 +609,12 @@ func (s *Store) UpdateTask(ctx context.Context, taskID string, input UpdateTaskI
 				return fmt.Errorf("invalid status: %s", *input.Status)
 			}
 			add("status", *input.Status)
+		}
+		if input.WorkflowRole != nil {
+			if !model.ValidWorkflowRole(*input.WorkflowRole) {
+				return fmt.Errorf("invalid workflow role: %s", *input.WorkflowRole)
+			}
+			add("workflow_role", *input.WorkflowRole)
 		}
 		if input.Status != nil && *input.Status == model.TaskStatusDone {
 			add("failure_count", 0)

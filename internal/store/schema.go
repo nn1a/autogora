@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 17
+const schemaVersion = 18
 
 type Store struct {
 	db              *sql.DB
@@ -121,6 +121,11 @@ func (s *Store) initialize(ctx context.Context) error {
 			return err
 		}
 	case !strings.Contains(definition, "'cline'") || !strings.Contains(definition, "'gemini'"):
+		// Runtime migration preserves workflow_role by name. Real v17 tables
+		// need the additive column before their rows can be copied.
+		if err := s.ensureTaskWorkflowRole(ctx); err != nil {
+			return err
+		}
 		if err := s.migrateRuntimeSchema(ctx); err != nil {
 			return err
 		}
@@ -129,11 +134,52 @@ func (s *Store) initialize(ctx context.Context) error {
 			return fmt.Errorf("ensure schema: %w", err)
 		}
 	}
+	if err := s.ensureTaskWorkflowRole(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDependencySatisfaction(ctx); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureTaskWorkflowRole(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(tasks)")
+	if err != nil {
+		return fmt.Errorf("inspect task workflow role: %w", err)
+	}
+	hasWorkflowRole := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan task column: %w", err)
+		}
+		if name == "workflow_role" {
+			hasWorkflowRole = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("inspect task workflow role: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if hasWorkflowRole {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE tasks
+		ADD COLUMN workflow_role TEXT NOT NULL DEFAULT 'worker'
+			CHECK (workflow_role IN ('worker', 'reviewer', 'finalizer', 'control'))
+	`); err != nil {
+		return fmt.Errorf("add task workflow role: %w", err)
 	}
 	return nil
 }
@@ -258,7 +304,22 @@ func (s *Store) migrateRuntimeSchema(ctx context.Context) error {
 		return fmt.Errorf("create runtime schema: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO tasks SELECT * FROM tasks_runtime_legacy;
+		INSERT INTO tasks(
+			id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
+			priority, workspace, workspace_kind, branch, current_run_id, result,
+			scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
+			workflow_template_id, current_step_key, block_kind, block_reason,
+			block_recurrences, failure_count, max_retries, created_at, updated_at,
+			workflow_role
+		)
+		SELECT
+			id, board, tenant, idempotency_key, title, body, assignee, runtime, status,
+			priority, workspace, workspace_kind, branch, current_run_id, result,
+			scheduled_at, max_runtime_seconds, skills_json, goal_mode, goal_max_turns,
+			workflow_template_id, current_step_key, block_kind, block_reason,
+			block_recurrences, failure_count, max_retries, created_at, updated_at,
+			workflow_role
+		FROM tasks_runtime_legacy;
 		INSERT INTO task_runs SELECT * FROM task_runs_runtime_legacy;
 		DROP TABLE task_runs_runtime_legacy;
 		DROP TABLE tasks_runtime_legacy;
@@ -389,7 +450,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   failure_count INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 2 CHECK (max_retries >= 1),
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  workflow_role TEXT NOT NULL DEFAULT 'worker' CHECK (workflow_role IN ('worker', 'reviewer', 'finalizer', 'control'))
 );
 
 CREATE TABLE IF NOT EXISTS task_links (

@@ -30,13 +30,14 @@ type SpecificationPlan struct {
 }
 
 type DecompositionTask struct {
-	Key      string        `json:"key"`
-	Title    string        `json:"title"`
-	Body     string        `json:"body"`
-	Assignee string        `json:"assignee"`
-	Runtime  model.Runtime `json:"runtime"`
-	Priority int           `json:"priority"`
-	Skills   []string      `json:"skills"`
+	Key          string             `json:"key"`
+	Title        string             `json:"title"`
+	Body         string             `json:"body"`
+	Assignee     string             `json:"assignee"`
+	Runtime      model.Runtime      `json:"runtime"`
+	WorkflowRole model.WorkflowRole `json:"workflowRole,omitempty"`
+	Priority     int                `json:"priority"`
+	Skills       []string           `json:"skills"`
 }
 
 type DecompositionPlan struct {
@@ -82,8 +83,9 @@ var decompositionSchema = map[string]any{
 			"properties": map[string]any{
 				"key": map[string]any{"type": "string", "minLength": 1}, "title": map[string]any{"type": "string", "minLength": 1},
 				"body": map[string]any{"type": "string", "minLength": 1}, "assignee": map[string]any{"type": "string", "minLength": 1},
-				"runtime":  map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
-				"priority": map[string]any{"type": "integer"}, "skills": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"runtime":      map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
+				"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
+				"priority":     map[string]any{"type": "integer"}, "skills": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			},
 			"required": []string{"key", "title", "body", "assignee", "runtime", "priority", "skills"},
 		}},
@@ -155,6 +157,12 @@ func validateDecomposition(plan *DecompositionPlan) error {
 		seen[task.Key] = true
 		if task.Runtime == model.RuntimeManual || !model.ValidRuntime(task.Runtime) {
 			return fmt.Errorf("invalid task runtime: %s", task.Runtime)
+		}
+		if task.WorkflowRole == "" {
+			task.WorkflowRole = model.WorkflowRoleWorker
+		}
+		if task.WorkflowRole != model.WorkflowRoleWorker && task.WorkflowRole != model.WorkflowRoleReviewer {
+			return fmt.Errorf("invalid planner task workflow role: %s; use worker or reviewer", task.WorkflowRole)
 		}
 		unique := map[string]bool{}
 		cleaned := make([]string, 0, len(task.Skills))
@@ -358,7 +366,7 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 			profile = options.DefaultProfile
 		}
 		priority := planned.Priority
-		nodes = append(nodes, store.TaskGraphNode{Key: planned.Key, Title: planned.Title, Body: planned.Body, Assignee: profile.Name, Runtime: profile.Runtime, Priority: &priority, Skills: planned.Skills})
+		nodes = append(nodes, store.TaskGraphNode{Key: planned.Key, Title: planned.Title, Body: planned.Body, Assignee: profile.Name, Runtime: profile.Runtime, WorkflowRole: planned.WorkflowRole, Priority: &priority, Skills: planned.Skills})
 	}
 	finalizer := options.DefaultProfile
 	if options.FinalizerProfile != nil {
