@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/nn1a/autogora/internal/model"
 )
 
 func formFieldLabel(field formField) string {
@@ -15,6 +16,61 @@ func formFieldLabel(field formField) string {
 		fieldBranch: "Branch", fieldMaxRuntime: "Max runtime (seconds)", fieldMaxRetries: "Max retries", fieldGoalMaxTurns: "Goal max turns",
 	}
 	return labels[field]
+}
+
+type formRouteSummary struct {
+	profile     string
+	assignee    string
+	runtime     string
+	model       string
+	provider    string
+	description string
+}
+
+func (f *taskForm) effectiveRoute() formRouteSummary {
+	summary := formRouteSummary{
+		profile:  "Custom",
+		assignee: strings.TrimSpace(f.inputs[fieldAssignee].Value()),
+		runtime:  formRuntimes[f.runtimeIndex],
+	}
+	if summary.assignee == "" {
+		summary.assignee = "Unassigned"
+	}
+	if profileIndex := f.profileIndexForAssignee(); profileIndex > 0 {
+		profile := f.profiles[profileIndex-1]
+		summary.profile = profile.Name
+		summary.runtime = string(profile.Runtime)
+		summary.model = strings.TrimSpace(profile.Model)
+		summary.provider = strings.TrimSpace(profile.Provider)
+		summary.description = strings.TrimSpace(profile.Description)
+	}
+	if summary.runtime == string(model.RuntimeManual) {
+		summary.model = "Manual task"
+		summary.provider = "Not applicable"
+		return summary
+	}
+	if summary.model == "" {
+		summary.model = "CLI default (unpinned)"
+	}
+	if summary.provider == "" {
+		summary.provider = "CLI default"
+	}
+	return summary
+}
+
+func (f *taskForm) selectionPosition(field formField) (int, int) {
+	switch field {
+	case fieldStatus:
+		return f.statusIndex + 1, len(formStatuses)
+	case fieldProfile:
+		return f.profileIndex + 1, len(f.profiles) + 1
+	case fieldRuntime:
+		return f.runtimeIndex + 1, len(formRuntimes)
+	case fieldWorkspaceKind:
+		return f.workspaceIndex + 1, len(formWorkspaceKinds)
+	default:
+		return 0, 0
+	}
 }
 
 func (f *taskForm) selectValue(field formField) string {
@@ -28,7 +84,7 @@ func (f *taskForm) selectValue(field formField) string {
 		profile := f.profiles[f.profileIndex-1]
 		model := strings.TrimSpace(profile.Model)
 		if model == "" {
-			model = "CLI default"
+			model = "CLI default (unpinned)"
 		}
 		return fmt.Sprintf("%s · %s · %s", profile.Name, profile.Runtime, model)
 	case fieldRuntime:
@@ -58,6 +114,8 @@ func (f *taskForm) renderField(field formField, width int) string {
 		hint := "  ↑/↓ select"
 		if field == fieldGoalMode {
 			hint = "  Space toggle"
+		} else if position, count := f.selectionPosition(field); count > 0 {
+			hint += fmt.Sprintf(" · %d/%d", position, count)
 		}
 		label += lipgloss.NewStyle().Foreground(colorMuted).Render(hint)
 	}
@@ -80,6 +138,38 @@ func (f *taskForm) renderField(field formField, width int) string {
 		value = lipgloss.NewStyle().Foreground(colorMuted).Render(value)
 	}
 	return lipgloss.NewStyle().Width(width).Render(label + "\n" + value)
+}
+
+func (f *taskForm) renderRouteSummary(width int) string {
+	route := f.effectiveRoute()
+	title := lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Effective route")
+	details := fmt.Sprintf(
+		"Profile: %s · Assignee: %s\nRuntime: %s · Model: %s\nProvider: %s",
+		route.profile,
+		route.assignee,
+		route.runtime,
+		route.model,
+		route.provider,
+	)
+	lines := []string{
+		title,
+		lipgloss.NewStyle().Width(width).Foreground(colorText).Render(details),
+		lipgloss.NewStyle().Width(width).Foreground(colorMuted).Render(
+			"Profiles own Assignee and Runtime. Choosing Custom or changing Runtime while profiled clears the profile Assignee, so the saved route is custom. Typing an exact listed name reselects that profile and its runtime/model. Manual uses no agent and shows Manual task.",
+		),
+	}
+	if len(f.profiles) == 0 {
+		availability := "Custom + Manual routes remain available."
+		if f.mode == "create" {
+			availability = "Custom + Manual task creation remains available; Ready requires an agent route."
+		}
+		lines = append(lines, lipgloss.NewStyle().Width(width).Foreground(statusColor("scheduled")).Render(
+			"No runnable profiles. Configure one in Agents / Board settings. "+availability,
+		))
+	} else if route.description != "" && f.focus == fieldProfile {
+		lines = append(lines, lipgloss.NewStyle().Width(width).Foreground(colorMuted).Render("About: "+route.description))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) renderTaskForm(width, height int) string {
@@ -129,15 +219,8 @@ func (m *Model) renderTaskForm(width, height int) string {
 			lines = append(lines, f.renderField(field, innerWidth), "")
 		}
 	}
-	if f.focus == fieldProfile && f.profileIndex > 0 {
-		profile := f.profiles[f.profileIndex-1]
-		description := strings.TrimSpace(profile.Description)
-		if profile.Provider != "" {
-			description = strings.TrimSpace(description + " · provider " + profile.Provider)
-		}
-		if description != "" {
-			lines = append(lines, lipgloss.NewStyle().Width(innerWidth).Foreground(colorMuted).Render(description), "")
-		}
+	if f.step() == 1 {
+		lines = append(lines, f.renderRouteSummary(innerWidth), "")
 	}
 	if f.err != nil {
 		lines = append(lines, lipgloss.NewStyle().Foreground(statusColor("blocked")).Render(f.err.Error()), "")

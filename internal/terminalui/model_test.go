@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
 	"github.com/nn1a/autogora/internal/runcontrol"
@@ -277,6 +278,27 @@ func TestTaskFormCreatesTriageTask(t *testing.T) {
 	m.Update(message)
 	if len(backend.actions) != 1 || backend.actions[0] != "create:Investigate issue" || m.desiredSelection != "created" {
 		t.Fatalf("task creation did not complete: actions=%v selection=%q", backend.actions, m.desiredSelection)
+	}
+}
+
+func TestCreateFormUsesBoardDefaultProfileFromContext(t *testing.T) {
+	defaultProfile := "reviewer"
+	profiles := []orchestration.ProfileRoute{
+		{Name: "implementer", Runtime: model.RuntimeCodex},
+		{Name: "reviewer", Runtime: model.RuntimeGemini, Model: "gemini-review"},
+	}
+	m := NewModel(context.Background(), &fakeBackend{}, "default")
+	m.Update(boardContextMsg{context: taskservice.BoardContext{
+		Metadata: boards.Metadata{Orchestration: boards.OrchestrationSettings{DefaultProfile: &defaultProfile}},
+		Profiles: profiles,
+	}})
+	m.column = statusIndex(m.statuses(), model.TaskStatusTodo)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if m.form == nil ||
+		m.form.profileIndex != 2 ||
+		m.form.inputs[fieldAssignee].Value() != "reviewer" ||
+		formRuntimes[m.form.runtimeIndex] != "gemini" {
+		t.Fatalf("create form ignored board-context default: %#v", m.form)
 	}
 }
 

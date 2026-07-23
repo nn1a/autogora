@@ -56,6 +56,7 @@ type taskForm struct {
 	expectedUpdatedAt string
 	activeRun         bool
 	board             string
+	defaultProfile    string
 	profiles          []orchestration.ProfileRoute
 	profileIndex      int
 	statusIndex       int
@@ -78,7 +79,7 @@ func newTextInput(value, placeholder string, limit int) textinput.Model {
 	return input
 }
 
-func newTaskForm(board string, profiles []orchestration.ProfileRoute, status model.TaskStatus) *taskForm {
+func newTaskForm(board string, profiles []orchestration.ProfileRoute, status model.TaskStatus, defaultProfile *string) *taskForm {
 	if status == "" || status == model.TaskStatusRunning || status == model.TaskStatusArchived {
 		status = model.TaskStatusTriage
 	}
@@ -89,7 +90,7 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 		}
 	}
 	form := &taskForm{
-		mode: "create", board: board, profiles: runnableProfiles,
+		mode: "create", board: board, defaultProfile: strings.TrimSpace(pointer(defaultProfile, "")), profiles: runnableProfiles,
 		inputs: map[formField]textinput.Model{
 			fieldTitle: newTextInput("", "Task title", 300), fieldPriority: newTextInput("0", "0", 12),
 			fieldScheduledAt: newTextInput("", "RFC3339, for example 2026-07-23T18:00:00+09:00", 80),
@@ -108,17 +109,15 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 		form.setInputValue(fieldScheduledAt, time.Now().Add(time.Hour).Format(time.RFC3339))
 	}
 	if len(runnableProfiles) > 0 && (status == model.TaskStatusTodo || status == model.TaskStatusReady || status == model.TaskStatusScheduled) {
-		form.profileIndex = 1
-		form.setInputValue(fieldAssignee, runnableProfiles[0].Name)
-		form.runtimeIndex = optionIndex(formRuntimes, string(runnableProfiles[0].Runtime))
+		form.applyPreferredProfile()
 	}
 	form.focus = fieldTitle
 	form.syncFocus()
 	return form
 }
 
-func editTaskForm(board string, profiles []orchestration.ProfileRoute, task model.Task) *taskForm {
-	form := newTaskForm(board, profiles, task.Status)
+func editTaskForm(board string, profiles []orchestration.ProfileRoute, task model.Task, defaultProfile *string) *taskForm {
+	form := newTaskForm(board, profiles, task.Status, defaultProfile)
 	form.mode, form.taskID, form.expectedUpdatedAt, form.activeRun = "edit", task.ID, task.UpdatedAt, task.CurrentRunID != nil
 	form.setInputValue(fieldTitle, task.Title)
 	form.setInputValue(fieldPriority, strconv.Itoa(task.Priority))
@@ -137,17 +136,76 @@ func editTaskForm(board string, profiles []orchestration.ProfileRoute, task mode
 	form.runtimeIndex = optionIndex(formRuntimes, string(task.Runtime))
 	form.workspaceIndex = optionIndex(formWorkspaceKinds, string(task.WorkspaceKind))
 	form.goalMode = task.GoalMode
-	for index, profile := range form.profiles {
-		if task.Assignee != nil && profile.Name == *task.Assignee && profile.Runtime == task.Runtime {
-			form.profileIndex = index + 1
-			break
-		}
-	}
+	form.syncProfileFromAssignee()
 	if form.activeRun {
 		form.focus = fieldPriority
 	}
 	form.syncFocus()
 	return form
+}
+
+func (f *taskForm) preferredProfileIndex() int {
+	if f.defaultProfile != "" {
+		for index, profile := range f.profiles {
+			if profile.Name == f.defaultProfile {
+				return index + 1
+			}
+		}
+	}
+	if len(f.profiles) > 0 {
+		return 1
+	}
+	return 0
+}
+
+func (f *taskForm) applyPreferredProfile() {
+	f.applyProfileSelection(f.preferredProfileIndex())
+}
+
+func (f *taskForm) applyProfileSelection(index int) {
+	f.profileIndex = index
+	if index == 0 {
+		f.setInputValue(fieldAssignee, "")
+		return
+	}
+	profile := f.profiles[index-1]
+	f.setInputValue(fieldAssignee, profile.Name)
+	f.runtimeIndex = optionIndex(formRuntimes, string(profile.Runtime))
+}
+
+// BoardContext intentionally combines configured and task-derived routes
+// without exposing their source. Treat every displayed route name as reserved
+// and canonical in the form: an exact assignee match adopts that route's
+// runtime/model, while a custom route must use a different assignee name.
+// This keeps configured profiles aligned with dispatcher name-based routing
+// and gives task-derived routes the same predictable form behavior.
+func (f *taskForm) profileIndexForAssignee() int {
+	assignee := strings.TrimSpace(f.inputs[fieldAssignee].Value())
+	if assignee == "" {
+		return 0
+	}
+	for index, profile := range f.profiles {
+		if profile.Name == assignee {
+			return index + 1
+		}
+	}
+	return 0
+}
+
+func (f *taskForm) syncProfileFromAssignee() {
+	f.profileIndex = f.profileIndexForAssignee()
+	if f.profileIndex == 0 {
+		return
+	}
+	profile := f.profiles[f.profileIndex-1]
+	f.runtimeIndex = optionIndex(formRuntimes, string(profile.Runtime))
+}
+
+func (f *taskForm) detachProfileAssignee() {
+	if f.profileIndex > 0 || f.profileIndexForAssignee() > 0 {
+		f.setInputValue(fieldAssignee, "")
+	}
+	f.profileIndex = 0
 }
 
 func (f *taskForm) setInputValue(field formField, value string) {
@@ -281,22 +339,13 @@ func (f *taskForm) cycleSelection(delta int) {
 			f.setInputValue(fieldScheduledAt, time.Now().Add(time.Hour).Format(time.RFC3339))
 		}
 		if f.profileIndex == 0 && len(f.profiles) > 0 && (status == model.TaskStatusTodo || status == model.TaskStatusReady || status == model.TaskStatusScheduled) {
-			f.profileIndex = 1
-			f.setInputValue(fieldAssignee, f.profiles[0].Name)
-			f.runtimeIndex = optionIndex(formRuntimes, string(f.profiles[0].Runtime))
+			f.applyPreferredProfile()
 		}
 	case fieldProfile:
-		f.profileIndex = cycle(f.profileIndex, len(f.profiles)+1, delta)
-		if f.profileIndex > 0 {
-			profile := f.profiles[f.profileIndex-1]
-			assignee := f.inputs[fieldAssignee]
-			assignee.SetValue(profile.Name)
-			f.inputs[fieldAssignee] = assignee
-			f.runtimeIndex = optionIndex(formRuntimes, string(profile.Runtime))
-		}
+		f.applyProfileSelection(cycle(f.profileIndex, len(f.profiles)+1, delta))
 	case fieldRuntime:
 		f.runtimeIndex = cycle(f.runtimeIndex, len(formRuntimes), delta)
-		f.profileIndex = 0
+		f.detachProfileAssignee()
 	case fieldWorkspaceKind:
 		f.workspaceIndex = cycle(f.workspaceIndex, len(formWorkspaceKinds), delta)
 	case fieldGoalMode:
@@ -342,8 +391,8 @@ func (f *taskForm) Update(message tea.KeyMsg) (tea.Cmd, formAction) {
 		var command tea.Cmd
 		input, command = input.Update(message)
 		f.inputs[f.focus] = input
-		if (f.focus == fieldAssignee || f.focus == fieldRuntime) && input.Value() != before {
-			f.profileIndex = 0
+		if f.focus == fieldAssignee && input.Value() != before {
+			f.syncProfileFromAssignee()
 		}
 		return command, formContinue
 	}
@@ -380,6 +429,7 @@ func (f *taskForm) validate() error {
 	if f.activeRun {
 		return nil
 	}
+	f.syncProfileFromAssignee()
 	if strings.TrimSpace(f.inputs[fieldTitle].Value()) == "" {
 		return errors.New("title cannot be empty")
 	}
@@ -433,6 +483,7 @@ func optionalValue(value string) *string {
 }
 
 func (f *taskForm) createInput() store.CreateTaskInput {
+	f.syncProfileFromAssignee()
 	priority, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value()))
 	maxRetries, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldMaxRetries].Value()))
 	goalMaxTurns, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldGoalMaxTurns].Value()))
@@ -460,6 +511,7 @@ func (f *taskForm) updateInput() store.UpdateTaskInput {
 			Priority:          &priority,
 		}
 	}
+	f.syncProfileFromAssignee()
 	maxRetries, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldMaxRetries].Value()))
 	goalMaxTurns, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldGoalMaxTurns].Value()))
 	var maxRuntime *int

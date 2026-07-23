@@ -258,7 +258,12 @@ func (m *Model) openCreateForm() tea.Cmd {
 		return nil
 	}
 	status := m.statuses()[m.column]
-	m.form = newTaskForm(m.board, m.boardContext.Profiles, status)
+	m.form = newTaskForm(
+		m.board,
+		m.boardContext.Profiles,
+		status,
+		m.boardContext.Metadata.Orchestration.DefaultProfile,
+	)
 	m.clearMutationStatus()
 	return m.form.syncFocus()
 }
@@ -286,7 +291,12 @@ func (m *Model) openEditTaskForm(task model.Task, focus formField) tea.Cmd {
 		m.err = errors.New("board settings are still loading")
 		return nil
 	}
-	m.form = editTaskForm(m.board, m.boardContext.Profiles, task)
+	m.form = editTaskForm(
+		m.board,
+		m.boardContext.Profiles,
+		task,
+		m.boardContext.Metadata.Orchestration.DefaultProfile,
+	)
 	if !m.form.locked(focus) {
 		m.form.focus = focus
 	}
