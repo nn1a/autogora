@@ -222,7 +222,6 @@ func autopilotUpdate(value any) (*boards.AutopilotUpdate, error) {
 	update := &boards.AutopilotUpdate{
 		Enabled: boolPointerFrom(body, "enabled"), AutoPlan: boolPointerFrom(body, "autoPlan"),
 		AutoExecute: boolPointerFrom(body, "autoExecute"), WorkspaceWrites: boolPointerFrom(body, "workspaceWrites"),
-		ReviewGate: boolPointerFrom(body, "reviewGate"),
 	}
 	if raw, exists := body["coordination"]; exists {
 		coordination, ok := raw.(map[string]any)

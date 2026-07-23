@@ -143,10 +143,10 @@ func TestBoardPersistsNormalizedAutopilotPolicy(t *testing.T) {
 
 	mode, profile := CoordinationModeAssist, "coordinator"
 	publicationMode, branch := PublicationModePullRequest, "develop"
-	writes, review := true, true
+	writes := true
 	updated, err := manager.Update("default", Update{Orchestration: &OrchestrationUpdate{
 		Autopilot: &AutopilotUpdate{
-			WorkspaceWrites: &writes, ReviewGate: &review,
+			WorkspaceWrites: &writes,
 			Coordination: &CoordinationUpdate{
 				Mode: &mode, Profile: store.OptionalString{Set: true, Value: &profile},
 			},
@@ -157,7 +157,7 @@ func TestBoardPersistsNormalizedAutopilotPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := updated.Orchestration.Autopilot
-	if !policy.WorkspaceWrites || !policy.ReviewGate || policy.Coordination.Mode != mode ||
+	if !policy.WorkspaceWrites || policy.Coordination.Mode != mode ||
 		policy.Coordination.Profile == nil || *policy.Coordination.Profile != profile ||
 		policy.Publication.Mode != publicationMode || policy.Publication.TargetBranch != branch ||
 		policy.Coordination.IdleSeconds != 300 || policy.Publication.Remote != "origin" {

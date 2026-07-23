@@ -189,7 +189,6 @@ type boardAutopilotInput struct {
 	AutoPlan        *bool                   `json:"autoPlan,omitempty"`
 	AutoExecute     *bool                   `json:"autoExecute,omitempty"`
 	WorkspaceWrites *bool                   `json:"workspaceWrites,omitempty"`
-	ReviewGate      *bool                   `json:"reviewGate,omitempty"`
 	Coordination    *boardCoordinationInput `json:"coordination,omitempty"`
 	Publication     *boardPublicationInput  `json:"publication,omitempty"`
 }
@@ -568,7 +567,7 @@ func autopilotBoardUpdate(input *boardAutopilotInput) (*boards.AutopilotUpdate, 
 	}
 	update := &boards.AutopilotUpdate{
 		Enabled: input.Enabled, AutoPlan: input.AutoPlan, AutoExecute: input.AutoExecute,
-		WorkspaceWrites: input.WorkspaceWrites, ReviewGate: input.ReviewGate,
+		WorkspaceWrites: input.WorkspaceWrites,
 	}
 	if coordination := input.Coordination; coordination != nil {
 		if coordination.Mode != nil && *coordination.Mode != boards.CoordinationModeObserve &&

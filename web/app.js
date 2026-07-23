@@ -3010,7 +3010,7 @@ function openSettings() {
   form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.finalizerProfile.value = settings.finalizerProfile || "";
   form.elements.autopilotEnabled.checked = Boolean(autopilot.enabled); form.elements.autoPlan.checked = Boolean(autopilot.autoPlan);
   form.elements.autoExecute.checked = Boolean(autopilot.autoExecute); form.elements.workspaceWrites.checked = Boolean(autopilot.workspaceWrites);
-  form.elements.reviewGate.checked = Boolean(autopilot.reviewGate); form.elements.coordinatorMode.value = coordination.mode || "observe";
+  form.elements.coordinatorMode.value = coordination.mode || "observe";
   form.elements.coordinatorProfile.value = coordination.profile || ""; form.elements.publicationMode.value = publication.mode || "manual";
   form.elements.publicationTargetBranch.value = publication.targetBranch || "main"; form.elements.publicationRemote.value = publication.remote || "origin";
   form.elements.publicationApproval.checked = Boolean(publication.requireApproval);
@@ -3032,7 +3032,6 @@ async function submitSettings(event) {
         autopilot: {
           enabled: data.get("autopilotEnabled") === "on", autoPlan: data.get("autoPlan") === "on",
           autoExecute: data.get("autoExecute") === "on", workspaceWrites: data.get("workspaceWrites") === "on",
-          reviewGate: data.get("reviewGate") === "on",
           coordination: { mode: data.get("coordinatorMode"), profile: data.get("coordinatorProfile") || null },
           publication: { mode: data.get("publicationMode"), targetBranch: data.get("publicationTargetBranch"), remote: data.get("publicationRemote"), requireApproval: data.get("publicationApproval") === "on" },
         } },

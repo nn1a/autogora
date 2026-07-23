@@ -77,7 +77,6 @@ type AutopilotSettings struct {
 	AutoPlan        bool                 `json:"autoPlan"`
 	AutoExecute     bool                 `json:"autoExecute"`
 	WorkspaceWrites bool                 `json:"workspaceWrites"`
-	ReviewGate      bool                 `json:"reviewGate"`
 	Coordination    CoordinationSettings `json:"coordination"`
 	Publication     PublicationSettings  `json:"publication"`
 }
@@ -139,7 +138,6 @@ type AutopilotUpdate struct {
 	AutoPlan        *bool
 	AutoExecute     *bool
 	WorkspaceWrites *bool
-	ReviewGate      *bool
 	Coordination    *CoordinationUpdate
 	Publication     *PublicationUpdate
 }
@@ -626,9 +624,6 @@ func applyAutopilot(current AutopilotSettings, update *AutopilotUpdate) Autopilo
 	}
 	if update.WorkspaceWrites != nil {
 		current.WorkspaceWrites = *update.WorkspaceWrites
-	}
-	if update.ReviewGate != nil {
-		current.ReviewGate = *update.ReviewGate
 	}
 	if coordination := update.Coordination; coordination != nil {
 		if coordination.Mode != nil {
