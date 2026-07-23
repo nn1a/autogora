@@ -110,6 +110,10 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 }
 
 func plannerCandidates(metadata boards.Metadata, config agentconfig.Config, role agentconfig.Role) []orchestration.PlannerCandidate {
+	if role == agentconfig.RoleCoordinator {
+		config = configWithCoordinatorProfile(config, metadata.Orchestration.Autopilot.Coordination.Profile)
+		return orchestration.GlobalPlannerCandidates(config, agentconfig.RoleCoordinator)
+	}
 	if role == agentconfig.RoleJudge {
 		if candidates := orchestration.GlobalPlannerCandidates(config, agentconfig.RoleJudge); len(candidates) > 0 {
 			return candidates
@@ -130,6 +134,16 @@ func plannerCandidates(metadata boards.Metadata, config agentconfig.Config, role
 		Profile: profile, Runtime: metadata.Orchestration.PlannerRuntime, Model: modelName,
 		Provider: provider, Source: "board",
 	}}
+}
+
+func configWithCoordinatorProfile(config agentconfig.Config, profile *string) agentconfig.Config {
+	if profile == nil || strings.TrimSpace(*profile) == "" {
+		return config
+	}
+	cloned := config
+	cloned.Defaults = config.Defaults
+	cloned.Defaults.CoordinatorAgents = []string{strings.TrimSpace(*profile)}
+	return cloned
 }
 
 func plannerFailureHealth(kind orchestration.PlannerFailureKind) model.AgentHealthStatus {

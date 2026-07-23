@@ -92,6 +92,13 @@ func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata bo
 }
 
 func dispatcherPlannerCandidates(metadata boards.Metadata, configured configuredProfileSet, options Options, role agentconfig.Role) []orchestration.PlannerCandidate {
+	if role == agentconfig.RoleCoordinator {
+		config := configured.Config
+		if profile := metadata.Orchestration.Autopilot.Coordination.Profile; profile != nil && strings.TrimSpace(*profile) != "" {
+			config.Defaults.CoordinatorAgents = []string{strings.TrimSpace(*profile)}
+		}
+		return orchestration.GlobalPlannerCandidates(config, agentconfig.RoleCoordinator)
+	}
 	if role == agentconfig.RoleJudge {
 		if candidates := orchestration.GlobalPlannerCandidates(configured.Config, agentconfig.RoleJudge); len(candidates) > 0 {
 			return candidates

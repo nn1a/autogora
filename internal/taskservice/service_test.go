@@ -149,6 +149,30 @@ func TestMergeProfileRoutesLetsBoardTightenGlobalLimit(t *testing.T) {
 	}
 }
 
+func TestCoordinatorCandidatesHonorBoardProfileThenGlobalDefault(t *testing.T) {
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{CoordinatorAgents: []string{"global-coord"}},
+		Agents: []agentconfig.Agent{
+			{ID: "global-coord", Runtime: model.RuntimeCodex, Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleCoordinator}},
+			{ID: "board-coord", Runtime: model.RuntimeClaude, Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleCoordinator}},
+		},
+	}
+	defaults := plannerCandidates(boards.Metadata{}, config, agentconfig.RoleCoordinator)
+	if len(defaults) != 1 || defaults[0].Profile != "global-coord" {
+		t.Fatalf("global coordinator defaults = %#v", defaults)
+	}
+	profile := "board-coord"
+	metadata := boards.Metadata{Orchestration: boards.OrchestrationSettings{
+		Autopilot: boards.AutopilotSettings{Coordination: boards.CoordinationSettings{Profile: &profile}},
+	}}
+	board := plannerCandidates(metadata, config, agentconfig.RoleCoordinator)
+	if len(board) != 1 || board[0].Profile != profile || board[0].Runtime != model.RuntimeClaude {
+		t.Fatalf("board coordinator override = %#v", board)
+	}
+}
+
 func TestServiceUsesGlobalDefaultPlannerWhenBoardIsUnpinned(t *testing.T) {
 	isolateGlobalAgentConfig(t)
 	command := filepath.Join(t.TempDir(), "cline-planner.sh")

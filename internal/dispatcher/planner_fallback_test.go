@@ -112,6 +112,32 @@ func TestDispatcherJudgeUsesOrderedGlobalDefaultFallback(t *testing.T) {
 	assertPlannerSelectionEvent(t, opened, task.Task.ID, "judge", "judge-backup", "judge-model", "judge-provider", "judge-primary")
 }
 
+func TestDispatcherCoordinatorRequiresCoordinatorRoleAndHonorsBoardProfile(t *testing.T) {
+	profile := "board-coord"
+	metadata := boards.Metadata{Orchestration: boards.OrchestrationSettings{
+		Autopilot: boards.AutopilotSettings{Coordination: boards.CoordinationSettings{Profile: &profile}},
+	}}
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{CoordinatorAgents: []string{"global-coord"}},
+		Agents: []agentconfig.Agent{
+			{ID: "global-coord", Runtime: model.RuntimeCodex, Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleCoordinator}},
+			{ID: "board-coord", Runtime: model.RuntimeClaude, Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleCoordinator}},
+			{ID: "wrong-role", Runtime: model.RuntimeCline, Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RolePlanner}},
+		},
+	}
+	candidates := dispatcherPlannerCandidates(metadata, configuredProfileSet{Config: config}, Options{}, agentconfig.RoleCoordinator)
+	if len(candidates) != 1 || candidates[0].Profile != profile || candidates[0].Runtime != model.RuntimeClaude {
+		t.Fatalf("board coordinator candidates = %#v", candidates)
+	}
+	metadata.Orchestration.Autopilot.Coordination.Profile = nil
+	candidates = dispatcherPlannerCandidates(metadata, configuredProfileSet{Config: config}, Options{}, agentconfig.RoleCoordinator)
+	if len(candidates) != 1 || candidates[0].Profile != "global-coord" {
+		t.Fatalf("global coordinator candidates = %#v", candidates)
+	}
+}
+
 func TestDispatcherPlannerSharesCapacityWithWorkerAcrossBoards(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)

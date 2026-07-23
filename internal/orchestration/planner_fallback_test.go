@@ -44,6 +44,23 @@ func TestGlobalPlannerCandidatesFollowDefaultsAndFallbackGraphs(t *testing.T) {
 	}
 }
 
+func TestGlobalPlannerCandidatesUseCoordinatorDefaults(t *testing.T) {
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{CoordinatorAgents: []string{"coord"}},
+		Agents: []agentconfig.Agent{{
+			ID: "coord", Runtime: model.RuntimeClaude, Enabled: true, MaxConcurrent: 1,
+			Roles: []agentconfig.Role{agentconfig.RoleCoordinator},
+		}},
+	}
+	candidates := GlobalPlannerCandidates(config, agentconfig.RoleCoordinator)
+	if len(candidates) != 1 || candidates[0].Profile != "coord" ||
+		candidates[0].Runtime != model.RuntimeClaude || candidates[0].Source != "global_default" {
+		t.Fatalf("unexpected coordinator candidates: %#v", candidates)
+	}
+}
+
 func TestFallbackPlannerSkipsCapacityFullCandidateWithoutFailure(t *testing.T) {
 	called := make([]string, 0, 1)
 	acquired := make([]string, 0, 2)

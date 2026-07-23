@@ -308,6 +308,8 @@ func GlobalPlannerCandidates(config agentconfig.Config, role agentconfig.Role) [
 	switch role {
 	case agentconfig.RolePlanner:
 		roots = config.Defaults.PlannerAgents
+	case agentconfig.RoleCoordinator:
+		roots = config.Defaults.CoordinatorAgents
 	case agentconfig.RoleJudge:
 		roots = config.Defaults.JudgeAgents
 	default:
