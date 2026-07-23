@@ -18,8 +18,8 @@ import (
 const (
 	DefaultEphemeralSlotTTL = 3 * time.Minute
 	MinEphemeralSlotTTL     = 30 * time.Second
-	// EphemeralSlotCleanupGrace keeps planner and judge capacity reserved while
-	// a timed-out process exits and its lease is released.
+	// EphemeralSlotCleanupGrace keeps planner, coordinator, and judge capacity
+	// reserved while a timed-out process exits and its lease is released.
 	EphemeralSlotCleanupGrace = 30 * time.Second
 	// The supported planner timeout is at most ten minutes. Keep this bound
 	// above that timeout plus cleanup grace so a live attempt never loses its
@@ -151,12 +151,12 @@ func (c *Manager) AcquireWorker(ctx context.Context, agentID string, limit int, 
 	return &Lease{Slot: slot, manager: c}, true, nil
 }
 
-// AcquireEphemeral acquires a planner or judge slot with a bounded lifetime.
-// The database also removes expired non-worker slots during every acquisition,
-// so a crashed caller cannot hold capacity indefinitely.
+// AcquireEphemeral acquires a planner, coordinator, or judge slot with a
+// bounded lifetime. The database also removes expired non-worker slots during
+// every acquisition, so a crashed caller cannot hold capacity indefinitely.
 func (c *Manager) AcquireEphemeral(ctx context.Context, agentID string, limit int, kind store.AgentSlotOwnerKind, board string, ttl time.Duration) (*Lease, bool, error) {
-	if kind != store.AgentSlotOwnerPlanner && kind != store.AgentSlotOwnerJudge {
-		return nil, false, fmt.Errorf("ephemeral slot owner must be planner or judge, got %s", kind)
+	if kind != store.AgentSlotOwnerPlanner && kind != store.AgentSlotOwnerCoordinator && kind != store.AgentSlotOwnerJudge {
+		return nil, false, fmt.Errorf("ephemeral slot owner must be planner, coordinator, or judge, got %s", kind)
 	}
 	coordination, err := c.coordinationStore(ctx)
 	if err != nil {
@@ -210,7 +210,8 @@ func (c *Manager) CleanupTerminalWorkers(ctx context.Context, agentID string) (i
 }
 
 // Release uses a cancellation-independent, bounded context so deferred release
-// still runs after a planner, judge, or worker context is canceled.
+// still runs after a planner, coordinator, judge, or worker context is
+// canceled.
 func (l *Lease) Release(ctx context.Context) error {
 	if l == nil || l.manager == nil {
 		return nil

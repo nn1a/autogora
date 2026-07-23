@@ -566,6 +566,15 @@ func TestSchema18MigrationAddsCoordinationPersistenceAndGraphState(t *testing.T)
 	if version != 19 {
 		t.Fatalf("schema version = %d, want 19", version)
 	}
+	var agentSlotDefinition string
+	if err := migrated.db.QueryRowContext(ctx,
+		"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'global_agent_slots'",
+	).Scan(&agentSlotDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(agentSlotDefinition, "'coordinator'") {
+		t.Fatalf("schema 19 global agent slots do not accept coordinator owners: %s", agentSlotDefinition)
+	}
 	incident, created, err := migrated.CreateCoordinationIncident(ctx, CreateCoordinationIncidentInput{
 		Trigger: model.CoordinationTriggerRetryExhausted, Summary: "Retry budget exhausted",
 		ExpectedGraphRevision: revisionPointer(0),

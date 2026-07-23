@@ -135,10 +135,26 @@ func TestEphemeralSlotBoundsExpiryAndReleasesAfterCancellation(t *testing.T) {
 	if lease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Minute); err != nil || acquired || lease != nil {
 		t.Fatalf("judge bypassed planner capacity: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}
+	if lease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerCoordinator, "default", time.Minute); err != nil || acquired || lease != nil {
+		t.Fatalf("coordinator bypassed planner capacity: %+v, acquired=%v, err=%v", lease, acquired, err)
+	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := plannerLease.Release(canceled); err != nil {
 		t.Fatalf("canceled release: %v", err)
+	}
+	coordinatorLease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerCoordinator, "default", time.Second)
+	if err != nil || !acquired || coordinatorLease == nil {
+		t.Fatalf("coordinator slot after release = %+v, acquired=%v, err=%v", coordinatorLease, acquired, err)
+	}
+	if coordinatorLease.Slot.OwnerKind != store.AgentSlotOwnerCoordinator || coordinatorLease.Slot.ExpiresAt == nil {
+		t.Fatalf("coordinator slot is not a bounded coordinator lease: %+v", coordinatorLease.Slot)
+	}
+	if lease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Minute); err != nil || acquired || lease != nil {
+		t.Fatalf("judge bypassed coordinator capacity: %+v, acquired=%v, err=%v", lease, acquired, err)
+	}
+	if err := coordinatorLease.Release(ctx); err != nil {
+		t.Fatalf("release coordinator slot: %v", err)
 	}
 	judgeLease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Second)
 	if err != nil || !acquired || judgeLease == nil {

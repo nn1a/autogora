@@ -12,9 +12,10 @@ import (
 type AgentSlotOwnerKind string
 
 const (
-	AgentSlotOwnerWorker  AgentSlotOwnerKind = "worker"
-	AgentSlotOwnerPlanner AgentSlotOwnerKind = "planner"
-	AgentSlotOwnerJudge   AgentSlotOwnerKind = "judge"
+	AgentSlotOwnerWorker      AgentSlotOwnerKind = "worker"
+	AgentSlotOwnerPlanner     AgentSlotOwnerKind = "planner"
+	AgentSlotOwnerCoordinator AgentSlotOwnerKind = "coordinator"
+	AgentSlotOwnerJudge       AgentSlotOwnerKind = "judge"
 )
 
 const (
@@ -87,9 +88,9 @@ func normalizeGlobalAgentSlotInput(input AcquireGlobalAgentSlotInput) (AcquireGl
 		if input.TTL != 0 {
 			return AcquireGlobalAgentSlotInput{}, "", nil, errors.New("worker agent slot must not expire")
 		}
-	case AgentSlotOwnerPlanner, AgentSlotOwnerJudge:
+	case AgentSlotOwnerPlanner, AgentSlotOwnerCoordinator, AgentSlotOwnerJudge:
 		if input.TTL <= 0 {
-			return AcquireGlobalAgentSlotInput{}, "", nil, errors.New("planner and judge agent slots require a positive TTL")
+			return AcquireGlobalAgentSlotInput{}, "", nil, errors.New("planner, coordinator, and judge agent slots require a positive TTL")
 		}
 	default:
 		return AcquireGlobalAgentSlotInput{}, "", nil, fmt.Errorf("unsupported global agent slot owner kind %q", input.OwnerKind)
@@ -114,7 +115,7 @@ func normalizeGlobalAgentSlotInput(input AcquireGlobalAgentSlotInput) (AcquireGl
 
 func cleanupExpiredGlobalAgentSlots(ctx context.Context, tx *sql.Tx, timestamp string) (int, error) {
 	result, err := tx.ExecContext(ctx, `DELETE FROM global_agent_slots
-		WHERE owner_kind IN ('planner', 'judge') AND expires_at <= ?`, timestamp)
+		WHERE owner_kind IN ('planner', 'coordinator', 'judge') AND expires_at <= ?`, timestamp)
 	if err != nil {
 		return 0, err
 	}
@@ -123,8 +124,9 @@ func cleanupExpiredGlobalAgentSlots(ctx context.Context, tx *sql.Tx, timestamp s
 }
 
 // AcquireGlobalAgentSlot atomically allocates the lowest available 1-based
-// slot for an agent. Expired short-lived planner and judge slots are removed
-// before every allocation; worker slots remain until explicitly released.
+// slot for an agent. Expired short-lived planner, coordinator, and judge slots
+// are removed before every allocation; worker slots remain until explicitly
+// released.
 func (s *Store) AcquireGlobalAgentSlot(ctx context.Context, raw AcquireGlobalAgentSlotInput) (slot GlobalAgentSlot, acquired bool, err error) {
 	if err := s.requireCoordinationStore(); err != nil {
 		return GlobalAgentSlot{}, false, err
@@ -232,7 +234,7 @@ func (s *Store) ReleaseGlobalAgentSlot(ctx context.Context, expected GlobalAgent
 		if expected.RunID == nil {
 			return false, errors.New("exact worker agent slot requires a run ID")
 		}
-	case AgentSlotOwnerPlanner, AgentSlotOwnerJudge:
+	case AgentSlotOwnerPlanner, AgentSlotOwnerCoordinator, AgentSlotOwnerJudge:
 	default:
 		return false, fmt.Errorf("unsupported global agent slot owner kind %q", expected.OwnerKind)
 	}
@@ -306,8 +308,9 @@ func (s *Store) ListGlobalAgentSlotsForBoard(ctx context.Context, board string) 
 	return result, rows.Err()
 }
 
-// CleanupExpiredGlobalAgentSlots removes only expiring planner and judge
-// leases. Worker slots deliberately have no expiry and require exact release.
+// CleanupExpiredGlobalAgentSlots removes only expiring planner, coordinator,
+// and judge leases. Worker slots deliberately have no expiry and require exact
+// release.
 func (s *Store) CleanupExpiredGlobalAgentSlots(ctx context.Context, current time.Time) (int, error) {
 	if err := s.requireCoordinationStore(); err != nil {
 		return 0, err

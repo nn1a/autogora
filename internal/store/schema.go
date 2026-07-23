@@ -618,7 +618,7 @@ CREATE TABLE IF NOT EXISTS global_workspace_leases (
 CREATE TABLE IF NOT EXISTS global_agent_slots (
   agent_id TEXT NOT NULL,
   slot INTEGER NOT NULL CHECK (slot >= 1),
-  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('worker', 'planner', 'judge')),
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('worker', 'planner', 'coordinator', 'judge')),
   board TEXT NOT NULL,
   run_id TEXT,
   owner_id TEXT NOT NULL UNIQUE,
@@ -628,7 +628,7 @@ CREATE TABLE IF NOT EXISTS global_agent_slots (
   PRIMARY KEY (agent_id, slot),
   CHECK (
     (owner_kind = 'worker' AND run_id IS NOT NULL AND expires_at IS NULL) OR
-    (owner_kind IN ('planner', 'judge') AND expires_at IS NOT NULL)
+    (owner_kind IN ('planner', 'coordinator', 'judge') AND expires_at IS NOT NULL)
   )
 );
 

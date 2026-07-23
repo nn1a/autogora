@@ -68,7 +68,10 @@ func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata bo
 	if manager != nil {
 		capacity := agentcapacity.New(manager)
 		ownerKind := store.AgentSlotOwnerPlanner
-		if role == agentconfig.RoleJudge {
+		switch role {
+		case agentconfig.RoleCoordinator:
+			ownerKind = store.AgentSlotOwnerCoordinator
+		case agentconfig.RoleJudge:
 			ownerKind = store.AgentSlotOwnerJudge
 		}
 		plannerOptions.AcquireAttempt = func(ctx context.Context, _ orchestration.PlannerRequest, candidate orchestration.PlannerCandidate) (orchestration.PlannerAttemptHandle, bool, error) {

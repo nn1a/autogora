@@ -86,7 +86,10 @@ func (s *Service) plannerForRole(metadata boards.Metadata, role agentconfig.Role
 			board = s.Store.Board()
 		}
 		ownerKind := store.AgentSlotOwnerPlanner
-		if role == agentconfig.RoleJudge {
+		switch role {
+		case agentconfig.RoleCoordinator:
+			ownerKind = store.AgentSlotOwnerCoordinator
+		case agentconfig.RoleJudge:
 			ownerKind = store.AgentSlotOwnerJudge
 		}
 		options.AcquireAttempt = func(ctx context.Context, _ orchestration.PlannerRequest, candidate orchestration.PlannerCandidate) (orchestration.PlannerAttemptHandle, bool, error) {

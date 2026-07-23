@@ -177,12 +177,19 @@ func TestGlobalAgentSlotExpiryCleanupSkipsWorkersAndRunsDuringAcquire(t *testing
 	if err != nil || !acquired || planner.ExpiresAt == nil || planner.RunID != nil {
 		t.Fatalf("planner acquire = %+v, acquired=%v, err=%v", planner, acquired, err)
 	}
-	replacement, acquired, err := opened.AcquireGlobalAgentSlot(ctx, AcquireGlobalAgentSlotInput{
-		AgentID: "claude", Limit: 1, OwnerKind: AgentSlotOwnerJudge,
-		Board: "beta", OwnerID: "judge-a", TTL: time.Minute, Current: current.Add(time.Minute),
+	coordinator, acquired, err := opened.AcquireGlobalAgentSlot(ctx, AcquireGlobalAgentSlotInput{
+		AgentID: "claude", Limit: 1, OwnerKind: AgentSlotOwnerCoordinator,
+		Board: "beta", OwnerID: "coordinator-a", TTL: time.Minute, Current: current.Add(time.Minute),
 	})
-	if err != nil || !acquired || replacement.Slot != planner.Slot || replacement.LeaseToken == planner.LeaseToken {
-		t.Fatalf("acquire did not clean expired planner: %+v, acquired=%v, err=%v", replacement, acquired, err)
+	if err != nil || !acquired || coordinator.Slot != planner.Slot || coordinator.LeaseToken == planner.LeaseToken {
+		t.Fatalf("coordinator did not replace expired planner: %+v, acquired=%v, err=%v", coordinator, acquired, err)
+	}
+	judge, acquired, err := opened.AcquireGlobalAgentSlot(ctx, AcquireGlobalAgentSlotInput{
+		AgentID: "claude", Limit: 1, OwnerKind: AgentSlotOwnerJudge,
+		Board: "gamma", OwnerID: "judge-a", TTL: time.Minute, Current: current.Add(2 * time.Minute),
+	})
+	if err != nil || !acquired || judge.Slot != coordinator.Slot || judge.LeaseToken == coordinator.LeaseToken {
+		t.Fatalf("judge did not replace expired coordinator: %+v, acquired=%v, err=%v", judge, acquired, err)
 	}
 
 	runID := "run-worker"
@@ -193,7 +200,7 @@ func TestGlobalAgentSlotExpiryCleanupSkipsWorkersAndRunsDuringAcquire(t *testing
 	if err != nil || !acquired || worker.ExpiresAt != nil {
 		t.Fatalf("worker acquire = %+v, acquired=%v, err=%v", worker, acquired, err)
 	}
-	removed, err := opened.CleanupExpiredGlobalAgentSlots(ctx, current.Add(2*time.Minute))
+	removed, err := opened.CleanupExpiredGlobalAgentSlots(ctx, current.Add(3*time.Minute))
 	if err != nil || removed != 1 {
 		t.Fatalf("explicit expiry cleanup removed %d, err=%v", removed, err)
 	}
@@ -246,6 +253,12 @@ func TestGlobalAgentSlotValidationAndCoordinationScope(t *testing.T) {
 		Board: "alpha", OwnerID: "planner-a", Current: current,
 	}); err == nil {
 		t.Fatal("non-expiring planner was accepted")
+	}
+	if _, _, err := coordination.AcquireGlobalAgentSlot(ctx, AcquireGlobalAgentSlotInput{
+		AgentID: "codex", Limit: 1, OwnerKind: AgentSlotOwnerCoordinator,
+		Board: "alpha", OwnerID: "coordinator-a", Current: current,
+	}); err == nil {
+		t.Fatal("non-expiring coordinator was accepted")
 	}
 
 	rows, err := coordination.db.QueryContext(ctx, "PRAGMA foreign_key_list(global_agent_slots)")
