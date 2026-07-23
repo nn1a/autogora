@@ -3,6 +3,7 @@ package terminalui
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ type fakeBackend struct {
 	tasks   []model.Task
 	details map[string]model.TaskDetail
 	actions []string
+	updates []store.UpdateTaskInput
 }
 
 func (f *fakeBackend) ListTasks(context.Context, store.ListTaskFilter) ([]model.Task, error) {
@@ -110,6 +112,7 @@ func (f *fakeBackend) CreateTask(_ context.Context, input store.CreateTaskInput)
 
 func (f *fakeBackend) UpdateTask(_ context.Context, id string, input store.UpdateTaskInput) (model.TaskDetail, error) {
 	f.actions = append(f.actions, "update:"+id)
+	f.updates = append(f.updates, input)
 	task := testTask(id, "updated", model.TaskStatusTodo)
 	if input.Title != nil {
 		task.Title = *input.Title
@@ -274,6 +277,41 @@ func TestTaskFormCreatesTriageTask(t *testing.T) {
 	m.Update(message)
 	if len(backend.actions) != 1 || backend.actions[0] != "create:Investigate issue" || m.desiredSelection != "created" {
 		t.Fatalf("task creation did not complete: actions=%v selection=%q", backend.actions, m.desiredSelection)
+	}
+}
+
+func TestRunningTaskFormSubmitsOnlyVersionedPriority(t *testing.T) {
+	runID := "run"
+	task := testTask("running", "Active task", model.TaskStatusRunning)
+	task.CurrentRunID = &runID
+	task.UpdatedAt = "2026-07-23T12:00:00.000Z"
+	task.Priority = 2
+	backend := &fakeBackend{details: map[string]model.TaskDetail{task.ID: {Task: task}}}
+	m := NewModel(context.Background(), backend, "default")
+	m.Update(boardContextMsg{context: taskservice.BoardContext{}})
+	m.tasks[task.Status] = []model.Task{task}
+	m.allTasks = []model.Task{task}
+	m.column = statusIndex(m.statuses(), task.Status)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if m.form == nil || m.form.focus != fieldPriority {
+		t.Fatalf("running edit form did not open on priority: %#v", m.form)
+	}
+	m.form.setInputValue(fieldPriority, "9")
+	m.form.setInputValue(fieldTenant, "operations")
+	_, command := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if command == nil {
+		t.Fatal("running metadata update did not submit")
+	}
+	m.Update(command())
+
+	expectedUpdatedAt, priority := task.UpdatedAt, 9
+	want := store.UpdateTaskInput{
+		ExpectedUpdatedAt: &expectedUpdatedAt,
+		Priority:          &priority,
+	}
+	if len(backend.updates) != 1 || !reflect.DeepEqual(backend.updates[0], want) {
+		t.Fatalf("running model update = %#v, want %#v", backend.updates, want)
 	}
 }
 

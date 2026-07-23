@@ -106,6 +106,13 @@ func (m *Model) renderTaskForm(width, height int) string {
 		lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(mode),
 		strings.Join(steps, "   "), "",
 	}
+	if f.activeRun {
+		lines = append(lines,
+			lipgloss.NewStyle().Foreground(colorMuted).Render("Running task · only Priority is editable."),
+			lipgloss.NewStyle().Foreground(colorMuted).Render("Terminate the active run before changing the title, description, tenant, or execution settings."),
+			"",
+		)
+	}
 	fields := f.stepFields()[f.step()]
 	if innerWidth >= 66 && f.step() != 0 {
 		columnWidth := (innerWidth - 3) / 2

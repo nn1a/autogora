@@ -51,20 +51,21 @@ var (
 )
 
 type taskForm struct {
-	mode           string
-	taskID         string
-	activeRun      bool
-	board          string
-	profiles       []orchestration.ProfileRoute
-	profileIndex   int
-	statusIndex    int
-	runtimeIndex   int
-	workspaceIndex int
-	goalMode       bool
-	focus          formField
-	inputs         map[formField]textinput.Model
-	body           textarea.Model
-	err            error
+	mode              string
+	taskID            string
+	expectedUpdatedAt string
+	activeRun         bool
+	board             string
+	profiles          []orchestration.ProfileRoute
+	profileIndex      int
+	statusIndex       int
+	runtimeIndex      int
+	workspaceIndex    int
+	goalMode          bool
+	focus             formField
+	inputs            map[formField]textinput.Model
+	body              textarea.Model
+	err               error
 }
 
 func newTextInput(value, placeholder string, limit int) textinput.Model {
@@ -118,7 +119,7 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 
 func editTaskForm(board string, profiles []orchestration.ProfileRoute, task model.Task) *taskForm {
 	form := newTaskForm(board, profiles, task.Status)
-	form.mode, form.taskID, form.activeRun = "edit", task.ID, task.CurrentRunID != nil
+	form.mode, form.taskID, form.expectedUpdatedAt, form.activeRun = "edit", task.ID, task.UpdatedAt, task.CurrentRunID != nil
 	form.setInputValue(fieldTitle, task.Title)
 	form.setInputValue(fieldPriority, strconv.Itoa(task.Priority))
 	form.setInputValue(fieldAssignee, pointer(task.Assignee, ""))
@@ -141,6 +142,9 @@ func editTaskForm(board string, profiles []orchestration.ProfileRoute, task mode
 			form.profileIndex = index + 1
 			break
 		}
+	}
+	if form.activeRun {
+		form.focus = fieldPriority
 	}
 	form.syncFocus()
 	return form
@@ -197,10 +201,10 @@ func (f *taskForm) locked(field formField) bool {
 		return false
 	}
 	switch field {
-	case fieldProfile, fieldAssignee, fieldRuntime, fieldWorkspaceKind, fieldWorkspace, fieldBranch:
-		return true
-	default:
+	case fieldPriority:
 		return false
+	default:
+		return true
 	}
 }
 
@@ -219,7 +223,7 @@ func (f *taskForm) syncFocus() tea.Cmd {
 		}
 		f.inputs[field] = input
 	}
-	if f.focus == fieldBody {
+	if f.focus == fieldBody && !f.locked(fieldBody) {
 		commands = append(commands, f.body.Focus())
 	} else {
 		f.body.Blur()
@@ -248,11 +252,14 @@ func (f *taskForm) moveFocus(delta int) tea.Cmd {
 
 func (f *taskForm) moveStep(delta int) tea.Cmd {
 	steps := f.stepFields()
-	next := (f.step() + delta + len(steps)) % len(steps)
-	for _, field := range steps[next] {
-		if !f.locked(field) {
-			f.focus = field
-			break
+	next := f.step()
+	for range len(steps) {
+		next = (next + delta + len(steps)) % len(steps)
+		for _, field := range steps[next] {
+			if !f.locked(field) {
+				f.focus = field
+				return f.syncFocus()
+			}
 		}
 	}
 	return f.syncFocus()
@@ -351,7 +358,7 @@ func (f *taskForm) Update(message tea.KeyMsg) (tea.Cmd, formAction) {
 }
 
 func (f *taskForm) UpdateMessage(message tea.Msg) tea.Cmd {
-	if f.focus == fieldBody {
+	if f.focus == fieldBody && !f.locked(fieldBody) {
 		var command tea.Cmd
 		f.body, command = f.body.Update(message)
 		return command
@@ -367,11 +374,14 @@ func (f *taskForm) UpdateMessage(message tea.Msg) tea.Cmd {
 }
 
 func (f *taskForm) validate() error {
-	if strings.TrimSpace(f.inputs[fieldTitle].Value()) == "" {
-		return errors.New("title cannot be empty")
-	}
 	if _, err := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value())); err != nil {
 		return errors.New("priority must be an integer")
+	}
+	if f.activeRun {
+		return nil
+	}
+	if strings.TrimSpace(f.inputs[fieldTitle].Value()) == "" {
+		return errors.New("title cannot be empty")
 	}
 	if value := strings.TrimSpace(f.inputs[fieldMaxRuntime].Value()); value != "" {
 		seconds, err := strconv.Atoi(value)
@@ -443,6 +453,13 @@ func (f *taskForm) createInput() store.CreateTaskInput {
 
 func (f *taskForm) updateInput() store.UpdateTaskInput {
 	priority, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldPriority].Value()))
+	expectedUpdatedAt := f.expectedUpdatedAt
+	if f.activeRun {
+		return store.UpdateTaskInput{
+			ExpectedUpdatedAt: &expectedUpdatedAt,
+			Priority:          &priority,
+		}
+	}
 	maxRetries, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldMaxRetries].Value()))
 	goalMaxTurns, _ := strconv.Atoi(strings.TrimSpace(f.inputs[fieldGoalMaxTurns].Value()))
 	var maxRuntime *int
@@ -453,7 +470,8 @@ func (f *taskForm) updateInput() store.UpdateTaskInput {
 	title, body := strings.TrimSpace(f.inputs[fieldTitle].Value()), f.body.Value()
 	runtime, kind, skills, goal := model.Runtime(formRuntimes[f.runtimeIndex]), model.WorkspaceKind(formWorkspaceKinds[f.workspaceIndex]), splitSkills(f.inputs[fieldSkills].Value()), f.goalMode
 	return store.UpdateTaskInput{
-		Title: &title, Body: &body, Priority: &priority, Runtime: &runtime, WorkspaceKind: &kind, Skills: &skills, GoalMode: &goal,
+		ExpectedUpdatedAt: &expectedUpdatedAt,
+		Title:             &title, Body: &body, Priority: &priority, Runtime: &runtime, WorkspaceKind: &kind, Skills: &skills, GoalMode: &goal,
 		MaxRuntimeSeconds: store.OptionalInt{Set: true, Value: maxRuntime}, MaxRetries: &maxRetries, GoalMaxTurns: &goalMaxTurns,
 		Assignee:    store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldAssignee].Value())},
 		Tenant:      store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldTenant].Value())},

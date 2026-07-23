@@ -1,6 +1,7 @@
 package terminalui
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/store"
 )
 
 func TestTaskFormAppliesBoardProfileToAgentFields(t *testing.T) {
@@ -79,18 +81,53 @@ func TestTaskFormBuildsCompleteCreateInput(t *testing.T) {
 	}
 }
 
-func TestRunningTaskFormLocksOwnershipButAllowsDescription(t *testing.T) {
+func TestRunningTaskFormOnlyAllowsPriority(t *testing.T) {
 	runID := "run"
 	task := testTask("task", "Running work", model.TaskStatusRunning)
 	task.CurrentRunID = &runID
+	task.UpdatedAt = "2026-07-23T12:00:00.000Z"
+	task.Priority = 3
+	tenant := "product"
+	task.Tenant = &tenant
 	form := editTaskForm("default", nil, task)
-	for _, field := range []formField{fieldProfile, fieldAssignee, fieldRuntime, fieldWorkspaceKind, fieldWorkspace} {
-		if !form.locked(field) {
-			t.Fatalf("field %v should be locked", field)
+	for _, field := range form.fields() {
+		wantLocked := field != fieldPriority
+		if form.locked(field) != wantLocked {
+			t.Fatalf("field %v locked = %v, want %v", field, form.locked(field), wantLocked)
 		}
 	}
-	if form.locked(fieldTitle) || form.locked(fieldBody) || form.locked(fieldPriority) {
-		t.Fatal("non-ownership fields should remain editable")
+	if form.focus != fieldPriority {
+		t.Fatalf("running form focus = %v, want priority", form.focus)
+	}
+	form.moveStep(1)
+	if form.focus != fieldPriority {
+		t.Fatalf("section navigation did not skip fully locked sections: focus=%v", form.focus)
+	}
+
+	form.setInputValue(fieldPriority, "8")
+	form.setInputValue(fieldTenant, "operations")
+	form.setInputValue(fieldMaxRetries, "locked-invalid-value")
+	if err := form.validate(); err != nil {
+		t.Fatalf("locked execution fields affected validation: %v", err)
+	}
+	expectedUpdatedAt, priority := task.UpdatedAt, 8
+	want := store.UpdateTaskInput{
+		ExpectedUpdatedAt: &expectedUpdatedAt,
+		Priority:          &priority,
+	}
+	if input := form.updateInput(); !reflect.DeepEqual(input, want) {
+		t.Fatalf("running update input = %#v, want %#v", input, want)
+	}
+
+	view := (&Model{form: form}).renderTaskForm(120, 34)
+	for _, text := range []string{
+		"only Priority is editable",
+		"Terminate the active run",
+		"locked while Running",
+	} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("running form omitted guidance %q:\n%s", text, view)
+		}
 	}
 }
 
