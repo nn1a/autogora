@@ -51,7 +51,7 @@ func exceptionalIntegrationFailure(err error) (*PrerequisiteIntegrationError, bo
 		return nil, false
 	}
 	switch integrationErr.Code {
-	case IntegrationFailureConflict, IntegrationFailureHistoryRewrite:
+	case IntegrationFailureConflict, IntegrationFailureHistoryRewrite, IntegrationFailureResolutionExhausted:
 		return integrationErr, true
 	default:
 		return nil, false
@@ -83,6 +83,8 @@ func persistExceptionalIntegrationIncident(opened *store.Store, taskID string, d
 	summary := "Prerequisite integration conflict requires coordination"
 	if integrationErr.Code == IntegrationFailureHistoryRewrite {
 		summary = "Worker history rewrite requires coordination"
+	} else if integrationErr.Code == IntegrationFailureResolutionExhausted {
+		summary = "Finalizer integration resolution exhausted"
 	}
 	if reason := strings.TrimSpace(integrationErr.Reason); reason != "" {
 		summary += ": " + reason

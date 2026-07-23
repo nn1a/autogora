@@ -2,6 +2,11 @@ package dispatcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -215,6 +220,139 @@ func TestRunnerCommandUsesRegisteredExecutableWithEnvironmentOverride(t *testing
 	command, err = BuildRunnerCommand(claim, options, "")
 	if err != nil || command.Command != "/tmp/test-codex" {
 		t.Fatalf("environment command override = %#v, %v", command, err)
+	}
+}
+
+func finalizerResolutionRunnerFixture(t *testing.T, targetCount int) (model.ClaimedTask, RunnerOptions) {
+	t.Helper()
+	claim := claimedTask(t, model.RuntimeCline)
+	claim.Task.Task.WorkflowRole = model.WorkflowRoleFinalizer
+	repository := gitRepositoryFixture(t)
+	worktree := filepath.Join(t.TempDir(), "finalizer")
+	finalizerGit(t, repository, "worktree", "add", "-q", "--detach", worktree, "HEAD")
+	base := finalizerGit(t, worktree, "rev-parse", "HEAD^{commit}")
+	repositoryPath := repository
+	claim.Workspace = &model.RunWorkspace{
+		RunID: claim.Run.ID, TaskID: claim.Task.Task.ID, Path: worktree,
+		Kind: model.WorkspaceWorktree, RepositoryPath: &repositoryPath,
+		BaseCommit: &base, Generated: true,
+	}
+	targets := make([]model.IntegrationResolutionTarget, 0, targetCount)
+	for index := range targetCount {
+		targets = append(targets, model.IntegrationResolutionTarget{
+			PrerequisiteID: "parent-" + strings.Repeat("x", 4) + fmt.Sprint(index),
+			ChangeSetID:    "changeset-" + fmt.Sprint(index), HeadCommit: base,
+			DurableRef:      "refs/autogora/runs/parent-" + fmt.Sprint(index),
+			MergeInProgress: index == 0,
+		})
+	}
+	fingerprint := strings.Repeat("f", 64)
+	common := finalizerGit(t, worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	manifestPath := filepath.Join(common, "autogora", "integration-resolutions", claim.Run.ID+".json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := model.IntegrationResolutionManifest{
+		Version: model.IntegrationResolutionManifestVersion,
+		TaskID:  claim.Task.Task.ID, RunID: claim.Run.ID,
+		ConflictFingerprint: fingerprint, WorkspacePath: worktree,
+		Targets: targets, ConflictingFiles: []string{"README.md"},
+		ConflictingFileCount: 1,
+	}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	claim.IntegrationResolution = &model.IntegrationResolution{
+		Attempt: 2, MaxAttempts: 3, ConflictFingerprint: fingerprint,
+		WorkspacePath: worktree, ManifestPath: manifestPath,
+		ManifestSHA256:       hex.EncodeToString(digest[:]),
+		ConflictingFileCount: 1, TargetCount: len(targets), Targets: targets,
+	}
+	options := RunnerOptions{
+		DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "autogora"),
+		AllowWrites: true,
+	}
+	return claim, options
+}
+
+func TestFinalizerResolutionPromptCarriesBoundedHostValidatedHandoff(t *testing.T) {
+	claim, options := finalizerResolutionRunnerFixture(t, 1)
+	command, err := BuildRunnerCommand(claim, options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := strings.Join(command.Args, " ")
+	for _, required := range []string{
+		"assigned Autogora finalizer", "attempt 2 of 3", "real Git merge conflict",
+		"immutable host-authored handoff manifest",
+		"finish its in-progress merge", "final history must retain every target head",
+		"host will reject an unresolved index",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("finalizer prompt missing %q: %s", required, prompt)
+		}
+	}
+	if command.Env["AUTOGORA_INTEGRATION_RESOLUTION_MANIFEST"] != claim.IntegrationResolution.ManifestPath ||
+		command.Env["AUTOGORA_INTEGRATION_RESOLUTION_SHA256"] != claim.IntegrationResolution.ManifestSHA256 ||
+		command.Env["AUTOGORA_INTEGRATION_RESOLUTION"] != "" {
+		t.Fatalf("bounded resolution environment = %#v", command.Env)
+	}
+}
+
+func TestFinalizerResolutionRunnerRejectsForgedTransportState(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*model.ClaimedTask, *RunnerOptions)
+		want   string
+	}{
+		{name: "ordinary role", mutate: func(claim *model.ClaimedTask, _ *RunnerOptions) {
+			claim.Task.Task.WorkflowRole = model.WorkflowRoleWorker
+		}, want: "requires a finalizer"},
+		{name: "read only", mutate: func(_ *model.ClaimedTask, options *RunnerOptions) {
+			options.AllowWrites = false
+		}, want: "requires workspace writes"},
+		{name: "shared workspace", mutate: func(claim *model.ClaimedTask, _ *RunnerOptions) {
+			claim.Workspace.Generated = false
+		}, want: "generated isolated worktree"},
+		{name: "workspace mismatch", mutate: func(claim *model.ClaimedTask, _ *RunnerOptions) {
+			claim.IntegrationResolution.WorkspacePath = t.TempDir()
+		}, want: "does not match"},
+		{name: "digest mismatch", mutate: func(claim *model.ClaimedTask, _ *RunnerOptions) {
+			claim.IntegrationResolution.ManifestSHA256 = strings.Repeat("0", 64)
+		}, want: "digest mismatch"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claim, options := finalizerResolutionRunnerFixture(t, 1)
+			test.mutate(&claim, &options)
+			if _, err := BuildRunnerCommand(claim, options, ""); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("BuildRunnerCommand error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFinalizerResolutionLargeFanInDoesNotExpandArgvOrEnvironment(t *testing.T) {
+	claim, options := finalizerResolutionRunnerFixture(t, 5000)
+	command, err := BuildRunnerCommand(claim, options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transportSize := len(strings.Join(command.Args, "\x00"))
+	for key, value := range command.Env {
+		transportSize += len(key) + len(value) + 1
+	}
+	if transportSize > 16*1024 {
+		t.Fatalf("large fan-in transport grew to %d bytes", transportSize)
+	}
+	if strings.Contains(strings.Join(command.Args, " "), "changeset-4999") {
+		t.Fatal("target details leaked into argv")
 	}
 }
 

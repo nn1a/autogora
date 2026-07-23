@@ -60,15 +60,139 @@ func TestExecuteTurnDoesNotStartAfterDeferredReclaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(t.TempDir(), "started")
+	gateCalls := 0
 	result := ExecuteTurn(ctx, RunnerCommand{
 		Command: "/bin/sh", Args: []string{"-c", "touch \"$1\"", "sh", marker}, CWD: t.TempDir(),
 	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, NewProcessSet(),
-		filepath.Join(t.TempDir(), "run.log"), nil)
+		filepath.Join(t.TempDir(), "run.log"), nil, func(context.Context) (TurnStartCompensation, error) {
+			gateCalls++
+			return nil, nil
+		})
 	if !errors.Is(result.SpawnError, store.ErrRunTerminationPending) {
 		t.Fatalf("spawn error = %v, want ErrRunTerminationPending", result.SpawnError)
 	}
+	if gateCalls != 0 {
+		t.Fatalf("start gate calls = %d, want 0 after deferred reclaim", gateCalls)
+	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("worker command started despite reclaim request: %v", err)
+	}
+}
+
+func TestExecuteTurnDoesNotInvokeStartGateWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "cancel before start gate", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	marker := filepath.Join(t.TempDir(), "started")
+	gateCalls := 0
+	cancel()
+	result := ExecuteTurn(ctx, RunnerCommand{
+		Command: "/bin/sh", Args: []string{"-c", "touch \"$1\"", "sh", marker}, CWD: t.TempDir(),
+	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, NewProcessSet(),
+		filepath.Join(t.TempDir(), "run.log"), nil, func(context.Context) (TurnStartCompensation, error) {
+			gateCalls++
+			return nil, nil
+		})
+	if !result.Canceled || !errors.Is(result.SpawnError, context.Canceled) {
+		t.Fatalf("execution = %#v, want canceled before spawn", result)
+	}
+	if gateCalls != 0 {
+		t.Fatalf("start gate calls = %d, want 0", gateCalls)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker command started despite canceled context: %v", err)
+	}
+}
+
+func TestExecuteTurnCompensatesStartGateWhenSpawnFails(t *testing.T) {
+	ctx := context.Background()
+	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "compensate failed spawn", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	gateCalls, compensationCalls := 0, 0
+	compensationErr := errors.New("compensation failed")
+	result := ExecuteTurn(ctx, RunnerCommand{
+		Command: filepath.Join(t.TempDir(), "missing-worker"), CWD: t.TempDir(),
+	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, NewProcessSet(),
+		filepath.Join(t.TempDir(), "run.log"), nil, func(context.Context) (TurnStartCompensation, error) {
+			gateCalls++
+			return func(compensationCtx context.Context) error {
+				compensationCalls++
+				if err := compensationCtx.Err(); err != nil {
+					t.Fatalf("compensation context is already done: %v", err)
+				}
+				if _, ok := compensationCtx.Deadline(); !ok {
+					t.Fatal("compensation context has no deadline")
+				}
+				return compensationErr
+			}, nil
+		})
+	if result.SpawnError == nil || !errors.Is(result.SpawnError, os.ErrNotExist) {
+		t.Fatalf("spawn error = %v, want executable not found", result.SpawnError)
+	}
+	if !errors.Is(result.SpawnError, compensationErr) {
+		t.Fatalf("spawn error = %v, want joined compensation error", result.SpawnError)
+	}
+	if gateCalls != 1 || compensationCalls != 1 {
+		t.Fatalf("gate calls = %d, compensation calls = %d; want 1 each", gateCalls, compensationCalls)
+	}
+}
+
+func TestExecuteTurnDoesNotCompensateAfterProcessStarts(t *testing.T) {
+	ctx := context.Background()
+	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "started worker", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	gateCalls, compensationCalls := 0, 0
+	result := ExecuteTurn(ctx, RunnerCommand{
+		Command: "/bin/sh", Args: []string{"-c", "sleep 30"}, CWD: t.TempDir(),
+	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: "invalid-token"}, NewProcessSet(),
+		filepath.Join(t.TempDir(), "run.log"), nil, func(context.Context) (TurnStartCompensation, error) {
+			gateCalls++
+			return func(context.Context) error {
+				compensationCalls++
+				return nil
+			}, nil
+		})
+	if result.SpawnError == nil || !strings.Contains(result.SpawnError.Error(), "record worker spawn") {
+		t.Fatalf("spawn error = %v, want spawn-record failure after process start", result.SpawnError)
+	}
+	if gateCalls != 1 || compensationCalls != 0 {
+		t.Fatalf("gate calls = %d, compensation calls = %d; want 1 and 0", gateCalls, compensationCalls)
 	}
 }
 

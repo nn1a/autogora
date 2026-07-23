@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 20
+const schemaVersion = 21
 
 type Store struct {
 	db              *sql.DB
@@ -623,6 +623,30 @@ CREATE TABLE IF NOT EXISTS run_workspaces (
   prepared_at TEXT NOT NULL
 );
 
+-- Conflict-resolution preparations and started attempts are control-plane
+-- safety state. They survive event retention so GC cannot reset retry bounds.
+CREATE TABLE IF NOT EXISTS integration_resolution_attempts (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  conflict_fingerprint TEXT NOT NULL
+    CHECK (length(conflict_fingerprint) = 64 AND conflict_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+  attempt INTEGER CHECK (attempt IS NULL OR attempt >= 1),
+  max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+  workspace_path TEXT NOT NULL,
+  prerequisite_id TEXT NOT NULL,
+  change_set_id TEXT NOT NULL,
+  conflicting_files_json TEXT NOT NULL DEFAULT '[]',
+  prepared_at TEXT NOT NULL,
+  started_at TEXT,
+  CHECK (
+    (attempt IS NULL AND started_at IS NULL) OR
+    (attempt IS NOT NULL AND started_at IS NOT NULL)
+  ),
+  CHECK (attempt IS NULL OR attempt <= max_attempts),
+  PRIMARY KEY (task_id, conflict_fingerprint, run_id),
+  UNIQUE (task_id, conflict_fingerprint, attempt)
+);
+
 CREATE TABLE IF NOT EXISTS run_agent_configs (
   run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -894,6 +918,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(board, status, scheduled_at,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(board, idempotency_key) WHERE idempotency_key IS NOT NULL AND status <> 'archived';
 CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
+CREATE INDEX IF NOT EXISTS idx_integration_resolution_attempts_task
+  ON integration_resolution_attempts(task_id, conflict_fingerprint, attempt DESC);
 CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_id, configured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_health_due ON agent_health(status, cooldown_until);
 CREATE INDEX IF NOT EXISTS idx_auto_decompose_due ON auto_decompose_state(next_attempt_at, claim_expires_at);

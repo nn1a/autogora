@@ -1329,11 +1329,32 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
+	blockPreparedResolution := func(reason string, exitCode int) (bool, error) {
+		if prepared.IntegrationResolution == nil {
+			return false, nil
+		}
+		if prepared.Workspace != nil {
+			reason += "; unresolved finalizer workspace preserved at " + prepared.Workspace.Path
+		}
+		durable, cancel := durableContext()
+		defer cancel()
+		err := recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+			Outcome: model.RunStatusBlocked, Reason: reason,
+			Kind: model.BlockKindNeedsInput, ExitCode: &exitCode,
+		})
+		return true, err
+	}
 	logsRoot, rootsErr := manager.LogsRoot(prepared.Task.Task.Board)
 	workspaceRoot, workspaceErr := manager.WorkspaceRoot(prepared.Task.Task.Board)
 	attachmentsRoot, attachmentsErr := manager.AttachmentsRoot(prepared.Task.Task.Board)
 	if rootsErr != nil || workspaceErr != nil || attachmentsErr != nil {
 		err := errors.Join(rootsErr, workspaceErr, attachmentsErr)
+		if blocked, blockErr := blockPreparedResolution("Board path resolution failed before finalizer launch: "+err.Error(), 1); blocked {
+			if blockErr != nil {
+				return fmt.Errorf("preserve finalizer resolution after board path failure for %s: %w", claim.Task.Task.ID, blockErr)
+			}
+			return nil
+		}
 		durable, cancel := durableContext()
 		defer cancel()
 		if persistErr := failRunDurably(durable, opened, scope, "Board path resolution failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit}); persistErr != nil {
@@ -1342,6 +1363,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return nil
 	}
 	if err := os.MkdirAll(logsRoot, 0o755); err != nil {
+		if blocked, blockErr := blockPreparedResolution("Log directory creation failed before finalizer launch: "+err.Error(), 1); blocked {
+			if blockErr != nil {
+				return fmt.Errorf("preserve finalizer resolution after log directory failure for %s: %w", prepared.Task.Task.ID, blockErr)
+			}
+			return nil
+		}
 		durable, cancel := durableContext()
 		defer cancel()
 		persistErr := failRunDurably(durable, opened, scope, "Log directory creation failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
@@ -1384,9 +1411,15 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		metadata, metadataErr := manager.Read(prepared.Task.Task.Board)
 		profileSet, profileErr := configuredProfiles(manager, prepared.Task.Task.Board, options)
 		if metadataErr != nil || profileErr != nil {
+			reason := "Goal judge configuration failed: " + errors.Join(metadataErr, profileErr).Error()
+			if blocked, blockErr := blockPreparedResolution(reason, 1); blocked {
+				if blockErr != nil {
+					return fmt.Errorf("preserve finalizer resolution after goal judge configuration failure for %s: %w", taskID, blockErr)
+				}
+				return nil
+			}
 			durable, cancel := durableContext()
 			defer cancel()
-			reason := "Goal judge configuration failed: " + errors.Join(metadataErr, profileErr).Error()
 			if persistErr := blockManagedRun(durable, reason, model.BlockKindTransient, 0); persistErr != nil {
 				return fmt.Errorf("persist goal judge configuration block for %s: %w", taskID, persistErr)
 			}
@@ -1398,9 +1431,15 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		goalPlanner, err = createRolePlanner(manager, opened, metadata, profileSet, options, agentconfig.RoleJudge, plannerCWD)
 		if err != nil {
+			reason := "Goal judge setup failed: " + err.Error()
+			if blocked, blockErr := blockPreparedResolution(reason, 1); blocked {
+				if blockErr != nil {
+					return fmt.Errorf("preserve finalizer resolution after goal judge setup failure for %s: %w", taskID, blockErr)
+				}
+				return nil
+			}
 			durable, cancel := durableContext()
 			defer cancel()
-			reason := "Goal judge setup failed: " + err.Error()
 			if persistErr := blockManagedRun(durable, reason, model.BlockKindTransient, 0); persistErr != nil {
 				return fmt.Errorf("persist goal judge setup block for %s: %w", taskID, persistErr)
 			}
@@ -1443,6 +1482,42 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return failRunDurably(durable, opened, scope, runError, failure)
 	}
 	health := agenthealth.New(manager, opened)
+	resolutionStarted := false
+	var resolutionStartGate TurnStartGate
+	if resolution := prepared.IntegrationResolution; resolution != nil {
+		resolutionStartGate = func(startCtx context.Context) (TurnStartCompensation, error) {
+			if resolutionStarted {
+				return nil, nil
+			}
+			if err := validateIntegrationResolutionHandoff(*prepared, runnerOptions, resolution.WorkspacePath); err != nil {
+				return nil, fmt.Errorf("revalidate integration resolution handoff before launch: %w", err)
+			}
+			if err := workspace.ValidateIntegrationResolutionStart(startCtx, *resolution); err != nil {
+				return nil, fmt.Errorf("revalidate live integration conflict before launch: %w", err)
+			}
+			input := store.StartIntegrationResolutionInput{
+				ConflictFingerprint: resolution.ConflictFingerprint,
+				ExpectedAttempt:     resolution.Attempt,
+				ExpectedMaxAttempts: resolution.MaxAttempts,
+			}
+			started, err := opened.StartIntegrationResolutionAttempt(startCtx, scope, input)
+			if err != nil {
+				return nil, err
+			}
+			if !started.StartedNow {
+				return nil, errors.New("integration resolution attempt already crossed its process-start boundary")
+			}
+			resolutionStarted = true
+			resolution.Attempt, resolution.MaxAttempts = started.Attempt, started.MaxAttempts
+			return func(compensationCtx context.Context) error {
+				if err := opened.CompensateIntegrationResolutionStart(compensationCtx, scope, input); err != nil {
+					return err
+				}
+				resolutionStarted = false
+				return nil
+			}, nil
+		}
+	}
 
 	for {
 		var command RunnerCommand
@@ -1452,6 +1527,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			command, err = BuildRunnerCommand(*prepared, runnerOptions, sessionID)
 		}
 		if err != nil {
+			if blocked, blockErr := blockPreparedResolution("Runner command construction failed before finalizer launch: "+err.Error(), 1); blocked {
+				if blockErr != nil {
+					return fmt.Errorf("preserve finalizer resolution after runner construction failure for %s: %w", taskID, blockErr)
+				}
+				return nil
+			}
 			durable, cancel := durableContext()
 			preserved, persistErr := preserveIfChanged(durable, "Runner command construction failed after work began: "+err.Error(), 1)
 			if persistErr == nil && !preserved {
@@ -1474,6 +1555,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		healthObservation, observationErr := health.Begin(ctx, configured.Profile, profile.GlobalRegistered)
 		if observationErr != nil {
+			if blocked, blockErr := blockPreparedResolution("Agent health observation failed before finalizer launch: "+observationErr.Error(), 1); blocked {
+				if blockErr != nil {
+					return fmt.Errorf("preserve finalizer resolution after agent health failure for %s: %w", taskID, blockErr)
+				}
+				return nil
+			}
 			durable, cancel := durableContext()
 			countFailure := false
 			persistErr := failRunDurably(durable, opened, scope, "Unable to reserve agent availability observation: "+observationErr.Error(), store.FailRunOptions{
@@ -1491,7 +1578,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return nil
 		}
 		options.log("launch %s via %s/%s profile=%s goal_turn=%d log=%s", taskID, prepared.Task.Task.Runtime, modelName, configured.Profile, turn, logPath)
-		execution := ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit)
+		var execution TurnExecution
+		if resolutionStartGate != nil {
+			execution = ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit, resolutionStartGate)
+		} else {
+			execution = ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit)
+		}
 		durable, cancel := durableContext()
 		currentDetail, getErr := retryStoreOperation(durable, func() (model.TaskDetail, error) {
 			return opened.GetTask(durable, taskID)

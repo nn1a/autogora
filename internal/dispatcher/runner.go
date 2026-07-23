@@ -1,13 +1,18 @@
 package dispatcher
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/nn1a/autogora/internal/filesecurity"
 	"github.com/nn1a/autogora/internal/model"
 )
 
@@ -51,7 +56,32 @@ func shellQuote(value string) string {
 
 func workerPrompt(claim model.ClaimedTask, cliPath string) string {
 	task := claim.Task.Task
-	instructions := []string{fmt.Sprintf("You are the assigned Autogora worker for %s.", task.ID)}
+	role := "worker"
+	if task.WorkflowRole == model.WorkflowRoleFinalizer {
+		role = "finalizer"
+	}
+	instructions := []string{fmt.Sprintf("You are the assigned Autogora %s for %s.", role, task.ID)}
+	if resolution := claim.IntegrationResolution; resolution != nil {
+		instructions = append(instructions,
+			fmt.Sprintf(
+				"This is bounded integration-resolution attempt %d of %d. Autogora preserved a real Git merge conflict in this run's isolated worktree.",
+				resolution.Attempt, resolution.MaxAttempts,
+			),
+			fmt.Sprintf(
+				"Read the immutable host-authored handoff manifest at %q and verify its SHA-256 is %s. It contains %d target commit(s) and bounded guidance for %d conflicting file(s), with %d omitted from the advisory list.",
+				resolution.ManifestPath, resolution.ManifestSHA256, resolution.TargetCount,
+				resolution.ConflictingFileCount, resolution.ConflictingFilesOmitted,
+			),
+			"Resolve the current index and finish its in-progress merge. Then integrate each remaining target in listed order unless its head is already an ancestor of HEAD.",
+			"You may choose the exact conflict resolution, but the final history must retain every target head. Do not copy a result while dropping its Git ancestry.",
+			"Run the relevant tests and inspect Git status before completing. The host will reject an unresolved index, a missing target head, or a rewritten prepared base.",
+			"If a safe resolution is not possible in this attempt, block with concrete evidence; Autogora preserves this worktree for manual review.",
+		)
+	} else if task.WorkflowRole == model.WorkflowRoleFinalizer {
+		instructions = append(instructions,
+			"This is the explicit final integration task. Preserve every prerequisite change set in Git history, run final validation, and complete only with an integration-ready result.",
+		)
+	}
 	if task.Runtime == model.RuntimeCline || task.Runtime == model.RuntimeGemini {
 		bridge := shellQuote(cliPath)
 		if task.Runtime == model.RuntimeCline {
@@ -122,7 +152,7 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 	if task.Tenant != nil {
 		tenant = *task.Tenant
 	}
-	return map[string]string{
+	result := map[string]string{
 		"AUTOGORA_DB": dbPath, "AUTOGORA_BOARD": task.Board, "AUTOGORA_TASK_ID": task.ID,
 		"AUTOGORA_RUN_ID": run.ID, "AUTOGORA_CLAIM_TOKEN": claim.ClaimToken, "AUTOGORA_WORKER_ID": run.WorkerID,
 		"AUTOGORA_TENANT": tenant, "AUTOGORA_WORKSPACE": cwd, "AUTOGORA_WORKSPACES_ROOT": options.WorkspaceRoot,
@@ -130,6 +160,214 @@ func commandEnvironment(claim model.ClaimedTask, options RunnerOptions, cwd, dbP
 		"AUTOGORA_CLI":           options.CLIPath,
 		"AUTOGORA_AGENT_PROFILE": options.Profile, "AUTOGORA_MODEL": options.Model, "AUTOGORA_PROVIDER": options.Provider,
 	}
+	if claim.IntegrationResolution != nil {
+		result["AUTOGORA_INTEGRATION_RESOLUTION_MANIFEST"] = claim.IntegrationResolution.ManifestPath
+		result["AUTOGORA_INTEGRATION_RESOLUTION_SHA256"] = claim.IntegrationResolution.ManifestSHA256
+	}
+	return result
+}
+
+func canonicalRunnerPath(value string) (string, error) {
+	value, err := filepath.Abs(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	if evaluated, err := filepath.EvalSymlinks(value); err == nil {
+		value = evaluated
+	}
+	return filepath.Clean(value), nil
+}
+
+func safeRunnerPathComponent(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z') &&
+			!(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') &&
+			character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func validRunnerObjectID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func runnerGitCommonDirectory(cwd string) (string, error) {
+	command := exec.Command("git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolve finalizer Git metadata directory: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return canonicalRunnerPath(string(output))
+}
+
+func validateResolutionTarget(target model.IntegrationResolutionTarget, index int) error {
+	if strings.TrimSpace(target.PrerequisiteID) == "" || strings.TrimSpace(target.ChangeSetID) == "" {
+		return errors.New("integration resolution manifest contains a target without provenance")
+	}
+	if !validRunnerObjectID(target.HeadCommit) {
+		return errors.New("integration resolution manifest contains an invalid target commit")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(target.DurableRef), "refs/autogora/runs/") {
+		return errors.New("integration resolution manifest contains an invalid durable ref")
+	}
+	if target.MergeInProgress != (index == 0) {
+		return errors.New("integration resolution manifest has an invalid merge-in-progress target")
+	}
+	return nil
+}
+
+func sameResolutionTarget(left, right model.IntegrationResolutionTarget) bool {
+	return left.PrerequisiteID == right.PrerequisiteID &&
+		left.ChangeSetID == right.ChangeSetID &&
+		strings.EqualFold(left.HeadCommit, right.HeadCommit) &&
+		left.DurableRef == right.DurableRef &&
+		left.MergeInProgress == right.MergeInProgress
+}
+
+func validateIntegrationResolutionHandoff(claim model.ClaimedTask, options RunnerOptions, cwd string) error {
+	resolution := claim.IntegrationResolution
+	if resolution == nil {
+		return nil
+	}
+	if claim.Task.Task.WorkflowRole != model.WorkflowRoleFinalizer {
+		return errors.New("integration resolution handoff requires a finalizer task")
+	}
+	if !options.AllowWrites {
+		return errors.New("integration resolution handoff requires workspace writes")
+	}
+	if claim.Workspace == nil || claim.Workspace.Kind != model.WorkspaceWorktree || !claim.Workspace.Generated {
+		return errors.New("integration resolution handoff requires a generated isolated worktree")
+	}
+	if resolution.Attempt < 1 || resolution.MaxAttempts < resolution.Attempt {
+		return errors.New("integration resolution handoff has an invalid attempt bound")
+	}
+	fingerprint := strings.ToLower(strings.TrimSpace(resolution.ConflictFingerprint))
+	if !validRunnerObjectID(fingerprint) || len(fingerprint) != sha256.Size*2 {
+		return errors.New("integration resolution handoff has an invalid conflict fingerprint")
+	}
+	digestText := strings.ToLower(strings.TrimSpace(resolution.ManifestSHA256))
+	if !validRunnerObjectID(digestText) || len(digestText) != sha256.Size*2 {
+		return errors.New("integration resolution handoff has an invalid manifest digest")
+	}
+	workspacePath, err := canonicalRunnerPath(claim.Workspace.Path)
+	if err != nil {
+		return err
+	}
+	resolutionWorkspace, err := canonicalRunnerPath(resolution.WorkspacePath)
+	if err != nil {
+		return err
+	}
+	canonicalCWD, err := canonicalRunnerPath(cwd)
+	if err != nil {
+		return err
+	}
+	if workspacePath != canonicalCWD || resolutionWorkspace != canonicalCWD {
+		return errors.New("integration resolution workspace does not match the runner directory")
+	}
+	if !safeRunnerPathComponent(claim.Run.ID) {
+		return errors.New("integration resolution run id is unsafe for a manifest path")
+	}
+	if len(resolution.ManifestPath) > 4096 {
+		return errors.New("integration resolution manifest path is too long")
+	}
+	if !filepath.IsAbs(strings.TrimSpace(resolution.ManifestPath)) {
+		return errors.New("integration resolution manifest path must be absolute")
+	}
+	common, err := runnerGitCommonDirectory(canonicalCWD)
+	if err != nil {
+		return err
+	}
+	trustedDirectory, err := canonicalRunnerPath(filepath.Join(common, "autogora", "integration-resolutions"))
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(common, trustedDirectory)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("integration resolution manifest directory escaped Git metadata")
+	}
+	manifestPath, err := filepath.Abs(strings.TrimSpace(resolution.ManifestPath))
+	if err != nil {
+		return err
+	}
+	manifestPath = filepath.Clean(manifestPath)
+	expectedPath := filepath.Join(trustedDirectory, claim.Run.ID+".json")
+	if manifestPath != expectedPath {
+		return errors.New("integration resolution manifest is outside its trusted run path")
+	}
+	info, err := os.Lstat(manifestPath)
+	if err != nil {
+		return fmt.Errorf("inspect integration resolution manifest: %w", err)
+	}
+	if err := filesecurity.ValidateCurrentUserFile(manifestPath, info); err != nil {
+		return fmt.Errorf("integration resolution manifest is not secure: %w", err)
+	}
+	if info.Size() <= 0 || info.Size() > model.IntegrationResolutionManifestMaxBytes {
+		return errors.New("integration resolution manifest has an invalid size")
+	}
+	manifestFile, err := os.Open(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read integration resolution manifest: %w", err)
+	}
+	defer manifestFile.Close()
+	encoded, err := io.ReadAll(io.LimitReader(manifestFile, model.IntegrationResolutionManifestMaxBytes+1))
+	if err != nil {
+		return fmt.Errorf("read integration resolution manifest: %w", err)
+	}
+	if len(encoded) > model.IntegrationResolutionManifestMaxBytes {
+		return errors.New("integration resolution manifest exceeds its size limit")
+	}
+	digest := sha256.Sum256(encoded)
+	if hex.EncodeToString(digest[:]) != digestText {
+		return errors.New("integration resolution manifest digest mismatch")
+	}
+	var manifest model.IntegrationResolutionManifest
+	if err := json.Unmarshal(encoded, &manifest); err != nil {
+		return fmt.Errorf("decode integration resolution manifest: %w", err)
+	}
+	if manifest.Version != model.IntegrationResolutionManifestVersion ||
+		manifest.TaskID != claim.Task.Task.ID || manifest.RunID != claim.Run.ID ||
+		strings.ToLower(manifest.ConflictFingerprint) != fingerprint ||
+		manifest.WorkspacePath != resolution.WorkspacePath {
+		return errors.New("integration resolution manifest does not match the active claim")
+	}
+	if resolution.TargetCount < 1 || len(manifest.Targets) != resolution.TargetCount ||
+		len(resolution.Targets) != resolution.TargetCount {
+		return errors.New("integration resolution target count changed before launch")
+	}
+	for index, target := range manifest.Targets {
+		if err := validateResolutionTarget(target, index); err != nil {
+			return err
+		}
+		if !sameResolutionTarget(target, resolution.Targets[index]) {
+			return errors.New("integration resolution target changed before launch")
+		}
+	}
+	if manifest.ConflictingFileCount != resolution.ConflictingFileCount ||
+		manifest.ConflictingFilesOmitted != resolution.ConflictingFilesOmitted ||
+		manifest.ConflictingFileCount < 0 || manifest.ConflictingFilesOmitted < 0 ||
+		len(manifest.ConflictingFiles) > 200 ||
+		len(manifest.ConflictingFiles)+manifest.ConflictingFilesOmitted != manifest.ConflictingFileCount {
+		return errors.New("integration resolution conflict summary changed before launch")
+	}
+	for _, path := range manifest.ConflictingFiles {
+		if strings.TrimSpace(path) == "" || len(path) > 1024 {
+			return errors.New("integration resolution conflict guidance exceeds its bound")
+		}
+	}
+	return nil
 }
 
 func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionID string) (RunnerCommand, error) {
@@ -154,6 +392,9 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 		if err != nil {
 			return RunnerCommand{}, err
 		}
+	}
+	if err := validateIntegrationResolutionHandoff(claim, options, cwd); err != nil {
+		return RunnerCommand{}, err
 	}
 	env := commandEnvironment(claim, options, cwd, dbPath)
 	prompt := workerPrompt(claim, cliPath)

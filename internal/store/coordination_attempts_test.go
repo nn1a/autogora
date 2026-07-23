@@ -1211,7 +1211,7 @@ func TestCoordinationAttemptRequiresActiveIncidentAndDoesNotExposeClaim(t *testi
 	}
 }
 
-func TestLatestSchemaRecreatesCoordinationAttemptTableWithoutVersionChange(t *testing.T) {
+func TestLatestSchemaRecreatesCoordinationAttemptTableAndAdvancesVersion(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/autogora.db"
 	initial, err := Open(path, "default", "")
@@ -1247,8 +1247,8 @@ func TestLatestSchemaRecreatesCoordinationAttemptTableWithoutVersionChange(t *te
 	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 20 || version != schemaVersion {
-		t.Fatalf("schema version = constant:%d database:%d, want 20", schemaVersion, version)
+	if schemaVersion != 21 || version != schemaVersion {
+		t.Fatalf("schema version = constant:%d database:%d, want 21", schemaVersion, version)
 	}
 	incident := createAttemptTestIncident(
 		t,

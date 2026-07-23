@@ -237,6 +237,54 @@ type PrerequisiteHandoff struct {
 	ChangeSet      *ChangeSet `json:"changeSet"`
 }
 
+// IntegrationResolutionTarget identifies one immutable prerequisite commit
+// that a finalizer must retain in its resolved history. MergeInProgress is true
+// only for the target currently represented by Git's MERGE_HEAD.
+type IntegrationResolutionTarget struct {
+	PrerequisiteID  string `json:"prerequisiteId"`
+	ChangeSetID     string `json:"changeSetId"`
+	HeadCommit      string `json:"headCommit"`
+	DurableRef      string `json:"durableRef"`
+	MergeInProgress bool   `json:"mergeInProgress"`
+}
+
+const (
+	IntegrationResolutionManifestVersion  = 1
+	IntegrationResolutionManifestMaxBytes = 16 << 20
+)
+
+// IntegrationResolutionManifest is the complete host-authored handoff kept in
+// Git's private metadata directory. Worker argv and environment receive only
+// its path and digest, so a large fan-in cannot exceed process argument limits.
+type IntegrationResolutionManifest struct {
+	Version                 int                           `json:"version"`
+	TaskID                  string                        `json:"taskId"`
+	RunID                   string                        `json:"runId"`
+	ConflictFingerprint     string                        `json:"conflictFingerprint"`
+	WorkspacePath           string                        `json:"workspacePath"`
+	Targets                 []IntegrationResolutionTarget `json:"targets"`
+	ConflictingFiles        []string                      `json:"conflictingFiles"`
+	ConflictingFileCount    int                           `json:"conflictingFileCount"`
+	ConflictingFilesOmitted int                           `json:"conflictingFilesOmitted"`
+}
+
+// IntegrationResolution is an execution-only handoff. It is deliberately
+// attached to the claimed run instead of board topology: the generated
+// worktree and its unresolved index belong to exactly one active claim.
+type IntegrationResolution struct {
+	Attempt                 int                           `json:"attempt"`
+	MaxAttempts             int                           `json:"maxAttempts"`
+	ConflictFingerprint     string                        `json:"conflictFingerprint"`
+	WorkspacePath           string                        `json:"workspacePath"`
+	ManifestPath            string                        `json:"manifestPath"`
+	ManifestSHA256          string                        `json:"manifestSha256"`
+	ConflictingFileCount    int                           `json:"conflictingFileCount"`
+	ConflictingFilesOmitted int                           `json:"conflictingFilesOmitted"`
+	TargetCount             int                           `json:"targetCount"`
+	ConflictingFiles        []string                      `json:"-"`
+	Targets                 []IntegrationResolutionTarget `json:"-"`
+}
+
 type Comment struct {
 	ID        int64  `json:"id"`
 	TaskID    string `json:"taskId"`
@@ -287,10 +335,11 @@ type TaskDetail struct {
 }
 
 type ClaimedTask struct {
-	Task       TaskDetail    `json:"task"`
-	Run        Run           `json:"run"`
-	ClaimToken string        `json:"claimToken"`
-	Workspace  *RunWorkspace `json:"workspace,omitempty"`
+	Task                  TaskDetail             `json:"task"`
+	Run                   Run                    `json:"run"`
+	ClaimToken            string                 `json:"claimToken"`
+	Workspace             *RunWorkspace          `json:"workspace,omitempty"`
+	IntegrationResolution *IntegrationResolution `json:"integrationResolution,omitempty"`
 }
 
 func ValidTaskStatus(value TaskStatus) bool {
