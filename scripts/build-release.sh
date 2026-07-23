@@ -65,6 +65,10 @@ for target in $targets; do
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
     -trimpath \
     -buildvcs=false \
+    -gcflags "github.com/nn1a/autogora/internal/...=-l" \
+    -gcflags "github.com/charmbracelet/...=-l" \
+    -gcflags "github.com/modelcontextprotocol/...=-l" \
+    -gcflags "github.com/google/jsonschema-go/...=-l" \
     -ldflags "-s -w -buildid= -X main.version=$version" \
     -o "$stage_dir/$binary_name" \
     ./cmd/autogora
