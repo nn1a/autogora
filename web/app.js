@@ -29,6 +29,7 @@ const state = {
   profiles: [], tasks: [], taskWindow: null, stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
   agentConfig: null, agentConfigExists: false, agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
   stageFocus: BOARD_STAGE_FOCUSES.includes(storedStageFocus) ? storedStageFocus : "all",
+  statusFocus: "",
   boardView: BOARD_VIEW_MODES.includes(storedBoardView) ? storedBoardView : "overview",
   automationTab: AUTOMATION_TABS.includes(storedAutomationTab) ? storedAutomationTab : "overview",
   automationHelpLanguage: AUTOMATION_HELP_LANGUAGES.includes(storedAutomationHelpLanguage)
@@ -437,16 +438,21 @@ function updateBoardViewControls() {
   $$("[data-board-view]").forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.boardView === state.boardView));
   });
-  const stage = state.stageFocus === "all"
-    ? "All stages"
-    : WORKFLOW_STAGES.find((item) => item.id === state.stageFocus)?.label || "All stages";
+  const stage = state.statusFocus
+    ? `${STATUS_LABELS[state.statusFocus]} column`
+    : state.stageFocus === "all"
+      ? "All stages"
+      : WORKFLOW_STAGES.find((item) => item.id === state.stageFocus)?.label || "All stages";
   const view = state.boardView[0].toUpperCase() + state.boardView.slice(1);
   $("#board-view-summary").textContent = `${stage} · ${view}`;
+  $("#status-focus-clear").classList.toggle("hidden", !state.statusFocus);
 }
 
 function setStageFocus(value) {
-  if (!BOARD_STAGE_FOCUSES.includes(value) || value === state.stageFocus) return;
+  if (!BOARD_STAGE_FOCUSES.includes(value) ||
+      (value === state.stageFocus && !state.statusFocus)) return;
   state.stageFocus = value;
+  state.statusFocus = "";
   localStorage.setItem("autogora.boardStageFocus", value);
   if (value === "archive" && !$("#show-archived").checked) {
     $("#show-archived").checked = true;
@@ -458,9 +464,25 @@ function setStageFocus(value) {
   renderBoard();
 }
 
+function setStatusFocus(value) {
+  if (!STATUSES.includes(value)) return;
+  state.statusFocus = value;
+  const stage = WORKFLOW_STAGES.find((candidate) => candidate.statuses.includes(value));
+  if (stage) state.stageFocus = stage.id;
+  localStorage.setItem("autogora.boardStageFocus", state.stageFocus);
+  if (value === "archived" && !$("#show-archived").checked) {
+    $("#show-archived").checked = true;
+    localStorage.setItem("autogora.showArchived", "true");
+    loadBoard().catch((error) => toast(error.message, true));
+    return;
+  }
+  renderBoard();
+}
+
 function setBoardView(value) {
   if (!BOARD_VIEW_MODES.includes(value) || value === state.boardView) return;
   state.boardView = value;
+  if (value === "graph") state.statusFocus = "";
   localStorage.setItem("autogora.boardView", value);
   renderBoard();
   if (value === "graph") loadBoardGraph({ force: true }).catch((error) => toast(error.message, true));
@@ -906,6 +928,7 @@ function renderBoard() {
   const board = $("#board");
   board.dataset.view = state.boardView;
   board.dataset.focus = state.stageFocus;
+  board.dataset.statusFocus = state.statusFocus;
   if (state.boardView === "graph") {
     updateBoardViewControls();
     renderBoardGraph();
@@ -915,7 +938,9 @@ function renderBoard() {
   const showArchived = $("#show-archived").checked || state.stageFocus === "archive";
   const stages = WORKFLOW_STAGES
     .filter((stage) => stage.id !== "archive" || showArchived)
-    .filter((stage) => state.stageFocus === "all" || stage.id === state.stageFocus);
+    .filter((stage) => state.statusFocus
+      ? stage.statuses.includes(state.statusFocus)
+      : state.stageFocus === "all" || stage.id === state.stageFocus);
   updateBoardViewControls();
   const emptyGuide = state.tasks.length === 0 ? `<section class="empty-guide" aria-label="Get started">
     <div class="empty-guide-intro"><span class="eyebrow">New board</span><h2>Set up a project, then add work</h2><p>Autogora can plan Triage cards, promote dependency-ready tasks, and assign healthy workers after these three checks.</p></div>
@@ -926,10 +951,18 @@ function renderBoard() {
   board.innerHTML = emptyGuide + stages.map((stage) => {
     const stageCount = stage.statuses.reduce((total, status) =>
       total + tasks.filter((task) => task.status === status).length, 0);
-    const columns = stage.statuses.map((status) => {
+    const visibleStatuses = state.statusFocus
+      ? stage.statuses.filter((status) => status === state.statusFocus)
+      : stage.statuses;
+    const columns = visibleStatuses.map((status) => {
       const cards = tasks.filter((task) => task.status === status);
       return `<section class="column status-${status}" data-status="${status}">
-        <header class="column-head"><span class="status-dot"></span><h3>${STATUS_LABELS[status]}</h3><span class="count">${cards.length}</span>${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}</header>
+        <header class="column-head"><span class="status-dot"></span><h3>${STATUS_LABELS[status]}</h3><span class="count">${cards.length}</span>
+          <div class="column-actions">
+            ${state.statusFocus === status ? "" : `<button class="icon-button compact" data-focus-status="${status}" aria-label="Focus ${STATUS_LABELS[status]} column" title="Show ${STATUS_LABELS[status]} tasks across the full board">↗</button>`}
+            ${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}
+          </div>
+        </header>
         <div class="column-body" role="region" aria-label="${STATUS_LABELS[status]} tasks" tabindex="0">${renderCardList(cards, status === "running" && $("#lane-profile").checked)}</div>
       </section>`;
     }).join("");
@@ -944,6 +977,9 @@ function renderBoard() {
     if (button.dataset.guide === "import") openGitHubImport();
     if (button.dataset.guide === "create") openTaskDialog("triage");
   }));
+  $$("[data-focus-status]").forEach((button) => {
+    button.addEventListener("click", () => setStatusFocus(button.dataset.focusStatus));
+  });
   bindCards();
   renderBulk();
 }
@@ -2992,10 +3028,11 @@ function bindGlobalActions() {
   $$('[data-close-dialog]').forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
   bindSegmentedControl('[data-board-control="focus"]', "[data-stage-focus]", (button) => setStageFocus(button.dataset.stageFocus));
   bindSegmentedControl('[data-board-control="view"]', "[data-board-view]", (button) => setBoardView(button.dataset.boardView));
+  $("#status-focus-clear").addEventListener("click", () => setStageFocus(state.stageFocus));
   $("#board-select").addEventListener("change", async (event) => {
     cancelAutomationLoad();
     cancelGraphLoad();
-    state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("autogora.board", state.board);
+    state.board = event.target.value; state.cursor = 0; state.selected.clear(); state.statusFocus = ""; localStorage.setItem("autogora.board", state.board);
     await loadBoard(); connectEvents();
   });
   ["#search", "#tenant-filter", "#assignee-filter"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
@@ -3005,6 +3042,7 @@ function bindGlobalActions() {
     localStorage.setItem("autogora.showArchived", checked);
     if (!checked && state.stageFocus === "archive") {
       state.stageFocus = "all";
+      state.statusFocus = "";
       localStorage.setItem("autogora.boardStageFocus", state.stageFocus);
       updateBoardViewControls();
     }

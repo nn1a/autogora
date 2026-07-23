@@ -257,6 +257,7 @@ main { min-width: 0; max-width: 100%; padding: 18px 22px 28px; }
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 .board-view-summary { margin-left: auto; overflow-wrap: anywhere; text-align: right; }
+#status-focus-clear { flex: 0 0 auto; }
 
 .bulk-bar {
   display: flex;
@@ -315,6 +316,12 @@ main { min-width: 0; max-width: 100%; padding: 18px 22px 28px; }
   gap: 10px;
 }
 .board[data-focus="archive"] .board-stage-grid { grid-template-columns: minmax(0, 1fr); }
+.board[data-status-focus]:not([data-status-focus=""]) .board-stage-grid { grid-template-columns: minmax(0, 1fr); }
+.board[data-status-focus]:not([data-status-focus=""]) .card-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr));
+  align-items: start;
+}
 .board[data-view="graph"] { display: block; overflow: hidden; }
 .graph-view {
   display: flex;
@@ -580,7 +587,8 @@ body.drag-active .trash-drop { transform: translate(-50%, 0); opacity: 1; pointe
   border-radius: 999px;
   font-size: 11px;
 }
-.column-head button { margin-left: auto; }
+.column-actions { display: flex; min-width: 0; margin-left: auto; gap: 5px; }
+.column-actions button { margin-left: 0; }
 .status-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--status-color, var(--muted)); box-shadow: 0 0 10px color-mix(in srgb, var(--status-color, transparent) 55%, transparent); }
 .status-triage { --status-color: #a98cff; }
 .status-todo { --status-color: #8791a3; }
@@ -1329,6 +1337,7 @@ hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   }
   .segmented-control button { width: 100%; }
   .board-view-summary { width: 100%; margin-left: 0; text-align: left; }
+  #status-focus-clear { width: 100%; }
   .graph-toolbar { align-items: stretch; flex-direction: column; }
   .graph-actions { justify-content: flex-start; }
   .graph-actions label { padding-left: 0; }

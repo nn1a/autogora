@@ -32,6 +32,7 @@ func TestDashboardPersistsAccessibleBoardViews(t *testing.T) {
 		`data-board-view="compact"`,
 		`data-board-view="flow"`,
 		`id="board-view-summary"`,
+		`id="status-focus-clear"`,
 		`title="Responsive status grids with full task cards"`,
 		`title="Denser status grids with condensed task cards"`,
 		`title="Separate stage panels that emphasize workflow order"`,
@@ -50,7 +51,10 @@ func TestDashboardPersistsAccessibleBoardViews(t *testing.T) {
 		`localStorage.setItem("autogora.boardView", value)`,
 		`board.dataset.view = state.boardView`,
 		`board.dataset.focus = state.stageFocus`,
+		`board.dataset.statusFocus = state.statusFocus`,
 		`state.stageFocus === "all" || stage.id === state.stageFocus`,
+		`function setStatusFocus(value)`,
+		`data-focus-status="${status}"`,
 		`["ArrowLeft", "ArrowRight", "Home", "End"]`,
 		`button.setAttribute("aria-pressed"`,
 	} {
@@ -62,6 +66,8 @@ func TestDashboardPersistsAccessibleBoardViews(t *testing.T) {
 		`.board[data-view="flow"][data-focus="all"]`,
 		`repeat(auto-fit, minmax(min(360px, 100%), 1fr))`,
 		`.board[data-view="compact"] .card-summary { display: none; }`,
+		`.board[data-status-focus]:not([data-status-focus=""]) .card-list`,
+		`repeat(auto-fit, minmax(min(290px, 100%), 1fr))`,
 		`.segmented-control button[aria-pressed="true"]`,
 		`overflow-x: hidden`,
 	} {
