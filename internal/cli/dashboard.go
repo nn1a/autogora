@@ -10,6 +10,20 @@ import (
 	"github.com/nn1a/autogora/internal/dashboard"
 )
 
+const dashboardHelp = `autogora dashboard [options]
+
+Runs the authenticated local Web UI with the embedded static assets.
+
+Options:
+  --host <address>      Listen address (default: 127.0.0.1)
+  --port <number>       Listen port; use 0 to choose a free port (default: 8420)
+  --token <token>       Reuse an explicit access token; omitted creates one
+  --db <path>           Override the project-specific SQLite path
+
+The command prints a tokenized URL. Keep the token private and stop the server
+with Ctrl-C. Binding a non-loopback address exposes the UI to that network.
+`
+
 func (a *App) runDashboard(ctx context.Context, opts options) error {
 	dbPath, err := a.dispatcherDBPath(opts.value("db"))
 	if err != nil {

@@ -100,7 +100,7 @@ func TestMCPAndCombinedSetupCommands(t *testing.T) {
 }
 
 func TestSetupCommandHelp(t *testing.T) {
-	for _, command := range []string{"init", "paths", "github", "skills", "mcp", "setup"} {
+	for _, command := range []string{"init", "paths", "github", "dashboard", "skills", "mcp", "setup"} {
 		app := New(&bytes.Buffer{}, &bytes.Buffer{})
 		output := runApp(t, app, command, "--help")
 		if !strings.HasPrefix(output, "autogora "+command) {

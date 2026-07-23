@@ -64,6 +64,8 @@ func setupCommandHelp(command string) string {
 		return githubHelp
 	case "agents":
 		return agentsHelp
+	case "dashboard":
+		return dashboardHelp
 	case "skills":
 		return skillsHelp
 	case "mcp":
