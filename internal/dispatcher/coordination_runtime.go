@@ -663,9 +663,18 @@ func coordinateIncident(
 			ctx, opened, attempt, incident, current, err,
 		))
 	}
+	analysisTimeout := options.PlannerTimeout
+	if analysisTimeout <= 0 {
+		analysisTimeout = 120 * time.Second
+	}
+	// PlannerTimeout is an end-to-end budget for the fallback chain. Individual
+	// candidates also observe this context, so a slow primary cannot outlive the
+	// incident lease and let another Supervisor duplicate the same paid analysis.
+	analysisCtx, cancelAnalysis := context.WithTimeout(ctx, analysisTimeout)
 	proposal, err := (coordinator.Analyzer{
 		Planner: planner, MaxActions: maxActions,
-	}).Analyze(ctx, snapshot)
+	}).Analyze(analysisCtx, snapshot)
+	cancelAnalysis()
 	if err != nil {
 		current = options.currentTime()
 		return errors.Join(err, failCoordinationAttempt(

@@ -417,6 +417,57 @@ func TestCoordinationRuntimeFailureReopensWithBackoff(t *testing.T) {
 	}
 }
 
+func TestCoordinationRuntimeBoundsWholeAnalysisByPlannerTimeout(t *testing.T) {
+	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
+	fixture.options.PlannerTimeout = 25 * time.Millisecond
+	var calls atomic.Int32
+	fixture.options.CoordinatorPlanner = func(
+		ctx context.Context,
+		_ orchestration.PlannerRequest,
+	) (any, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	started := time.Now()
+	err := runCoordinationPass(
+		context.Background(), fixture.manager, []string{"default"},
+		fixture.options, &coordinationRuntimeState{}, fixture.current,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Coordinator timeout error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Coordinator analysis exceeded its total timeout: %s", elapsed)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("Coordinator calls = %d, want 1", calls.Load())
+	}
+	opened, openErr := fixture.manager.OpenStore(context.Background(), "default")
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer opened.Close()
+	incident, getErr := opened.GetCoordinationIncident(
+		context.Background(), fixture.incident.ID,
+	)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	attempts, listErr := opened.ListCoordinationAttempts(
+		context.Background(),
+		store.CoordinationAttemptFilter{IncidentID: fixture.incident.ID},
+	)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if incident.Status != model.CoordinationIncidentOpen ||
+		len(attempts) != 1 ||
+		attempts[0].Status != model.CoordinationAttemptFailed {
+		t.Fatalf("timeout recovery: incident=%+v attempts=%+v", incident, attempts)
+	}
+}
+
 func TestReconcilePendingCoordinationSupersedesStaleApproval(t *testing.T) {
 	fixture := seedCoordinationRuntimeFixture(t, boards.CoordinationModeAssist)
 	var calls atomic.Int32
