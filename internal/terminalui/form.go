@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -19,6 +20,7 @@ const (
 	fieldTitle formField = iota
 	fieldBody
 	fieldStatus
+	fieldScheduledAt
 	fieldPriority
 	fieldProfile
 	fieldAssignee
@@ -85,7 +87,8 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 		mode: "create", board: board, profiles: runnableProfiles,
 		inputs: map[formField]textinput.Model{
 			fieldTitle: newTextInput("", "Task title", 300), fieldPriority: newTextInput("0", "0", 12),
-			fieldAssignee: newTextInput("", "profile or worker name", 200), fieldSkills: newTextInput("", "comma-separated", 1000),
+			fieldScheduledAt: newTextInput("", "RFC3339, for example 2026-07-23T18:00:00+09:00", 80),
+			fieldAssignee:    newTextInput("", "profile or worker name", 200), fieldSkills: newTextInput("", "comma-separated", 1000),
 			fieldTenant: newTextInput("", "optional", 200), fieldWorkspace: newTextInput("", "absolute path or empty", 2000),
 		},
 	}
@@ -94,6 +97,14 @@ func newTaskForm(board string, profiles []orchestration.ProfileRoute, status mod
 	form.body.CharLimit = 50_000
 	form.body.SetHeight(6)
 	form.statusIndex = optionIndex(formStatuses, string(status))
+	if status == model.TaskStatusScheduled {
+		form.setInputValue(fieldScheduledAt, time.Now().Add(time.Hour).Format(time.RFC3339))
+	}
+	if len(runnableProfiles) > 0 && (status == model.TaskStatusTodo || status == model.TaskStatusReady || status == model.TaskStatusScheduled) {
+		form.profileIndex = 1
+		form.setInputValue(fieldAssignee, runnableProfiles[0].Name)
+		form.runtimeIndex = optionIndex(formRuntimes, string(runnableProfiles[0].Runtime))
+	}
 	form.focus = fieldTitle
 	form.syncFocus()
 	return form
@@ -108,6 +119,7 @@ func editTaskForm(board string, profiles []orchestration.ProfileRoute, task mode
 	form.setInputValue(fieldSkills, strings.Join(task.Skills, ", "))
 	form.setInputValue(fieldTenant, pointer(task.Tenant, ""))
 	form.setInputValue(fieldWorkspace, pointer(task.Workspace, ""))
+	form.setInputValue(fieldScheduledAt, pointer(task.ScheduledAt, ""))
 	form.body.SetValue(task.Body)
 	form.runtimeIndex = optionIndex(formRuntimes, string(task.Runtime))
 	form.workspaceIndex = optionIndex(formWorkspaceKinds, string(task.WorkspaceKind))
@@ -140,15 +152,15 @@ func optionIndex(options []string, value string) int {
 
 func (f *taskForm) fields() []formField {
 	if f.mode == "create" {
-		return []formField{fieldTitle, fieldBody, fieldStatus, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
+		return []formField{fieldTitle, fieldBody, fieldStatus, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
 	}
-	return []formField{fieldTitle, fieldBody, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
+	return []formField{fieldTitle, fieldBody, fieldScheduledAt, fieldPriority, fieldProfile, fieldAssignee, fieldRuntime, fieldSkills, fieldTenant, fieldWorkspaceKind, fieldWorkspace, fieldGoalMode}
 }
 
 func (f *taskForm) stepFields() [][]formField {
 	task := []formField{fieldTitle, fieldBody, fieldPriority}
 	if f.mode == "create" {
-		task = []formField{fieldTitle, fieldBody, fieldStatus, fieldPriority}
+		task = []formField{fieldTitle, fieldBody, fieldStatus, fieldScheduledAt, fieldPriority}
 	}
 	return [][]formField{
 		task,
@@ -245,6 +257,15 @@ func (f *taskForm) cycleSelection(delta int) {
 	switch f.focus {
 	case fieldStatus:
 		f.statusIndex = cycle(f.statusIndex, len(formStatuses), delta)
+		status := model.TaskStatus(formStatuses[f.statusIndex])
+		if status == model.TaskStatusScheduled && strings.TrimSpace(f.inputs[fieldScheduledAt].Value()) == "" {
+			f.setInputValue(fieldScheduledAt, time.Now().Add(time.Hour).Format(time.RFC3339))
+		}
+		if f.profileIndex == 0 && len(f.profiles) > 0 && (status == model.TaskStatusTodo || status == model.TaskStatusReady || status == model.TaskStatusScheduled) {
+			f.profileIndex = 1
+			f.setInputValue(fieldAssignee, f.profiles[0].Name)
+			f.runtimeIndex = optionIndex(formRuntimes, string(f.profiles[0].Runtime))
+		}
 	case fieldProfile:
 		f.profileIndex = cycle(f.profileIndex, len(f.profiles)+1, delta)
 		if f.profileIndex > 0 {
@@ -347,6 +368,13 @@ func (f *taskForm) validate() error {
 		(strings.TrimSpace(f.inputs[fieldAssignee].Value()) == "" || formRuntimes[f.runtimeIndex] == string(model.RuntimeManual)) {
 		return errors.New("Ready requires an assignee and an agent runtime")
 	}
+	if formStatuses[f.statusIndex] == string(model.TaskStatusScheduled) {
+		value := strings.TrimSpace(f.inputs[fieldScheduledAt].Value())
+		at, err := time.Parse(time.RFC3339, value)
+		if err != nil || !at.After(time.Now()) {
+			return errors.New("Scheduled requires a future RFC3339 time")
+		}
+	}
 	return nil
 }
 
@@ -377,7 +405,7 @@ func (f *taskForm) createInput() store.CreateTaskInput {
 		Status: model.TaskStatus(formStatuses[f.statusIndex]), Assignee: optionalValue(f.inputs[fieldAssignee].Value()),
 		Runtime: model.Runtime(formRuntimes[f.runtimeIndex]), Priority: priority, Tenant: optionalValue(f.inputs[fieldTenant].Value()),
 		WorkspaceKind: model.WorkspaceKind(formWorkspaceKinds[f.workspaceIndex]), Workspace: optionalValue(f.inputs[fieldWorkspace].Value()),
-		Skills: splitSkills(f.inputs[fieldSkills].Value()), GoalMode: f.goalMode,
+		ScheduledAt: optionalValue(f.inputs[fieldScheduledAt].Value()), Skills: splitSkills(f.inputs[fieldSkills].Value()), GoalMode: f.goalMode,
 	}
 }
 
@@ -387,8 +415,9 @@ func (f *taskForm) updateInput() store.UpdateTaskInput {
 	runtime, kind, skills, goal := model.Runtime(formRuntimes[f.runtimeIndex]), model.WorkspaceKind(formWorkspaceKinds[f.workspaceIndex]), splitSkills(f.inputs[fieldSkills].Value()), f.goalMode
 	return store.UpdateTaskInput{
 		Title: &title, Body: &body, Priority: &priority, Runtime: &runtime, WorkspaceKind: &kind, Skills: &skills, GoalMode: &goal,
-		Assignee:  store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldAssignee].Value())},
-		Tenant:    store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldTenant].Value())},
-		Workspace: store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldWorkspace].Value())},
+		Assignee:    store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldAssignee].Value())},
+		Tenant:      store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldTenant].Value())},
+		Workspace:   store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldWorkspace].Value())},
+		ScheduledAt: store.OptionalString{Set: true, Value: optionalValue(f.inputs[fieldScheduledAt].Value())},
 	}
 }

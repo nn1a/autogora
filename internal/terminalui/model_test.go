@@ -2,6 +2,7 @@ package terminalui
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -273,5 +274,129 @@ func TestTaskFormCreatesTriageTask(t *testing.T) {
 	m.Update(message)
 	if len(backend.actions) != 1 || backend.actions[0] != "create:Investigate issue" || m.desiredSelection != "created" {
 		t.Fatalf("task creation did not complete: actions=%v selection=%q", backend.actions, m.desiredSelection)
+	}
+}
+
+func TestMutationErrorSurvivesBackgroundLoadsUntilDismissedOrRetried(t *testing.T) {
+	task := testTask("task", "Keep the failure visible", model.TaskStatusTodo)
+	m := NewModel(context.Background(), &fakeBackend{}, "default")
+	m.tasks[task.Status] = []model.Task{task}
+	m.allTasks = []model.Task{task}
+	m.column = statusIndex(m.statuses(), task.Status)
+	mutationErr := errors.New("worker authentication required")
+	m.Update(mutationMsg{action: "promote", id: task.ID, err: mutationErr})
+
+	m.Update(tasksLoadedMsg{tasks: []model.Task{task}, at: time.Now()})
+	m.Update(detailLoadedMsg{id: task.ID, detail: model.TaskDetail{Task: task}})
+	m.Update(boardContextMsg{context: taskservice.BoardContext{}})
+	if !errors.Is(m.err, mutationErr) {
+		t.Fatalf("background loads cleared mutation error: %v", m.err)
+	}
+	detailRefreshErr := errors.New("temporary detail failure")
+	m.Update(detailLoadedMsg{id: task.ID, err: detailRefreshErr})
+	if !errors.Is(m.err, mutationErr) || !errors.Is(m.detailErr, detailRefreshErr) {
+		t.Fatalf("detail error displaced mutation failure: mutation=%v detail=%v", m.err, m.detailErr)
+	}
+
+	refreshErr := errors.New("temporary refresh failure")
+	m.Update(tasksLoadedMsg{err: refreshErr})
+	if !errors.Is(m.err, mutationErr) || !strings.Contains(m.View(), mutationErr.Error()) {
+		t.Fatalf("refresh error displaced mutation failure: mutation=%v refresh=%v", m.err, m.tasksErr)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.err != nil {
+		t.Fatalf("escape did not dismiss mutation error: %v", m.err)
+	}
+	if !strings.Contains(m.View(), refreshErr.Error()) {
+		t.Fatal("dismissing the mutation error should reveal the current refresh error")
+	}
+
+	m.err = mutationErr
+	command := m.mutate("promote", task.ID, "")
+	if command == nil || m.err != nil || !m.busy {
+		t.Fatalf("starting the next mutation did not clear the old error: command=%v err=%v busy=%v", command != nil, m.err, m.busy)
+	}
+}
+
+func TestTargetedRunKeepsNavigationAndRefreshAvailable(t *testing.T) {
+	ready := testTask("ready", "Long running task", model.TaskStatusReady)
+	running := testTask("running", "Another active task", model.TaskStatusRunning)
+	backend := &fakeBackend{tasks: []model.Task{ready, running}, details: map[string]model.TaskDetail{
+		ready.ID:   {Task: ready},
+		running.ID: {Task: running},
+	}}
+	m := NewModel(context.Background(), backend, "default")
+	m.allTasks = append([]model.Task{}, backend.tasks...)
+	m.regroupTasks()
+	m.column = statusIndex(m.statuses(), model.TaskStatusReady)
+
+	runCommand := m.mutate("start", ready.ID, "")
+	if runCommand == nil || !m.busy || m.busyAction != "start" {
+		t.Fatalf("targeted dispatcher did not enter running state: busy=%v action=%q", m.busy, m.busyAction)
+	}
+	_, detailCommand := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if m.selectedID() != running.ID || detailCommand == nil {
+		t.Fatalf("navigation/detail load was blocked during dispatcher run: selected=%q", m.selectedID())
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.detailTab != 1 {
+		t.Fatalf("detail tabs were blocked during dispatcher run: tab=%d", m.detailTab)
+	}
+	_, refreshCommand := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if refreshCommand == nil {
+		t.Fatal("manual refresh was blocked during dispatcher run")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if m.form != nil {
+		t.Fatal("a second mutation form opened while dispatcher run was active")
+	}
+	if command := m.mutate("promote", running.ID, ""); command != nil {
+		t.Fatal("a second mutation started while dispatcher run was active")
+	}
+	if !strings.Contains(m.View(), "dispatcher running") || !strings.Contains(m.View(), "navigation available") {
+		t.Fatal("the running-state hint does not explain that navigation remains available")
+	}
+
+	m.Update(runCommand())
+	if m.busy || m.busyAction != "" {
+		t.Fatalf("dispatcher completion did not release mutation lock: busy=%v action=%q", m.busy, m.busyAction)
+	}
+}
+
+func TestEmptyBoardExplainsFirstWorkflowAndGitHubImport(t *testing.T) {
+	m := NewModel(context.Background(), &fakeBackend{}, "product")
+	m.width, m.height = 120, 32
+	m.Update(tasksLoadedMsg{tasks: nil, at: time.Now()})
+	view := m.View()
+	for _, value := range []string{
+		"Start your first workflow",
+		"Configure agents",
+		"autogora agents detect --save",
+		"Choose a workspace",
+		"Execution",
+		"Import or create work",
+		"autogora github import --repo OWNER/REPO --board product",
+		"Press n to create",
+	} {
+		if !strings.Contains(view, value) {
+			t.Fatalf("empty-board guidance omitted %q:\n%s", value, view)
+		}
+	}
+}
+
+func TestSuccessNoticeExpiresWithoutBeingClearedByImmediateReload(t *testing.T) {
+	m := NewModel(context.Background(), &fakeBackend{}, "default")
+	m.Update(mutationMsg{action: "create", detail: &model.TaskDetail{Task: testTask("created", "New", model.TaskStatusTriage)}})
+	if m.notice == "" || m.noticeUntil.IsZero() {
+		t.Fatal("successful mutation did not create a bounded notice")
+	}
+	m.Update(tasksLoadedMsg{tasks: nil, at: m.noticeUntil.Add(-time.Second)})
+	if m.notice == "" {
+		t.Fatal("the mutation reload cleared the success notice immediately")
+	}
+	m.Update(refreshMsg(m.noticeUntil))
+	if m.notice != "" || !m.noticeUntil.IsZero() {
+		t.Fatalf("stale success notice remained visible: %q until=%v", m.notice, m.noticeUntil)
 	}
 }

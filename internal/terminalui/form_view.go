@@ -11,7 +11,7 @@ func formFieldLabel(field formField) string {
 	labels := map[formField]string{
 		fieldTitle: "Title", fieldBody: "Description", fieldStatus: "Status", fieldPriority: "Priority",
 		fieldProfile: "Board profile", fieldAssignee: "Assignee", fieldRuntime: "Runtime", fieldSkills: "Skills",
-		fieldTenant: "Tenant", fieldWorkspaceKind: "Workspace kind", fieldWorkspace: "Workspace path", fieldGoalMode: "Goal mode",
+		fieldTenant: "Tenant", fieldWorkspaceKind: "Workspace kind", fieldWorkspace: "Workspace path", fieldGoalMode: "Goal mode", fieldScheduledAt: "Run after (RFC3339)",
 	}
 	return labels[field]
 }

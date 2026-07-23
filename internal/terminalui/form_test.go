@@ -3,6 +3,7 @@ package terminalui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nn1a/autogora/internal/model"
@@ -12,11 +13,34 @@ import (
 func TestTaskFormAppliesBoardProfileToAgentFields(t *testing.T) {
 	profiles := []orchestration.ProfileRoute{{Name: "reviewer", Runtime: model.RuntimeGemini, Description: "Reviews changes"}}
 	form := newTaskForm("product", profiles, model.TaskStatusTodo)
+	if form.profileIndex != 1 || form.inputs[fieldAssignee].Value() != "reviewer" || formRuntimes[form.runtimeIndex] != "gemini" {
+		t.Fatalf("default profile was not applied: profile=%d assignee=%q runtime=%q", form.profileIndex, form.inputs[fieldAssignee].Value(), formRuntimes[form.runtimeIndex])
+	}
 	form.focus = fieldProfile
 	form.syncFocus()
-	form.Update(tea.KeyMsg{Type: tea.KeyRight})
-	if form.profileIndex != 1 || form.inputs[fieldAssignee].Value() != "reviewer" || formRuntimes[form.runtimeIndex] != "gemini" {
-		t.Fatalf("profile was not applied: profile=%d assignee=%q runtime=%q", form.profileIndex, form.inputs[fieldAssignee].Value(), formRuntimes[form.runtimeIndex])
+	form.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if form.profileIndex != 0 {
+		t.Fatal("profile selector did not retain its custom route option")
+	}
+}
+
+func TestScheduledFormRequiresAndPersistsFutureTime(t *testing.T) {
+	form := newTaskForm("default", []orchestration.ProfileRoute{{Name: "worker", Runtime: model.RuntimeCodex}}, model.TaskStatusScheduled)
+	form.setInputValue(fieldTitle, "Run later")
+	if err := form.validate(); err != nil {
+		t.Fatalf("default future schedule was rejected: %v", err)
+	}
+	input := form.createInput()
+	if input.ScheduledAt == nil {
+		t.Fatal("scheduled create input omitted scheduledAt")
+	}
+	parsed, err := time.Parse(time.RFC3339, *input.ScheduledAt)
+	if err != nil || !parsed.After(time.Now()) {
+		t.Fatalf("invalid persisted schedule %q: %v", *input.ScheduledAt, err)
+	}
+	form.setInputValue(fieldScheduledAt, "")
+	if err := form.validate(); err == nil || !strings.Contains(err.Error(), "future RFC3339") {
+		t.Fatalf("missing schedule error = %v", err)
 	}
 }
 

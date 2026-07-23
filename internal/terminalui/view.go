@@ -136,6 +136,51 @@ func (m *Model) renderColumn(status model.TaskStatus, width, height int, focused
 	return baseBorder.Copy().BorderForeground(borderColor).Width(width-2).Height(height).Padding(0, 1).Render(strings.Join(lines, "\n"))
 }
 
+func (m *Model) renderEmptyBoard(width, height int) string {
+	panelWidth := min(78, width-4)
+	lineWidth := max(4, panelWidth-6)
+	importCommand := fmt.Sprintf("autogora github import --repo OWNER/REPO --board %s", m.board)
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Start your first workflow"),
+		lipgloss.NewStyle().Foreground(colorMuted).Render("Complete these once, then bring work into Triage."),
+		"",
+		lipgloss.NewStyle().Bold(true).Render("1  Configure agents"),
+		"   " + truncate("autogora agents detect --save", lineWidth-3),
+		lipgloss.NewStyle().Foreground(colorMuted).Render("   Review defaults and supervisor policy in another terminal."),
+		"",
+		lipgloss.NewStyle().Bold(true).Render("2  Choose a workspace"),
+		lipgloss.NewStyle().Foreground(colorMuted).Render("   Press n → Execution → Workspace, or use the board default."),
+		"",
+		lipgloss.NewStyle().Bold(true).Render("3  Import or create work"),
+		"   " + truncate(importCommand, lineWidth-3),
+		lipgloss.NewStyle().Foreground(colorMuted).Render("   Run import in another terminal, then press r. Press n to create."),
+	}
+	if width < 70 || height < 20 {
+		lines = []string{
+			lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Start your first workflow"), "",
+			"1  Agents",
+			truncate("autogora agents detect --save", lineWidth),
+			"2  Workspace",
+			truncate("n → Execution → Workspace", lineWidth),
+			"3  Import or create",
+			truncate("autogora github import", lineWidth),
+			truncate("--repo OWNER/REPO --board "+m.board, lineWidth),
+			truncate("or press n to create · r refresh", lineWidth),
+		}
+	}
+	if height < 13 {
+		lines = []string{
+			lipgloss.NewStyle().Bold(true).Foreground(colorFocus).Render("Empty board"),
+			truncate("1 Agents: autogora agents detect --save", lineWidth),
+			truncate("2 Workspace: n → Execution", lineWidth),
+			truncate("3 Import: autogora github import", lineWidth),
+			truncate("n create · r refresh · ? help", lineWidth),
+		}
+	}
+	panel := baseBorder.Copy().BorderForeground(colorFocus).Width(panelWidth-2).Padding(1, 2).Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, panel)
+}
+
 func detailTaskLine(task model.Task, width int) string {
 	return lipgloss.NewStyle().Foreground(statusColor(task.Status)).Render("• "+truncate(task.Title, max(1, width-4))) +
 		lipgloss.NewStyle().Foreground(colorMuted).Render("  "+task.ID)
@@ -300,13 +345,21 @@ func (m *Model) View() string {
 	} else if !m.updated.IsZero() && m.width >= 80 {
 		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  updated " + m.updated.Format(time.Kitchen))
 	}
-	if m.err != nil {
-		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("  " + truncate(m.err.Error(), max(10, m.width-30)))
+	visibleErr := m.err
+	if visibleErr == nil {
+		visibleErr = m.backgroundError()
+	}
+	if visibleErr != nil {
+		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusBlocked)).Render("  " + truncate(visibleErr.Error(), max(10, m.width-30)))
 	} else if m.notice != "" {
 		header += lipgloss.NewStyle().Foreground(statusColor(model.TaskStatusDone)).Render("  " + m.notice)
 	}
 	if m.busy {
-		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  applying…")
+		busyLabel := "applying…"
+		if m.busyAction == "start" {
+			busyLabel = "dispatcher running · navigation available"
+		}
+		header += lipgloss.NewStyle().Foreground(colorMuted).Render("  " + busyLabel)
 	}
 
 	footer := lipgloss.NewStyle().Foreground(colorMuted).Render("space actions  n new  e edit  m move  f filters  C comment  p promote  c complete  ? help")
@@ -326,7 +379,9 @@ func (m *Model) View() string {
 	}
 	board := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
 	content := board
-	if wideDetail {
+	if len(m.allTasks) == 0 && !m.loading && m.tasksErr == nil && m.search == "" && m.tenantFilter == "" && m.assigneeFilter == "" && m.runtimeFilter == "" {
+		content = m.renderEmptyBoard(m.width, contentHeight)
+	} else if wideDetail {
 		content = lipgloss.JoinHorizontal(lipgloss.Top, board, " ", m.renderDetail(detailWidth, contentHeight))
 	} else if m.detailOn {
 		content = m.renderDetail(m.width, contentHeight)

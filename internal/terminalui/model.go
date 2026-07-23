@@ -14,7 +14,10 @@ import (
 	"github.com/nn1a/autogora/internal/taskservice"
 )
 
-const refreshInterval = 2 * time.Second
+const (
+	refreshInterval = 2 * time.Second
+	noticeDuration  = 5 * time.Second
+)
 
 var boardStatuses = []model.TaskStatus{
 	model.TaskStatusTriage,
@@ -77,6 +80,9 @@ type Model struct {
 	graph            *model.RelationshipGraph
 	loading          bool
 	err              error
+	tasksErr         error
+	detailErr        error
+	boardContextErr  error
 	updated          time.Time
 	help             bool
 	detailOn         bool
@@ -90,7 +96,9 @@ type Model struct {
 	assigneeFilter   string
 	runtimeFilter    model.Runtime
 	busy             bool
+	busyAction       string
 	notice           string
+	noticeUntil      time.Time
 	promptLabel      string
 	promptDraft      string
 	promptTaskID     string
@@ -179,7 +187,7 @@ func (m *Model) selectedID() string {
 
 func (m *Model) moveColumn(delta int) tea.Cmd {
 	m.column = max(0, min(len(m.statuses())-1, m.column+delta))
-	m.detail, m.graph, m.detailScroll = nil, nil, 0
+	m.detail, m.graph, m.detailErr, m.detailScroll = nil, nil, nil, 0
 	return m.loadDetail(m.selectedID())
 }
 
@@ -190,32 +198,75 @@ func (m *Model) moveCard(delta int) tea.Cmd {
 		return nil
 	}
 	m.cursors[status] = max(0, min(len(items)-1, m.cursors[status]+delta))
-	m.detail, m.graph, m.detailScroll = nil, nil, 0
+	m.detail, m.graph, m.detailErr, m.detailScroll = nil, nil, nil, 0
 	return m.loadDetail(m.selectedID())
 }
 
+func (m *Model) clearMutationStatus() {
+	m.err, m.notice, m.noticeUntil = nil, "", time.Time{}
+}
+
+func (m *Model) backgroundError() error {
+	for _, err := range []error{m.tasksErr, m.detailErr, m.boardContextErr} {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Model) beginMutation(action string) bool {
+	if m.busy {
+		return false
+	}
+	m.clearMutationStatus()
+	m.busy, m.busyAction = true, action
+	return true
+}
+
+func mutationKey(key string) bool {
+	switch key {
+	case " ", "m", "n", "e", "s", "C", "b", "p", "u", "c", "x":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Model) beginPrompt(mode, label, value, taskID string) {
+	if m.busy {
+		return
+	}
 	m.inputMode, m.promptLabel, m.promptDraft, m.promptTaskID = mode, label, value, taskID
-	m.err, m.notice = nil, ""
+	m.clearMutationStatus()
 }
 
 func (m *Model) beginConfirm(action string, task model.Task) {
+	if m.busy {
+		return
+	}
 	m.confirm = &confirmState{action: action, id: task.ID, title: task.Title}
-	m.err, m.notice = nil, ""
+	m.clearMutationStatus()
 }
 
 func (m *Model) openCreateForm() tea.Cmd {
+	if m.busy {
+		return nil
+	}
 	if m.boardContext == nil {
 		m.err = errors.New("board settings are still loading")
 		return nil
 	}
 	status := m.statuses()[m.column]
 	m.form = newTaskForm(m.board, m.boardContext.Profiles, status)
-	m.err, m.notice = nil, ""
+	m.clearMutationStatus()
 	return m.form.syncFocus()
 }
 
 func (m *Model) openEditForm(focus formField) tea.Cmd {
+	if m.busy {
+		return nil
+	}
 	if m.boardContext == nil {
 		m.err = errors.New("board settings are still loading")
 		return nil
@@ -228,6 +279,9 @@ func (m *Model) openEditForm(focus formField) tea.Cmd {
 }
 
 func (m *Model) openEditTaskForm(task model.Task, focus formField) tea.Cmd {
+	if m.busy {
+		return nil
+	}
 	if m.boardContext == nil {
 		m.err = errors.New("board settings are still loading")
 		return nil
@@ -236,12 +290,14 @@ func (m *Model) openEditTaskForm(task model.Task, focus formField) tea.Cmd {
 	if !m.form.locked(focus) {
 		m.form.focus = focus
 	}
-	m.err, m.notice = nil, ""
+	m.clearMutationStatus()
 	return m.form.syncFocus()
 }
 
 func (m *Model) submitForm(form *taskForm) tea.Cmd {
-	m.busy = true
+	if !m.beginMutation(form.mode) {
+		return nil
+	}
 	return func() tea.Msg {
 		var detail model.TaskDetail
 		var err error
@@ -256,7 +312,9 @@ func (m *Model) submitForm(form *taskForm) tea.Cmd {
 }
 
 func (m *Model) mutate(action, id, value string) tea.Cmd {
-	m.busy = true
+	if !m.beginMutation(action) {
+		return nil
+	}
 	return func() tea.Msg {
 		var detail model.TaskDetail
 		var err error
@@ -474,10 +532,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.inputMode != "" && m.inputMode != "search" {
 			return m.handlePrompt(message)
 		}
-		if m.busy {
-			if message.String() == "ctrl+c" || message.String() == "q" {
-				return m, tea.Quit
-			}
+		if m.busy && mutationKey(message.String()) {
 			return m, nil
 		}
 		if m.inputMode == "search" {
@@ -593,6 +648,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.detailOn = !m.detailOn
 		case "esc":
 			m.help, m.detailOn = false, false
+			m.clearMutationStatus()
 		}
 	case tea.MouseMsg:
 		event := tea.MouseEvent(message)
@@ -612,11 +668,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = false
 		if message.err != nil {
-			m.err = message.err
+			m.tasksErr = message.err
 			break
 		}
 		selected := m.selectedID()
-		m.err, m.updated = nil, message.at
+		m.tasksErr, m.updated = nil, message.at
 		m.allTasks = append([]model.Task{}, message.tasks...)
 		m.regroupTasks()
 		if m.desiredSelection != "" {
@@ -641,29 +697,33 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if message.err != nil {
-			m.err = message.err
+			m.detailErr = message.err
 			break
 		}
-		m.detail, m.graph, m.err = &message.detail, &message.graph, nil
+		m.detail, m.graph, m.detailErr = &message.detail, &message.graph, nil
 	case boardContextMsg:
 		if message.err != nil {
-			m.err = message.err
+			m.boardContextErr = message.err
 			break
 		}
-		m.boardContext = &message.context
+		m.boardContext, m.boardContextErr = &message.context, nil
 	case mutationMsg:
-		m.busy = false
+		m.busy, m.busyAction = false, ""
 		if message.err != nil {
-			m.err, m.notice = message.err, ""
+			m.err, m.notice, m.noticeUntil = message.err, "", time.Time{}
 			break
 		}
 		m.err, m.notice = nil, actionLabel(message.action)
+		m.noticeUntil = time.Now().Add(noticeDuration)
 		if message.detail != nil && message.detail.Task.ID != "" {
 			m.desiredSelection = message.detail.Task.ID
 		}
 		m.loading = true
 		return m, m.loadTasks()
 	case refreshMsg:
+		if m.notice != "" && !m.noticeUntil.IsZero() && !time.Time(message).Before(m.noticeUntil) {
+			m.notice, m.noticeUntil = "", time.Time{}
+		}
 		return m, tea.Batch(m.loadTasks(), m.loadBoardContext(), tick())
 	}
 	return m, nil
