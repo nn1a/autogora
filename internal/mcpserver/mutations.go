@@ -704,11 +704,26 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			if err != nil || claim == nil {
 				return claim, err
 			}
-			prepared, err := workspace.New(s.manager).Prepare(ctx, opened, claim)
+			workspaces := workspace.New(s.manager)
+			prepared, err := workspaces.Prepare(ctx, opened, claim)
 			if err != nil {
 				message := "Workspace preparation failed: " + err.Error()
 				_, _ = opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, message, store.FailRunOptions{})
 				return nil, err
+			}
+			if _, err := workspaces.IntegratePrerequisiteChangeSets(ctx, opened, prepared); err != nil {
+				var integrationErr *workspace.PrerequisiteIntegrationError
+				if errors.As(err, &integrationErr) {
+					_, blockErr := opened.BlockRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.BlockInput{
+						Reason: integrationErr.Reason, Kind: integrationErr.BlockKind,
+					})
+					return nil, errors.Join(err, blockErr)
+				}
+				countFailure := false
+				_, failErr := opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "Prerequisite integration failed: "+err.Error(), store.FailRunOptions{
+					Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+				})
+				return nil, errors.Join(err, failErr)
 			}
 			return prepared, nil
 		})

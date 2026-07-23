@@ -251,10 +251,25 @@ func (s *Service) ClaimTaskForUser(ctx context.Context, taskID string, ttlSecond
 	if claim == nil {
 		return nil, fmt.Errorf("task is not claimable: %s", taskID)
 	}
-	prepared, err := workspace.New(s.manager).Prepare(ctx, s.Store, claim)
+	workspaces := workspace.New(s.manager)
+	prepared, err := workspaces.Prepare(ctx, s.Store, claim)
 	if err != nil {
 		_, _ = s.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "Workspace preparation failed: "+err.Error(), store.FailRunOptions{})
 		return nil, err
+	}
+	if _, err := workspaces.IntegratePrerequisiteChangeSets(ctx, s.Store, prepared); err != nil {
+		var integrationErr *workspace.PrerequisiteIntegrationError
+		if errors.As(err, &integrationErr) {
+			_, blockErr := s.BlockRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.BlockInput{
+				Reason: integrationErr.Reason, Kind: integrationErr.BlockKind,
+			})
+			return nil, errors.Join(err, blockErr)
+		}
+		countFailure := false
+		_, failErr := s.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "Prerequisite integration failed: "+err.Error(), store.FailRunOptions{
+			Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+		})
+		return nil, errors.Join(err, failErr)
 	}
 	return prepared, nil
 }

@@ -575,6 +575,20 @@ func (a *App) runClaim(ctx context.Context, opts options) error {
 		_, _ = opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, message, store.FailRunOptions{})
 		return err
 	}
+	if _, err := workspaces.IntegratePrerequisiteChangeSets(ctx, opened, prepared); err != nil {
+		var integrationErr *workspace.PrerequisiteIntegrationError
+		if errors.As(err, &integrationErr) {
+			_, blockErr := opened.BlockRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, store.BlockInput{
+				Reason: integrationErr.Reason, Kind: integrationErr.BlockKind,
+			})
+			return errors.Join(err, blockErr)
+		}
+		countFailure := false
+		_, failErr := opened.FailRun(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, "Prerequisite integration failed: "+err.Error(), store.FailRunOptions{
+			Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+		})
+		return errors.Join(err, failErr)
+	}
 	return writeJSON(a.Stdout, prepared)
 }
 

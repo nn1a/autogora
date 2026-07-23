@@ -686,6 +686,9 @@ func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspace
 			if err != nil {
 				return model.TaskDetail{}, err
 			}
+			if err := workspaces.VerifyPrerequisiteChangeSets(ctx, opened, prepared.Task.Task.ID, *prepared.Workspace, snapshot.HeadCommit); err != nil {
+				return model.TaskDetail{}, err
+			}
 			if _, err := opened.RecordRunChangeSet(ctx, scope, store.RecordChangeSetInput{
 				RunID: scope.RunID, RepositoryPath: snapshot.RepositoryPath, WorktreePath: snapshot.WorktreePath,
 				BaseCommit: snapshot.BaseCommit, HeadCommit: snapshot.HeadCommit, DurableRef: snapshot.DurableRef,
@@ -744,6 +747,37 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		_, _ = opened.FailRun(durable, scope, "Workspace preparation failed: "+err.Error(), failure)
 		options.log("workspace failure %s: %v", claim.Task.Task.ID, err)
+		return
+	}
+	if _, err := workspaces.IntegratePrerequisiteChangeSets(ctx, opened, prepared); err != nil {
+		durable, cancel := durableContext()
+		defer cancel()
+		var integrationErr *workspace.PrerequisiteIntegrationError
+		if errors.As(err, &integrationErr) {
+			_, blockErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: integrationErr.Reason, Kind: integrationErr.BlockKind})
+			if blockErr == nil {
+				_, blockErr = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
+			}
+			if blockErr != nil {
+				_ = opened.DiscardRunTerminalRequest(durable, scope, "prerequisite integration block finalization failed")
+				countFailure := false
+				_, failErr := opened.FailRun(durable, scope, integrationErr.Reason, store.FailRunOptions{
+					CountFailure: &countFailure, FailureLimit: options.FailureLimit,
+				})
+				if failErr == nil {
+					_, failErr = opened.BlockTask(durable, claim.Task.Task.ID, store.BlockInput{Reason: integrationErr.Reason, Kind: integrationErr.BlockKind})
+				}
+				options.log("prerequisite integration block fallback failed %s: %v", claim.Task.Task.ID, errors.Join(blockErr, failErr))
+			}
+			options.log("blocked prerequisite integration for %s: %v", claim.Task.Task.ID, err)
+			return
+		}
+		countFailure := false
+		_, _ = opened.FailRun(durable, scope, "Prerequisite integration failed: "+err.Error(), store.FailRunOptions{
+			Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+			CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
+		})
+		options.log("prerequisite integration failure %s: %v", claim.Task.Task.ID, err)
 		return
 	}
 	logsRoot, rootsErr := manager.LogsRoot(prepared.Task.Task.Board)

@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -302,6 +303,164 @@ printf '%s\n' 'after terminal request' >> "$AUTOGORA_WORKSPACE/feature.txt"`)
 	refHead, err := ref.Output()
 	if err != nil || strings.TrimSpace(string(refHead)) != change.HeadCommit {
 		t.Fatalf("durable ref mismatch: %q want %s err=%v", refHead, change.HeadCommit, err)
+	}
+}
+
+func TestDispatcherIntegratesPinnedPrerequisiteChangeSetsBeforeWorkerLaunch(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	repository := gitRepositoryFixture(t)
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "writer"
+	first, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "first prerequisite", Assignee: &assignee, Runtime: model.RuntimeCline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "second prerequisite", Assignee: &assignee, Runtime: model.RuntimeCline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "fan-in implementation", Assignee: &assignee, Runtime: model.RuntimeCline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, first.Task.ID, child.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, second.Task.ID, child.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+
+	cliPath := buildAutogora(t)
+	fixture := executableFixture(t, fmt.Sprintf(`
+case "$AUTOGORA_TASK_ID" in
+  %s) printf 'first prerequisite\n' > "$AUTOGORA_WORKSPACE/first.txt" ;;
+  %s) printf 'second prerequisite\n' > "$AUTOGORA_WORKSPACE/second.txt" ;;
+  %s)
+    test "$(cat "$AUTOGORA_WORKSPACE/first.txt")" = "first prerequisite"
+    test "$(cat "$AUTOGORA_WORKSPACE/second.txt")" = "second prerequisite"
+    printf 'fan-in complete\n' > "$AUTOGORA_WORKSPACE/child.txt"
+    ;;
+esac
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "work completed" >/dev/null`, first.Task.ID, second.Task.ID, child.Task.ID))
+	runTarget := func(taskID string) {
+		t.Helper()
+		if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Board: "default", TaskID: taskID, Once: true,
+			AllowWrites: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+				if name == "AUTOGORA_CLINE_BIN" {
+					return fixture
+				}
+				return ""
+			}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runTarget(first.Task.ID)
+	runTarget(second.Task.ID)
+	runTarget(child.Task.ID)
+
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	firstDetail, _ := check.GetTask(ctx, first.Task.ID)
+	secondDetail, _ := check.GetTask(ctx, second.Task.ID)
+	childDetail, _ := check.GetTask(ctx, child.Task.ID)
+	if childDetail.Task.Status != model.TaskStatusDone || len(firstDetail.ChangeSets) != 1 || len(secondDetail.ChangeSets) != 1 || len(childDetail.ChangeSets) != 1 {
+		t.Fatalf("fan-in did not complete with durable change sets: first=%#v second=%#v child=%#v", firstDetail, secondDetail, childDetail)
+	}
+	childChange := childDetail.ChangeSets[0]
+	if len(childChange.ChangedFiles) != 1 || childChange.ChangedFiles[0] != "child.txt" {
+		t.Fatalf("child change set includes inherited prerequisite files: %#v", childChange)
+	}
+	for _, parentHead := range []string{firstDetail.ChangeSets[0].HeadCommit, secondDetail.ChangeSets[0].HeadCommit} {
+		command := exec.Command("git", "-C", repository, "merge-base", "--is-ancestor", parentHead, childChange.HeadCommit)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("child head dropped prerequisite %s: %v\n%s", parentHead, err, output)
+		}
+	}
+}
+
+func TestDispatcherBlocksConflictingPrerequisiteChangeSetsWithoutLaunchingWorker(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	repository := gitRepositoryFixture(t)
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "writer"
+	first, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "first conflicting prerequisite", Assignee: &assignee, Runtime: model.RuntimeCline})
+	second, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "second conflicting prerequisite", Assignee: &assignee, Runtime: model.RuntimeCline})
+	child, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "conflicting fan-in", Assignee: &assignee, Runtime: model.RuntimeCline})
+	if _, err := opened.LinkTasks(ctx, first.Task.ID, child.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.LinkTasks(ctx, second.Task.ID, child.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+	marker := filepath.Join(t.TempDir(), "child-worker-launched")
+	t.Setenv("AUTOGORA_TEST_CHILD_MARKER", marker)
+	cliPath := buildAutogora(t)
+	fixture := executableFixture(t, fmt.Sprintf(`
+case "$AUTOGORA_TASK_ID" in
+  %s) printf 'first version\n' > "$AUTOGORA_WORKSPACE/README.md" ;;
+  %s) printf 'second version\n' > "$AUTOGORA_WORKSPACE/README.md" ;;
+  %s) touch "$AUTOGORA_TEST_CHILD_MARKER" ;;
+esac
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "work completed" >/dev/null`, first.Task.ID, second.Task.ID, child.Task.ID))
+	runTarget := func(taskID string) {
+		t.Helper()
+		if err := Run(ctx, Options{DBPath: dbPath, CLIPath: cliPath, Board: "default", TaskID: taskID, Once: true,
+			AllowWrites: true, AutoDecompose: boolValue(false), Getenv: func(name string) string {
+				if name == "AUTOGORA_CLINE_BIN" {
+					return fixture
+				}
+				return ""
+			}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runTarget(first.Task.ID)
+	runTarget(second.Task.ID)
+	runTarget(child.Task.ID)
+
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, child.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || detail.Task.BlockKind == nil ||
+		*detail.Task.BlockKind != model.BlockKindNeedsInput || detail.Task.BlockReason == nil || !strings.Contains(*detail.Task.BlockReason, "conflicts in README.md") {
+		t.Fatalf("conflicting fan-in was not blocked for review: %#v", detail)
+	}
+	if len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked {
+		t.Fatalf("conflicting integration left an invalid run history: %#v", detail.Runs)
+	}
+	if len(detail.ChangeSets) != 0 || len(detail.RunWorkspaces) != 1 {
+		t.Fatalf("conflicting integration recorded a child change set: %#v", detail)
+	}
+	if unmerged, err := exec.Command("git", "-C", detail.RunWorkspaces[0].Path, "ls-files", "-u").Output(); err != nil || len(unmerged) != 0 {
+		t.Fatalf("conflicting integration left unmerged files: %q err=%v", unmerged, err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("child worker launched despite prerequisite conflict: %v", err)
 	}
 }
 

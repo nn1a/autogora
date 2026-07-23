@@ -120,3 +120,54 @@ func (s *Store) BindRunWorkspace(ctx context.Context, scope RunScope, input Bind
 	}
 	return *value, nil
 }
+
+// UpdateRunWorkspaceBase records the effective commit presented to a worker
+// after Autogora has integrated prerequisite change sets. The active-run scope
+// keeps an old dispatcher or unrelated worker from changing this baseline.
+func (s *Store) UpdateRunWorkspaceBase(ctx context.Context, scope RunScope, baseCommit string) (model.RunWorkspace, error) {
+	baseCommit = strings.TrimSpace(baseCommit)
+	if baseCommit == "" {
+		return model.RunWorkspace{}, errors.New("run workspace base commit cannot be empty")
+	}
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		task, run, err := requireActiveRun(ctx, tx, scope)
+		if err != nil {
+			return err
+		}
+		workspace, err := scanRunWorkspace(tx.QueryRowContext(ctx, `SELECT run_id, task_id, path, kind,
+			repository_path, base_commit, generated, prepared_at FROM run_workspaces WHERE run_id = ?`, run.ID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("run workspace is not prepared")
+		}
+		if err != nil {
+			return err
+		}
+		if workspace.Kind != model.WorkspaceWorktree {
+			return fmt.Errorf("cannot update the base commit of a %s workspace", workspace.Kind)
+		}
+		if workspace.BaseCommit != nil && *workspace.BaseCommit == baseCommit {
+			return nil
+		}
+		var previous any
+		if workspace.BaseCommit != nil {
+			previous = *workspace.BaseCommit
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE run_workspaces SET base_commit = ? WHERE run_id = ?", baseCommit, run.ID); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, task.ID, "workspace_base_updated", map[string]any{
+			"previousBaseCommit": previous, "baseCommit": baseCommit,
+		}, &run.ID)
+	})
+	if err != nil {
+		return model.RunWorkspace{}, err
+	}
+	value, err := s.GetRunWorkspace(ctx, scope.RunID)
+	if err != nil {
+		return model.RunWorkspace{}, err
+	}
+	if value == nil {
+		return model.RunWorkspace{}, errors.New("updated run workspace was not found")
+	}
+	return *value, nil
+}
