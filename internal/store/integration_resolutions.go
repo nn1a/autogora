@@ -308,7 +308,8 @@ func (s *Store) StartIntegrationResolutionAttempt(
 }
 
 // CompensateIntegrationResolutionStart refunds the exact attempt charged by a
-// start gate when exec.Cmd.Start fails before any process exists.
+// start gate while the executor's platform fence still guarantees that no
+// coding-agent code has been released.
 func (s *Store) CompensateIntegrationResolutionStart(
 	ctx context.Context,
 	scope RunScope,

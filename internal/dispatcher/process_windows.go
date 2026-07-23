@@ -12,10 +12,30 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func newWorkerCommand(command RunnerCommand) (*workerCommand, error) {
+	child := exec.Command(command.Command, command.Args...)
+	return &workerCommand{
+		child: child,
+		release: func() (bool, error) {
+			if child.Process == nil {
+				return false, errors.New("worker process has not started")
+			}
+			if err := resumeSuspendedProcess(uint32(child.Process.Pid)); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+		cleanup: func() {},
+	}, nil
+}
+
+func preflightWorkerCommand(command RunnerCommand) (RunnerCommand, error) {
+	return command, nil
+}
+
 func configureProcess(cmd *exec.Cmd) {
-	// The worker must not execute before it belongs to the Job Object. Go does
-	// not expose the primary thread handle, so attachProcessTree locates and
-	// resumes that thread only after assignment succeeds.
+	// The worker must not execute before it belongs to the Job Object and its
+	// durable spawn record exists. release on workerCommand resumes it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
 }
 
@@ -58,11 +78,6 @@ func attachProcessTree(cmd *exec.Cmd) (func(), error) {
 	if err := windows.AssignProcessToJobObject(job, process); err != nil {
 		closeJob()
 		return nil, fmt.Errorf("assign worker job object: %w", err)
-	}
-	if err := resumeSuspendedProcess(uint32(cmd.Process.Pid)); err != nil {
-		// Closing a configured, assigned job kills the still-suspended worker.
-		closeJob()
-		return nil, fmt.Errorf("resume protected worker: %w", err)
 	}
 	return closeJob, nil
 }
