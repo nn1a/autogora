@@ -223,7 +223,7 @@ func TestValidateAgainstSnapshotClassifiesAtomicRouteAndUnblock(t *testing.T) {
 	}
 }
 
-func TestValidateAgainstSnapshotRequiresReadyEnabledWorkerCapacity(t *testing.T) {
+func TestValidateAgainstSnapshotRequiresEligibleWorkerRoute(t *testing.T) {
 	base := validationSnapshot()
 	proposal := Proposal{
 		IncidentID: "ci1", ExpectedGraphRevision: 4,
@@ -241,7 +241,8 @@ func TestValidateAgainstSnapshotRequiresReadyEnabledWorkerCapacity(t *testing.T)
 		{name: "disabled", edit: func(agent *AgentSnapshot) { agent.Enabled = false }, code: "disabled_agent"},
 		{name: "unknown health", edit: func(agent *AgentSnapshot) { agent.Health = "" }, code: "unhealthy_agent"},
 		{name: "wrong role", edit: func(agent *AgentSnapshot) { agent.Roles = []string{"planner"} }, code: "wrong_agent_role"},
-		{name: "full", edit: func(agent *AgentSnapshot) { agent.ActiveSlots = agent.MaxConcurrent }, code: "agent_capacity"},
+		{name: "invalid maximum", edit: func(agent *AgentSnapshot) { agent.MaxConcurrent = 0 }, code: "agent_capacity"},
+		{name: "invalid active count", edit: func(agent *AgentSnapshot) { agent.ActiveSlots = -1 }, code: "agent_capacity"},
 		{name: "cooldown", edit: func(agent *AgentSnapshot) {
 			value := "2099-01-01T00:00:00Z"
 			agent.CooldownUntil = &value
@@ -261,6 +262,29 @@ func TestValidateAgainstSnapshotRequiresReadyEnabledWorkerCapacity(t *testing.T)
 				t.Fatalf("%s validation = %#v", test.name, result)
 			}
 		})
+	}
+}
+
+func TestValidateAgainstSnapshotTreatsFullWorkerAsDispatchBackpressure(t *testing.T) {
+	snapshot := validationSnapshot()
+	snapshot.AvailableAgents = append([]AgentSnapshot(nil), snapshot.AvailableAgents...)
+	snapshot.AvailableAgents[1].ActiveSlots = snapshot.AvailableAgents[1].MaxConcurrent
+	proposal := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 4,
+		Summary: "Reroute", Rationale: "Queue work on the healthy fallback.",
+		Actions: []Action{{
+			Kind: ActionSetRoute, TaskID: "blocked", ExpectedUpdatedAt: "v2",
+			Assignee: "claude", Runtime: model.RuntimeClaude,
+			Reason: "Use the healthy route when its current worker releases the slot.",
+		}},
+	}
+
+	result := ValidateAgainstSnapshot(proposal, snapshot, 3)
+	if !result.Valid || len(result.Issues) != 0 || len(result.Actions) != 1 {
+		t.Fatalf("full worker should remain a valid queued route: %#v", result)
+	}
+	if result.Actions[0].Risk != ActionRiskConditional {
+		t.Fatalf("full worker route risk = %s, want %s", result.Actions[0].Risk, ActionRiskConditional)
 	}
 }
 

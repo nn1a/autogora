@@ -329,7 +329,11 @@ func validateRoute(index int, assignee string, runtime model.Runtime, agents map
 	if health := strings.TrimSpace(agent.Health); health != string(model.AgentHealthReady) {
 		addIssue(index, "unhealthy_agent", fmt.Sprintf("agent %s health is %s", assignee, health))
 	}
-	if agent.MaxConcurrent < 1 || agent.ActiveSlots < 0 || agent.ActiveSlots >= agent.MaxConcurrent {
+	// A healthy route remains valid while all of its slots are occupied.
+	// Capacity is transient dispatch backpressure, not a reason to spend
+	// another Coordinator analysis call or reject an otherwise safe recovery.
+	// Invalid capacity metadata is still rejected.
+	if agent.MaxConcurrent < 1 || agent.ActiveSlots < 0 {
 		addIssue(index, "agent_capacity", fmt.Sprintf(
 			"agent %s has %d of %d slots active", assignee, agent.ActiveSlots, agent.MaxConcurrent,
 		))
@@ -466,7 +470,7 @@ func classifyValidatedRisk(
 			agent, found := agents[*final.Assignee]
 			if found && agent.Enabled && agent.Runtime == final.Runtime &&
 				strings.TrimSpace(agent.Health) == string(model.AgentHealthReady) &&
-				agent.MaxConcurrent > 0 && agent.ActiveSlots >= 0 && agent.ActiveSlots < agent.MaxConcurrent &&
+				agent.MaxConcurrent > 0 && agent.ActiveSlots >= 0 &&
 				agent.CooldownUntil == nil && containsString(agent.Roles, "worker") {
 				return ActionRiskConditional
 			}
