@@ -66,17 +66,16 @@ func TestDispatchAutopilotRemainsOptIn(t *testing.T) {
 	}
 }
 
-func TestDeprecatedDaemonRetainsAutopilotCompatibility(t *testing.T) {
+func TestDispatchDoesNotExposePreReleaseDaemonAlias(t *testing.T) {
 	app := dispatchTestApp(t)
-	var captured dispatcher.Options
-	app.DispatchRunner = func(_ context.Context, options dispatcher.Options) error {
-		captured = options
+	app.DispatchRunner = func(context.Context, dispatcher.Options) error {
+		t.Fatal("removed daemon alias started the dispatcher")
 		return nil
 	}
 
-	runApp(t, app, "daemon", "--force")
-	if !captured.Autopilot || captured.Once {
-		t.Fatalf("daemon compatibility options = %#v", captured)
+	err := app.Run(context.Background(), []string{"daemon", "--force"})
+	if err == nil || !strings.Contains(err.Error(), "unknown or not-yet-ported command: daemon") {
+		t.Fatalf("removed daemon alias error = %v", err)
 	}
 }
 

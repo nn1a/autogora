@@ -116,11 +116,8 @@ func (a *App) dispatchCandidates(ctx context.Context, opts options, limit int) (
 	return map[string]any{"dryRun": true, "candidates": candidates}, nil
 }
 
-func (a *App) runDispatch(ctx context.Context, command string, opts options) error {
-	if command == "daemon" && !opts.flags["force"] {
-		return errors.New("daemon is deprecated and requires --force; prefer dispatch --watch")
-	}
-	if command == "dispatch" && opts.flags["once"] && opts.flags["watch"] {
+func (a *App) runDispatch(ctx context.Context, opts options) error {
+	if opts.flags["once"] && opts.flags["watch"] {
 		return errors.New("--once and --watch cannot be used together")
 	}
 	maxWorkers, err := numberOption(firstNonEmpty(opts.value("max"), opts.value("max-workers")), 2)
@@ -233,7 +230,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		run = dispatcher.Run
 	}
 	return run(ctx, dispatcher.Options{
-		DBPath: dbPath, CLIPath: cliPath, Board: a.board(opts), Once: command != "daemon" && opts.flags["once"],
+		DBPath: dbPath, CLIPath: cliPath, Board: a.board(opts), Once: opts.flags["once"],
 		Interval: time.Duration(intervalMS) * time.Millisecond, MaxWorkers: maxWorkers,
 		MaxInProgress: maxInProgress, MaxInProgressPerAssignee: maxPerAssignee,
 		ClaimTTLSeconds: claimTTL, StaleTimeout: time.Duration(staleSeconds) * time.Second,
@@ -243,7 +240,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, FinalizerProfile: finalizerProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
 		PlannerModel: opts.value("planner-model"), PlannerProvider: opts.value("planner-provider"),
-		AllowWrites: opts.flags["allow-writes"], Autopilot: command == "daemon" || opts.flags["autopilot"],
+		AllowWrites: opts.flags["allow-writes"], Autopilot: opts.flags["autopilot"],
 		WorkingDirectory: cwd, Getenv: a.Getenv,
 		OnLog: func(message string) { _, _ = fmt.Fprintf(a.Stderr, "[autogora] %s\n", message) },
 	})
