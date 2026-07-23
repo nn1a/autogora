@@ -279,6 +279,52 @@ function defaultWorkerProfile() {
   return profileByName(preferred) || workerProfiles()[0] || null;
 }
 
+function authoritativeTaskRoute(profileName, assignee, runtime) {
+  const customAssignee = String(assignee || "").trim();
+  const profile = profileByName(profileName) || profileByName(customAssignee);
+  if (profile) {
+    return {
+      profile, assignee: profile.name, runtime: profile.runtime,
+      model: profile.model || "CLI default (unpinned)", provider: profile.provider || "",
+    };
+  }
+  return {
+    profile: null, assignee: customAssignee || null, runtime,
+    model: runtime === "manual" ? "Manual task" : "CLI default (unpinned)", provider: "",
+  };
+}
+
+function taskRoutePreview(route) {
+  return route.provider ? `${route.model} · ${route.provider}` : route.model;
+}
+
+function applyAuthoritativeRouteControls(controls) {
+  const route = authoritativeTaskRoute(
+    controls.profile.value, controls.assignee.value, controls.runtime.value,
+  );
+  if (route.profile) {
+    controls.profile.value = route.profile.name;
+    controls.assignee.value = route.assignee;
+    controls.runtime.value = route.runtime;
+  }
+  controls.model.value = taskRoutePreview(route);
+  return route;
+}
+
+function switchRouteControlsToCustom(controls) {
+  if (profileByName(controls.assignee.value)) controls.assignee.value = "";
+  controls.profile.value = "";
+  return applyAuthoritativeRouteControls(controls);
+}
+
+function taskDialogRouteControls() {
+  const form = $("#task-form");
+  return {
+    profile: form.elements.profile, assignee: form.elements.assignee,
+    runtime: form.elements.runtime, model: form.elements.modelPreview,
+  };
+}
+
 function availableWorkerAgents() {
   const configured = state.agentConfig?.agents || [];
   return configured.filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
@@ -318,13 +364,14 @@ function renderFilters() {
 
 function cardHtml(task) {
   const owner = task.assignee || "Unassigned";
+  const route = authoritativeTaskRoute("", task.assignee, task.runtime);
   const progress = task.status !== "done" && task.status !== "archived" && task.subtasksTotal > 0
     ? `<span class="pill" title="Completed subtasks">${task.subtasksDone}/${task.subtasksTotal}</span>` : "";
   const summary = task.body?.trim()
     ? `<div class="card-summary markdown markdown-compact">${markdown(task.body.trim(), { compact: true })}</div>`
     : "";
   return `<article class="card status-${task.status} ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" tabindex="0" data-task="${escapeHtml(task.id)}" data-task-version="${escapeHtml(task.updatedAt)}"
-    aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${task.runtime}`)}">
+    aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${route.runtime}`)}">
     <div class="card-top"><input type="checkbox" aria-label="Select ${escapeHtml(task.title)}" ${state.selected.has(task.id) ? "checked" : ""}>
       <span class="status-badge"><span class="status-dot"></span>${STATUS_LABELS[task.status]}</span>
       <span class="mono card-id">${escapeHtml(task.id)}</span>${progress}</div>
@@ -333,7 +380,7 @@ function cardHtml(task) {
     <div class="card-owner ${task.assignee ? "" : "unassigned"}">
       <span class="avatar" aria-hidden="true">${escapeHtml(initials(task.assignee))}</span>
       <span class="owner-copy"><small>Owner</small><strong>${escapeHtml(owner)}</strong></span>
-      <span class="runtime-chip" title="Worker runtime">${escapeHtml(task.runtime)}</span>
+      <span class="runtime-chip" title="Effective worker runtime">${escapeHtml(route.runtime)}</span>
     </div>
     <div class="card-foot">
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
@@ -582,15 +629,7 @@ function updateTaskScheduleVisibility() {
 }
 
 function updateTaskModelPreview() {
-  const form = $("#task-form");
-  const profile = profileByName(form.elements.profile.value);
-  if (profile) {
-    form.elements.assignee.value = profile.name;
-    form.elements.runtime.value = profile.runtime;
-    form.elements.modelPreview.value = profile.model || "CLI default (unpinned)";
-    return;
-  }
-  form.elements.modelPreview.value = form.elements.runtime.value === "manual" ? "Manual task" : "CLI default (unpinned)";
+  applyAuthoritativeRouteControls(taskDialogRouteControls());
 }
 
 async function openDrawer(taskId, { focus = true, force = false } = {}) {
@@ -712,10 +751,11 @@ function renderDrawer(detail) {
     ? `<div class="detail-row" data-open-task="${escapeHtml(detail.parentTask.id)}"><button type="button" class="icon-button compact" data-remove-parent-task="${escapeHtml(detail.parentTask.id)}" aria-label="Remove parent task">×</button><strong>${escapeHtml(detail.parentTask.title)}</strong><span class="mono">${escapeHtml(detail.parentTask.id)}</span></div>`
     : "<small>No parent task</small>";
   const subtasks = detail.subtasks.map((subtask) => `<div class="detail-row" data-open-task="${escapeHtml(subtask.id)}"><button type="button" class="icon-button compact" data-remove-subtask="${escapeHtml(subtask.id)}" aria-label="Remove subtask">×</button><strong>${escapeHtml(subtask.title)}</strong><span class="mono">${escapeHtml(subtask.id)} · ${escapeHtml(subtask.status)}</span></div>`).join("");
-  const selectedProfile = workerProfiles().find((profile) => profile.name === (task.assignee || "") && profile.runtime === task.runtime);
+  const selectedRoute = authoritativeTaskRoute("", task.assignee, task.runtime);
+  const selectedProfile = selectedRoute.profile;
   const drawerProfileOptions = `<option value="">Custom assignment</option>${workerProfiles().map((profile) =>
     `<option value="${escapeHtml(profile.name)}"${selectedProfile?.name === profile.name ? " selected" : ""}>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)}</option>`).join("")}`;
-  const routeModel = selectedProfile?.model || (task.runtime === "manual" ? "Manual task" : "CLI default (unpinned)");
+  const routeModel = taskRoutePreview(selectedRoute);
   $("#drawer-content").innerHTML = `
     <div class="drawer-title-block"><span class="eyebrow">Task</span><h1>${escapeHtml(task.title)}</h1></div>
     <div class="task-context">
@@ -723,7 +763,7 @@ function renderDrawer(detail) {
         <span class="avatar" aria-hidden="true">${escapeHtml(initials(task.assignee))}</span>
         <span><small>Owner</small><strong>${escapeHtml(task.assignee || "Unassigned")}</strong></span>
       </div>
-      <div><small>Runtime</small><strong>${escapeHtml(task.runtime)}</strong></div>
+      <div><small>Effective runtime</small><strong>${escapeHtml(selectedRoute.runtime)}</strong></div>
       <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
     </div>
     ${task.status === "blocked" ? `<div class="detail-row"><strong>Blocked · ${escapeHtml(task.blockKind || "needs_input")}</strong><div>${escapeHtml(task.blockReason || "No reason recorded")}</div></div>` : ""}
@@ -733,7 +773,7 @@ function renderDrawer(detail) {
     <div class="drawer-grid drawer-routing-grid">
       <label>Board profile<select id="edit-profile">${drawerProfileOptions}</select></label>
       <label>Assignee<input id="edit-assignee" value="${escapeHtml(task.assignee || "")}"></label>
-      <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+      <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === selectedRoute.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
       <label>Current route model<input id="edit-model-preview" value="${escapeHtml(routeModel)}" readonly></label>
       <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
       <label>Tenant<input id="edit-tenant" value="${escapeHtml(task.tenant || "")}"></label>
@@ -802,29 +842,34 @@ function bindDrawer(detail) {
     state.drawerDirty = true;
   };
   drawerEditSelectors.forEach((selector) => $(selector)?.addEventListener("input", markDirty));
-  const updateRoutePreview = () => {
-    const profile = profileByName($("#edit-profile").value);
-    if (profile) {
-      $("#edit-assignee").value = profile.name;
-      $("#edit-runtime").value = profile.runtime;
-      $("#edit-model-preview").value = profile.model || "CLI default (unpinned)";
-      return;
-    }
-    $("#edit-model-preview").value = $("#edit-runtime").value === "manual" ? "Manual task" : "CLI default (unpinned)";
-  };
-  $("#edit-profile").addEventListener("change", updateRoutePreview);
-  $("#edit-assignee").addEventListener("input", () => { $("#edit-profile").value = ""; updateRoutePreview(); });
-  $("#edit-runtime").addEventListener("change", () => { $("#edit-profile").value = ""; updateRoutePreview(); });
+  const routeControls = () => ({
+    profile: $("#edit-profile"), assignee: $("#edit-assignee"),
+    runtime: $("#edit-runtime"), model: $("#edit-model-preview"),
+  });
+  $("#edit-profile").addEventListener("change", () => {
+    const controls = routeControls();
+    if (controls.profile.value) applyAuthoritativeRouteControls(controls);
+    else switchRouteControlsToCustom(controls);
+  });
+  $("#edit-assignee").addEventListener("input", () => {
+    const controls = routeControls();
+    controls.profile.value = "";
+    applyAuthoritativeRouteControls(controls);
+  });
+  $("#edit-runtime").addEventListener("change", () => {
+    switchRouteControlsToCustom(routeControls());
+  });
   $("#save-task").addEventListener("click", async () => {
     try {
       const scheduleValue = $("#edit-scheduled-at").value;
       if (detail.task.status === "scheduled") futureScheduleISO(scheduleValue);
+      const route = applyAuthoritativeRouteControls(routeControls());
       const payload = detail.task.status === "running"
         ? { expectedUpdatedAt: state.drawerVersion, priority: Number($("#edit-priority").value) }
         : {
           expectedUpdatedAt: state.drawerVersion,
           title: $("#edit-title").value, body: $("#edit-body").value,
-          assignee: $("#edit-assignee").value || null, runtime: $("#edit-runtime").value,
+          assignee: route.assignee, runtime: route.runtime,
           priority: Number($("#edit-priority").value),
           tenant: $("#edit-tenant").value || null, workspaceKind: $("#edit-workspace-kind").value,
           workspace: $("#edit-workspace").value || null, branch: $("#edit-branch").value || null,
@@ -1541,12 +1586,18 @@ function bindGlobalActions() {
     openAgentSettings().catch((error) => toast(error.message, true));
   });
   $("#task-form").addEventListener("submit", submitTask);
-  $("#task-form [name=profile]").addEventListener("change", updateTaskModelPreview);
+  $("#task-form [name=profile]").addEventListener("change", () => {
+    const controls = taskDialogRouteControls();
+    if (controls.profile.value) applyAuthoritativeRouteControls(controls);
+    else switchRouteControlsToCustom(controls);
+  });
   $("#task-form [name=assignee]").addEventListener("input", () => {
-    $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
+    const controls = taskDialogRouteControls();
+    controls.profile.value = "";
+    applyAuthoritativeRouteControls(controls);
   });
   $("#task-form [name=runtime]").addEventListener("change", () => {
-    $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
+    switchRouteControlsToCustom(taskDialogRouteControls());
   });
   $("#task-form [name=status]").addEventListener("change", updateTaskScheduleVisibility);
   $("#github-form").addEventListener("submit", submitGitHubImport);
@@ -1594,9 +1645,10 @@ async function submitTask(event) {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
     const scheduledAt = data.get("status") === "scheduled" ? futureScheduleISO(data.get("scheduledAt")) : null;
+    const route = authoritativeTaskRoute(data.get("profile"), data.get("assignee"), data.get("runtime"));
     await api(boardPath("/api/tasks"), { method: "POST", body: JSON.stringify({
       title: data.get("title"), body: data.get("body"), status: data.get("status"),
-      assignee: data.get("assignee") || null, runtime: data.get("runtime"), priority: Number(data.get("priority")),
+      assignee: route.assignee, runtime: route.runtime, priority: Number(data.get("priority")),
       tenant: data.get("tenant") || null, workspaceKind: data.get("workspaceKind"), workspace: data.get("workspace") || null,
       branch: data.get("branch") || null, maxRuntimeSeconds: data.get("maxRuntimeSeconds") ? Number(data.get("maxRuntimeSeconds")) : null,
       maxRetries: Number(data.get("maxRetries")) || 2, scheduledAt,
