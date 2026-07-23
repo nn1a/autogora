@@ -6,7 +6,7 @@ GCFLAGS += -gcflags=github.com/charmbracelet/...=-l
 GCFLAGS += -gcflags=github.com/modelcontextprotocol/...=-l
 GCFLAGS += -gcflags=github.com/google/jsonschema-go/...=-l
 
-.PHONY: build test verify release
+.PHONY: build test verify release release-musl release-plan test-release test-release-musl
 
 build:
 	mkdir -p bin
@@ -20,4 +20,16 @@ verify:
 	$(GO) vet ./...
 
 release:
-	./scripts/build-release.sh "$(VERSION)" release
+	GO="$(GO)" ./scripts/build-release.sh "$(VERSION)" release
+
+release-musl:
+	TARGETS="linux-musl/amd64 linux-musl/arm64" GO="$(GO)" ./scripts/build-release.sh "$(VERSION)" release
+
+release-plan:
+	RELEASE_PLAN_ONLY=1 GO="$(GO)" ./scripts/build-release.sh "$(VERSION)" release
+
+test-release:
+	GO="$(GO)" ./scripts/build-release_test.sh
+
+test-release-musl:
+	RELEASE_TEST_MUSL=1 GO="$(GO)" ./scripts/build-release_test.sh
