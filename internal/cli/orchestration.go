@@ -165,27 +165,27 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 			if getErr != nil {
 				err = getErr
 			} else {
-				fallback, selectedOrchestrator := orchestration.SelectProfileRoutes(
-					profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile, plannerRuntime,
+				fallback, selectedFinalizer := orchestration.SelectProfileRoutes(
+					profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.FinalizerProfile, plannerRuntime,
 				)
 				if opts.present("default-profile") {
 					fallback, err = mergeExplicitProfileRoute(opts.value("default-profile"), profiles, plannerRuntime)
 					if err == nil && !orchestration.RunnableProfileRoute(fallback) {
 						err = errors.New("--default-profile requires an enabled worker profile")
 					}
-					if err == nil && !opts.present("orchestrator-profile") {
-						selectedOrchestrator = fallback
+					if err == nil && !opts.present("finalizer-profile") {
+						selectedFinalizer = fallback
 					}
 				}
-				if err == nil && opts.present("orchestrator-profile") {
-					selectedOrchestrator, err = mergeExplicitProfileRoute(opts.value("orchestrator-profile"), profiles, plannerRuntime)
-					if err == nil && !orchestration.RunnableProfileRoute(selectedOrchestrator) {
-						err = errors.New("--orchestrator-profile requires an enabled worker profile")
+				if err == nil && opts.present("finalizer-profile") {
+					selectedFinalizer, err = mergeExplicitProfileRoute(opts.value("finalizer-profile"), profiles, plannerRuntime)
+					if err == nil && !orchestration.RunnableProfileRoute(selectedFinalizer) {
+						err = errors.New("--finalizer-profile requires an enabled worker profile")
 					}
 				}
 				if err == nil {
 					entry.Value, err = orchestration.DecomposeTriageTask(ctx, opened, taskID, orchestration.DecomposeOptions{
-						Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &selectedOrchestrator,
+						Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &selectedFinalizer,
 						AutoPromoteChildren: &metadata.Orchestration.AutoPromoteChildren, Planner: planner, Plan: explicitPlan,
 					})
 				}

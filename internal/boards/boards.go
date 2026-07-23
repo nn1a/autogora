@@ -41,7 +41,7 @@ type OrchestrationSettings struct {
 	PlannerModel         string        `json:"plannerModel,omitempty"`
 	PlannerProvider      string        `json:"plannerProvider,omitempty"`
 	DefaultProfile       *string       `json:"defaultProfile"`
-	OrchestratorProfile  *string       `json:"orchestratorProfile"`
+	FinalizerProfile     *string       `json:"finalizerProfile"`
 	Profiles             []Profile     `json:"profiles"`
 }
 
@@ -79,7 +79,7 @@ type OrchestrationUpdate struct {
 	PlannerModel         *string
 	PlannerProvider      *string
 	DefaultProfile       store.OptionalString
-	OrchestratorProfile  store.OptionalString
+	FinalizerProfile     store.OptionalString
 	Profiles             *[]Profile
 }
 
@@ -350,7 +350,7 @@ func (m *Manager) Read(board string) (Metadata, error) {
 	}
 	orchestration := raw.Orchestration
 	if orchestration.PlannerRuntime == "" && orchestration.AutoDecomposePerTick == 0 && orchestration.Profiles == nil &&
-		orchestration.DefaultProfile == nil && orchestration.OrchestratorProfile == nil {
+		orchestration.DefaultProfile == nil && orchestration.FinalizerProfile == nil {
 		orchestration = defaultOrchestration()
 	} else {
 		orchestration = normalizeOrchestration(orchestration)
@@ -386,8 +386,8 @@ func applyOrchestration(current OrchestrationSettings, update *OrchestrationUpda
 	if update.DefaultProfile.Set {
 		current.DefaultProfile = update.DefaultProfile.Value
 	}
-	if update.OrchestratorProfile.Set {
-		current.OrchestratorProfile = update.OrchestratorProfile.Value
+	if update.FinalizerProfile.Set {
+		current.FinalizerProfile = update.FinalizerProfile.Value
 	}
 	if update.Profiles != nil {
 		current.Profiles = *update.Profiles

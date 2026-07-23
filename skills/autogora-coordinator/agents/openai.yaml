@@ -1,7 +1,7 @@
 interface:
-  display_name: "Autogora Orchestrator"
+  display_name: "Autogora Coordinator"
   short_description: "Plan and route work through Autogora MCP"
-  default_prompt: "Use $autogora-orchestrator to decompose this goal into assigned Autogora tasks and dependencies."
+  default_prompt: "Use $autogora-coordinator to coordinate this goal through assigned Autogora tasks and dependencies."
 dependencies:
   tools:
     - type: "mcp"

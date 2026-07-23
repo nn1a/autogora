@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
-	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -132,7 +132,7 @@ func TestDispatcherPlannerSharesCapacityWithWorkerAcrossBoards(t *testing.T) {
 	if err != nil || owner == nil {
 		t.Fatalf("claim primary worker: %+v, %v", owner, err)
 	}
-	lease, acquired, err := agentcoord.New(manager).AcquireWorker(ctx, assignee, 1, "alpha", owner.Run.ID)
+	lease, acquired, err := agentcapacity.New(manager).AcquireWorker(ctx, assignee, 1, "alpha", owner.Run.ID)
 	if err != nil || !acquired {
 		t.Fatalf("acquire primary worker capacity: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}

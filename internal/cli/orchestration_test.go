@@ -27,16 +27,16 @@ func TestCLIDecomposeUsesBoardRoutesAndSkipsDisabledDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defaultProfile, orchestratorProfile := "disabled", "orchestrator"
+	defaultProfile, finalizerProfile := "disabled", "finalizer"
 	profiles := []boards.Profile{
 		{Name: "disabled", Runtime: model.RuntimeCodex, Disabled: true, Priority: 100},
 		{Name: "worker", Runtime: model.RuntimeClaude, Priority: 10},
-		{Name: "orchestrator", Runtime: model.RuntimeGemini, Priority: 5},
+		{Name: "finalizer", Runtime: model.RuntimeGemini, Priority: 5},
 	}
 	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
-		Profiles:            &profiles,
-		DefaultProfile:      store.OptionalString{Set: true, Value: &defaultProfile},
-		OrchestratorProfile: store.OptionalString{Set: true, Value: &orchestratorProfile},
+		Profiles:         &profiles,
+		DefaultProfile:   store.OptionalString{Set: true, Value: &defaultProfile},
+		FinalizerProfile: store.OptionalString{Set: true, Value: &finalizerProfile},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,8 +47,8 @@ func TestCLIDecomposeUsesBoardRoutesAndSkipsDisabledDefaults(t *testing.T) {
 		Tasks: []orchestration.DecompositionTask{{Key: "child", Title: "Implement", Body: "Implement and test.", Assignee: "disabled", Runtime: model.RuntimeCodex, Priority: 1}},
 	}
 	result := decomposeWithCLI(t, app, dbPath, rootID, plan)
-	if result.Graph == nil || len(result.Graph.ChildIDs) != 1 || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "orchestrator" || result.Task.Task.Runtime != model.RuntimeGemini {
-		t.Fatalf("board orchestrator route not used: %#v", result)
+	if result.Graph == nil || len(result.Graph.ChildIDs) != 1 || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "finalizer" || result.Task.Task.Runtime != model.RuntimeGemini {
+		t.Fatalf("board finalizer route not used: %#v", result)
 	}
 	opened, err := manager.OpenStore(ctx, "default")
 	if err != nil {
@@ -104,10 +104,10 @@ func TestCLIDecomposeExplicitRoutesOverrideBoardDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := runApp(t, app, "decompose", rootID, "--db", dbPath,
-		"--profile", "cli-worker:gemini", "--default-profile", "cli-worker", "--orchestrator-profile", "board-worker", "--plan-json", string(encodedPlan))
+		"--profile", "cli-worker:gemini", "--default-profile", "cli-worker", "--finalizer-profile", "board-worker", "--plan-json", string(encodedPlan))
 	result := decodeCLIDecomposition(t, output)
 	if result.Graph == nil || len(result.Graph.ChildIDs) != 1 || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "board-worker" || result.Task.Task.Runtime != model.RuntimeClaude {
-		t.Fatalf("explicit orchestrator route not used: %#v", result)
+		t.Fatalf("explicit finalizer route not used: %#v", result)
 	}
 	opened, err := manager.OpenStore(context.Background(), "default")
 	if err != nil {

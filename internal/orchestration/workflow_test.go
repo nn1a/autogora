@@ -49,9 +49,9 @@ func TestSpecifyAndDecomposeTriageTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := DecomposeTriageTask(ctx, opened, root.Task.ID, DecomposeOptions{
-		Profiles:            []ProfileRoute{{Name: "researcher", Runtime: model.RuntimeCodex}, {Name: "writer", Runtime: model.RuntimeClaude}},
-		DefaultProfile:      ProfileRoute{Name: "fallback", Runtime: model.RuntimeCodex},
-		OrchestratorProfile: &ProfileRoute{Name: "orchestrator", Runtime: model.RuntimeClaude},
+		Profiles:         []ProfileRoute{{Name: "researcher", Runtime: model.RuntimeCodex}, {Name: "writer", Runtime: model.RuntimeClaude}},
+		DefaultProfile:   ProfileRoute{Name: "fallback", Runtime: model.RuntimeCodex},
+		FinalizerProfile: &ProfileRoute{Name: "finalizer", Runtime: model.RuntimeClaude},
 		Plan: &DecompositionPlan{
 			Fanout: true, RootTitle: "Coordinate report", RootBody: "Verify final report", Reason: "parallel",
 			Tasks: []DecompositionTask{
@@ -65,7 +65,7 @@ func TestSpecifyAndDecomposeTriageTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Fanout || result.Graph == nil || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "orchestrator" {
+	if !result.Fanout || result.Graph == nil || result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "finalizer" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 	eu, err := opened.GetTask(ctx, result.Graph.TasksByKey["eu"])

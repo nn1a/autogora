@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
-	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/notifications"
@@ -53,7 +53,7 @@ type Options struct {
 	AutoDecomposePerTick     int
 	DecompositionProfiles    []orchestration.ProfileRoute
 	DefaultProfile           *orchestration.ProfileRoute
-	OrchestratorProfile      *orchestration.ProfileRoute
+	FinalizerProfile         *orchestration.ProfileRoute
 	PlannerRuntime           model.Runtime
 	PlannerModel             string
 	PlannerProvider          string
@@ -863,14 +863,14 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 				copy(taskRoster, discovered)
 				taskRoster[len(discovered)] = task
 				profiles := orchestration.ResolveProfileRoutes(taskRoster, decompositionProfiles)
-				defaultName, orchestratorName := metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile
+				defaultName, finalizerName := metadata.Orchestration.DefaultProfile, metadata.Orchestration.FinalizerProfile
 				if defaultName == nil {
 					if globalDefault, found := firstConfiguredAgent(configured.Config, configured.DefaultWorkers, agentconfig.RoleWorker); found {
 						value := globalDefault.ID
 						defaultName = &value
 					}
 				}
-				fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, defaultName, orchestratorName, plannerRuntime)
+				fallback, finalizer := orchestration.SelectProfileRoutes(profiles, defaultName, finalizerName, plannerRuntime)
 				if options.DefaultProfile != nil {
 					fallback = *options.DefaultProfile
 				}
@@ -882,14 +882,14 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 						}
 					}
 				}
-				if options.OrchestratorProfile != nil {
-					orchestrator = *options.OrchestratorProfile
-				} else if metadata.Orchestration.OrchestratorProfile == nil && fallback.Name != orchestrator.Name {
-					orchestrator = fallback
+				if options.FinalizerProfile != nil {
+					finalizer = *options.FinalizerProfile
+				} else if metadata.Orchestration.FinalizerProfile == nil && fallback.Name != finalizer.Name {
+					finalizer = fallback
 				}
 				value := metadata.Orchestration.AutoPromoteChildren
 				result, err := orchestration.DecomposeTriageTask(ctx, opened, task.ID, orchestration.DecomposeOptions{
-					Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &orchestrator, AutoPromoteChildren: &value, Planner: planner,
+					Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &finalizer, AutoPromoteChildren: &value, Planner: planner,
 				})
 				if err != nil {
 					if ctx.Err() != nil {
@@ -1056,7 +1056,7 @@ func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspace
 
 func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store, claim *model.ClaimedTask, options Options, processes *ProcessSet, clineApprovalDir string) (runErr error) {
 	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
-	var agentLease *agentcoord.Lease
+	var agentLease *agentcapacity.Lease
 	defer func() {
 		if agentLease == nil {
 			return
@@ -1114,7 +1114,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	}
 	if profile.GlobalRegistered {
 		var acquired bool
-		agentLease, acquired, err = agentcoord.New(manager).AcquireWorker(
+		agentLease, acquired, err = agentcapacity.New(manager).AcquireWorker(
 			ctx, profile.Name, profile.MaxConcurrent, claim.Task.Task.Board, claim.Run.ID,
 		)
 		if err != nil || !acquired {
@@ -1693,7 +1693,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		return err
 	}
 	generatedClineApprovalDir := ""
-	planning := startPlanningCoordinator(ctx, manager, options)
+	planning := startPlanningQueue(ctx, manager, options)
 	oncePlanningWaited := false
 	nextClaimBoard := ""
 	defer func() {

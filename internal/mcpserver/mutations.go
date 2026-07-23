@@ -77,7 +77,7 @@ type decomposeInput struct {
 	TaskID              string                           `json:"task_id"`
 	Profiles            []orchestration.ProfileRoute     `json:"profiles,omitempty"`
 	DefaultProfile      *orchestration.ProfileRoute      `json:"default_profile,omitempty"`
-	OrchestratorProfile *orchestration.ProfileRoute      `json:"orchestrator_profile,omitempty"`
+	FinalizerProfile    *orchestration.ProfileRoute      `json:"finalizer_profile,omitempty"`
 	AutoPromoteChildren *bool                            `json:"auto_promote_children,omitempty"`
 	Plan                *orchestration.DecompositionPlan `json:"plan,omitempty"`
 	PlannerRuntime      model.Runtime                    `json:"planner_runtime,omitempty"`
@@ -535,23 +535,23 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			if err != nil {
 				return nil, err
 			}
-			defaultProfile, orchestratorProfile := orchestration.SelectProfileRoutes(
-				profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile, plannerRuntime,
+			defaultProfile, finalizerProfile := orchestration.SelectProfileRoutes(
+				profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.FinalizerProfile, plannerRuntime,
 			)
 			if input.DefaultProfile != nil {
 				if !orchestration.RunnableProfileRoute(*input.DefaultProfile) {
 					return nil, errors.New("default_profile requires an enabled worker profile")
 				}
 				defaultProfile = *input.DefaultProfile
-				if input.OrchestratorProfile == nil {
-					orchestratorProfile = defaultProfile
+				if input.FinalizerProfile == nil {
+					finalizerProfile = defaultProfile
 				}
 			}
-			if input.OrchestratorProfile != nil {
-				if !orchestration.RunnableProfileRoute(*input.OrchestratorProfile) {
-					return nil, errors.New("orchestrator_profile requires an enabled worker profile")
+			if input.FinalizerProfile != nil {
+				if !orchestration.RunnableProfileRoute(*input.FinalizerProfile) {
+					return nil, errors.New("finalizer_profile requires an enabled worker profile")
 				}
-				orchestratorProfile = *input.OrchestratorProfile
+				finalizerProfile = *input.FinalizerProfile
 			}
 			autoPromote := input.AutoPromoteChildren
 			if autoPromote == nil {
@@ -559,7 +559,7 @@ func (s *Service) registerMutations(server *mcp.Server) {
 				autoPromote = &value
 			}
 			return orchestration.DecomposeTriageTask(ctx, opened, input.TaskID, orchestration.DecomposeOptions{
-				Profiles: profiles, DefaultProfile: defaultProfile, OrchestratorProfile: &orchestratorProfile,
+				Profiles: profiles, DefaultProfile: defaultProfile, FinalizerProfile: &finalizerProfile,
 				AutoPromoteChildren: autoPromote, Planner: planner, Plan: input.Plan,
 			})
 		})

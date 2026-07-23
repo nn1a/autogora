@@ -184,7 +184,7 @@ func orchestrationUpdate(value any) (*boards.OrchestrationUpdate, error) {
 		update.PlannerRuntime = &runtime
 	}
 	update.DefaultProfile = optionalString(body, "defaultProfile")
-	update.OrchestratorProfile = optionalString(body, "orchestratorProfile")
+	update.FinalizerProfile = optionalString(body, "finalizerProfile")
 	if raw, exists := body["profiles"]; exists {
 		items, ok := raw.([]any)
 		if !ok {

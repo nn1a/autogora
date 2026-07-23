@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
-	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -48,7 +48,7 @@ func TestTaskServiceSkipsCapacityFullPlannerWithoutChangingHealth(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	seed, acquired, err := agentcoord.New(manager).AcquireEphemeral(ctx, "primary", 1, store.AgentSlotOwnerPlanner, "default", time.Minute)
+	seed, acquired, err := agentcapacity.New(manager).AcquireEphemeral(ctx, "primary", 1, store.AgentSlotOwnerPlanner, "default", time.Minute)
 	if err != nil || !acquired {
 		t.Fatalf("seed primary capacity: %+v, %v, %v", seed, acquired, err)
 	}

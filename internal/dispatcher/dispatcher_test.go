@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
-	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -135,7 +135,7 @@ func TestDispatcherHonorsGlobalAgentCapacityAcrossBoards(t *testing.T) {
 	if err != nil || owner == nil {
 		t.Fatalf("claim capacity owner: %+v, %v", owner, err)
 	}
-	lease, acquired, err := agentcoord.New(manager).AcquireWorker(ctx, assignee, 1, "alpha", owner.Run.ID)
+	lease, acquired, err := agentcapacity.New(manager).AcquireWorker(ctx, assignee, 1, "alpha", owner.Run.ID)
 	if err != nil || !acquired {
 		t.Fatalf("acquire capacity owner: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}

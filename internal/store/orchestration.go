@@ -27,15 +27,15 @@ type TaskGraphDependency struct {
 }
 
 type TaskGraphInput struct {
-	RootTaskID           string
-	ExpectedUpdatedAt    *string
-	RootTitle            string
-	RootBody             string
-	OrchestratorAssignee string
-	OrchestratorRuntime  model.Runtime
-	AutoPromoteChildren  *bool
-	Nodes                []TaskGraphNode
-	Dependencies         []TaskGraphDependency
+	RootTaskID          string
+	ExpectedUpdatedAt   *string
+	RootTitle           string
+	RootBody            string
+	FinalizerAssignee   string
+	FinalizerRuntime    model.Runtime
+	AutoPromoteChildren *bool
+	Nodes               []TaskGraphNode
+	Dependencies        []TaskGraphDependency
 }
 
 type TaskGraphResult struct {
@@ -92,12 +92,12 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 			return TaskGraphResult{}, fmt.Errorf("task graph node %s has no assignee", node.Key)
 		}
 	}
-	if !model.ValidRuntime(input.OrchestratorRuntime) {
-		return TaskGraphResult{}, fmt.Errorf("invalid orchestrator runtime: %s", input.OrchestratorRuntime)
+	if !model.ValidRuntime(input.FinalizerRuntime) {
+		return TaskGraphResult{}, fmt.Errorf("invalid finalizer runtime: %s", input.FinalizerRuntime)
 	}
-	input.OrchestratorAssignee = strings.TrimSpace(input.OrchestratorAssignee)
-	if input.OrchestratorAssignee == "" {
-		return TaskGraphResult{}, errors.New("orchestrator assignee cannot be empty")
+	input.FinalizerAssignee = strings.TrimSpace(input.FinalizerAssignee)
+	if input.FinalizerAssignee == "" {
+		return TaskGraphResult{}, errors.New("finalizer assignee cannot be empty")
 	}
 	for _, dependency := range input.Dependencies {
 		if !keys[dependency.Parent] || !keys[dependency.Child] {
@@ -177,7 +177,7 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET title = ?, body = ?, assignee = ?, runtime = ?, status = 'todo',
 			block_kind = NULL, block_reason = NULL, updated_at = ? WHERE id = ?`,
-			title, body, input.OrchestratorAssignee, input.OrchestratorRuntime, now(), root.ID); err != nil {
+			title, body, input.FinalizerAssignee, input.FinalizerRuntime, now(), root.ID); err != nil {
 			return err
 		}
 		for _, leafID := range leafIDs {

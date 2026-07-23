@@ -16,16 +16,16 @@ func TestResolveAndSelectProfileRoutes(t *testing.T) {
 	if len(profiles) != 2 || profiles[0].Runtime != model.RuntimeGemini || profiles[0].Description == "" || profiles[1].Name != "implementer" {
 		t.Fatalf("resolved profiles = %#v", profiles)
 	}
-	fallback, orchestrator := SelectProfileRoutes(profiles, &implementer, &reviewer, model.RuntimeCodex)
-	if fallback.Name != "implementer" || orchestrator.Name != "reviewer" || orchestrator.Runtime != model.RuntimeGemini {
-		t.Fatalf("selected routes = %#v %#v", fallback, orchestrator)
+	fallback, finalizer := SelectProfileRoutes(profiles, &implementer, &reviewer, model.RuntimeCodex)
+	if fallback.Name != "implementer" || finalizer.Name != "reviewer" || finalizer.Runtime != model.RuntimeGemini {
+		t.Fatalf("selected routes = %#v %#v", fallback, finalizer)
 	}
 }
 
 func TestSelectProfileRoutesSuppliesRunnableEmptyBoardFallback(t *testing.T) {
-	fallback, orchestrator := SelectProfileRoutes(nil, nil, nil, model.RuntimeCline)
-	if fallback.Name != "cline-worker" || fallback.Runtime != model.RuntimeCline || orchestrator.Name != fallback.Name || orchestrator.Runtime != fallback.Runtime {
-		t.Fatalf("fallback routes = %#v %#v", fallback, orchestrator)
+	fallback, finalizer := SelectProfileRoutes(nil, nil, nil, model.RuntimeCline)
+	if fallback.Name != "cline-worker" || fallback.Runtime != model.RuntimeCline || finalizer.Name != fallback.Name || finalizer.Runtime != fallback.Runtime {
+		t.Fatalf("fallback routes = %#v %#v", fallback, finalizer)
 	}
 }
 
@@ -34,8 +34,8 @@ func TestSelectProfileRoutesSkipsDisabledAndUsesPriority(t *testing.T) {
 	backup := ProfileRoute{Name: "backup", Runtime: model.RuntimeClaude, Priority: 5}
 	primary := ProfileRoute{Name: "primary", Runtime: model.RuntimeGemini, Priority: 10}
 	profiles := ResolveProfileRoutes(nil, []ProfileRoute{disabled, backup, primary})
-	fallback, orchestrator := SelectProfileRoutes(profiles, nil, nil, model.RuntimeCodex)
-	if fallback.Name != "primary" || orchestrator.Name != "primary" || profiles[0].Name != "disabled" || profiles[1].Name != "primary" {
-		t.Fatalf("unexpected profile selection: profiles=%#v fallback=%#v orchestrator=%#v", profiles, fallback, orchestrator)
+	fallback, finalizer := SelectProfileRoutes(profiles, nil, nil, model.RuntimeCodex)
+	if fallback.Name != "primary" || finalizer.Name != "primary" || profiles[0].Name != "disabled" || profiles[1].Name != "primary" {
+		t.Fatalf("unexpected profile selection: profiles=%#v fallback=%#v finalizer=%#v", profiles, fallback, finalizer)
 	}
 }

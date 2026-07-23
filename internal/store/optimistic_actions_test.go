@@ -129,7 +129,7 @@ func TestApplyTaskGraphRejectsStaleRootVersionAtomically(t *testing.T) {
 	_, err = opened.ApplyTaskGraph(ctx, TaskGraphInput{
 		RootTaskID: root.Task.ID, ExpectedUpdatedAt: &stale,
 		RootTitle: "stale root", RootBody: "stale body",
-		OrchestratorAssignee: worker, OrchestratorRuntime: model.RuntimeCodex,
+		FinalizerAssignee: worker, FinalizerRuntime: model.RuntimeCodex,
 		Nodes: []TaskGraphNode{{Key: "child", Title: "child", Body: "work", Assignee: worker, Runtime: model.RuntimeCodex}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "conflict") {

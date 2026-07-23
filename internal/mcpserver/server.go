@@ -14,7 +14,7 @@ import (
 	"github.com/nn1a/autogora/internal/store"
 )
 
-const instructions = "Use Autogora as the canonical task state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with autogora_complete or autogora_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Orchestrators route work but do not implement it."
+const instructions = "Use Autogora as the canonical task state. Workers must read their task first and heartbeat during long work. Ordinary workers terminate exactly once with autogora_complete or autogora_block; goal-mode workers may leave a non-terminal progress handoff so the dispatcher can judge and resume the session. Coordinators route work but do not implement it."
 
 type Service struct {
 	manager *boards.Manager
@@ -156,17 +156,17 @@ type boardUpdateInput struct {
 }
 
 type boardOrchestrationInput struct {
-	AutoDecompose          *bool           `json:"autoDecompose,omitempty"`
-	AutoDecomposePerTick   *int            `json:"autoDecomposePerTick,omitempty"`
-	AutoPromoteChildren    *bool           `json:"autoPromoteChildren,omitempty"`
-	PlannerRuntime         *model.Runtime  `json:"plannerRuntime,omitempty"`
-	PlannerModel           *string         `json:"plannerModel,omitempty"`
-	PlannerProvider        *string         `json:"plannerProvider,omitempty"`
-	DefaultProfile         *string         `json:"defaultProfile,omitempty"`
-	OrchestratorProfile    *string         `json:"orchestratorProfile,omitempty"`
-	Profiles               *[]profileRoute `json:"profiles,omitempty"`
-	defaultProfileSet      bool
-	orchestratorProfileSet bool
+	AutoDecompose        *bool           `json:"autoDecompose,omitempty"`
+	AutoDecomposePerTick *int            `json:"autoDecomposePerTick,omitempty"`
+	AutoPromoteChildren  *bool           `json:"autoPromoteChildren,omitempty"`
+	PlannerRuntime       *model.Runtime  `json:"plannerRuntime,omitempty"`
+	PlannerModel         *string         `json:"plannerModel,omitempty"`
+	PlannerProvider      *string         `json:"plannerProvider,omitempty"`
+	DefaultProfile       *string         `json:"defaultProfile,omitempty"`
+	FinalizerProfile     *string         `json:"finalizerProfile,omitempty"`
+	Profiles             *[]profileRoute `json:"profiles,omitempty"`
+	defaultProfileSet    bool
+	finalizerProfileSet  bool
 }
 
 func presence(raw []byte, names ...string) map[string]bool {
@@ -208,8 +208,8 @@ func (input *boardOrchestrationInput) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*input = boardOrchestrationInput(value)
-	found := presence(raw, "defaultProfile", "orchestratorProfile")
-	input.defaultProfileSet, input.orchestratorProfileSet = found["defaultProfile"], found["orchestratorProfile"]
+	found := presence(raw, "defaultProfile", "finalizerProfile")
+	input.defaultProfileSet, input.finalizerProfileSet = found["defaultProfile"], found["finalizerProfile"]
 	return nil
 }
 
@@ -481,8 +481,8 @@ func orchestrationBoardUpdate(input *boardOrchestrationInput) (*boards.Orchestra
 	if input.defaultProfileSet {
 		update.DefaultProfile = store.OptionalString{Set: true, Value: input.DefaultProfile}
 	}
-	if input.orchestratorProfileSet {
-		update.OrchestratorProfile = store.OptionalString{Set: true, Value: input.OrchestratorProfile}
+	if input.finalizerProfileSet {
+		update.FinalizerProfile = store.OptionalString{Set: true, Value: input.FinalizerProfile}
 	}
 	if input.Profiles != nil {
 		if len(*input.Profiles) > 200 {

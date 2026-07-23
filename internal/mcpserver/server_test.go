@@ -426,10 +426,10 @@ func TestMCPDecomposeFallsBackFromUnavailableBoardProfiles(t *testing.T) {
 				{Name: "disabled", Runtime: model.RuntimeCodex, Disabled: true, Priority: 100},
 				{Name: "worker", Runtime: model.RuntimeClaude, Priority: 10},
 			}
-			orchestrator := configuredDefault
+			finalizer := configuredDefault
 			if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{
-				DefaultProfile:      store.OptionalString{Set: true, Value: &configuredDefault},
-				OrchestratorProfile: store.OptionalString{Set: true, Value: &orchestrator}, Profiles: &profiles,
+				DefaultProfile:   store.OptionalString{Set: true, Value: &configuredDefault},
+				FinalizerProfile: store.OptionalString{Set: true, Value: &finalizer}, Profiles: &profiles,
 			}}); err != nil {
 				t.Fatal(err)
 			}

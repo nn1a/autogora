@@ -47,7 +47,7 @@ func ResolveProfileRoutes(tasks []model.Task, configured []ProfileRoute) []Profi
 
 // SelectProfileRoutes applies the configured names to a resolved roster and
 // supplies a runnable fallback when a new board has no profiles yet.
-func SelectProfileRoutes(profiles []ProfileRoute, defaultName, orchestratorName *string, plannerRuntime model.Runtime) (ProfileRoute, ProfileRoute) {
+func SelectProfileRoutes(profiles []ProfileRoute, defaultName, finalizerName *string, plannerRuntime model.Runtime) (ProfileRoute, ProfileRoute) {
 	fallback := ProfileRoute{}
 	for _, profile := range profiles {
 		if defaultName != nil && profile.Name == *defaultName && RunnableProfileRoute(profile) {
@@ -69,12 +69,12 @@ func SelectProfileRoutes(profiles []ProfileRoute, defaultName, orchestratorName 
 	if fallback.Name == "" && len(profiles) == 0 {
 		fallback = ProfileRoute{Name: string(plannerRuntime) + "-worker", Runtime: plannerRuntime}
 	}
-	orchestrator := fallback
+	finalizer := fallback
 	for _, profile := range profiles {
-		if orchestratorName != nil && profile.Name == *orchestratorName && RunnableProfileRoute(profile) {
-			orchestrator = profile
+		if finalizerName != nil && profile.Name == *finalizerName && RunnableProfileRoute(profile) {
+			finalizer = profile
 			break
 		}
 	}
-	return fallback, orchestrator
+	return fallback, finalizer
 }

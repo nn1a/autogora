@@ -404,7 +404,7 @@ func (s *Store) BuildWorkerContext(ctx context.Context, taskID string) (string, 
 	}
 	omitted := len(graph.Nodes) - len(contextNodes) + graph.OmittedNodeCount
 	if omitted > 0 {
-		lines = append(lines, fmt.Sprintf("- … %d additional related node(s) omitted from this bounded context; use autogora_graph from an orchestrator/admin session for the bounded topology view.", omitted))
+		lines = append(lines, fmt.Sprintf("- … %d additional related node(s) omitted from this bounded context; use autogora_graph from a coordinator/admin session for the bounded topology view.", omitted))
 	}
 	if len(detail.Parents) > 0 {
 		lines = append(lines, "", "## Prerequisite handoffs")

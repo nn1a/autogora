@@ -180,7 +180,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		}
 		profiles = append(profiles, profile)
 	}
-	var defaultProfile, orchestratorProfile *orchestration.ProfileRoute
+	var defaultProfile, finalizerProfile *orchestration.ProfileRoute
 	if opts.present("default-profile") {
 		value, err := parseRoutingProfile(opts.value("default-profile"), profileFallback)
 		if err != nil {
@@ -188,12 +188,12 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		}
 		defaultProfile = &value
 	}
-	if opts.present("orchestrator-profile") {
-		value, err := parseRoutingProfile(opts.value("orchestrator-profile"), profileFallback)
+	if opts.present("finalizer-profile") {
+		value, err := parseRoutingProfile(opts.value("finalizer-profile"), profileFallback)
 		if err != nil {
 			return err
 		}
-		orchestratorProfile = &value
+		finalizerProfile = &value
 	}
 	var autoDecompose *bool
 	if opts.present("auto-decompose") {
@@ -213,7 +213,7 @@ func (a *App) runDispatch(ctx context.Context, command string, opts options) err
 		HeartbeatMaxStale: time.Duration(heartbeatSeconds) * time.Second, CrashGrace: &crashGrace,
 		RateLimitCooldown: &rateCooldown, FailureLimit: failureLimit,
 		AutoDecompose: autoDecompose, AutoDecomposePerTick: autoPerTick,
-		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, OrchestratorProfile: orchestratorProfile,
+		DecompositionProfiles: profiles, DefaultProfile: defaultProfile, FinalizerProfile: finalizerProfile,
 		PlannerRuntime: plannerRuntime, PlannerTimeout: time.Duration(plannerTimeoutMS) * time.Millisecond,
 		PlannerModel: opts.value("planner-model"), PlannerProvider: opts.value("planner-provider"),
 		AllowWrites: opts.flags["allow-writes"], WorkingDirectory: cwd, Getenv: a.Getenv,

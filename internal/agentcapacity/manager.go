@@ -1,4 +1,4 @@
-package agentcoord
+package agentcapacity
 
 import (
 	"context"
@@ -28,32 +28,32 @@ const (
 	leaseReleaseTimeout = 5 * time.Second
 )
 
-type Coordinator struct {
-	manager *boards.Manager
-	now     func() time.Time
+type Manager struct {
+	boards *boards.Manager
+	now    func() time.Time
 }
 
 type Lease struct {
-	Slot        store.GlobalAgentSlot
-	coordinator *Coordinator
+	Slot    store.GlobalAgentSlot
+	manager *Manager
 }
 
-func New(manager *boards.Manager) *Coordinator {
-	return &Coordinator{manager: manager, now: time.Now}
+func New(boardManager *boards.Manager) *Manager {
+	return &Manager{boards: boardManager, now: time.Now}
 }
 
-func (c *Coordinator) currentTime() time.Time {
+func (c *Manager) currentTime() time.Time {
 	if c != nil && c.now != nil {
 		return c.now().UTC()
 	}
 	return time.Now().UTC()
 }
 
-func (c *Coordinator) coordinationStore(ctx context.Context) (*store.Store, error) {
-	if c == nil || c.manager == nil {
+func (c *Manager) coordinationStore(ctx context.Context) (*store.Store, error) {
+	if c == nil || c.boards == nil {
 		return nil, errors.New("agent slot coordination requires a board manager")
 	}
-	return c.manager.OpenCoordinationStore(ctx)
+	return c.boards.OpenCoordinationStore(ctx)
 }
 
 func workerOwnerID(agentID, board, runID string) string {
@@ -74,11 +74,11 @@ func boundedEphemeralTTL(ttl time.Duration) time.Duration {
 	return ttl
 }
 
-func (c *Coordinator) workerRunIsActive(ctx context.Context, board, runID string) (bool, error) {
-	if c == nil || c.manager == nil {
+func (c *Manager) workerRunIsActive(ctx context.Context, board, runID string) (bool, error) {
+	if c == nil || c.boards == nil {
 		return false, errors.New("agent slot coordination requires a board manager")
 	}
-	opened, err := c.manager.OpenStore(ctx, board)
+	opened, err := c.boards.OpenStore(ctx, board)
 	if err != nil {
 		return false, err
 	}
@@ -107,7 +107,7 @@ func (c *Coordinator) workerRunIsActive(ctx context.Context, board, runID string
 // AcquireWorker acquires one global slot for an already-running worker. If the
 // configured limit is full, terminal worker owners are verified against their
 // board databases and removed with exact-token comparison before one retry.
-func (c *Coordinator) AcquireWorker(ctx context.Context, agentID string, limit int, board, runID string) (*Lease, bool, error) {
+func (c *Manager) AcquireWorker(ctx context.Context, agentID string, limit int, board, runID string) (*Lease, bool, error) {
 	agentID = strings.TrimSpace(agentID)
 	board = strings.TrimSpace(board)
 	runID = strings.TrimSpace(runID)
@@ -135,7 +135,7 @@ func (c *Coordinator) AcquireWorker(ctx context.Context, agentID string, limit i
 		if err != nil {
 			return nil, false, err
 		}
-		return &Lease{Slot: slot, coordinator: c}, true, nil
+		return &Lease{Slot: slot, manager: c}, true, nil
 	}
 	cleaned, err := c.cleanupTerminalWorkers(ctx, coordination, agentID)
 	if err != nil {
@@ -148,13 +148,13 @@ func (c *Coordinator) AcquireWorker(ctx context.Context, agentID string, limit i
 	if err != nil || !acquired {
 		return nil, acquired, err
 	}
-	return &Lease{Slot: slot, coordinator: c}, true, nil
+	return &Lease{Slot: slot, manager: c}, true, nil
 }
 
 // AcquireEphemeral acquires a planner or judge slot with a bounded lifetime.
 // The database also removes expired non-worker slots during every acquisition,
 // so a crashed caller cannot hold capacity indefinitely.
-func (c *Coordinator) AcquireEphemeral(ctx context.Context, agentID string, limit int, kind store.AgentSlotOwnerKind, board string, ttl time.Duration) (*Lease, bool, error) {
+func (c *Manager) AcquireEphemeral(ctx context.Context, agentID string, limit int, kind store.AgentSlotOwnerKind, board string, ttl time.Duration) (*Lease, bool, error) {
 	if kind != store.AgentSlotOwnerPlanner && kind != store.AgentSlotOwnerJudge {
 		return nil, false, fmt.Errorf("ephemeral slot owner must be planner or judge, got %s", kind)
 	}
@@ -170,10 +170,10 @@ func (c *Coordinator) AcquireEphemeral(ctx context.Context, agentID string, limi
 	if err != nil || !acquired {
 		return nil, acquired, err
 	}
-	return &Lease{Slot: slot, coordinator: c}, true, nil
+	return &Lease{Slot: slot, manager: c}, true, nil
 }
 
-func (c *Coordinator) cleanupTerminalWorkers(ctx context.Context, coordination *store.Store, agentID string) (int, error) {
+func (c *Manager) cleanupTerminalWorkers(ctx context.Context, coordination *store.Store, agentID string) (int, error) {
 	slots, err := coordination.ListGlobalAgentSlots(ctx, agentID)
 	if err != nil {
 		return 0, err
@@ -200,7 +200,7 @@ func (c *Coordinator) cleanupTerminalWorkers(ctx context.Context, coordination *
 	return cleaned, nil
 }
 
-func (c *Coordinator) CleanupTerminalWorkers(ctx context.Context, agentID string) (int, error) {
+func (c *Manager) CleanupTerminalWorkers(ctx context.Context, agentID string) (int, error) {
 	coordination, err := c.coordinationStore(ctx)
 	if err != nil {
 		return 0, err
@@ -212,7 +212,7 @@ func (c *Coordinator) CleanupTerminalWorkers(ctx context.Context, agentID string
 // Release uses a cancellation-independent, bounded context so deferred release
 // still runs after a planner, judge, or worker context is canceled.
 func (l *Lease) Release(ctx context.Context) error {
-	if l == nil || l.coordinator == nil {
+	if l == nil || l.manager == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -220,7 +220,7 @@ func (l *Lease) Release(ctx context.Context) error {
 	}
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
 	defer cancel()
-	coordination, err := l.coordinator.coordinationStore(releaseCtx)
+	coordination, err := l.manager.coordinationStore(releaseCtx)
 	if err != nil {
 		return err
 	}

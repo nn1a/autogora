@@ -225,7 +225,7 @@ func TestDispatchLeavesBoardOrchestrationSettingsUnsetWithoutOverrides(t *testin
 	}
 
 	runApp(t, app, "dispatch", "--once", "--db", dbPath)
-	if captured.PlannerRuntime != "" || captured.AutoDecomposePerTick != 0 || captured.DecompositionProfiles != nil || captured.DefaultProfile != nil || captured.OrchestratorProfile != nil {
+	if captured.PlannerRuntime != "" || captured.AutoDecomposePerTick != 0 || captured.DecompositionProfiles != nil || captured.DefaultProfile != nil || captured.FinalizerProfile != nil {
 		t.Fatalf("dispatch defaults override board orchestration settings: %#v", captured)
 	}
 }

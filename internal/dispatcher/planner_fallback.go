@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentcapacity"
 	"github.com/nn1a/autogora/internal/agentconfig"
-	"github.com/nn1a/autogora/internal/agentcoord"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -66,7 +66,7 @@ func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata bo
 		},
 	}
 	if manager != nil {
-		coordinator := agentcoord.New(manager)
+		capacity := agentcapacity.New(manager)
 		ownerKind := store.AgentSlotOwnerPlanner
 		if role == agentconfig.RoleJudge {
 			ownerKind = store.AgentSlotOwnerJudge
@@ -75,13 +75,13 @@ func createRolePlanner(manager *boards.Manager, opened *store.Store, metadata bo
 			if !strings.HasPrefix(candidate.Source, "global_") {
 				return nil, true, nil
 			}
-			return coordinator.AcquireEphemeral(ctx, candidate.Profile, candidate.MaxConcurrent, ownerKind, metadata.Slug, options.PlannerTimeout+agentcoord.EphemeralSlotCleanupGrace)
+			return capacity.AcquireEphemeral(ctx, candidate.Profile, candidate.MaxConcurrent, ownerKind, metadata.Slug, options.PlannerTimeout+agentcapacity.EphemeralSlotCleanupGrace)
 		}
 		plannerOptions.ReleaseAttempt = func(ctx context.Context, handle orchestration.PlannerAttemptHandle) error {
 			if handle == nil {
 				return nil
 			}
-			lease, ok := handle.(*agentcoord.Lease)
+			lease, ok := handle.(*agentcapacity.Lease)
 			if !ok {
 				return fmt.Errorf("unexpected planner capacity handle %T", handle)
 			}

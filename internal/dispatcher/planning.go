@@ -86,10 +86,10 @@ type planningPass struct {
 	done   chan struct{}
 }
 
-// planningCoordinator keeps planner work off the dispatcher lifecycle loop.
+// planningQueue keeps planner work off the dispatcher lifecycle loop.
 // At most one pass runs and one later pass waits, so a hung planner cannot
 // create an unbounded queue while maintenance and worker claims continue.
-type planningCoordinator struct {
+type planningQueue struct {
 	ctx         context.Context
 	manager     *boards.Manager
 	options     Options
@@ -100,13 +100,13 @@ type planningCoordinator struct {
 	stopped     bool
 }
 
-func startPlanningCoordinator(ctx context.Context, manager *boards.Manager, options Options) *planningCoordinator {
-	coordinator := &planningCoordinator{
+func startPlanningQueue(ctx context.Context, manager *boards.Manager, options Options) *planningQueue {
+	queue := &planningQueue{
 		ctx: ctx, manager: manager, options: options, diagnostics: &autoDecomposeDiagnostics{},
 		queue: make(chan planningPass, 1), done: make(chan struct{}),
 	}
-	go coordinator.run()
-	return coordinator
+	go queue.run()
+	return queue
 }
 
 func uniqueBoardSlugs(boardSlugs []string) []string {
@@ -206,7 +206,7 @@ func (d *autoDecomposeDiagnostics) setTriageCursor(board string, cursor *store.T
 
 // Enqueue coalesces repeated lifecycle ticks into a single pending pass. A nil
 // result means an equivalent later pass is already queued or shutdown began.
-func (p *planningCoordinator) Enqueue(boardSlugs []string) <-chan struct{} {
+func (p *planningQueue) Enqueue(boardSlugs []string) <-chan struct{} {
 	boards := uniqueBoardSlugs(boardSlugs)
 	if len(boards) == 0 {
 		return nil
@@ -225,7 +225,7 @@ func (p *planningCoordinator) Enqueue(boardSlugs []string) <-chan struct{} {
 	}
 }
 
-func (p *planningCoordinator) run() {
+func (p *planningQueue) run() {
 	defer close(p.done)
 	defer p.stopAndDrain()
 	for {
@@ -239,7 +239,7 @@ func (p *planningCoordinator) run() {
 	}
 }
 
-func (p *planningCoordinator) stopAndDrain() {
+func (p *planningQueue) stopAndDrain() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stopped = true
@@ -253,7 +253,7 @@ func (p *planningCoordinator) stopAndDrain() {
 	}
 }
 
-func (p *planningCoordinator) Wait(timeout time.Duration) bool {
+func (p *planningQueue) Wait(timeout time.Duration) bool {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}

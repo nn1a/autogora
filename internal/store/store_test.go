@@ -501,7 +501,7 @@ func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.
 	worker := "worker"
 	result, err := store.ApplyTaskGraph(ctx, TaskGraphInput{
 		RootTaskID: root.Task.ID, RootTitle: "Analyzed goal", RootBody: "A verifiable execution plan.",
-		OrchestratorAssignee: "orchestrator", OrchestratorRuntime: model.RuntimeCodex,
+		FinalizerAssignee: "finalizer", FinalizerRuntime: model.RuntimeCodex,
 		Nodes: []TaskGraphNode{
 			{Key: "research", Title: "Research", Body: "Collect evidence", Assignee: worker, Runtime: model.RuntimeCodex},
 			{Key: "report", Title: "Report", Body: "Write report", Assignee: worker, Runtime: model.RuntimeClaude},
@@ -514,8 +514,8 @@ func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.
 	if len(result.ChildIDs) != 2 || len(result.LeafIDs) != 1 || result.LeafIDs[0] != result.TasksByKey["report"] {
 		t.Fatalf("unexpected graph result: %+v", result)
 	}
-	if result.Root.Task.Status != model.TaskStatusTodo || result.Root.Task.Assignee == nil || *result.Root.Task.Assignee != "orchestrator" {
-		t.Fatalf("root was not converted into orchestrator: %+v", result.Root.Task)
+	if result.Root.Task.Status != model.TaskStatusTodo || result.Root.Task.Assignee == nil || *result.Root.Task.Assignee != "finalizer" {
+		t.Fatalf("root was not converted into finalizer: %+v", result.Root.Task)
 	}
 	if result.RelationshipGraph.TotalPhases != 3 || len(result.Root.Subtasks) != 2 {
 		t.Fatalf("graph topology mismatch: %+v", result.RelationshipGraph)
@@ -530,7 +530,7 @@ func TestApplyTaskGraphIsAtomicAndSeparatesHierarchyFromDependencies(t *testing.
 		t.Fatal(err)
 	}
 	_, err = store.ApplyTaskGraph(ctx, TaskGraphInput{
-		RootTaskID: cyclic.Task.ID, OrchestratorAssignee: "orchestrator", OrchestratorRuntime: model.RuntimeCodex,
+		RootTaskID: cyclic.Task.ID, FinalizerAssignee: "finalizer", FinalizerRuntime: model.RuntimeCodex,
 		Nodes: []TaskGraphNode{
 			{Key: "a", Title: "A", Body: "A", Assignee: worker, Runtime: model.RuntimeCodex},
 			{Key: "b", Title: "B", Body: "B", Assignee: worker, Runtime: model.RuntimeCodex},

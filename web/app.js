@@ -1365,7 +1365,7 @@ function openSettings() {
   form.elements.autoPromoteChildren.checked = settings.autoPromoteChildren;
   form.elements.plannerRuntime.value = settings.plannerRuntime; form.elements.autoDecomposePerTick.value = settings.autoDecomposePerTick;
   form.elements.plannerModel.value = settings.plannerModel || ""; form.elements.plannerProvider.value = settings.plannerProvider || "";
-  form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.orchestratorProfile.value = settings.orchestratorProfile || "";
+  form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.finalizerProfile.value = settings.finalizerProfile || "";
   renderProfileEditor(settings.profiles || []);
   $("#archive-board").classList.toggle("hidden", state.board === "default");
   $("#settings-dialog").showModal();
@@ -1380,7 +1380,7 @@ async function submitSettings(event) {
       orchestration: { autoDecompose: data.get("autoDecompose") === "on", autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
         plannerModel: data.get("plannerModel"), plannerProvider: data.get("plannerProvider"),
         autoDecomposePerTick: Number(data.get("autoDecomposePerTick")), defaultProfile: data.get("defaultProfile") || null,
-        orchestratorProfile: data.get("orchestratorProfile") || null, profiles },
+        finalizerProfile: data.get("finalizerProfile") || null, profiles },
     }) });
     $("#settings-dialog").close(); await loadBoards(); await loadBoard();
   } catch (error) { toast(error.message, true); }

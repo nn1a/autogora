@@ -38,7 +38,7 @@ The configured MCP-disabled Cline runtime uses the scoped CLI bridge instead.
 
 const combinedSetupHelp = `autogora setup --client <name> [options]
 
-Installs the bundled worker/orchestrator Skills and registers Autogora MCP.
+Installs the bundled worker/coordinator Skills and registers Autogora MCP.
 Both destinations are preflighted before changes begin.
 
 Options:

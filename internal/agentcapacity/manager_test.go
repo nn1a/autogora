@@ -1,4 +1,4 @@
-package agentcoord
+package agentcapacity
 
 import (
 	"context"
@@ -51,12 +51,12 @@ func TestWorkerSlotReclaimsOnlyVerifiedTerminalOwner(t *testing.T) {
 	defer beta.Close()
 	alphaRun := claimedWorkerRun(t, ctx, alpha, "alpha worker")
 	betaRun := claimedWorkerRun(t, ctx, beta, "beta worker")
-	coordinator := New(manager)
-	alphaLease, acquired, err := coordinator.AcquireWorker(ctx, "shared-agent", 1, "alpha", alphaRun.Run.ID)
+	capacity := New(manager)
+	alphaLease, acquired, err := capacity.AcquireWorker(ctx, "shared-agent", 1, "alpha", alphaRun.Run.ID)
 	if err != nil || !acquired {
 		t.Fatalf("alpha slot = %+v, acquired=%v, err=%v", alphaLease, acquired, err)
 	}
-	if lease, acquired, err := coordinator.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID); err != nil || acquired || lease != nil {
+	if lease, acquired, err := capacity.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID); err != nil || acquired || lease != nil {
 		t.Fatalf("running owner was reclaimed: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}
 	process := exec.Command(os.Args[0], "-test.run=TestAgentCoordProcessHelper")
@@ -79,7 +79,7 @@ func TestWorkerSlotReclaimsOnlyVerifiedTerminalOwner(t *testing.T) {
 	if _, err := alpha.FailRun(ctx, scope, "finished", store.FailRunOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if lease, acquired, err := coordinator.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID); err != nil || acquired || lease != nil {
+	if lease, acquired, err := capacity.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID); err != nil || acquired || lease != nil {
 		t.Fatalf("terminal owner with live process was reclaimed: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}
 	if err := process.Process.Kill(); err != nil {
@@ -88,7 +88,7 @@ func TestWorkerSlotReclaimsOnlyVerifiedTerminalOwner(t *testing.T) {
 	if _, err := process.Process.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	betaLease, acquired, err := coordinator.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID)
+	betaLease, acquired, err := capacity.AcquireWorker(ctx, "shared-agent", 1, "beta", betaRun.Run.ID)
 	if err != nil || !acquired || betaLease == nil || betaLease.Slot.Board != "beta" {
 		t.Fatalf("terminal owner was not reclaimed: %+v, acquired=%v, err=%v", betaLease, acquired, err)
 	}
@@ -119,9 +119,9 @@ func TestEphemeralSlotBoundsExpiryAndReleasesAfterCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator := New(manager)
+	capacity := New(manager)
 	before := time.Now().UTC()
-	plannerLease, acquired, err := coordinator.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerPlanner, "default", time.Hour)
+	plannerLease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerPlanner, "default", time.Hour)
 	if err != nil || !acquired || plannerLease == nil || plannerLease.Slot.ExpiresAt == nil {
 		t.Fatalf("planner slot = %+v, acquired=%v, err=%v", plannerLease, acquired, err)
 	}
@@ -132,7 +132,7 @@ func TestEphemeralSlotBoundsExpiryAndReleasesAfterCancellation(t *testing.T) {
 	if remaining := expiresAt.Sub(before); remaining > MaxEphemeralSlotTTL+time.Second || remaining < MaxEphemeralSlotTTL-time.Second {
 		t.Fatalf("bounded planner expiry = %s", remaining)
 	}
-	if lease, acquired, err := coordinator.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Minute); err != nil || acquired || lease != nil {
+	if lease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Minute); err != nil || acquired || lease != nil {
 		t.Fatalf("judge bypassed planner capacity: %+v, acquired=%v, err=%v", lease, acquired, err)
 	}
 	canceled, cancel := context.WithCancel(ctx)
@@ -140,7 +140,7 @@ func TestEphemeralSlotBoundsExpiryAndReleasesAfterCancellation(t *testing.T) {
 	if err := plannerLease.Release(canceled); err != nil {
 		t.Fatalf("canceled release: %v", err)
 	}
-	judgeLease, acquired, err := coordinator.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Second)
+	judgeLease, acquired, err := capacity.AcquireEphemeral(ctx, "shared-agent", 1, store.AgentSlotOwnerJudge, "default", time.Second)
 	if err != nil || !acquired || judgeLease == nil {
 		t.Fatalf("judge slot after release = %+v, acquired=%v, err=%v", judgeLease, acquired, err)
 	}
@@ -155,16 +155,16 @@ func TestEphemeralSlotOutlivesMaximumPlannerTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator := New(manager)
+	capacity := New(manager)
 	current := time.Date(2026, time.July, 23, 9, 0, 0, 0, time.UTC)
-	coordinator.now = func() time.Time { return current }
+	capacity.now = func() time.Time { return current }
 	const maximumPlannerTimeout = 10 * time.Minute
 	requestedTTL := maximumPlannerTimeout + EphemeralSlotCleanupGrace
 	if requestedTTL >= MaxEphemeralSlotTTL {
 		t.Fatalf("maximum planner TTL %s must remain below ephemeral bound %s", requestedTTL, MaxEphemeralSlotTTL)
 	}
 
-	lease, acquired, err := coordinator.AcquireEphemeral(
+	lease, acquired, err := capacity.AcquireEphemeral(
 		ctx, "maximum-timeout-agent", 1, store.AgentSlotOwnerPlanner, "default", requestedTTL,
 	)
 	if err != nil || !acquired || lease == nil || lease.Slot.ExpiresAt == nil {

@@ -220,13 +220,13 @@ func (s *Service) DecomposeTaskWithVersion(ctx context.Context, taskID string, p
 			defaultProfile = &value
 		}
 	}
-	fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, defaultProfile, metadata.Orchestration.OrchestratorProfile, metadata.Orchestration.PlannerRuntime)
+	fallback, finalizer := orchestration.SelectProfileRoutes(profiles, defaultProfile, metadata.Orchestration.FinalizerProfile, metadata.Orchestration.PlannerRuntime)
 	planner, err := s.planner(metadata)
 	if err != nil {
 		return orchestration.DecompositionResult{}, err
 	}
 	return orchestration.DecomposeTriageTask(ctx, s.Store, taskID, orchestration.DecomposeOptions{
-		Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &orchestrator,
+		Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &finalizer,
 		AutoPromoteChildren: &metadata.Orchestration.AutoPromoteChildren, Planner: planner, Plan: plan,
 		ExpectedUpdatedAt: expectedUpdatedAt,
 	})

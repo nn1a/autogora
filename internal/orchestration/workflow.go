@@ -288,7 +288,7 @@ func SpecifyTriageTaskWithVersion(ctx context.Context, opened *store.Store, task
 type DecomposeOptions struct {
 	Profiles            []ProfileRoute
 	DefaultProfile      ProfileRoute
-	OrchestratorProfile *ProfileRoute
+	FinalizerProfile    *ProfileRoute
 	AutoPromoteChildren *bool
 	Planner             Planner
 	Plan                *DecompositionPlan
@@ -360,13 +360,13 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 		priority := planned.Priority
 		nodes = append(nodes, store.TaskGraphNode{Key: planned.Key, Title: planned.Title, Body: planned.Body, Assignee: profile.Name, Runtime: profile.Runtime, Priority: &priority, Skills: planned.Skills})
 	}
-	orchestrator := options.DefaultProfile
-	if options.OrchestratorProfile != nil {
-		orchestrator = *options.OrchestratorProfile
+	finalizer := options.DefaultProfile
+	if options.FinalizerProfile != nil {
+		finalizer = *options.FinalizerProfile
 	}
 	graph, err := opened.ApplyTaskGraph(ctx, store.TaskGraphInput{
 		RootTaskID: taskID, ExpectedUpdatedAt: &plannedVersion, RootTitle: plan.RootTitle, RootBody: plan.RootBody,
-		OrchestratorAssignee: orchestrator.Name, OrchestratorRuntime: orchestrator.Runtime,
+		FinalizerAssignee: finalizer.Name, FinalizerRuntime: finalizer.Runtime,
 		AutoPromoteChildren: options.AutoPromoteChildren, Nodes: nodes, Dependencies: plan.Dependencies,
 	})
 	if err != nil {

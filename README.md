@@ -127,7 +127,7 @@ or raise the global concurrency cap. A board may also add a board-only route.
 
 ## Set up an agent client
 
-Autogora embeds its worker and orchestrator Skills and can register its stdio
+Autogora embeds its worker and coordinator Skills and can register its stdio
 MCP server through each client's native CLI. Preview both changes, then apply
 them from the project that will own the board:
 
@@ -610,7 +610,7 @@ autogora decompose <triage-id> \
   --profile "writer:claude:synthesizes verified reports" \
   --profile "reviewer:gemini:checks the implementation through Gemini CLI" \
   --default-profile researcher:codex \
-  --orchestrator-profile writer:claude
+  --finalizer-profile writer:claude
 ```
 
 For deterministic automation, `specify` accepts `--title` plus `--body`, and
@@ -728,7 +728,7 @@ clarifications as comments, or terminate the run before changing its task spec.
 The portable Agent Skills are under `skills/`:
 
 - `autogora-worker`: execute and close one claimed task
-- `autogora-orchestrator`: create an executable dependency graph
+- `autogora-coordinator`: create and recover an executable dependency graph
 
 Install both embedded Skills into the project (the default) and inspect them:
 
