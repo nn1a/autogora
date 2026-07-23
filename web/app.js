@@ -7,6 +7,11 @@ const COLORS = {
   triage: "#a98cff", todo: "#8791a3", scheduled: "#e7b65b", ready: "#5e91ff",
   running: "#36c9b0", blocked: "#ff6978", review: "#de84ff", done: "#55d38b", archived: "#667085",
 };
+const WORKFLOW_STAGES = [
+  { id: "planning", label: "Planning", ariaLabel: "Planning workflow stage", statuses: ["triage", "todo", "scheduled", "ready"] },
+  { id: "execution", label: "Execution", ariaLabel: "Execution workflow stage", statuses: ["running", "blocked", "review", "done"] },
+  { id: "archive", label: "Archive", ariaLabel: "Archive workflow stage", statuses: ["archived"] },
+];
 
 const storedTheme = localStorage.getItem("autogora.theme");
 let activeTheme = ["light", "dark"].includes(storedTheme)
@@ -209,12 +214,20 @@ function renderCardList(tasks, lanes) {
 
 function renderBoard() {
   const tasks = filteredTasks();
-  const statuses = $("#show-archived").checked ? STATUSES : STATUSES.filter((status) => status !== "archived");
-  $("#board").innerHTML = statuses.map((status) => {
-    const cards = tasks.filter((task) => task.status === status);
-    return `<section class="column" data-status="${status}" style="--status-color:${COLORS[status]}">
-      <header class="column-head"><span class="status-dot"></span><h2>${STATUS_LABELS[status]}</h2><span class="count">${cards.length}</span>${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}</header>
-      ${renderCardList(cards, status === "running" && $("#lane-profile").checked)}
+  const stages = WORKFLOW_STAGES.filter((stage) => stage.id !== "archive" || $("#show-archived").checked);
+  $("#board").innerHTML = stages.map((stage) => {
+    const stageCount = stage.statuses.reduce((total, status) =>
+      total + tasks.filter((task) => task.status === status).length, 0);
+    const columns = stage.statuses.map((status) => {
+      const cards = tasks.filter((task) => task.status === status);
+      return `<section class="column" data-status="${status}" style="--status-color:${COLORS[status]}">
+        <header class="column-head"><span class="status-dot"></span><h3>${STATUS_LABELS[status]}</h3><span class="count">${cards.length}</span>${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}</header>
+        <div class="column-body" role="region" aria-label="${STATUS_LABELS[status]} tasks" tabindex="0">${renderCardList(cards, status === "running" && $("#lane-profile").checked)}</div>
+      </section>`;
+    }).join("");
+    return `<section class="board-stage" data-stage="${stage.id}" aria-label="${stage.ariaLabel}">
+      <header class="board-stage-head"><h2>${stage.label}</h2><span>${stageCount} ${stageCount === 1 ? "task" : "tasks"}</span></header>
+      <div class="board-stage-grid">${columns}</div>
     </section>`;
   }).join("");
   bindCards();
