@@ -276,7 +276,7 @@ func requireBlockKind(value string) (model.BlockKind, error) {
 }
 
 func (a *App) runLifecycle(ctx context.Context, command string, opts options) error {
-	opened, _, _, err := a.openStore(ctx, opts)
+	opened, manager, _, err := a.openStore(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -306,7 +306,7 @@ func (a *App) runLifecycle(ctx context.Context, command string, opts options) er
 		}
 		results := []model.TaskDetail{}
 		if scope != nil {
-			value, err := opened.CompleteRun(ctx, *scope, completion)
+			value, err := workspace.New(manager).CompleteRun(ctx, opened, *scope, completion)
 			if err != nil {
 				return err
 			}

@@ -756,7 +756,9 @@ func (s *Service) registerMutations(server *mcp.Server) {
 			return nil, err
 		}
 		return usingStore(ctx, s, input.Board, func(opened *store.Store, _ string) (any, error) {
-			return opened.CompleteRun(ctx, scope, store.CompletionInput{Summary: input.Summary, Result: input.Result, Metadata: input.Metadata, Artifacts: input.Artifacts})
+			return workspace.New(s.manager).CompleteRun(ctx, opened, scope, store.CompletionInput{
+				Summary: input.Summary, Result: input.Result, Metadata: input.Metadata, Artifacts: input.Artifacts,
+			})
 		})
 	})
 	addTool(server, "autogora_block", "Block Kanban run", "Stop an active run for input, capability, dependency, or transient reasons.", false, true, false, false, func(ctx context.Context, input blockInput) (any, error) {

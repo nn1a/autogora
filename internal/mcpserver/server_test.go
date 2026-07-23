@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -67,6 +68,20 @@ func toolJSON(t *testing.T, session *mcp.ClientSession, name string, arguments m
 		}
 	}
 	return result
+}
+
+func runMCPGit(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
+	command.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Autogora", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Autogora", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
@@ -180,6 +195,66 @@ func TestCoreMCPToolsShareBoardAndBoundedContext(t *testing.T) {
 	toolJSON(t, session, "autogora_show", map[string]any{"board": "project", "task_id": created.Task.ID}, &completed)
 	if completed.Task.Status != model.TaskStatusDone || len(completed.Runs) != 1 || completed.Runs[0].Status != model.RunStatusCompleted {
 		t.Fatalf("scoped MCP lifecycle did not complete shared task: %+v", completed)
+	}
+}
+
+func TestMCPDirectWorktreeCompletionCapturesDurableChangeSet(t *testing.T) {
+	ctx := context.Background()
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runMCPGit(t, repository, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runMCPGit(t, repository, "add", "README.md")
+	runMCPGit(t, repository, "commit", "-q", "-m", "base")
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(ctx, "project", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	server, _ := New(manager, "test")
+	session, done := connectTestServer(t, server)
+	defer closeTestServer(t, session, done)
+	var created struct {
+		Task model.Task `json:"task"`
+	}
+	toolJSON(t, session, "autogora_create", map[string]any{
+		"board": "project", "title": "MCP direct implementation", "assignee": "worker", "runtime": "cline",
+	}, &created)
+	var claimed struct {
+		Run        model.Run          `json:"run"`
+		ClaimToken string             `json:"claimToken"`
+		Workspace  model.RunWorkspace `json:"workspace"`
+	}
+	toolJSON(t, session, "autogora_claim", map[string]any{"board": "project", "task_id": created.Task.ID}, &claimed)
+	if claimed.Workspace.Kind != model.WorkspaceWorktree || claimed.Workspace.Path == "" {
+		t.Fatalf("MCP claim omitted worktree: %#v", claimed)
+	}
+	if err := os.WriteFile(filepath.Join(claimed.Workspace.Path, "mcp.txt"), []byte("captured through MCP\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toolJSON(t, session, "autogora_complete", map[string]any{
+		"board": "project", "run_id": claimed.Run.ID, "claim_token": claimed.ClaimToken, "summary": "MCP implementation complete",
+	}, nil)
+	opened, err := manager.OpenStore(ctx, "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	detail, err := opened.GetTask(ctx, created.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusDone || len(detail.ChangeSets) != 1 || detail.ChangeSets[0].State != "ready" {
+		t.Fatalf("MCP direct completion omitted change set: %#v", detail)
+	}
+	if contents := runMCPGit(t, repository, "show", detail.ChangeSets[0].HeadCommit+":mcp.txt"); contents != "captured through MCP" {
+		t.Fatalf("captured MCP contents = %q", contents)
 	}
 }
 

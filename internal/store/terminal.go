@@ -114,7 +114,18 @@ func (s *Store) MarkRunManaged(ctx context.Context, scope RunScope) error {
 	})
 }
 
-func (s *Store) requestRunCompletion(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
+func (s *Store) IsRunManaged(ctx context.Context, runID string) (bool, error) {
+	if strings.TrimSpace(runID) == "" {
+		return false, errors.New("run id cannot be empty")
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM managed_runs WHERE run_id = ?", runID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *Store) requestRunCompletion(ctx context.Context, scope RunScope, completion CompletionInput, deferFinalization bool) (model.TaskDetail, error) {
 	summary, result := strings.TrimSpace(completion.Summary), strings.TrimSpace(completion.Result)
 	if summary == "" {
 		summary = result
@@ -152,7 +163,7 @@ func (s *Store) requestRunCompletion(ctx context.Context, scope RunScope, comple
 		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM managed_runs WHERE run_id = ?", run.ID).Scan(&managedCount); err != nil {
 			return err
 		}
-		finalizeNow = run.PID == nil && managedCount == 0
+		finalizeNow = !deferFinalization && run.PID == nil && managedCount == 0
 		timestamp := now()
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_terminal_requests(run_id, kind, summary, result,
 			metadata_json, artifacts_json, requested_at) VALUES (?, 'complete', ?, ?, ?, ?, ?)`, run.ID,
@@ -337,8 +348,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 				return errors.New("task prerequisites changed while completion was pending")
 			}
 			var workspaceKind string
-			workspaceErr := tx.QueryRowContext(ctx, `SELECT rw.kind FROM run_workspaces rw
-				JOIN managed_runs mr ON mr.run_id = rw.run_id WHERE rw.run_id = ?`, runID).Scan(&workspaceKind)
+			workspaceErr := tx.QueryRowContext(ctx, "SELECT kind FROM run_workspaces WHERE run_id = ?", runID).Scan(&workspaceKind)
 			if workspaceErr != nil && !errors.Is(workspaceErr, sql.ErrNoRows) {
 				return workspaceErr
 			}
@@ -346,7 +356,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 				var state string
 				if err := tx.QueryRowContext(ctx, "SELECT state FROM task_change_sets WHERE run_id = ?", runID).Scan(&state); err != nil {
 					if errors.Is(err, sql.ErrNoRows) {
-						return errors.New("managed worktree completion requires a durable change set")
+						return errors.New("worktree completion requires a durable change set")
 					}
 					return err
 				}

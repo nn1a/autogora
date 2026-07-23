@@ -460,7 +460,14 @@ func (s *Store) RecordSpawn(ctx context.Context, scope RunScope, pid int, logPat
 }
 
 func (s *Store) CompleteRun(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
-	return s.requestRunCompletion(ctx, scope, completion)
+	return s.requestRunCompletion(ctx, scope, completion, false)
+}
+
+// RequestRunCompletion records a two-phase completion request without
+// finalizing it. Callers use this when they must durably capture workspace
+// changes before the task can become Done.
+func (s *Store) RequestRunCompletion(ctx context.Context, scope RunScope, completion CompletionInput) (model.TaskDetail, error) {
+	return s.requestRunCompletion(ctx, scope, completion, true)
 }
 
 func syntheticRun(ctx context.Context, q querier, task model.Task, status model.RunStatus, summary string, metadata map[string]any, runError string) (string, error) {
