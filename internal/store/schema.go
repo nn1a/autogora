@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 14
+const schemaVersion = 15
 
 type Store struct {
 	db              *sql.DB
@@ -404,6 +404,14 @@ CREATE TABLE IF NOT EXISTS agent_health (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS service_leases (
+  name TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  renewed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS resource_leases (
   resource_key TEXT PRIMARY KEY,
   run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
@@ -510,6 +518,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_id, configured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_health_due ON agent_health(status, cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_service_leases_expiry ON service_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
