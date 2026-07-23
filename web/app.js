@@ -3,10 +3,6 @@ const STATUS_LABELS = {
   triage: "Triage", todo: "To do", scheduled: "Scheduled", ready: "Ready",
   running: "Running", blocked: "Blocked", review: "Review", done: "Done", archived: "Archived",
 };
-const COLORS = {
-  triage: "#a98cff", todo: "#8791a3", scheduled: "#e7b65b", ready: "#5e91ff",
-  running: "#36c9b0", blocked: "#ff6978", review: "#de84ff", done: "#55d38b", archived: "#667085",
-};
 const WORKFLOW_STAGES = [
   { id: "planning", label: "Planning", ariaLabel: "Planning workflow stage", statuses: ["triage", "todo", "scheduled", "ready"] },
   { id: "execution", label: "Execution", ariaLabel: "Execution workflow stage", statuses: ["running", "blocked", "review", "done"] },
@@ -21,8 +17,9 @@ document.documentElement.dataset.theme = activeTheme;
 
 const state = {
   boards: [], board: localStorage.getItem("autogora.board") || "default", metadata: null,
-  profiles: [], tasks: [], stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
-  agentConfig: null, agentConfigExists: false, detections: [], effectiveAgents: [], supervisor: null,
+  profiles: [], tasks: [], taskWindow: null, stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
+  agentConfig: null, agentConfigExists: false, detections: [], effectiveAgents: [], supervisor: null, operations: [],
+  drawerDirty: false, drawerVersion: null, drawerRequest: 0,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -79,6 +76,20 @@ function relativeTime(value) {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
+function localDateTimeValue(value = Date.now() + 60 * 60 * 1000) {
+  const date = new Date(value);
+  const offset = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function futureScheduleISO(value) {
+  const parsed = new Date(value);
+  if (!value || Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+    throw new Error("Choose a valid future schedule time");
+  }
+  return parsed.toISOString();
+}
+
 function boardPath(path) {
   const separator = path.includes("?") ? "&" : "?";
   return `${path}${separator}board=${encodeURIComponent(state.board)}`;
@@ -109,6 +120,11 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => element.classList.add("hidden"), 3500);
 }
 
+window.addEventListener("unhandledrejection", (event) => {
+  event.preventDefault();
+  toast(event.reason?.message || String(event.reason || "Unexpected background error"), true);
+});
+
 async function loadBoards() {
   const payload = await api("/api/boards");
   state.boards = payload.boards;
@@ -126,6 +142,9 @@ async function loadBoard() {
   state.metadata = payload.board;
   state.profiles = payload.profiles || payload.board?.orchestration?.profiles || [];
   state.tasks = payload.tasks;
+  state.taskWindow = payload.taskWindow || {
+    returned: payload.tasks.length, total: payload.tasks.length, truncated: false, limit: payload.tasks.length,
+  };
   state.stats = payload.stats;
   state.diagnostics = payload.diagnostics;
   renderFilters();
@@ -138,6 +157,16 @@ function workerProfiles() {
 
 function profileByName(name) {
   return workerProfiles().find((profile) => profile.name === name);
+}
+
+function defaultWorkerProfile() {
+  const preferred = state.metadata?.orchestration?.defaultProfile;
+  return profileByName(preferred) || workerProfiles()[0] || null;
+}
+
+function availableWorkerAgents() {
+  const configured = state.agentConfig?.agents || [];
+  return configured.filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
 }
 
 function filteredTasks() {
@@ -160,15 +189,16 @@ function renderFilters() {
   $("#assignee-filter").value = assignees.includes(assignee) ? assignee : "";
   const diagnosticIssues = state.diagnostics?.issues || [];
   const healthy = diagnosticIssues.length === 0;
+  const taskWindow = state.taskWindow || {};
+  const windowWarning = taskWindow.truncated
+    ? `<span class="metric window-warning" role="status" title="The board snapshot is limited. Use the task list API with targeted filters to inspect tasks outside this window."><strong>${taskWindow.returned} shown</strong><span>of ${taskWindow.total}</span></span>`
+    : "";
   $("#stats").innerHTML = `
     <span class="metric"><strong>${state.stats?.total || 0}</strong><span>tasks</span></span>
     <span class="metric"><strong>${state.stats?.byStatus?.running || 0}</strong><span>running</span></span>
-    <button type="button" id="health-details" class="health-chip ${healthy ? "healthy" : "attention"}"><span aria-hidden="true"></span>${healthy ? "Healthy" : `Needs attention (${diagnosticIssues.length})`}</button>`;
-  $("#health-details").addEventListener("click", () => {
-    if (healthy) return;
-    alert(diagnosticIssues.slice(0, 20).map((issue) => `${issue.kind} · ${issue.taskId}\n${issue.detail}`).join("\n\n")
-      + (diagnosticIssues.length > 20 ? `\n\n… ${diagnosticIssues.length - 20} more issue(s)` : ""));
-  });
+    ${windowWarning}
+    <button type="button" id="health-details" class="health-chip ${healthy ? "healthy" : "attention"}"><span aria-hidden="true"></span>${healthy ? "Board checks clear" : `Board attention (${diagnosticIssues.length})`}</button>`;
+  $("#health-details").addEventListener("click", () => openActivity().catch((error) => toast(error.message, true)));
 }
 
 function cardHtml(task) {
@@ -178,8 +208,8 @@ function cardHtml(task) {
   const summary = task.body?.trim()
     ? `<div class="card-summary">${escapeHtml(task.body.trim())}</div>`
     : "";
-  return `<article class="card ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" tabindex="0" data-task="${escapeHtml(task.id)}"
-    style="--status-color:${COLORS[task.status]}" aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${task.runtime}`)}">
+  return `<article class="card status-${task.status} ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" tabindex="0" data-task="${escapeHtml(task.id)}" data-task-version="${escapeHtml(task.updatedAt)}"
+    aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${task.runtime}`)}">
     <div class="card-top"><input type="checkbox" aria-label="Select ${escapeHtml(task.title)}" ${state.selected.has(task.id) ? "checked" : ""}>
       <span class="status-badge"><span class="status-dot"></span>${STATUS_LABELS[task.status]}</span>
       <span class="mono card-id">${escapeHtml(task.id)}</span>${progress}</div>
@@ -194,6 +224,7 @@ function cardHtml(task) {
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
       ${task.commentsCount ? `<span title="Comments">💬 ${task.commentsCount}</span>` : ""}${task.relationshipsCount ? `<span title="Relationships">↔ ${task.relationshipsCount}</span>` : ""}
+      ${task.status === "scheduled" ? `<span title="Scheduled time">${task.scheduledAt ? `After ${escapeHtml(new Date(task.scheduledAt).toLocaleString())}` : "On hold · no time"}</span>` : ""}
       <span class="updated">Updated ${relativeTime(task.updatedAt)}</span>
     </div>
   </article>`;
@@ -215,12 +246,18 @@ function renderCardList(tasks, lanes) {
 function renderBoard() {
   const tasks = filteredTasks();
   const stages = WORKFLOW_STAGES.filter((stage) => stage.id !== "archive" || $("#show-archived").checked);
-  $("#board").innerHTML = stages.map((stage) => {
+  const emptyGuide = state.tasks.length === 0 ? `<section class="empty-guide" aria-label="Get started">
+    <div class="empty-guide-intro"><span class="eyebrow">New board</span><h2>Set up a project, then add work</h2><p>Autogora can plan Triage cards, promote dependency-ready tasks, and assign healthy workers after these three checks.</p></div>
+    <div class="guide-step"><strong>1 · Coding agents</strong><span>${availableWorkerAgents().length ? `${availableWorkerAgents().length} worker agent${availableWorkerAgents().length === 1 ? "" : "s"} configured.` : "Choose installed CLIs, models, and fallbacks."}</span><button type="button" data-guide="agents">${availableWorkerAgents().length ? "Review agents" : "Set up agents"}</button></div>
+    <div class="guide-step"><strong>2 · Project directory</strong><span>${state.metadata?.defaultWorkdir ? escapeHtml(state.metadata.defaultWorkdir) : "Choose the Git repository workers may inspect or change."}</span><button type="button" data-guide="workspace">${state.metadata?.defaultWorkdir ? "Review project" : "Set project path"}</button></div>
+    <div class="guide-step"><strong>3 · Add work</strong><span>Import GitHub issues for review or create a task directly.</span><button type="button" data-guide="import" class="primary">Import issues</button><button type="button" data-guide="create" class="ghost">Create task</button></div>
+  </section>` : "";
+  $("#board").innerHTML = emptyGuide + stages.map((stage) => {
     const stageCount = stage.statuses.reduce((total, status) =>
       total + tasks.filter((task) => task.status === status).length, 0);
     const columns = stage.statuses.map((status) => {
       const cards = tasks.filter((task) => task.status === status);
-      return `<section class="column" data-status="${status}" style="--status-color:${COLORS[status]}">
+      return `<section class="column status-${status}" data-status="${status}">
         <header class="column-head"><span class="status-dot"></span><h3>${STATUS_LABELS[status]}</h3><span class="count">${cards.length}</span>${status === "running" ? "" : `<button class="icon-button compact" data-create-status="${status}" aria-label="Create in ${STATUS_LABELS[status]}" title="Create in ${STATUS_LABELS[status]}">+</button>`}</header>
         <div class="column-body" role="region" aria-label="${STATUS_LABELS[status]} tasks" tabindex="0">${renderCardList(cards, status === "running" && $("#lane-profile").checked)}</div>
       </section>`;
@@ -230,6 +267,12 @@ function renderBoard() {
       <div class="board-stage-grid">${columns}</div>
     </section>`;
   }).join("");
+  $$('[data-guide]').forEach((button) => button.addEventListener("click", () => {
+    if (button.dataset.guide === "agents") openAgentSettings().catch((error) => toast(error.message, true));
+    if (button.dataset.guide === "workspace") openSettings();
+    if (button.dataset.guide === "import") openGitHubImport();
+    if (button.dataset.guide === "create") openTaskDialog("triage");
+  }));
   bindCards();
   renderBulk();
 }
@@ -251,6 +294,7 @@ function bindCards() {
     });
     card.addEventListener("dragstart", (event) => {
       event.dataTransfer.setData("text/plain", taskId);
+      event.dataTransfer.setData("application/x-autogora-updated-at", card.dataset.taskVersion);
       card.classList.add("dragging");
       document.body.classList.add("drag-active");
     });
@@ -262,7 +306,8 @@ function bindCards() {
     column.addEventListener("drop", async (event) => {
       event.preventDefault(); column.classList.remove("drag-over");
       const taskId = event.dataTransfer.getData("text/plain");
-      if (taskId) await moveTask(taskId, column.dataset.status);
+      const expectedUpdatedAt = event.dataTransfer.getData("application/x-autogora-updated-at");
+      if (taskId) await moveTask(taskId, column.dataset.status, expectedUpdatedAt);
     });
   });
   $$('[data-create-status]').forEach((button) => button.addEventListener("click", () => openTaskDialog(button.dataset.createStatus)));
@@ -272,21 +317,33 @@ function bindCards() {
   trash.ondrop = async (event) => {
     event.preventDefault(); trash.classList.remove("drag-over"); document.body.classList.remove("drag-active");
     const taskId = event.dataTransfer.getData("text/plain");
+    const expectedUpdatedAt = event.dataTransfer.getData("application/x-autogora-updated-at");
     if (!taskId || !confirm(`Permanently delete ${taskId}?`)) return;
-    try { await api(boardPath(`/api/tasks/${taskId}`), { method: "DELETE" }); await loadBoard(); }
+    try {
+      await api(boardPath(`/api/tasks/${taskId}`), {
+        method: "DELETE", body: JSON.stringify({ expectedUpdatedAt: expectedUpdatedAt || null }),
+      });
+      await loadBoard();
+    }
     catch (error) { toast(error.message, true); }
   };
 }
 
-async function moveTask(taskId, status) {
+async function moveTask(taskId, status, expectedUpdatedAt = null) {
   try {
+    expectedUpdatedAt ||= state.tasks.find((task) => task.id === taskId)?.updatedAt || null;
     if (status === "running") {
-      await api(boardPath("/api/dispatch"), { method: "POST", body: JSON.stringify({ taskId }) });
+      await api(boardPath("/api/dispatch"), { method: "POST", body: JSON.stringify({ taskId, expectedUpdatedAt }) });
       toast("Task sent to the dispatcher");
       await loadBoard();
       return;
     }
-    const body = { status };
+    const body = { status, expectedUpdatedAt };
+    if (status === "scheduled") {
+      const at = prompt("Run after (local date and time):", localDateTimeValue());
+      if (at === null) return;
+      body.scheduledAt = futureScheduleISO(at);
+    } else body.scheduledAt = null;
     if (status === "done") body.summary = prompt("Completion summary:", "Completed from dashboard") || "Completed from dashboard";
     if (status === "blocked") body.reason = prompt("Block reason:");
     if (status === "blocked" && !body.reason) return;
@@ -305,13 +362,24 @@ function renderBulk() {
 async function bulkMutation(mutation) {
   if (!state.selected.size) return;
   try {
+    if (mutation.status === "scheduled" && !mutation.scheduledAt) {
+      const at = prompt("Run selected tasks after (local date and time):", localDateTimeValue());
+      if (at === null) return;
+      mutation = { ...mutation, scheduledAt: futureScheduleISO(at) };
+    } else if (mutation.status) mutation = { ...mutation, scheduledAt: null };
+    const ids = [...state.selected];
+    const expectedUpdatedAt = Object.fromEntries(ids.map((id) => [
+      id, state.tasks.find((task) => task.id === id)?.updatedAt,
+    ]).filter(([, version]) => version));
     const result = await api(boardPath("/api/tasks/bulk"), {
-      method: "POST", body: JSON.stringify({ ids: [...state.selected], mutation }),
+      method: "POST", body: JSON.stringify({ ids, mutation: { ...mutation, expectedUpdatedAt } }),
     });
-    state.selected.clear();
-    toast(`${result.ok.length} updated${result.errors.length ? `, ${result.errors.length} failed` : ""}`, result.errors.length > 0);
+    state.selected = new Set(result.errors.map((item) => item.id));
+    const failure = result.errors[0]?.error;
+    toast(`${result.ok.length} updated${result.errors.length ? `, ${result.errors.length} failed${failure ? `: ${failure}` : ""}` : ""}`, result.errors.length > 0);
     await loadBoard();
   } catch (error) { toast(error.message, true); }
+  finally { $("#bulk-status").value = ""; }
 }
 
 function openTaskDialog(status = "todo") {
@@ -321,8 +389,20 @@ function openTaskDialog(status = "todo") {
   const profiles = workerProfiles();
   form.elements.profile.innerHTML = `<option value="">Custom assignment</option>${profiles.map((profile) =>
     `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)} · ${escapeHtml(profile.model || "CLI default")}</option>`).join("")}`;
+  const preferred = ["todo", "ready", "scheduled"].includes(status) ? defaultWorkerProfile() : null;
+  if (preferred) form.elements.profile.value = preferred.name;
+  if (status === "scheduled") form.elements.scheduledAt.value = localDateTimeValue();
+  updateTaskScheduleVisibility();
   updateTaskModelPreview();
   $("#task-dialog").showModal();
+}
+
+function updateTaskScheduleVisibility() {
+  const form = $("#task-form");
+  const scheduled = form.elements.status.value === "scheduled";
+  $("#task-schedule-field").classList.toggle("hidden", !scheduled);
+  form.elements.scheduledAt.required = scheduled;
+  if (scheduled && !form.elements.scheduledAt.value) form.elements.scheduledAt.value = localDateTimeValue();
 }
 
 function updateTaskModelPreview() {
@@ -337,27 +417,49 @@ function updateTaskModelPreview() {
   form.elements.modelPreview.value = form.elements.runtime.value === "manual" ? "Manual task" : "CLI default (unpinned)";
 }
 
-async function openDrawer(taskId) {
+async function openDrawer(taskId, { focus = true, force = false } = {}) {
+  if (!force && state.drawerDirty && state.drawerTask === taskId) {
+    $("#drawer-refresh").classList.remove("hidden");
+    return;
+  }
+  if (!force && state.drawerDirty && state.drawerTask && state.drawerTask !== taskId
+      && !confirm("Discard unsaved task changes?")) return;
+  const requestID = ++state.drawerRequest;
   try {
     if (!state.drawerTask) drawerReturnFocus = document.activeElement;
     const detail = await api(boardPath(`/api/tasks/${taskId}`));
+    if (requestID !== state.drawerRequest) return;
+    if (!force && state.drawerTask === taskId && state.drawerDirty) {
+      $("#drawer-refresh").classList.remove("hidden");
+      return;
+    }
     state.drawerTask = taskId;
+    state.drawerDirty = false;
+    state.drawerVersion = detail.task.updatedAt;
+    $("#drawer-refresh").classList.add("hidden");
     $("#drawer-id").textContent = taskId;
     $("#drawer-status").textContent = STATUS_LABELS[detail.task.status];
-    $("#drawer-status").style.setProperty("--status-color", COLORS[detail.task.status]);
-    $("#drawer").classList.add("open");
-    $("#drawer").setAttribute("aria-hidden", "false");
-    $("#scrim").classList.remove("hidden");
+    $("#drawer-status").className = `status-chip status-${detail.task.status}`;
     renderDrawer(detail);
-    $("#drawer-close").focus({ preventScroll: true });
-  } catch (error) { toast(error.message, true); }
+    const drawer = $("#drawer");
+    if (!drawer.open) drawer.showModal();
+    document.body.classList.add("drawer-open");
+    drawer.classList.add("open");
+    if (focus) $("#drawer-close").focus({ preventScroll: true });
+  } catch (error) {
+    if (requestID === state.drawerRequest) toast(error.message, true);
+  }
 }
 
 function closeDrawer() {
+  state.drawerRequest++;
   state.drawerTask = null;
-  $("#drawer").classList.remove("open");
-  $("#drawer").setAttribute("aria-hidden", "true");
-  $("#scrim").classList.add("hidden");
+  state.drawerDirty = false;
+  state.drawerVersion = null;
+  const drawer = $("#drawer");
+  drawer.classList.remove("open");
+  if (drawer.open) drawer.close();
+  document.body.classList.remove("drawer-open");
   if (drawerReturnFocus?.isConnected) drawerReturnFocus.focus({ preventScroll: true });
   drawerReturnFocus = null;
 }
@@ -367,8 +469,16 @@ function taskOptions(excludeId) {
     .map((task) => `<option value="${escapeHtml(task.id)}">${escapeHtml(task.id)} · ${escapeHtml(task.title)}</option>`).join("");
 }
 
+const drawerEditSelectors = [
+  "#edit-title", "#edit-profile", "#edit-assignee", "#edit-runtime", "#edit-priority", "#edit-tenant", "#edit-workspace-kind",
+  "#edit-workspace", "#edit-branch", "#edit-scheduled-at", "#edit-max-runtime", "#edit-max-retries", "#edit-body", "#edit-skills",
+  "#edit-goal-mode", "#edit-goal-turns",
+];
+const drawerRunningLockedSelectors = drawerEditSelectors.filter((selector) => selector !== "#edit-priority");
+
 function renderDrawer(detail) {
   const task = detail.task;
+  const editLocked = task.status === "running";
   const runAgents = new Map((detail.runAgentConfigs || []).map((config) => [config.runId, config]));
   const runRows = detail.runs.slice().reverse().map((run) => {
     const config = runAgents.get(run.id);
@@ -376,9 +486,10 @@ function renderDrawer(detail) {
     const provenance = config ? `${String(config.source || "unknown").replaceAll("_", " ")}${config.fallbackFrom ? ` · fallback from ${config.fallbackFrom}` : ""}` : "";
     return `<div class="detail-row">
       ${run.status === "running" ? `<button data-terminate-run="${escapeHtml(run.id)}" class="danger compact">Terminate</button>` : ""}
+      ${run.logPath ? `<button data-run-log="${escapeHtml(run.id)}" class="ghost compact">Log tail</button>` : ""}
       <strong>${escapeHtml(run.workerId)}</strong>
       <span class="detail-status">${escapeHtml(run.status)}</span>
-      <span class="mono">${escapeHtml(run.id)} · ${relativeTime(run.claimedAt)}</span>
+      <span class="mono">${escapeHtml(run.id)} · claimed ${relativeTime(run.claimedAt)} · heartbeat ${relativeTime(run.heartbeatAt)} · lease ${escapeHtml(new Date(run.claimExpiresAt).toLocaleString())}</span>
       ${config ? `<div>${escapeHtml(route)}</div><div class="mono">${escapeHtml(provenance)}</div>` : ""}
       ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
     </div>`;
@@ -389,7 +500,17 @@ function renderDrawer(detail) {
     <strong>${escapeHtml(attachment.name)}</strong>
     ${attachment.path ? `<a href="${boardPath(`/api/attachments/${attachment.id}/download?taskId=${task.id}`)}">Download</a>` : `<a href="${escapeHtml(attachment.url)}" target="_blank" rel="noopener noreferrer">Open URL</a>`}
   </div>`).join("");
-  const events = detail.events.slice().reverse().slice(0, 30).map((event) => `<div class="detail-row"><strong>${escapeHtml(event.kind)}</strong><span class="mono">#${event.id} · ${escapeHtml(event.createdAt)}</span></div>`).join("");
+  const events = detail.events.slice().reverse().slice(0, 30).map((event) => {
+    const payload = event.payload && Object.keys(event.payload).length ? JSON.stringify(event.payload, null, 2) : "";
+    return `<div class="detail-row"><strong>${escapeHtml(event.kind)}</strong><span class="mono">#${event.id} · ${escapeHtml(event.createdAt)}</span>${payload ? `<div class="event-payload">${escapeHtml(payload)}</div>` : ""}</div>`;
+  }).join("");
+  const changeSets = (detail.changeSets || []).slice().reverse().map((change) => `<div class="detail-row">
+    <strong>${escapeHtml(change.state)} change set · ${escapeHtml(change.id)}</strong>
+    <span class="mono">${escapeHtml(change.headCommit)} · ${escapeHtml(change.durableRef)}</span>
+    <div>${change.changedFiles?.length ? escapeHtml(change.changedFiles.join(", ")) : "No changed files recorded"}</div>
+    <div class="mono">${escapeHtml(change.worktreePath)}</div>
+  </div>`).join("");
+  const workspaces = (detail.runWorkspaces || []).slice().reverse().map((workspace) => `<div class="detail-row"><strong>${escapeHtml(workspace.kind)} workspace</strong><span class="mono">${escapeHtml(workspace.runId)} · ${escapeHtml(workspace.path)}</span>${workspace.baseCommit ? `<div>Base ${escapeHtml(workspace.baseCommit)}</div>` : ""}</div>`).join("");
   const dependency = (item) => `<div class="detail-row" data-open-task="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span class="mono">${escapeHtml(item.id)} · ${escapeHtml(item.status)}</span></div>`;
   const graph = detail.relationshipGraph;
   const focusNode = graph.nodes.find((node) => node.task.id === task.id);
@@ -426,6 +547,9 @@ function renderDrawer(detail) {
       <div><small>Runtime</small><strong>${escapeHtml(task.runtime)}</strong></div>
       <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
     </div>
+    ${task.status === "blocked" ? `<div class="detail-row"><strong>Blocked · ${escapeHtml(task.blockKind || "needs_input")}</strong><div>${escapeHtml(task.blockReason || "No reason recorded")}</div></div>` : ""}
+    ${task.result ? `<div class="detail-row"><strong>Result</strong><div>${markdown(task.result)}</div></div>` : ""}
+    ${editLocked ? '<div class="detail-row" role="note"><strong>Execution settings are locked while this task is running.</strong><div>Priority remains editable. Use comments for durable context, or terminate the run before changing the task specification.</div></div>' : ""}
     <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
     <div class="drawer-grid drawer-routing-grid">
       <label>Board profile<select id="edit-profile">${drawerProfileOptions}</select></label>
@@ -433,9 +557,18 @@ function renderDrawer(detail) {
       <label>Runtime<select id="edit-runtime">${["manual", "codex", "claude", "cline", "gemini"].map((item) => `<option ${item === task.runtime ? "selected" : ""}>${item}</option>`).join("")}</select></label>
       <label>Current route model<input id="edit-model-preview" value="${escapeHtml(routeModel)}" readonly></label>
       <label>Priority<input id="edit-priority" type="number" value="${task.priority}"></label>
+      <label>Tenant<input id="edit-tenant" value="${escapeHtml(task.tenant || "")}"></label>
+      <label>Workspace kind<select id="edit-workspace-kind">${["scratch", "dir", "worktree"].map((item) => `<option ${item === task.workspaceKind ? "selected" : ""}>${item}</option>`).join("")}</select></label>
+      <label>Workspace path<input id="edit-workspace" value="${escapeHtml(task.workspace || "")}" placeholder="automatic"></label>
+      <label>Branch<input id="edit-branch" value="${escapeHtml(task.branch || "")}"></label>
+      <label>Run after<input id="edit-scheduled-at" type="datetime-local" value="${task.scheduledAt ? localDateTimeValue(task.scheduledAt) : ""}"></label>
+      <label>Max runtime (seconds)<input id="edit-max-runtime" type="number" min="1" value="${task.maxRuntimeSeconds || ""}"></label>
+      <label>Max retries<input id="edit-max-retries" type="number" min="1" value="${task.maxRetries || 2}"></label>
     </div>
     <label>Description<textarea id="edit-body" rows="9">${escapeHtml(task.body)}</textarea></label>
-    <button id="save-task" class="primary">Save changes</button>
+    <label>Skills<input id="edit-skills" value="${escapeHtml((task.skills || []).join(", "))}" placeholder="comma-separated"></label>
+    <div class="drawer-grid"><label class="inline"><input id="edit-goal-mode" type="checkbox"${task.goalMode ? " checked" : ""}> Goal mode</label><label>Goal max turns<input id="edit-goal-turns" type="number" min="1" value="${task.goalMaxTurns || 20}"></label></div>
+    <button id="save-task" class="primary">${editLocked ? "Save priority" : "Save changes"}</button>
     <div class="action-row">
       ${task.status === "triage" ? '<button data-action="specify">Specify</button><button data-action="decompose">Decompose</button>' : ""}
       ${task.status === "blocked" ? '<button data-action="unblock">Unblock</button>' : ""}
@@ -468,12 +601,24 @@ function renderDrawer(detail) {
     <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
     <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
     <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
+    <h3>Change results</h3><div class="detail-list">${changeSets || '<small>No change sets</small>'}</div>
+    <h3>Run workspaces</h3><div class="detail-list">${workspaces || '<small>No prepared workspaces</small>'}</div>
     <h3>Recent events</h3><div class="detail-list">${events}</div>`;
+  if (editLocked) {
+    drawerRunningLockedSelectors.forEach((selector) => {
+      const control = $(selector);
+      if (control) control.disabled = true;
+    });
+  }
   bindDrawer(detail);
 }
 
 function bindDrawer(detail) {
   const taskId = detail.task.id;
+  const markDirty = () => {
+    state.drawerDirty = true;
+  };
+  drawerEditSelectors.forEach((selector) => $(selector)?.addEventListener("input", markDirty));
   const updateRoutePreview = () => {
     const profile = profileByName($("#edit-profile").value);
     if (profile) {
@@ -489,13 +634,30 @@ function bindDrawer(detail) {
   $("#edit-runtime").addEventListener("change", () => { $("#edit-profile").value = ""; updateRoutePreview(); });
   $("#save-task").addEventListener("click", async () => {
     try {
-      await api(boardPath(`/api/tasks/${taskId}`), { method: "PATCH", body: JSON.stringify({
-        title: $("#edit-title").value, body: $("#edit-body").value,
-        assignee: $("#edit-assignee").value || null, runtime: $("#edit-runtime").value,
-        priority: Number($("#edit-priority").value),
-      }) });
-      toast("Task saved"); await loadBoard(); await openDrawer(taskId);
-    } catch (error) { toast(error.message, true); }
+      const scheduleValue = $("#edit-scheduled-at").value;
+      if (detail.task.status === "scheduled") futureScheduleISO(scheduleValue);
+      const payload = detail.task.status === "running"
+        ? { expectedUpdatedAt: state.drawerVersion, priority: Number($("#edit-priority").value) }
+        : {
+          expectedUpdatedAt: state.drawerVersion,
+          title: $("#edit-title").value, body: $("#edit-body").value,
+          assignee: $("#edit-assignee").value || null, runtime: $("#edit-runtime").value,
+          priority: Number($("#edit-priority").value),
+          tenant: $("#edit-tenant").value || null, workspaceKind: $("#edit-workspace-kind").value,
+          workspace: $("#edit-workspace").value || null, branch: $("#edit-branch").value || null,
+          scheduledAt: scheduleValue ? new Date(scheduleValue).toISOString() : null,
+          maxRuntimeSeconds: $("#edit-max-runtime").value ? Number($("#edit-max-runtime").value) : null,
+          maxRetries: Number($("#edit-max-retries").value) || 2,
+          skills: $("#edit-skills").value.split(",").map((item) => item.trim()).filter(Boolean),
+          goalMode: $("#edit-goal-mode").checked, goalMaxTurns: Number($("#edit-goal-turns").value) || 20,
+        };
+      await api(boardPath(`/api/tasks/${taskId}`), { method: "PATCH", body: JSON.stringify(payload) });
+      state.drawerDirty = false;
+      toast("Task saved"); await loadBoard(); await openDrawer(taskId, { focus: false });
+    } catch (error) {
+      toast(error.message, true);
+      if (error.message.includes("conflict")) $("#drawer-refresh").classList.remove("hidden");
+    }
   });
   $$('[data-action]', $("#drawer-content")).forEach((button) => button.addEventListener("click", () => drawerAction(taskId, button.dataset.action)));
   $$('[data-open-task]', $("#drawer-content")).forEach((row) => row.addEventListener("click", () => openDrawer(row.dataset.openTask)));
@@ -512,8 +674,24 @@ function bindDrawer(detail) {
   $$('[data-terminate-run]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {
     if (!confirm("Terminate this active run and release its task?")) return;
     const termination = await api(boardPath(`/api/runs/${button.dataset.terminateRun}/terminate`), { method: "POST", body: JSON.stringify({ reason: "Terminated by dashboard user" }) });
-    if (termination.pending) toast("Termination signal sent; the task will be released after the worker exits.");
+    if (termination.pending && termination.signaled) toast("Termination signal sent; the task will be released after the worker exits.");
+    else if (termination.pending) toast("Termination recorded; the dispatcher will verify the process and workspace before releasing the task.");
+    else toast("Run reclaimed.");
     await openDrawer(taskId); await loadBoard();
+  }));
+  $$('[data-run-log]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {
+    try {
+      button.disabled = true;
+      const log = await api(boardPath(`/api/tasks/${taskId}/log?runId=${encodeURIComponent(button.dataset.runLog)}&tailBytes=32768`));
+      let output = $(".run-log-output", button.closest(".detail-row"));
+      if (!output) {
+        output = document.createElement("pre");
+        output.className = "run-log-output";
+        button.closest(".detail-row").append(output);
+      }
+      output.textContent = log.text || "(log is empty)";
+    } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
   }));
   $$('[data-remove-attachment]', $("#drawer-content")).forEach((button) => button.addEventListener("click", async () => {
     await api(boardPath(`/api/tasks/${taskId}/attachments/${button.dataset.removeAttachment}`), { method: "DELETE" });
@@ -553,36 +731,190 @@ function bindDrawer(detail) {
 }
 
 async function drawerAction(taskId, action) {
+  const actionButtons = $$('[data-action]', $("#drawer-content"));
+  const expectedUpdatedAt = state.drawerVersion;
   try {
+    actionButtons.forEach((button) => { button.disabled = true; });
     if (action === "delete") {
       if (!confirm("Permanently delete this task?")) return;
-      await api(boardPath(`/api/tasks/${taskId}`), { method: "DELETE" }); closeDrawer();
+      await api(boardPath(`/api/tasks/${taskId}`), {
+        method: "DELETE", body: JSON.stringify({ expectedUpdatedAt }),
+      });
+      closeDrawer();
     } else if (action === "complete") {
       const summary = prompt("Completion summary:"); if (!summary) return;
-      await api(boardPath(`/api/tasks/${taskId}/complete`), { method: "POST", body: JSON.stringify({ summary }) });
+      await api(boardPath(`/api/tasks/${taskId}/complete`), {
+        method: "POST", body: JSON.stringify({ summary, expectedUpdatedAt }),
+      });
     } else if (action === "block") {
       const reason = prompt("Block reason:"); if (!reason) return;
-      await api(boardPath(`/api/tasks/${taskId}/block`), { method: "POST", body: JSON.stringify({ reason, kind: "needs_input" }) });
+      await api(boardPath(`/api/tasks/${taskId}/block`), {
+        method: "POST", body: JSON.stringify({ reason, kind: "needs_input", expectedUpdatedAt }),
+      });
     } else if (action === "specify" || action === "decompose") {
       if (!confirm(`${action} this triage card using the board planner?`)) return;
-      await api(boardPath(`/api/tasks/${taskId}/${action}`), { method: "POST", body: "{}" });
+      await api(boardPath(`/api/tasks/${taskId}/${action}`), {
+        method: "POST", body: JSON.stringify({ expectedUpdatedAt }),
+      });
     } else if (action === "dispatch") {
-      await api(boardPath("/api/dispatch"), { method: "POST", body: JSON.stringify({ taskId }) });
-      toast("Task sent to the dispatcher");
+      const dispatch = await api(boardPath("/api/dispatch"), {
+        method: "POST", body: JSON.stringify({ taskId, expectedUpdatedAt }),
+      });
+      toast(dispatch.mode === "supervisor" ? "Supervisor is watching this Ready task" : `Dispatcher operation ${dispatch.operation?.id || "started"}`);
     } else if (action === "archive") {
       if (!confirm("Archive this task?")) return;
-      await api(boardPath(`/api/tasks/${taskId}/archive`), { method: "POST", body: "{}" }); closeDrawer();
+      await api(boardPath(`/api/tasks/${taskId}/archive`), {
+        method: "POST", body: JSON.stringify({ expectedUpdatedAt }),
+      });
+      closeDrawer();
     } else {
-      await api(boardPath(`/api/tasks/${taskId}/${action}`), { method: "POST", body: "{}" });
+      await api(boardPath(`/api/tasks/${taskId}/${action}`), {
+        method: "POST", body: JSON.stringify({ expectedUpdatedAt }),
+      });
     }
     await loadBoard(); if (state.drawerTask) await openDrawer(taskId);
-  } catch (error) { toast(error.message, true); }
+  } catch (error) {
+    toast(error.message, true);
+    if (error.message.includes("conflict")) $("#drawer-refresh").classList.remove("hidden");
+  }
+  finally { actionButtons.forEach((button) => { if (button.isConnected) button.disabled = false; }); }
 }
 
 function parseRoute(value) {
   const [name, runtime = "codex", ...description] = value.trim().split(":");
   if (!name || !["codex", "claude", "cline", "gemini"].includes(runtime)) throw new Error(`Invalid route: ${value}`);
   return { name, runtime, description: description.join(":") };
+}
+
+function openGitHubImport() {
+  const form = $("#github-form");
+  form.reset();
+  form.elements.limit.value = "30";
+  form.elements.priority.value = "0";
+  $("#github-result").classList.add("hidden");
+  $("#github-result").innerHTML = "";
+  $("#github-dialog").showModal();
+}
+
+function githubImportPayload(dryRun) {
+  const data = new FormData($("#github-form"));
+  return {
+    repository: String(data.get("repository") || "").trim(), host: String(data.get("host") || "").trim(),
+    state: data.get("state"), labels: String(data.get("labels") || "").trim(), search: String(data.get("search") || "").trim(),
+    issues: String(data.get("issues") || "").trim(), limit: Number(data.get("limit")) || 30,
+    tenant: String(data.get("tenant") || "").trim() || null, priority: Number(data.get("priority")) || 0, dryRun,
+  };
+}
+
+function renderGitHubResult(result) {
+  const target = $("#github-result");
+  const issues = result.issues || [];
+  const failures = result.errors || [];
+  target.innerHTML = `<div class="import-summary">
+    <span class="pill">${escapeHtml(result.status || "success")}</span>
+    <span class="pill">${result.fetched || 0} fetched</span>
+    <span class="pill">${result.dryRun ? `${result.planned || 0} planned` : `${result.created || 0} created`}</span>
+    <span class="pill">${result.existing || 0} existing</span>
+    ${result.failed ? `<span class="pill priority">${result.failed} failed</span>` : ""}
+  </div>
+  <div class="mono">${escapeHtml(result.repository || "Current board repository")}</div>
+  <div class="import-issues">${issues.map((issue) => `<div class="import-issue"><strong>#${issue.number}</strong><span>${escapeHtml(issue.title)}</span><span class="mono">${escapeHtml(issue.action)}</span></div>`).join("")}
+  ${failures.map((failure) => `<div class="import-issue"><strong>#${failure.number || "?"}</strong><span>${escapeHtml(failure.error)}</span><span class="mono">failed</span></div>`).join("")}</div>`;
+  target.classList.remove("hidden");
+}
+
+async function runGitHubImport(dryRun) {
+  const preview = $("#github-preview");
+  const submit = $("#github-submit");
+  try {
+    preview.disabled = true; submit.disabled = true;
+    const result = await api(boardPath("/api/github/import"), { method: "POST", body: JSON.stringify(githubImportPayload(dryRun)) });
+    renderGitHubResult(result);
+    if (!dryRun) {
+      await loadBoard();
+      toast(result.failed ? `Import finished with ${result.failed} failure(s)` : `${result.created} issue(s) added to Triage`, result.failed > 0);
+    }
+  } catch (error) { toast(error.message, true); }
+  finally { preview.disabled = false; submit.disabled = false; }
+}
+
+async function submitGitHubImport(event) {
+  event.preventDefault();
+  await runGitHubImport(false);
+}
+
+function renderAutomationChip() {
+  const chip = $("#automation");
+  const supervisor = state.supervisor || {};
+  const workers = availableWorkerAgents();
+  chip.classList.remove("running", "stopped", "failed");
+  if (!state.agentConfigExists || !workers.length) {
+    chip.textContent = "Setup incomplete";
+    chip.classList.add("stopped");
+    chip.title = "Configure at least one enabled worker agent";
+  } else if (supervisor.running) {
+    chip.textContent = `Automation running · ${supervisor.allowWrites ? "write" : "read-only"}`;
+    chip.classList.add("running");
+    chip.title = `${workers.length} configured worker agent(s); click for activity`;
+  } else if (supervisor.lastError) {
+    chip.textContent = supervisor.desired && supervisor.nextAttemptAt ? "Automation restarting" : "Automation failed";
+    chip.classList.add("failed");
+    chip.title = `${supervisor.lastError}${supervisor.nextAttemptAt ? `; next attempt ${new Date(supervisor.nextAttemptAt).toLocaleString()}` : ""}`;
+  } else {
+    chip.textContent = "Automation stopped";
+    chip.classList.add("stopped");
+    chip.title = "Click to inspect or start automatic orchestration";
+  }
+}
+
+async function refreshOperationalStatus() {
+  const requests = await Promise.allSettled([
+    api("/api/supervisor"), api(boardPath("/api/agents/effective")), api(boardPath("/api/operations")),
+  ]);
+  if (requests[0].status === "fulfilled") state.supervisor = requests[0].value;
+  if (requests[1].status === "fulfilled") state.effectiveAgents = requests[1].value.profiles || [];
+  if (requests[2].status === "fulfilled") state.operations = requests[2].value || [];
+  renderAutomationChip();
+  if ($("#activity-dialog").open) await loadActivity();
+}
+
+function payloadText(payload) {
+  if (payload == null) return "";
+  if (typeof payload === "string") return payload;
+  try { return JSON.stringify(payload, null, 2); } catch (_) { return String(payload); }
+}
+
+async function loadActivity() {
+  const [inspection, supervisor, effective, operations] = await Promise.all([
+    api(boardPath("/api/inspect")), api("/api/supervisor"), api(boardPath("/api/agents/effective")), api(boardPath("/api/operations")),
+  ]);
+  state.supervisor = supervisor; state.effectiveAgents = effective.profiles || []; state.operations = operations || [];
+  renderAutomationChip();
+  const diagnostics = inspection.diagnostics || {};
+  const active = diagnostics.activeRuns || [];
+  const issues = diagnostics.issues || [];
+  const workerAgents = (effective.config?.agents || []).filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
+  const agentRows = (effective.profiles || []).map((profile) => `<div class="detail-row"><strong>${escapeHtml(profile.name)} · ${escapeHtml(profile.runtime)} · ${escapeHtml(profile.model || "CLI default (unpinned)")}</strong><span class="detail-status">${escapeHtml(profile.health?.status || "unknown")}</span>${profile.health?.lastError ? `<div>${escapeHtml(profile.health.lastError)}</div>` : ""}<span class="mono">${profile.activeRuns || 0} active${profile.health?.cooldownUntil ? ` · cooldown until ${escapeHtml(new Date(profile.health.cooldownUntil).toLocaleString())}` : ""}</span></div>`).join("");
+  const activeRows = active.map(({ task, run, agentConfig }) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(task.id)}"><strong>${escapeHtml(task.title)}</strong><span class="detail-status">${escapeHtml(run.status)}</span><div>${escapeHtml(agentConfig ? `${agentConfig.profile} · ${agentConfig.runtime} · ${agentConfig.model || "CLI default (unpinned)"}${agentConfig.fallbackFrom ? ` · fallback from ${agentConfig.fallbackFrom}` : ""}` : `${run.workerId} · ${run.runtime}`)}</div><span class="mono">${escapeHtml(run.id)} · heartbeat ${relativeTime(run.heartbeatAt)} · lease ${escapeHtml(new Date(run.claimExpiresAt).toLocaleString())}</span></div>`).join("");
+  const operationRows = operations.slice(0, 20).map((operation) => `<div class="detail-row ${operation.taskId ? "activity-row" : ""}"${operation.taskId ? ` data-activity-task="${escapeHtml(operation.taskId)}"` : ""}><strong>${escapeHtml(operation.kind)} · ${escapeHtml(operation.status)}</strong><span class="mono">${escapeHtml(operation.id)} · ${escapeHtml(operation.mode)} · ${operation.allowWrites ? "write" : "read-only"} · ${relativeTime(operation.startedAt)}</span>${operation.error ? `<div>${escapeHtml(operation.error)}</div>` : ""}</div>`).join("");
+  const issueRows = issues.map((issue) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(issue.taskId)}"><strong>${escapeHtml(issue.kind)} · ${escapeHtml(issue.taskId)}</strong><div>${escapeHtml(issue.detail)}</div></div>`).join("");
+  const eventRows = (inspection.recentEvents || []).map((event) => `<div class="detail-row activity-row" data-activity-task="${escapeHtml(event.taskId)}"><strong>${escapeHtml(event.kind)} · ${escapeHtml(event.taskId)}</strong><span class="mono">#${event.id} · ${relativeTime(event.createdAt)}${event.runId ? ` · ${escapeHtml(event.runId)}` : ""}</span>${payloadText(event.payload) ? `<div class="event-payload">${escapeHtml(payloadText(event.payload))}</div>` : ""}</div>`).join("");
+  $("#activity-content").innerHTML = `
+    <section class="activity-section"><div class="activity-summary"><div><small>Event stream</small><strong>${$("#connection").classList.contains("online") ? "Connected" : "Offline"}</strong></div><div><small>Automation</small><strong>${supervisor.running ? `Running · ${supervisor.allowWrites ? "write" : "read-only"}` : supervisor.desired && supervisor.nextAttemptAt ? `Restarting · attempt ${Number(supervisor.restartCount || 0) + 1}` : supervisor.lastError ? "Failed" : "Stopped"}</strong></div><div><small>Worker readiness</small><strong>${workerAgents.length ? `${workerAgents.length} configured` : "Setup incomplete"}</strong></div></div>${supervisor.lastError ? `<div class="detail-row"><strong>Supervisor error</strong><div>${escapeHtml(supervisor.lastError)}</div>${supervisor.nextAttemptAt ? `<span class="mono">Next attempt ${escapeHtml(new Date(supervisor.nextAttemptAt).toLocaleString())}</span>` : ""}</div>` : ""}</section>
+    <section class="activity-section"><h3>Active runs · ${active.length}</h3><div class="detail-list">${activeRows || "<small>No workers are running.</small>"}</div></section>
+    <section class="activity-section"><h3>Agents</h3><div class="detail-list">${agentRows || "<small>No effective worker profiles.</small>"}</div></section>
+    <section class="activity-section"><h3>Dispatch operations</h3><div class="detail-list">${operationRows || "<small>No WebUI dispatch operations in this session.</small>"}</div></section>
+    <section class="activity-section"><h3>Board checks · ${issues.length ? `${issues.length} item(s)` : "clear"}</h3><div class="detail-list">${issueRows || "<small>No workflow, recovery, scheduling, or review items.</small>"}</div></section>
+    <section class="activity-section"><h3>Recent durable events</h3><div class="detail-list">${eventRows || "<small>No task events yet.</small>"}</div></section>`;
+  $$('[data-activity-task]', $("#activity-content")).forEach((row) => row.addEventListener("click", () => {
+    $("#activity-dialog").close(); openDrawer(row.dataset.activityTask);
+  }));
+}
+
+async function openActivity() {
+  if (!$("#activity-dialog").open) $("#activity-dialog").showModal();
+  $("#activity-content").innerHTML = '<div class="detail-row">Loading activity…</div>';
+  await loadActivity();
 }
 
 function profileEditorRow(profile = {}) {
@@ -781,6 +1113,7 @@ async function loadAgentConfiguration() {
   state.agentConfigExists = configuration.exists;
   state.supervisor = supervisor;
   $("#agents-config-path").textContent = configuration.path;
+  renderAutomationChip();
   return configuration;
 }
 
@@ -790,6 +1123,9 @@ function renderSupervisorStatus() {
   const toggle = $("#supervisor-toggle");
   if (status.running) {
     statusElement.textContent = `Running · ${status.maxWorkers || 1} worker${status.maxWorkers === 1 ? "" : "s"} · ${status.allowWrites ? "workspace writes allowed" : "read-only workers"}`;
+    toggle.textContent = "Stop";
+  } else if (status.desired && status.nextAttemptAt) {
+    statusElement.textContent = `Restarting · attempt ${Number(status.restartCount || 0) + 1} at ${new Date(status.nextAttemptAt).toLocaleTimeString()}${status.lastError ? ` · ${status.lastError}` : ""}`;
     toggle.textContent = "Stop";
   } else {
     statusElement.textContent = status.lastError ? `Stopped · ${status.lastError}` : "Stopped";
@@ -840,9 +1176,10 @@ async function submitAgentSettings(event) {
     state.agentConfig = saved.config; state.agentConfigExists = saved.exists;
     state.supervisor = await api("/api/supervisor");
     renderSupervisorStatus();
+    renderAutomationChip();
     $("#agents-dialog").close();
     await loadBoard();
-    toast(config.supervisor.autoStart ? "Agent settings saved; orchestration is running" : "Agent settings saved");
+    toast(state.supervisor.running ? "Agent settings saved; orchestration is running" : "Agent settings saved; automation is stopped");
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Save and apply"; }
 }
@@ -852,9 +1189,10 @@ async function toggleSupervisor() {
   if (!state.agentConfigExists) return;
   try {
     button.disabled = true;
-    const action = state.supervisor?.running ? "stop" : "start";
+    const action = state.supervisor?.running || state.supervisor?.desired ? "stop" : "start";
     state.supervisor = await api(`/api/supervisor/${action}`, { method: "POST", body: "{}" });
     renderSupervisorStatus();
+    renderAutomationChip();
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 }
@@ -874,14 +1212,14 @@ function connectEvents() {
   state.socket?.close();
   const socket = new EventSource(`/api/events/stream?board=${encodeURIComponent(state.board)}&since=${state.cursor}`);
   state.socket = socket;
-  socket.addEventListener("open", () => { $("#connection").textContent = "live"; $("#connection").classList.add("online"); });
+  socket.addEventListener("open", () => { $("#connection").textContent = "events connected"; $("#connection").classList.add("online"); });
   socket.addEventListener("message", (message) => {
     const payload = JSON.parse(message.data);
     if (payload.cursor) state.cursor = payload.cursor;
     scheduleRefresh();
   });
   socket.addEventListener("error", () => {
-    $("#connection").textContent = "offline"; $("#connection").classList.remove("online");
+    $("#connection").textContent = "events offline"; $("#connection").classList.remove("online");
   });
 }
 
@@ -890,7 +1228,11 @@ function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(async () => {
     await loadBoard();
-    if (state.drawerTask) await openDrawer(state.drawerTask).catch(() => closeDrawer());
+    if (state.drawerTask && state.drawerDirty) {
+      $("#drawer-refresh").classList.remove("hidden");
+    } else if (state.drawerTask) {
+      await openDrawer(state.drawerTask, { focus: false }).catch(() => closeDrawer());
+    }
   }, 180);
 }
 
@@ -912,7 +1254,9 @@ function bindGlobalActions() {
   ["#search", "#tenant-filter", "#assignee-filter"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
   $("#lane-profile").addEventListener("change", () => { localStorage.setItem("autogora.laneByProfile", $("#lane-profile").checked); renderBoard(); });
   $("#show-archived").addEventListener("change", () => { localStorage.setItem("autogora.showArchived", $("#show-archived").checked); loadBoard(); });
-  $("#drawer-close").addEventListener("click", closeDrawer); $("#scrim").addEventListener("click", closeDrawer);
+  $("#drawer-close").addEventListener("click", closeDrawer);
+  $("#drawer").addEventListener("cancel", (event) => { event.preventDefault(); closeDrawer(); });
+  $("#drawer-refresh").addEventListener("click", () => state.drawerTask && openDrawer(state.drawerTask, { focus: false, force: true }));
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.drawerTask) closeDrawer(); });
   $("#bulk-clear").addEventListener("click", () => { state.selected.clear(); renderBoard(); });
   $("#bulk-status").addEventListener("change", (event) => { if (event.target.value) bulkMutation({ status: event.target.value }); });
@@ -921,10 +1265,17 @@ function bindGlobalActions() {
   $("#bulk-delete").addEventListener("click", () => confirm("Permanently delete selected tasks?") && bulkMutation({ delete: true }));
   $("#new-board").addEventListener("click", () => { $("#board-form").reset(); $("#board-dialog").showModal(); });
   $("#new-swarm").addEventListener("click", () => { $("#swarm-form").reset(); $("#swarm-dialog").showModal(); });
-  $("#nudge").addEventListener("click", async () => { await api(boardPath("/api/dispatch"), { method: "POST", body: "{}" }); toast("Dispatcher pass started"); });
+  $("#nudge").addEventListener("click", async () => {
+    const result = await api(boardPath("/api/dispatch"), { method: "POST", body: "{}" });
+    toast(result.mode === "supervisor" ? "Supervisor is already watching this board" : `Dispatcher operation ${result.operation?.id || "started"}`);
+    await refreshOperationalStatus();
+  });
   $("#theme-toggle").addEventListener("click", () => setTheme(activeTheme === "dark" ? "light" : "dark"));
   $("#board-settings").addEventListener("click", openSettings);
   $("#agent-settings").addEventListener("click", () => openAgentSettings().catch((error) => toast(error.message, true)));
+  $("#import-issues").addEventListener("click", openGitHubImport);
+  $("#automation").addEventListener("click", () => openActivity().catch((error) => toast(error.message, true)));
+  $("#activity-refresh").addEventListener("click", () => loadActivity().catch((error) => toast(error.message, true)));
   $("#manage-agents").addEventListener("click", () => {
     $("#settings-dialog").close();
     openAgentSettings().catch((error) => toast(error.message, true));
@@ -937,6 +1288,9 @@ function bindGlobalActions() {
   $("#task-form [name=runtime]").addEventListener("change", () => {
     $("#task-form [name=profile]").value = ""; updateTaskModelPreview();
   });
+  $("#task-form [name=status]").addEventListener("change", updateTaskScheduleVisibility);
+  $("#github-form").addEventListener("submit", submitGitHubImport);
+  $("#github-preview").addEventListener("click", () => runGitHubImport(true));
   $("#board-form").addEventListener("submit", submitBoard);
   $("#settings-form").addEventListener("submit", submitSettings);
   $("#auto-describe-profiles").addEventListener("click", autoDescribeProfiles);
@@ -977,11 +1331,15 @@ function bindGlobalActions() {
 async function submitTask(event) {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
+    const scheduledAt = data.get("status") === "scheduled" ? futureScheduleISO(data.get("scheduledAt")) : null;
     await api(boardPath("/api/tasks"), { method: "POST", body: JSON.stringify({
       title: data.get("title"), body: data.get("body"), status: data.get("status"),
       assignee: data.get("assignee") || null, runtime: data.get("runtime"), priority: Number(data.get("priority")),
       tenant: data.get("tenant") || null, workspaceKind: data.get("workspaceKind"), workspace: data.get("workspace") || null,
-      skills: String(data.get("skills") || "").split(",").map((item) => item.trim()).filter(Boolean), goalMode: data.get("goalMode") === "on",
+      branch: data.get("branch") || null, maxRuntimeSeconds: data.get("maxRuntimeSeconds") ? Number(data.get("maxRuntimeSeconds")) : null,
+      maxRetries: Number(data.get("maxRetries")) || 2, scheduledAt,
+      skills: String(data.get("skills") || "").split(",").map((item) => item.trim()).filter(Boolean),
+      goalMode: data.get("goalMode") === "on", goalMaxTurns: Number(data.get("goalMaxTurns")) || 20,
     }) });
     $("#task-dialog").close(); await loadBoard();
   } catch (error) { toast(error.message, true); }
@@ -1073,11 +1431,13 @@ async function archiveBoard(event) {
 async function main() {
   setTheme(activeTheme, false); initializeSelects(); bindGlobalActions();
   try {
-    await loadBoards(); await loadBoard(); connectEvents();
+    await loadBoards();
     const configuration = await loadAgentConfiguration();
+    await loadBoard(); connectEvents(); await refreshOperationalStatus();
     if (!configuration.exists && sessionStorage.getItem("autogora.agentSetupDeferred") !== "true") {
       await openAgentSettings({ firstRun: true });
     }
+    window.setInterval(() => refreshOperationalStatus().catch(() => {}), 5000);
   }
   catch (error) { toast(error.message, true); }
 }

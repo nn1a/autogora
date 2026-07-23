@@ -17,10 +17,38 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/model"
+	setupcfg "github.com/nn1a/autogora/internal/setup"
 	"github.com/nn1a/autogora/internal/store"
 )
 
+func TestErrorStatusTreatsConcurrentBoardMutationAsConflict(t *testing.T) {
+	for _, message := range []string{
+		"board metadata mutation is in progress: product-web",
+		"workspace resource is busy",
+	} {
+		if status := errorStatus(errors.New(message)); status != http.StatusConflict {
+			t.Fatalf("errorStatus(%q) = %d, want %d", message, status, http.StatusConflict)
+		}
+	}
+}
+
 const testToken = "test-dashboard-token-32-characters"
+
+type dashboardGitHubRunner struct {
+	outputs []setupcfg.CommandOutput
+	calls   [][]string
+}
+
+func (runner *dashboardGitHubRunner) LookPath(string) (string, error) { return "/usr/bin/gh", nil }
+func (runner *dashboardGitHubRunner) Run(_ context.Context, _ string, _ string, args ...string) (setupcfg.CommandOutput, error) {
+	runner.calls = append(runner.calls, append([]string{}, args...))
+	if len(runner.outputs) == 0 {
+		return setupcfg.CommandOutput{}, errors.New("unexpected gh invocation")
+	}
+	output := runner.outputs[0]
+	runner.outputs = runner.outputs[1:]
+	return output, nil
+}
 
 func startTestServer(t *testing.T) *Server {
 	return startTestServerWithOptions(t, func(*Options) {})
@@ -170,6 +198,39 @@ func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 	html.Body.Close()
 	if html.StatusCode != http.StatusOK || !strings.Contains(string(contents), "<title>Autogora</title>") || !strings.Contains(string(contents), `class="dialog-wide"`) {
 		t.Fatalf("embedded dashboard mismatch: %d %s", html.StatusCode, contents)
+	}
+}
+
+func TestGitHubImportAPIProvidesPreviewAndEnterpriseImport(t *testing.T) {
+	issue := `[{"id":"I_dashboard","number":42,"title":"Fix session retry","body":"Retry once.","url":"https://ghe.example.com/team/service/issues/42","state":"OPEN","labels":[{"name":"bug"}],"assignees":[],"author":{"login":"reporter"},"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z"}]`
+	runner := &dashboardGitHubRunner{outputs: []setupcfg.CommandOutput{{Stdout: issue}, {Stdout: issue}}}
+	server := startTestServerWithOptions(t, func(options *Options) { options.GitHubRunner = runner })
+	body := map[string]any{
+		"host": "ghe.example.com", "repository": "team/service", "labels": "bug",
+		"limit": 20, "tenant": "platform", "priority": 5,
+	}
+	previewBody := map[string]any{}
+	for key, value := range body {
+		previewBody[key] = value
+	}
+	previewBody["dryRun"] = true
+	response, previewValue := apiRequest(t, server, http.MethodPost, "/api/github/import?board=default", previewBody)
+	preview := mapValue(t, previewValue)
+	if response.StatusCode != http.StatusOK || preview["planned"] != float64(1) || preview["created"] != float64(0) || preview["status"] != "success" {
+		t.Fatalf("unexpected import preview: %d %#v", response.StatusCode, preview)
+	}
+	response, importedValue := apiRequest(t, server, http.MethodPost, "/api/github/import?board=default", body)
+	imported := mapValue(t, importedValue)
+	if response.StatusCode != http.StatusOK || imported["created"] != float64(1) || imported["repository"] != "ghe.example.com/team/service" {
+		t.Fatalf("unexpected import result: %d %#v", response.StatusCode, imported)
+	}
+	if len(runner.calls) != 2 || !strings.Contains(strings.Join(runner.calls[0], " "), "ghe.example.com/team/service") {
+		t.Fatalf("enterprise repository not passed to gh: %#v", runner.calls)
+	}
+	boardResponse, boardValue := apiRequest(t, server, http.MethodGet, "/api/board?board=default", nil)
+	tasks := arrayValue(t, mapValue(t, boardValue)["tasks"])
+	if boardResponse.StatusCode != http.StatusOK || len(tasks) != 1 || mapValue(t, tasks[0])["status"] != "triage" {
+		t.Fatalf("imported triage task missing: %d %#v", boardResponse.StatusCode, tasks)
 	}
 }
 
@@ -444,6 +505,56 @@ func TestBoardTaskHierarchyAndAttachmentAPI(t *testing.T) {
 	}
 }
 
+func TestDashboardRequiresFutureScheduleAndRejectsStaleEdits(t *testing.T) {
+	server := startTestServer(t)
+	missing, value := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{"title": "Missing time", "status": "scheduled"})
+	if missing.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, value)["error"].(string), "scheduledAt") {
+		t.Fatalf("missing schedule response = %d %#v", missing.StatusCode, value)
+	}
+	past, _ := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{"title": "Past", "status": "scheduled", "scheduledAt": "2020-01-01T00:00:00Z"})
+	if past.StatusCode != http.StatusBadRequest {
+		t.Fatalf("past schedule status = %d", past.StatusCode)
+	}
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	createdResponse, created := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{"title": "Scheduled", "status": "scheduled", "scheduledAt": future})
+	if createdResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("future schedule status = %d: %#v", createdResponse.StatusCode, created)
+	}
+	task := mapValue(t, mapValue(t, created)["task"])
+	taskID, stale := task["id"].(string), task["updatedAt"].(string)
+	cleared, clearedValue := apiRequest(t, server, http.MethodPatch, "/api/tasks/"+taskID, map[string]any{"scheduledAt": nil})
+	if cleared.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, clearedValue)["error"].(string), "scheduledAt") {
+		t.Fatalf("cleared schedule response = %d %#v", cleared.StatusCode, clearedValue)
+	}
+	updated, latest := apiRequest(t, server, http.MethodPatch, "/api/tasks/"+taskID, map[string]any{"expectedUpdatedAt": stale, "title": "Latest title"})
+	if updated.StatusCode != http.StatusOK {
+		t.Fatalf("fresh edit failed: %d %#v", updated.StatusCode, latest)
+	}
+	conflict, conflictValue := apiRequest(t, server, http.MethodPatch, "/api/tasks/"+taskID, map[string]any{"expectedUpdatedAt": stale, "title": "Stale title"})
+	if conflict.StatusCode != http.StatusConflict || !strings.Contains(mapValue(t, conflictValue)["error"].(string), "refresh") {
+		t.Fatalf("stale edit response = %d %#v", conflict.StatusCode, conflictValue)
+	}
+	_, loaded := apiRequest(t, server, http.MethodGet, "/api/tasks/"+taskID, nil)
+	if mapValue(t, mapValue(t, loaded)["task"])["title"] != "Latest title" {
+		t.Fatalf("stale edit overwrote task: %#v", loaded)
+	}
+
+	bulkMissing, bulkMissingValue := apiRequest(t, server, http.MethodPost, "/api/tasks/bulk", map[string]any{
+		"ids": []any{taskID}, "mutation": map[string]any{"status": "scheduled"},
+	})
+	if bulkMissing.StatusCode != http.StatusBadRequest || !strings.Contains(mapValue(t, bulkMissingValue)["error"].(string), "scheduledAt") {
+		t.Fatalf("bulk missing schedule response = %d %#v", bulkMissing.StatusCode, bulkMissingValue)
+	}
+	bulkFuture := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	bulkResponse, bulkValue := apiRequest(t, server, http.MethodPost, "/api/tasks/bulk", map[string]any{
+		"ids": []any{taskID}, "mutation": map[string]any{"status": "scheduled", "scheduledAt": bulkFuture},
+	})
+	bulkResult := mapValue(t, bulkValue)
+	if bulkResponse.StatusCode != http.StatusOK || len(arrayValue(t, bulkResult["ok"])) != 1 || len(arrayValue(t, bulkResult["errors"])) != 0 {
+		t.Fatalf("bulk future schedule response = %d %#v", bulkResponse.StatusCode, bulkValue)
+	}
+}
+
 func TestSSEStreamsTaskEvents(t *testing.T) {
 	server := startTestServer(t)
 	_, existing := apiRequest(t, server, http.MethodGet, "/api/events?since=0", nil)
@@ -485,6 +596,16 @@ func TestSSEStreamsTaskEvents(t *testing.T) {
 
 func TestTargetedDispatchRejectsStrandedRoutesAndAcceptsRunnableTask(t *testing.T) {
 	server := startTestServer(t)
+	config := map[string]any{
+		"schemaVersion": 1,
+		"supervisor":    map[string]any{"autoStart": false, "maxWorkers": 1, "allowWrites": true},
+		"defaults":      map[string]any{"workerAgents": []string{"worker"}, "plannerAgents": []string{}, "judgeAgents": []string{}},
+		"agents": []any{map[string]any{"id": "worker", "runtime": "cline", "command": "/missing/cline", "enabled": true,
+			"maxConcurrent": 1, "roles": []string{"worker"}}},
+	}
+	if response, value := apiRequest(t, server, http.MethodPut, "/api/config", config); response.StatusCode != http.StatusOK {
+		t.Fatalf("config save failed: %d %#v", response.StatusCode, value)
+	}
 	_, stranded := apiRequest(t, server, http.MethodPost, "/api/tasks", map[string]any{
 		"title": "No worker route", "status": "ready", "runtime": "manual",
 	})
@@ -499,7 +620,13 @@ func TestTargetedDispatchRejectsStrandedRoutesAndAcceptsRunnableTask(t *testing.
 	})
 	runnableID := mapValue(t, mapValue(t, runnable)["task"])["id"].(string)
 	accepted, value := apiRequest(t, server, http.MethodPost, "/api/dispatch", map[string]any{"taskId": runnableID})
-	if accepted.StatusCode != http.StatusAccepted || mapValue(t, value)["taskId"] != runnableID {
+	acceptedValue := mapValue(t, value)
+	if accepted.StatusCode != http.StatusAccepted || acceptedValue["taskId"] != runnableID || acceptedValue["allowWrites"] != true || acceptedValue["mode"] != "one_shot" {
 		t.Fatalf("targeted dispatch response = %d %#v", accepted.StatusCode, value)
+	}
+	operationsResponse, operationsValue := apiRequest(t, server, http.MethodGet, "/api/operations?board=default", nil)
+	operations := arrayValue(t, operationsValue)
+	if operationsResponse.StatusCode != http.StatusOK || len(operations) != 1 || mapValue(t, operations[0])["taskId"] != runnableID {
+		t.Fatalf("dispatch operation not observable: %d %#v", operationsResponse.StatusCode, operations)
 	}
 }

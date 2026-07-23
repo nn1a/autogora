@@ -6,7 +6,7 @@ import (
 )
 
 func TestDashboardAssetsAreEmbedded(t *testing.T) {
-	for _, name := range []string{"index.html", "app.js", "styles.css"} {
+	for _, name := range []string{"index.html", "app.js", "styles.css", "favicon.svg"} {
 		contents, err := Files.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read embedded %s: %v", name, err)
@@ -67,6 +67,8 @@ func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 	}
 
 	for _, marker := range []string{
+		`@media (max-width: 1700px)`,
+		`grid-template-columns: repeat(8, minmax(0, 1fr))`,
 		`grid-template-columns: repeat(4, minmax(0, 1fr))`,
 		`@media (max-width: 1200px)`,
 		`grid-template-columns: repeat(2, minmax(0, 1fr))`,
@@ -84,6 +86,50 @@ func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 	for _, obsolete := range []string{`grid-auto-flow: column`, `grid-auto-columns:`, `scroll-snap-type: x`} {
 		if strings.Contains(string(styles), obsolete) {
 			t.Fatalf("horizontal board layout marker %q is still present", obsolete)
+		}
+	}
+}
+
+func TestDashboardStatusColorsRespectStrictStylePolicy(t *testing.T) {
+	html, err := Files.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	javascript, err := Files.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := Files.ReadFile("styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(html), "style=") || strings.Contains(string(javascript), "style=") || strings.Contains(string(javascript), ".style.setProperty") {
+		t.Fatal("dashboard uses inline styles that the Content-Security-Policy blocks")
+	}
+	for _, marker := range []string{"status-${task.status}", "status-${status}", ".status-triage", ".status-running", ".status-done"} {
+		if !strings.Contains(string(javascript)+string(styles), marker) {
+			t.Fatalf("CSP-safe status marker %q is missing", marker)
+		}
+	}
+}
+
+func TestDashboardCarriesTaskVersionsThroughInteractiveMutations(t *testing.T) {
+	javascript, err := Files.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`data-task-version="${escapeHtml(task.updatedAt)}"`,
+		`application/x-autogora-updated-at`,
+		`const expectedUpdatedAt = state.drawerVersion`,
+		`mutation: { ...mutation, expectedUpdatedAt }`,
+		`state.selected = new Set(result.errors.map`,
+		`taskWindow.truncated`,
+		`${taskWindow.returned} shown`,
+	} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("optimistic Web mutation marker %q is missing", marker)
 		}
 	}
 }

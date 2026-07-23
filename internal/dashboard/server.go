@@ -20,6 +20,8 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
+	"github.com/nn1a/autogora/internal/dispatcher"
+	"github.com/nn1a/autogora/internal/githubissues"
 	"github.com/nn1a/autogora/internal/supervisor"
 	webui "github.com/nn1a/autogora/web"
 )
@@ -32,19 +34,23 @@ type Options struct {
 	Token          string
 	OnLog          func(string)
 	AgentDetection agentconfig.DetectOptions
+	GitHubRunner   githubissues.CommandRunner
 }
 
 type Server struct {
-	HTTP       *http.Server
-	Listener   net.Listener
-	Token      string
-	URL        string
-	manager    *boards.Manager
-	options    Options
-	ctx        context.Context
-	cancel     context.CancelFunc
-	workers    sync.WaitGroup
-	supervisor *supervisor.Controller
+	HTTP          *http.Server
+	Listener      net.Listener
+	Token         string
+	URL           string
+	manager       *boards.Manager
+	options       Options
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+	supervisor    *supervisor.Controller
+	operationsMu  sync.Mutex
+	operations    []operationRecord
+	runDispatcher func(context.Context, dispatcher.Options) error
 }
 
 func randomToken() (string, error) {
@@ -77,7 +83,10 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 		options.Host = "127.0.0.1"
 	}
 	serverContext, cancelServer := context.WithCancel(ctx)
-	service := &Server{Token: token, manager: manager, options: options, ctx: serverContext, cancel: cancelServer}
+	service := &Server{
+		Token: token, manager: manager, options: options, ctx: serverContext, cancel: cancelServer,
+		runDispatcher: dispatcher.Run,
+	}
 	service.supervisor = supervisor.New(supervisor.Options{DBPath: options.DBPath, CLIPath: options.CLIPath, OnLog: options.OnLog})
 	service.HTTP = &http.Server{Handler: service, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	listener, err := net.Listen("tcp", net.JoinHostPort(options.Host, strconv.Itoa(options.Port)))
@@ -153,7 +162,7 @@ func errorStatus(err error) int {
 		return http.StatusNotFound
 	case strings.Contains(message, "requires"), strings.Contains(message, "invalid"), strings.Contains(message, "must"), strings.Contains(message, "cannot be empty"):
 		return http.StatusBadRequest
-	case strings.Contains(message, "already"), strings.Contains(message, "cannot"), strings.Contains(message, "only"), strings.Contains(message, "cycle"), strings.Contains(message, "active"), strings.Contains(message, "terminal"):
+	case strings.Contains(message, "already"), strings.Contains(message, "cannot"), strings.Contains(message, "only"), strings.Contains(message, "cycle"), strings.Contains(message, "active"), strings.Contains(message, "terminal"), strings.Contains(message, "conflict"), strings.Contains(message, "in progress"), strings.Contains(message, "busy"):
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
@@ -237,7 +246,7 @@ func (s *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) 
 }
 
 func (s *Server) serveStatic(response http.ResponseWriter, request *http.Request) {
-	files := map[string]string{"/": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
+	files := map[string]string{"/": "index.html", "/app.js": "app.js", "/styles.css": "styles.css", "/favicon.svg": "favicon.svg"}
 	name, ok := files[request.URL.Path]
 	if !ok {
 		sendJSON(response, http.StatusNotFound, map[string]any{"error": "Not found"})
@@ -248,7 +257,7 @@ func (s *Server) serveStatic(response http.ResponseWriter, request *http.Request
 		sendError(response, err)
 		return
 	}
-	contentTypes := map[string]string{"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "styles.css": "text/css; charset=utf-8"}
+	contentTypes := map[string]string{"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "styles.css": "text/css; charset=utf-8", "favicon.svg": "image/svg+xml"}
 	response.Header().Set("Content-Type", contentTypes[name])
 	if name == "index.html" {
 		response.Header().Set("Cache-Control", "no-store")

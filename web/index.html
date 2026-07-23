@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0e14">
   <title>Autogora</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -19,12 +20,14 @@
       <button id="new-board" class="ghost">New board</button>
       <button id="board-settings" class="ghost">Settings</button>
       <button id="agent-settings" class="ghost">Agents</button>
+      <button id="import-issues" class="ghost">Import issues</button>
       <button id="new-swarm" class="ghost">Swarm</button>
-      <button id="nudge" class="primary"><span class="nudge-wide">Dispatch now</span><span class="nudge-short">Run now</span></button>
+      <button id="nudge" class="primary"><span class="nudge-wide">Run now</span><span class="nudge-short">Run now</span></button>
       <button id="theme-toggle" class="ghost theme-toggle" type="button" aria-label="Switch to light theme">
         <span class="theme-icon" aria-hidden="true">☀</span><span class="theme-label">Light</span>
       </button>
-      <span id="connection" class="connection" title="Live event connection" aria-live="polite">offline</span>
+      <button id="automation" class="automation-chip stopped" type="button" aria-live="polite">Automation unknown</button>
+      <span id="connection" class="connection" title="Event stream connection" aria-live="polite">events offline</span>
     </div>
   </header>
 
@@ -52,14 +55,13 @@
     <div id="trash-drop" class="trash-drop" aria-label="Delete task drop zone">Drop here to delete</div>
   </main>
 
-  <aside id="drawer" class="drawer" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Task details" tabindex="-1">
+  <dialog id="drawer" class="drawer" aria-label="Task details">
     <div class="drawer-head">
       <div><span id="drawer-id" class="mono"></span><span id="drawer-status" class="status-chip"></span></div>
-      <button id="drawer-close" class="icon-button" aria-label="Close">×</button>
+      <div class="drawer-head-actions"><button id="drawer-refresh" class="ghost compact hidden">Refresh available</button><button id="drawer-close" class="icon-button" aria-label="Close">×</button></div>
     </div>
     <div id="drawer-content" class="drawer-content"></div>
-  </aside>
-  <div id="scrim" class="scrim hidden"></div>
+  </dialog>
 
   <dialog id="task-dialog">
     <form id="task-form" method="dialog" class="dialog-form">
@@ -75,11 +77,44 @@
         <label>Priority<input name="priority" type="number" value="0"></label>
         <label>Tenant<input name="tenant"></label>
         <label>Workspace kind<select name="workspaceKind"><option>scratch</option><option>dir</option><option>worktree</option></select></label>
+        <label>Branch<input name="branch" placeholder="optional base branch"></label>
+        <label>Max runtime (seconds)<input name="maxRuntimeSeconds" type="number" min="1" placeholder="agent default"></label>
+        <label>Max retries<input name="maxRetries" type="number" min="1" value="2"></label>
+        <label id="task-schedule-field" class="hidden">Run after<input name="scheduledAt" type="datetime-local"></label>
       </div>
       <label>Workspace path<input name="workspace" placeholder="absolute path (optional)"></label>
       <label>Skills<input name="skills" placeholder="comma-separated"></label>
-      <label class="inline"><input name="goalMode" type="checkbox"> Goal mode</label>
+      <div class="form-grid"><label class="inline"><input name="goalMode" type="checkbox"> Goal mode</label><label>Goal max turns<input name="goalMaxTurns" type="number" min="1" value="20"></label></div>
       <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button id="task-submit" class="primary">Create</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="github-dialog" class="dialog-wide">
+    <form id="github-form" method="dialog" class="dialog-form">
+      <header><div><h2>Import GitHub issues</h2><small>Uses the server's existing <code>gh</code> authentication, including GitHub Enterprise hosts.</small></div><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <section class="trust-callout"><strong>Review boundary</strong><span>Imported descriptions are untrusted external input. Automatic planning waits for you to review and explicitly Specify, Decompose, or Promote each Triage card.</span></section>
+      <div class="form-grid">
+        <label>Repository<input name="repository" placeholder="OWNER/REPO or HOST/OWNER/REPO"></label>
+        <label>Enterprise host<input name="host" placeholder="github.corp.example"></label>
+        <label>State<select name="state"><option>open</option><option>closed</option><option>all</option></select></label>
+        <label>Limit<input name="limit" type="number" min="1" max="1000" value="30"></label>
+        <label>Labels<input name="labels" placeholder="bug, ready"></label>
+        <label>Search<input name="search" placeholder="no:assignee sort:created-asc"></label>
+        <label>Specific issue numbers<input name="issues" placeholder="Leave blank with filters"></label>
+        <label>Tenant<input name="tenant"></label>
+        <label>Priority<input name="priority" type="number" value="0"></label>
+      </div>
+      <small>Leave Repository blank to use the selected board's project Git repository. Specific issue numbers cannot be combined with state, labels, or search filters.</small>
+      <div id="github-result" class="import-result hidden" aria-live="polite"></div>
+      <footer><button type="button" data-close-dialog class="ghost">Cancel</button><button id="github-preview" type="button">Preview</button><button id="github-submit" class="primary">Import to Triage</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="activity-dialog" class="dialog-wide">
+    <form method="dialog" class="dialog-form">
+      <header><div><h2>Automation & activity</h2><small>Connection, orchestration, active work, results, and recovery signals for this board.</small></div><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <div id="activity-content" class="activity-content" aria-live="polite"></div>
+      <footer><button id="activity-refresh" type="button">Refresh</button><button type="button" data-close-dialog class="primary">Close</button></footer>
     </form>
   </dialog>
 

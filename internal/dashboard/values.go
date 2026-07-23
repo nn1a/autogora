@@ -51,6 +51,25 @@ func stringArray(value any) []string {
 	return result
 }
 
+func stringMap(value any) (map[string]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	items, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("expectedUpdatedAt must be an object keyed by task id")
+	}
+	result := make(map[string]string, len(items))
+	for key, value := range items {
+		text, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("expectedUpdatedAt for %s must be a string", key)
+		}
+		result[key] = text
+	}
+	return result, nil
+}
+
 func runtimeValue(value any) model.Runtime {
 	runtime := model.Runtime(stringValue(value))
 	if runtime != "" && model.ValidRuntime(runtime) {
@@ -126,10 +145,10 @@ func boolPointerFrom(body map[string]any, key string) *bool {
 }
 
 func taskUpdate(body map[string]any) store.UpdateTaskInput {
-	input := store.UpdateTaskInput{Title: stringPointerFrom(body, "title"), Body: stringPointerFrom(body, "body"),
+	input := store.UpdateTaskInput{ExpectedUpdatedAt: stringPointerFrom(body, "expectedUpdatedAt"), Title: stringPointerFrom(body, "title"), Body: stringPointerFrom(body, "body"),
 		Assignee: optionalString(body, "assignee"), Tenant: optionalString(body, "tenant"), Workspace: optionalString(body, "workspace"),
 		Branch: optionalString(body, "branch"), ScheduledAt: optionalString(body, "scheduledAt"), MaxRuntimeSeconds: optionalInt(body, "maxRuntimeSeconds"),
-		GoalMode: boolPointerFrom(body, "goalMode"), GoalMaxTurns: intPointerFrom(body, "goalMaxTurns")}
+		MaxRetries: intPointerFrom(body, "maxRetries"), GoalMode: boolPointerFrom(body, "goalMode"), GoalMaxTurns: intPointerFrom(body, "goalMaxTurns")}
 	if runtime := runtimeValue(body["runtime"]); runtime != "" {
 		input.Runtime = &runtime
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/dispatcher"
 	"github.com/nn1a/autogora/internal/maintenance"
@@ -64,20 +65,27 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 				return err
 			}
 			value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
+				expectedUpdatedAt := stringPointerFrom(body, "expectedUpdatedAt")
 				switch action {
 				case "complete":
 					metadata, _ := body["metadata"].(map[string]any)
-					return opened.CompleteTask(ctx, taskID, store.CompletionInput{Summary: stringValue(body["summary"]), Result: stringValue(body["result"]), Metadata: metadata})
+					return opened.CompleteTask(ctx, taskID, store.CompletionInput{
+						Summary: stringValue(body["summary"]), Result: stringValue(body["result"]),
+						Metadata: metadata, ExpectedUpdatedAt: expectedUpdatedAt,
+					})
 				case "block":
-					return opened.BlockTask(ctx, taskID, store.BlockInput{Reason: firstText(stringValue(body["reason"]), "Blocked from dashboard"), Kind: model.BlockKind(stringValue(body["kind"]))})
+					return opened.BlockTask(ctx, taskID, store.BlockInput{
+						Reason: firstText(stringValue(body["reason"]), "Blocked from dashboard"), Kind: model.BlockKind(stringValue(body["kind"])),
+						ExpectedUpdatedAt: expectedUpdatedAt,
+					})
 				case "unblock":
-					return opened.UnblockTask(ctx, taskID)
+					return opened.UnblockTaskWithVersion(ctx, taskID, expectedUpdatedAt)
 				case "promote":
-					return opened.PromoteTask(ctx, taskID)
+					return opened.PromoteTaskWithVersion(ctx, taskID, expectedUpdatedAt)
 				case "schedule":
-					return opened.ScheduleTask(ctx, taskID, optionalString(body, "at").Value, stringValue(body["reason"]))
+					return opened.ScheduleTaskWithVersion(ctx, taskID, optionalString(body, "at").Value, stringValue(body["reason"]), expectedUpdatedAt)
 				default:
-					return opened.ArchiveTask(ctx, taskID)
+					return opened.ArchiveTaskWithVersion(ctx, taskID, expectedUpdatedAt)
 				}
 			})
 			if err == nil {
@@ -112,7 +120,9 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 			explicit = &orchestration.SpecificationPlan{Title: stringValue(body["title"]), Body: stringValue(body["body"])}
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			return taskservice.New(opened, s.manager, board).SpecifyTask(ctx, taskID, explicit, stringValue(body["author"]))
+			return taskservice.New(opened, s.manager, board).SpecifyTaskWithVersion(
+				ctx, taskID, explicit, stringValue(body["author"]), stringPointerFrom(body, "expectedUpdatedAt"),
+			)
 		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, value)
@@ -132,7 +142,9 @@ func (s *Server) handleTaskAction(response http.ResponseWriter, request *http.Re
 			}
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			return taskservice.New(opened, s.manager, board).DecomposeTask(ctx, taskID, plan)
+			return taskservice.New(opened, s.manager, board).DecomposeTaskWithVersion(
+				ctx, taskID, plan, stringPointerFrom(body, "expectedUpdatedAt"),
+			)
 		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, value)
@@ -309,6 +321,10 @@ func (s *Server) handleExtendedAPI(response http.ResponseWriter, request *http.R
 					if err != nil {
 						return model.Task{}, err
 					}
+					if expectedUpdatedAt := stringPointerFrom(body, "expectedUpdatedAt"); expectedUpdatedAt != nil &&
+						strings.TrimSpace(*expectedUpdatedAt) != detail.Task.UpdatedAt {
+						return model.Task{}, fmt.Errorf("task update conflict: %s changed at %s; refresh before dispatching", taskID, detail.Task.UpdatedAt)
+					}
 					if detail.Task.Status != model.TaskStatusReady || detail.Task.Assignee == nil || detail.Task.Runtime == model.RuntimeManual {
 						return model.Task{}, fmt.Errorf("cannot dispatch task that is not ready: %s", taskID)
 					}
@@ -317,19 +333,46 @@ func (s *Server) handleExtendedAPI(response http.ResponseWriter, request *http.R
 					return err
 				}
 			}
+			config, err := agentconfig.Load(agentconfig.Options{})
+			if err != nil {
+				return err
+			}
+			allowWrites := config.Supervisor.AllowWrites
+			if _, provided := body["allowWrites"]; provided {
+				allowWrites = boolValue(body["allowWrites"], false)
+			}
+			status := s.supervisor.Status()
+			if status.Running {
+				sendJSON(response, http.StatusAccepted, map[string]any{
+					"accepted": true, "board": board, "taskId": taskID,
+					"mode": "supervisor", "allowWrites": status.AllowWrites,
+					"message": "The running supervisor is already watching this board.",
+				})
+				return nil
+			}
 			autoDecompose := (*bool)(nil)
+			expectedUpdatedAt := (*string)(nil)
 			if taskID != "" {
 				value := false
 				autoDecompose = &value
+				expectedUpdatedAt = stringPointerFrom(body, "expectedUpdatedAt")
 			}
+			operation := s.beginOperation("dispatch", board, taskID, "one_shot", allowWrites)
 			s.workers.Add(1)
 			go func() {
 				defer s.workers.Done()
-				if err := dispatcher.Run(s.ctx, dispatcher.Options{DBPath: s.options.DBPath, CLIPath: s.options.CLIPath, Board: board, TaskID: taskID, Once: true, MaxWorkers: intValue(body["maxWorkers"], 2), AllowWrites: boolValue(body["allowWrites"], false), AutoDecompose: autoDecompose}); err != nil && s.options.OnLog != nil {
-					s.options.OnLog("dashboard dispatch failed: " + err.Error())
+				runErr := s.runDispatcher(s.ctx, dispatcher.Options{
+					DBPath: s.options.DBPath, CLIPath: s.options.CLIPath, Board: board, TaskID: taskID,
+					ExpectedUpdatedAt: expectedUpdatedAt, Once: true,
+					MaxWorkers:  intValue(body["maxWorkers"], config.Supervisor.MaxWorkers),
+					AllowWrites: allowWrites, AutoDecompose: autoDecompose, AgentConfig: &config,
+				})
+				s.finishOperation(operation.ID, runErr)
+				if runErr != nil && s.options.OnLog != nil {
+					s.options.OnLog("dashboard dispatch failed: " + runErr.Error())
 				}
 			}()
-			sendJSON(response, http.StatusAccepted, map[string]any{"accepted": true, "board": board, "taskId": taskID})
+			sendJSON(response, http.StatusAccepted, map[string]any{"accepted": true, "board": board, "taskId": taskID, "mode": operation.Mode, "allowWrites": allowWrites, "operation": operation})
 			return nil
 		}
 	}

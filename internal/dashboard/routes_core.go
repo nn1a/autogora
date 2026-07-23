@@ -54,6 +54,9 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	if segments[1] == "supervisor" {
 		return s.handleSupervisor(response, request, segments)
 	}
+	if segments[1] == "operations" {
+		return s.handleOperations(response, request, segments)
+	}
 	board, err := s.boardFrom(request)
 	if err != nil {
 		return err
@@ -96,7 +99,7 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 				if err != nil {
 					return nil, err
 				}
-				events, err := opened.ListEvents(request.Context(), store.EventFilter{Limit: 100})
+				events, err := opened.ListEvents(request.Context(), store.EventFilter{Limit: 100, NewestFirst: true})
 				return map[string]any{"diagnostics": diagnostics, "recentEvents": events}, err
 			})
 			if err == nil {
@@ -104,6 +107,8 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 			}
 			return err
 		}
+	case "github":
+		return s.handleGitHubImport(response, request, segments, board)
 	}
 	return s.handleExtendedAPI(response, request, segments, board)
 }
@@ -184,12 +189,22 @@ type dashboardTask struct {
 	RelationshipsCount int `json:"relationshipsCount"`
 }
 
+const dashboardTaskLimit = 500
+
+type dashboardTaskWindow struct {
+	Returned  int  `json:"returned"`
+	Total     int  `json:"total"`
+	Truncated bool `json:"truncated"`
+	Limit     int  `json:"limit"`
+}
+
 func (s *Server) handleBoardSnapshot(response http.ResponseWriter, request *http.Request, board string) error {
 	if request.Method != http.MethodGet {
 		return errors.New("board endpoint requires GET")
 	}
 	value, err := usingStore(request.Context(), s, board, func(opened *store.Store) (any, error) {
-		tasks, err := opened.ListTasks(request.Context(), store.ListTaskFilter{IncludeArchived: request.URL.Query().Get("includeArchived") == "true", Limit: 500})
+		includeArchived := request.URL.Query().Get("includeArchived") == "true"
+		tasks, err := opened.ListTasks(request.Context(), store.ListTaskFilter{IncludeArchived: includeArchived, Limit: dashboardTaskLimit})
 		if err != nil {
 			return nil, err
 		}
@@ -219,8 +234,16 @@ func (s *Server) handleBoardSnapshot(response http.ResponseWriter, request *http
 		if err != nil {
 			return nil, err
 		}
+		visibleTotal := stats.Total
+		if !includeArchived {
+			visibleTotal -= stats.ByStatus[model.TaskStatusArchived]
+		}
+		taskWindow := dashboardTaskWindow{
+			Returned: len(result), Total: visibleTotal,
+			Truncated: len(result) < visibleTotal, Limit: dashboardTaskLimit,
+		}
 		diagnostics, err := opened.Diagnose(request.Context(), board)
-		return map[string]any{"board": boardContext.Metadata, "profiles": boardContext.Profiles, "tasks": result, "stats": stats, "diagnostics": diagnostics}, err
+		return map[string]any{"board": boardContext.Metadata, "profiles": boardContext.Profiles, "tasks": result, "taskWindow": taskWindow, "stats": stats, "diagnostics": diagnostics}, err
 	})
 	if err == nil {
 		sendJSON(response, http.StatusOK, value)
@@ -237,6 +260,17 @@ func createTaskInput(body map[string]any, board string) store.CreateTaskInput {
 		MaxRuntimeSeconds: optionalInt(body, "maxRuntimeSeconds").Value, Skills: stringArray(body["skills"]), GoalMode: boolValue(body["goalMode"], false),
 		GoalMaxTurns: intValue(body["goalMaxTurns"], 0), MaxRetries: intValue(body["maxRetries"], 0), Parents: stringArray(body["parents"])}
 	return input
+}
+
+func requireFutureSchedule(value *string) error {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return errors.New("scheduled task requires scheduledAt; choose a future time")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*value))
+	if err != nil || !parsed.After(time.Now()) {
+		return errors.New("scheduledAt must be a valid future ISO-8601 date")
+	}
+	return nil
 }
 
 func (s *Server) handleTasks(response http.ResponseWriter, request *http.Request, segments []string, board string) error {
@@ -268,7 +302,13 @@ func (s *Server) handleTasks(response http.ResponseWriter, request *http.Request
 			if err != nil {
 				return err
 			}
-			value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) { return opened.CreateTask(ctx, createTaskInput(body, board)) })
+			input := createTaskInput(body, board)
+			if input.Status == model.TaskStatusScheduled {
+				if err := requireFutureSchedule(input.ScheduledAt); err != nil {
+					return err
+				}
+			}
+			value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) { return opened.CreateTask(ctx, input) })
 			if err == nil {
 				sendJSON(response, http.StatusCreated, value)
 			}
@@ -288,9 +328,32 @@ func (s *Server) handleTasks(response http.ResponseWriter, request *http.Request
 		if nested, ok := body["mutation"].(map[string]any); ok {
 			mutationBody = nested
 		}
-		mutation := store.BulkMutation{Archive: boolValue(mutationBody["archive"], false), Delete: boolValue(mutationBody["delete"], false), Assignee: optionalString(mutationBody, "assignee"), Priority: intPointerFrom(mutationBody, "priority")}
+		expectedValue := mutationBody["expectedUpdatedAt"]
+		if expectedValue == nil {
+			expectedValue = body["expectedUpdatedAt"]
+		}
+		expectedUpdatedAt, err := stringMap(expectedValue)
+		if err != nil {
+			return err
+		}
+		mutation := store.BulkMutation{
+			Archive: boolValue(mutationBody["archive"], false), Delete: boolValue(mutationBody["delete"], false),
+			Assignee: optionalString(mutationBody, "assignee"), Priority: intPointerFrom(mutationBody, "priority"),
+			ExpectedUpdatedAt: expectedUpdatedAt,
+		}
 		if status := statusValue(mutationBody["status"]); status != "" {
 			mutation.Status = &status
+			if status == model.TaskStatusScheduled {
+				mutation.ScheduledAt = optionalString(mutationBody, "scheduledAt")
+				if err := requireFutureSchedule(mutation.ScheduledAt.Value); err != nil {
+					return err
+				}
+			} else {
+				// A Web status move away from Scheduled also removes the
+				// reservation. Keeping a future value would make the store's
+				// queue reconciliation move the task back to Scheduled.
+				mutation.ScheduledAt = store.OptionalString{Set: true}
+			}
 		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) { return opened.BulkMutate(ctx, ids, mutation), nil })
 		if err == nil {
@@ -330,16 +393,47 @@ func (s *Server) handleTasks(response http.ResponseWriter, request *http.Request
 		if err != nil {
 			return err
 		}
+		status := statusValue(body["status"])
+		if status != "" && status != model.TaskStatusScheduled {
+			// Status and reservation are written by the same UpdateTask
+			// transaction for ordinary Web board moves.
+			body["scheduledAt"] = nil
+		}
 		value, err := usingStore(ctx, s, board, func(opened *store.Store) (any, error) {
-			status := statusValue(body["status"])
+			scheduled := optionalString(body, "scheduledAt")
+			if status == model.TaskStatusScheduled || scheduled.Set {
+				current, err := opened.GetTask(ctx, taskID)
+				if err != nil {
+					return nil, err
+				}
+				effectiveStatus := current.Task.Status
+				if status != "" {
+					effectiveStatus = status
+				}
+				effectiveSchedule := current.Task.ScheduledAt
+				if scheduled.Set {
+					effectiveSchedule = scheduled.Value
+				}
+				if effectiveStatus == model.TaskStatusScheduled || effectiveSchedule != nil {
+					if err := requireFutureSchedule(effectiveSchedule); err != nil {
+						return nil, err
+					}
+				}
+			}
 			switch status {
 			case model.TaskStatusDone:
 				metadata, _ := body["metadata"].(map[string]any)
-				return opened.CompleteTask(ctx, taskID, store.CompletionInput{Summary: stringValue(body["summary"]), Result: stringValue(body["result"]), Metadata: metadata})
+				return opened.CompleteTask(ctx, taskID, store.CompletionInput{
+					Summary: stringValue(body["summary"]), Result: stringValue(body["result"]),
+					Metadata: metadata, ExpectedUpdatedAt: stringPointerFrom(body, "expectedUpdatedAt"),
+				})
 			case model.TaskStatusBlocked:
-				return opened.BlockTask(ctx, taskID, store.BlockInput{Reason: firstText(stringValue(body["reason"]), "Blocked from dashboard"), Kind: model.BlockKind(stringValue(body["kind"]))})
+				return opened.BlockTask(ctx, taskID, store.BlockInput{
+					Reason: firstText(stringValue(body["reason"]), "Blocked from dashboard"), Kind: model.BlockKind(stringValue(body["kind"])),
+					ExpectedUpdatedAt: stringPointerFrom(body, "expectedUpdatedAt"),
+				})
 			case model.TaskStatusArchived:
-				return opened.ArchiveTask(ctx, taskID)
+				return opened.ArchiveTaskWithVersion(ctx, taskID, stringPointerFrom(body, "expectedUpdatedAt"))
 			default:
 				return opened.UpdateTask(ctx, taskID, taskUpdate(body))
 			}
@@ -350,7 +444,13 @@ func (s *Server) handleTasks(response http.ResponseWriter, request *http.Request
 		return err
 	}
 	if len(segments) == 3 && request.Method == http.MethodDelete {
-		err := usingStoreError(ctx, s, board, func(opened *store.Store) error { return opened.DeleteTask(ctx, taskID) })
+		body, err := readJSON(request)
+		if err != nil {
+			return err
+		}
+		err = usingStoreError(ctx, s, board, func(opened *store.Store) error {
+			return opened.DeleteTaskWithVersion(ctx, taskID, stringPointerFrom(body, "expectedUpdatedAt"))
+		})
 		if err == nil {
 			sendJSON(response, http.StatusOK, map[string]any{"id": taskID, "deleted": true})
 		}
