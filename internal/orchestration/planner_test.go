@@ -85,3 +85,21 @@ func TestCLIPlannerRejectsManualRuntime(t *testing.T) {
 		t.Fatal("expected manual planner runtime to be rejected")
 	}
 }
+
+func TestCLIPlannerUsesRegisteredCommand(t *testing.T) {
+	planner, err := CreateCLIPlanner(CLIPlannerOptions{
+		Runtime: model.RuntimeCodex, Command: fixturePath(t, "planner-agent.sh"), Model: "gpt-test",
+		CWD: t.TempDir(), Timeout: 5 * time.Second, Getenv: func(string) string { return "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := planner(context.Background(), PlannerRequest{Kind: PlannerSpecify, Prompt: "Specify this", Schema: testSchema()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(map[string]any)
+	if !ok || result["title"] != "Planner-generated task specification" {
+		t.Fatalf("registered planner command result = %#v", value)
+	}
+}

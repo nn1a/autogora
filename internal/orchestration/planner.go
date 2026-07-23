@@ -34,6 +34,7 @@ type Planner func(context.Context, PlannerRequest) (any, error)
 
 type CLIPlannerOptions struct {
 	Runtime  model.Runtime
+	Command  string
 	Model    string
 	Provider string
 	CWD      string
@@ -62,9 +63,12 @@ func (w *limitedBuffer) Write(value []byte) (int, error) {
 
 func (w *limitedBuffer) String() string { return w.buffer.String() }
 
-func plannerBinary(getenv func(string) string, runtime model.Runtime) string {
+func plannerBinary(getenv func(string) string, runtime model.Runtime, configured string) string {
 	name := "AUTOGORA_" + strings.ToUpper(string(runtime)) + "_BIN"
 	if value := strings.TrimSpace(getenv(name)); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(configured); value != "" {
 		return value
 	}
 	return string(runtime)
@@ -215,7 +219,7 @@ func CreateCLIPlanner(options CLIPlannerOptions) (Planner, error) {
 		if err := os.WriteFile(schemaPath, schema, 0o600); err != nil {
 			return nil, err
 		}
-		binary := plannerBinary(getenv, options.Runtime)
+		binary := plannerBinary(getenv, options.Runtime, options.Command)
 		var value any
 		switch options.Runtime {
 		case model.RuntimeCodex:

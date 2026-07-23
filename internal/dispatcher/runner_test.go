@@ -188,6 +188,31 @@ func TestRunnerCommandsPassConfiguredModelAndClineProvider(t *testing.T) {
 	}
 }
 
+func TestRunnerCommandUsesRegisteredExecutableWithEnvironmentOverride(t *testing.T) {
+	claim := claimedTask(t, model.RuntimeCodex)
+	options := RunnerOptions{
+		DBPath: filepath.Join(t.TempDir(), "db"), CLIPath: filepath.Join(t.TempDir(), "autogora"),
+		Command: "/opt/autogora/codex-primary", Getenv: func(string) string { return "" },
+	}
+	command, err := BuildRunnerCommand(claim, options, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Command != options.Command {
+		t.Fatalf("registered command = %q, want %q", command.Command, options.Command)
+	}
+	options.Getenv = func(name string) string {
+		if name == "AUTOGORA_CODEX_BIN" {
+			return "/tmp/test-codex"
+		}
+		return ""
+	}
+	command, err = BuildRunnerCommand(claim, options, "")
+	if err != nil || command.Command != "/tmp/test-codex" {
+		t.Fatalf("environment command override = %#v, %v", command, err)
+	}
+}
+
 func TestSessionIDExtraction(t *testing.T) {
 	output := "noise\n{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n"
 	if SessionIDFromOutput(output) != "thread-1" {

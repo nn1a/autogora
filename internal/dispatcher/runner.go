@@ -34,6 +34,7 @@ type RunnerOptions struct {
 	DBPath           string
 	CLIPath          string
 	Profile          string
+	Command          string
 	Model            string
 	Provider         string
 	AllowWrites      bool
@@ -107,6 +108,9 @@ func workerBinary(options RunnerOptions, runtime model.Runtime) string {
 	}
 	name := "AUTOGORA_" + strings.ToUpper(string(runtime)) + "_BIN"
 	if value := strings.TrimSpace(getenv(name)); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(options.Command); value != "" {
 		return value
 	}
 	return string(runtime)

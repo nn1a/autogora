@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -59,21 +60,36 @@ func (s *Service) BoardContext(ctx context.Context) (BoardContext, error) {
 }
 
 // ProfileRoutes matches the Web API profile list: task-derived routes first,
-// with configured board profiles overriding routes that have the same name.
+// followed by global worker agents and board-local profiles. A board profile
+// may specialize a global agent without changing its runtime or relaxing its
+// availability and concurrency limits.
 func (s *Service) ProfileRoutes(ctx context.Context, metadata boards.Metadata) ([]orchestration.ProfileRoute, error) {
 	tasks, err := s.ListTasks(ctx, store.ListTaskFilter{Board: s.board, IncludeArchived: true, Limit: 500})
 	if err != nil {
 		return nil, err
 	}
-	return orchestration.ResolveProfileRoutes(tasks, profileRoutes(metadata.Orchestration.Profiles)), nil
+	config, err := agentconfig.Load(agentconfig.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("load global agent configuration: %w", err)
+	}
+	configured := mergeProfileRoutes(globalWorkerProfileRoutes(config), profileRoutes(metadata.Orchestration.Profiles))
+	return orchestration.ResolveProfileRoutes(tasks, configured), nil
 }
 
 func (s *Service) planner(metadata boards.Metadata) (orchestration.Planner, error) {
+	runtime := metadata.Orchestration.PlannerRuntime
+	modelName, provider, command := metadata.Orchestration.PlannerModel, metadata.Orchestration.PlannerProvider, ""
+	config, err := agentconfig.Load(agentconfig.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("load global agent configuration: %w", err)
+	}
+	if modelName == "" && provider == "" {
+		if agent, found := firstGlobalAgent(config, config.Defaults.PlannerAgents, agentconfig.RolePlanner); found {
+			runtime, modelName, provider, command = agent.Runtime, agent.Model, agent.Provider, agent.Command
+		}
+	}
 	return orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{
-		Runtime:  metadata.Orchestration.PlannerRuntime,
-		Model:    metadata.Orchestration.PlannerModel,
-		Provider: metadata.Orchestration.PlannerProvider,
-		Timeout:  120 * time.Second,
+		Runtime: runtime, Command: command, Model: modelName, Provider: provider, Timeout: 120 * time.Second,
 	})
 }
 
@@ -97,6 +113,84 @@ func profileRoutes(values []boards.Profile) []orchestration.ProfileRoute {
 			Fallbacks: append([]string{}, value.Fallbacks...)})
 	}
 	return result
+}
+
+func globalWorkerProfileRoutes(config agentconfig.Config) []orchestration.ProfileRoute {
+	result := make([]orchestration.ProfileRoute, 0, len(config.Agents))
+	for _, agent := range config.Agents {
+		if !agentSupportsRole(agent, agentconfig.RoleWorker) {
+			continue
+		}
+		result = append(result, orchestration.ProfileRoute{
+			Name: agent.ID, Runtime: agent.Runtime, Model: agent.Model, Provider: agent.Provider,
+			Disabled: !agent.Enabled, MaxConcurrent: agent.MaxConcurrent, Fallbacks: append([]string{}, agent.Fallbacks...),
+		})
+	}
+	return result
+}
+
+func agentSupportsRole(agent agentconfig.Agent, role agentconfig.Role) bool {
+	for _, candidate := range agent.Roles {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
+}
+
+func firstGlobalAgent(config agentconfig.Config, ids []string, role agentconfig.Role) (agentconfig.Agent, bool) {
+	for _, id := range ids {
+		agent, found := config.Find(id)
+		if found && agent.Enabled && agentSupportsRole(agent, role) {
+			return agent, true
+		}
+	}
+	return agentconfig.Agent{}, false
+}
+
+func mergeProfileRoutes(global, board []orchestration.ProfileRoute) []orchestration.ProfileRoute {
+	result := make([]orchestration.ProfileRoute, len(global))
+	copy(result, global)
+	index := make(map[string]int, len(global)+len(board))
+	for position, profile := range result {
+		index[profile.Name] = position
+	}
+	for _, profile := range board {
+		position, found := index[profile.Name]
+		if !found {
+			index[profile.Name] = len(result)
+			result = append(result, profile)
+			continue
+		}
+		registered := result[position]
+		if profile.Model != "" {
+			registered.Model = profile.Model
+		}
+		if profile.Provider != "" {
+			registered.Provider = profile.Provider
+		}
+		if profile.Description != "" {
+			registered.Description = profile.Description
+		}
+		registered.Priority = profile.Priority
+		if len(profile.Fallbacks) > 0 {
+			registered.Fallbacks = append([]string{}, profile.Fallbacks...)
+		}
+		registered.Disabled = registered.Disabled || profile.Disabled
+		registered.MaxConcurrent = concurrencyLimit(registered.MaxConcurrent, profile.MaxConcurrent)
+		result[position] = registered
+	}
+	return result
+}
+
+func concurrencyLimit(global, board int) int {
+	if global > 0 && (board <= 0 || global < board) {
+		return global
+	}
+	if board > 0 {
+		return board
+	}
+	return 0
 }
 
 func (s *Service) DecomposeTask(ctx context.Context, taskID string, plan *orchestration.DecompositionPlan) (orchestration.DecompositionResult, error) {
