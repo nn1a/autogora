@@ -136,16 +136,17 @@ type PlannerAttemptAcquire func(context.Context, PlannerRequest, PlannerCandidat
 type PlannerAttemptRelease func(context.Context, PlannerAttemptHandle) error
 
 type FallbackPlannerOptions struct {
-	Candidates     []PlannerCandidate
-	CWD            string
-	Timeout        time.Duration
-	Getenv         func(string) string
-	Factory        PlannerFactory
-	Available      func(context.Context, PlannerCandidate) (bool, error)
-	AcquireAttempt PlannerAttemptAcquire
-	ReleaseAttempt PlannerAttemptRelease
-	OnFailure      func(context.Context, PlannerAttempt) error
-	OnSelected     func(context.Context, PlannerSelection) error
+	Candidates               []PlannerCandidate
+	CWD                      string
+	Timeout                  time.Duration
+	MaxInvocationsPerRequest int
+	Getenv                   func(string) string
+	Factory                  PlannerFactory
+	Available                func(context.Context, PlannerCandidate) (bool, error)
+	AcquireAttempt           PlannerAttemptAcquire
+	ReleaseAttempt           PlannerAttemptRelease
+	OnFailure                func(context.Context, PlannerAttempt) error
+	OnSelected               func(context.Context, PlannerSelection) error
 }
 
 type preparedPlannerCandidate struct {
@@ -209,6 +210,10 @@ func CreateFallbackPlanner(options FallbackPlannerOptions) (Planner, error) {
 		failures := make([]error, 0, len(prepared))
 		primary := prepared[0].candidate.Profile
 		for _, configured := range prepared {
+			if options.MaxInvocationsPerRequest > 0 &&
+				attempt >= options.MaxInvocationsPerRequest {
+				break
+			}
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}

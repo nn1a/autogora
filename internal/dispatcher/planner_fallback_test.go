@@ -151,6 +151,74 @@ func TestDispatcherCoordinatorRequiresCoordinatorRoleAndHonorsBoardProfile(t *te
 	}
 }
 
+func TestDispatcherCoordinatorUsesOneExternalCandidatePerBudgetedAttempt(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	primary := executableFixture(t, "echo 'quota exceeded: rate limit' >&2\nexit 1")
+	backup := executableFixture(t, `printf '%s\n' '{"type":"run_result","text":"{\"ok\":true}"}'`)
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{CoordinatorAgents: []string{"primary"}},
+		Agents: []agentconfig.Agent{
+			{
+				ID: "primary", Runtime: model.RuntimeCline, Command: primary,
+				Enabled: true, MaxConcurrent: 1,
+				Roles:     []agentconfig.Role{agentconfig.RoleCoordinator},
+				Fallbacks: []string{"backup"},
+			},
+			{
+				ID: "backup", Runtime: model.RuntimeCline, Command: backup,
+				Enabled: true, MaxConcurrent: 1,
+				Roles: []agentconfig.Role{agentconfig.RoleCoordinator},
+			},
+		},
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		PlannerTimeout:     5 * time.Second,
+		RateLimitCooldown:  durationValue(time.Hour),
+		AgentRetryCooldown: durationValue(time.Hour),
+		Getenv:             func(string) string { return "" },
+	}
+	planner, err := createRolePlanner(
+		manager, opened, metadata, configuredProfileSet{Config: config},
+		options, agentconfig.RoleCoordinator, t.TempDir(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := orchestration.PlannerRequest{
+		Kind: orchestration.PlannerCoordinator, Prompt: "coordinate",
+		Schema: map[string]any{"type": "object"},
+	}
+	if _, err := planner(ctx, request); err == nil {
+		t.Fatal("first budgeted attempt unexpectedly invoked the fallback")
+	}
+	health, err := opened.GetAgentHealth(ctx, "primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.Status != model.AgentHealthRateLimited {
+		t.Fatalf("primary health = %#v", health)
+	}
+	value, err := planner(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := value.(map[string]any); result["ok"] != true {
+		t.Fatalf("fallback result = %#v", value)
+	}
+}
+
 func TestDispatcherPlannerSharesCapacityWithWorkerAcrossBoards(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)

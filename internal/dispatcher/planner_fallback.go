@@ -83,6 +83,13 @@ func createRolePlannerWithSelection(
 			return nil
 		},
 	}
+	if role == agentconfig.RoleCoordinator {
+		// The board's maxCallsPerHour budget counts logical coordination
+		// attempts. Keep that accounting exact by invoking at most one external
+		// candidate per attempt. A classified availability failure updates agent
+		// health; the next bounded attempt then advances to a healthy fallback.
+		plannerOptions.MaxInvocationsPerRequest = 1
+	}
 	if manager != nil {
 		capacity := agentcapacity.New(manager)
 		ownerKind := store.AgentSlotOwnerPlanner

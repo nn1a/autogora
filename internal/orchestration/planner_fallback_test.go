@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,6 +187,34 @@ func TestFallbackPlannerReleasesCapacityOnRetryableFailure(t *testing.T) {
 	}
 	if want := []PlannerAttemptHandle{"primary-lease", "backup-lease"}; !reflect.DeepEqual(released, want) {
 		t.Fatalf("released handles = %#v, want %#v", released, want)
+	}
+}
+
+func TestFallbackPlannerLimitsExternalInvocationsPerRequest(t *testing.T) {
+	called := make([]string, 0, 2)
+	planner, err := CreateFallbackPlanner(FallbackPlannerOptions{
+		Candidates: []PlannerCandidate{
+			{Profile: "primary", Runtime: model.RuntimeCodex, Model: "primary"},
+			{Profile: "backup", Runtime: model.RuntimeClaude, Model: "backup"},
+		},
+		MaxInvocationsPerRequest: 1,
+		Factory: func(options CLIPlannerOptions) (Planner, error) {
+			name := options.Model
+			return func(context.Context, PlannerRequest) (any, error) {
+				called = append(called, name)
+				return nil, errors.New("HTTP 429: rate limit exceeded")
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = planner(context.Background(), PlannerRequest{})
+	if err == nil || !strings.Contains(err.Error(), "primary") {
+		t.Fatalf("bounded planner error = %v", err)
+	}
+	if want := []string{"primary"}; !reflect.DeepEqual(called, want) {
+		t.Fatalf("planner calls = %v, want %v", called, want)
 	}
 }
 
