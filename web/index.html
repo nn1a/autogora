@@ -21,7 +21,8 @@
       <button id="board-settings" class="ghost">Settings</button>
       <button id="agent-settings" class="ghost">Agents</button>
       <button id="import-issues" class="ghost">Import issues</button>
-      <button id="new-swarm" class="ghost">Swarm</button>
+      <button id="new-swarm" class="ghost" aria-describedby="swarm-button-help" title="Advanced DAG template: parallel workers, verifier, and synthesizer">Swarm <span class="button-info" aria-hidden="true">i</span></button>
+      <span id="swarm-button-help" class="sr-only">Swarm creates an advanced parallel worker, verifier, and synthesizer DAG. It does not enable board automation or run Coordinator recovery.</span>
       <button id="nudge" class="primary"><span class="nudge-wide">Run now</span><span class="nudge-short">Run now</span></button>
       <button id="theme-toggle" class="ghost theme-toggle" type="button" aria-label="Switch to light theme">
         <span class="theme-icon" aria-hidden="true">☀</span><span class="theme-label">Light</span>
@@ -39,6 +40,29 @@
       <label><input id="show-archived" type="checkbox"> Archived</label>
       <label><input id="lane-profile" type="checkbox"> Running lanes</label>
       <div id="stats" class="stats"></div>
+    </section>
+
+    <section class="board-view-controls" aria-label="Board view controls">
+      <div class="view-control">
+        <span id="stage-focus-label" class="view-control-label">Focus</span>
+        <div class="segmented-control" role="group" aria-labelledby="stage-focus-label" aria-describedby="stage-focus-help" data-board-control="focus">
+          <button type="button" class="compact" data-stage-focus="all" aria-pressed="true" title="Show every visible workflow stage">All stages</button>
+          <button type="button" class="compact" data-stage-focus="planning" aria-pressed="false" title="Show only Triage through Ready">Planning</button>
+          <button type="button" class="compact" data-stage-focus="execution" aria-pressed="false" title="Show only Running through Done">Execution</button>
+          <button type="button" class="compact" data-stage-focus="archive" aria-pressed="false" title="Load and show only archived tasks">Archive</button>
+        </div>
+        <span id="stage-focus-help" class="sr-only">Focus shows one workflow stage at a time. Archive Focus also loads archived tasks.</span>
+      </div>
+      <div class="view-control">
+        <span id="board-view-label" class="view-control-label">View</span>
+        <div class="segmented-control" role="group" aria-labelledby="board-view-label" aria-describedby="board-view-help" data-board-control="view">
+          <button type="button" class="compact" data-board-view="overview" aria-pressed="true" title="Responsive status grids with full task cards">Overview</button>
+          <button type="button" class="compact" data-board-view="compact" aria-pressed="false" title="Denser status grids with condensed task cards">Compact</button>
+          <button type="button" class="compact" data-board-view="flow" aria-pressed="false" title="Separate stage panels that emphasize workflow order">Flow</button>
+        </div>
+        <span id="board-view-help" class="sr-only">Overview shows full cards, Compact reduces card density, and Flow separates Planning, Execution, and Archive into stage panels.</span>
+      </div>
+      <small id="board-view-summary" class="board-view-summary" aria-live="polite">All stages · Overview</small>
     </section>
 
     <section id="bulk-bar" class="bulk-bar hidden" aria-live="polite">
@@ -242,6 +266,10 @@
   <dialog id="swarm-dialog" class="dialog-wide">
     <form id="swarm-form" method="dialog" class="dialog-form">
       <header><h2>Create task swarm</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
+      <section class="swarm-help" aria-label="About Swarm">
+        <strong>Advanced DAG template</strong>
+        <span>Swarm creates parallel worker tasks followed by verifier and synthesizer dependencies. It is separate from normal Autopilot execution and Coordinator recovery.</span>
+      </section>
       <label>Goal<textarea name="goal" rows="4" required></textarea></label>
       <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude,reviewer:gemini"></label>
       <div class="form-grid">

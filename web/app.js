@@ -8,8 +8,12 @@ const WORKFLOW_STAGES = [
   { id: "execution", label: "Execution", ariaLabel: "Execution workflow stage", statuses: ["running", "blocked", "review", "done"] },
   { id: "archive", label: "Archive", ariaLabel: "Archive workflow stage", statuses: ["archived"] },
 ];
+const BOARD_STAGE_FOCUSES = ["all", ...WORKFLOW_STAGES.map((stage) => stage.id)];
+const BOARD_VIEW_MODES = ["overview", "compact", "flow"];
 
 const storedTheme = localStorage.getItem("autogora.theme");
+const storedStageFocus = localStorage.getItem("autogora.boardStageFocus");
+const storedBoardView = localStorage.getItem("autogora.boardView");
 let activeTheme = ["light", "dark"].includes(storedTheme)
   ? storedTheme
   : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -19,6 +23,8 @@ const state = {
   boards: [], board: localStorage.getItem("autogora.board") || "default", metadata: null,
   profiles: [], tasks: [], taskWindow: null, stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
   agentConfig: null, agentConfigExists: false, agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
+  stageFocus: BOARD_STAGE_FOCUSES.includes(storedStageFocus) ? storedStageFocus : "all",
+  boardView: BOARD_VIEW_MODES.includes(storedBoardView) ? storedBoardView : "overview",
   drawerDirty: false, drawerVersion: null, drawerRequest: 0,
 };
 
@@ -352,16 +358,77 @@ function renderCardList(tasks, lanes) {
   ).join("");
 }
 
+function updateBoardViewControls() {
+  $$("[data-stage-focus]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.stageFocus === state.stageFocus));
+  });
+  $$("[data-board-view]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.boardView === state.boardView));
+  });
+  const stage = state.stageFocus === "all"
+    ? "All stages"
+    : WORKFLOW_STAGES.find((item) => item.id === state.stageFocus)?.label || "All stages";
+  const view = state.boardView[0].toUpperCase() + state.boardView.slice(1);
+  $("#board-view-summary").textContent = `${stage} · ${view}`;
+}
+
+function setStageFocus(value) {
+  if (!BOARD_STAGE_FOCUSES.includes(value) || value === state.stageFocus) return;
+  state.stageFocus = value;
+  localStorage.setItem("autogora.boardStageFocus", value);
+  if (value === "archive" && !$("#show-archived").checked) {
+    $("#show-archived").checked = true;
+    localStorage.setItem("autogora.showArchived", "true");
+    updateBoardViewControls();
+    loadBoard().catch((error) => toast(error.message, true));
+    return;
+  }
+  renderBoard();
+}
+
+function setBoardView(value) {
+  if (!BOARD_VIEW_MODES.includes(value) || value === state.boardView) return;
+  state.boardView = value;
+  localStorage.setItem("autogora.boardView", value);
+  renderBoard();
+}
+
+function bindSegmentedControl(selector, buttonSelector, select) {
+  const control = $(selector);
+  const buttons = $$(buttonSelector, control);
+  control.addEventListener("click", (event) => {
+    const button = event.target.closest(buttonSelector);
+    if (button) select(button);
+  });
+  control.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const current = buttons.indexOf(document.activeElement);
+    if (current < 0) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+    buttons[next].focus();
+    select(buttons[next]);
+  });
+}
+
 function renderBoard() {
   const tasks = filteredTasks();
-  const stages = WORKFLOW_STAGES.filter((stage) => stage.id !== "archive" || $("#show-archived").checked);
+  const board = $("#board");
+  board.dataset.view = state.boardView;
+  board.dataset.focus = state.stageFocus;
+  const showArchived = $("#show-archived").checked || state.stageFocus === "archive";
+  const stages = WORKFLOW_STAGES
+    .filter((stage) => stage.id !== "archive" || showArchived)
+    .filter((stage) => state.stageFocus === "all" || stage.id === state.stageFocus);
+  updateBoardViewControls();
   const emptyGuide = state.tasks.length === 0 ? `<section class="empty-guide" aria-label="Get started">
     <div class="empty-guide-intro"><span class="eyebrow">New board</span><h2>Set up a project, then add work</h2><p>Autogora can plan Triage cards, promote dependency-ready tasks, and assign healthy workers after these three checks.</p></div>
     <div class="guide-step"><strong>1 · Coding agents</strong><span>${availableWorkerAgents().length ? `${availableWorkerAgents().length} worker agent${availableWorkerAgents().length === 1 ? "" : "s"} configured.` : "Choose installed CLIs, models, and fallbacks."}</span><button type="button" data-guide="agents">${availableWorkerAgents().length ? "Review agents" : "Set up agents"}</button></div>
     <div class="guide-step"><strong>2 · Project directory</strong><span>${state.metadata?.defaultWorkdir ? escapeHtml(state.metadata.defaultWorkdir) : "Choose the Git repository workers may inspect or change."}</span><button type="button" data-guide="workspace">${state.metadata?.defaultWorkdir ? "Review project" : "Set project path"}</button></div>
     <div class="guide-step"><strong>3 · Add work</strong><span>Import GitHub issues for review or create a task directly.</span><button type="button" data-guide="import" class="primary">Import issues</button><button type="button" data-guide="create" class="ghost">Create task</button></div>
   </section>` : "";
-  $("#board").innerHTML = emptyGuide + stages.map((stage) => {
+  board.innerHTML = emptyGuide + stages.map((stage) => {
     const stageCount = stage.statuses.reduce((total, status) =>
       total + tasks.filter((task) => task.status === status).length, 0);
     const columns = stage.statuses.map((status) => {
@@ -1423,19 +1490,30 @@ function initializeSelects() {
   const options = mutableStatuses.map((status) => `<option value="${status}">${status}</option>`).join("");
   $("#task-form [name=status]").innerHTML = options;
   $("#bulk-status").innerHTML = `<option value="">Move to…</option>${options}`;
-  $("#show-archived").checked = localStorage.getItem("autogora.showArchived") === "true";
+  $("#show-archived").checked = localStorage.getItem("autogora.showArchived") === "true" || state.stageFocus === "archive";
   $("#lane-profile").checked = localStorage.getItem("autogora.laneByProfile") === "true";
 }
 
 function bindGlobalActions() {
   $$('[data-close-dialog]').forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
+  bindSegmentedControl('[data-board-control="focus"]', "[data-stage-focus]", (button) => setStageFocus(button.dataset.stageFocus));
+  bindSegmentedControl('[data-board-control="view"]', "[data-board-view]", (button) => setBoardView(button.dataset.boardView));
   $("#board-select").addEventListener("change", async (event) => {
     state.board = event.target.value; state.cursor = 0; state.selected.clear(); localStorage.setItem("autogora.board", state.board);
     await loadBoard(); connectEvents();
   });
   ["#search", "#tenant-filter", "#assignee-filter"].forEach((selector) => $(selector).addEventListener("input", renderBoard));
   $("#lane-profile").addEventListener("change", () => { localStorage.setItem("autogora.laneByProfile", $("#lane-profile").checked); renderBoard(); });
-  $("#show-archived").addEventListener("change", () => { localStorage.setItem("autogora.showArchived", $("#show-archived").checked); loadBoard(); });
+  $("#show-archived").addEventListener("change", () => {
+    const checked = $("#show-archived").checked;
+    localStorage.setItem("autogora.showArchived", checked);
+    if (!checked && state.stageFocus === "archive") {
+      state.stageFocus = "all";
+      localStorage.setItem("autogora.boardStageFocus", state.stageFocus);
+      updateBoardViewControls();
+    }
+    loadBoard();
+  });
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer").addEventListener("cancel", (event) => { event.preventDefault(); closeDrawer(); });
   $("#drawer-refresh").addEventListener("click", () => state.drawerTask && openDrawer(state.drawerTask, { focus: false, force: true }));

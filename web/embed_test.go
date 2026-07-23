@@ -105,7 +105,8 @@ func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 		`grid-template-columns: repeat(2, minmax(0, 1fr))`,
 		`@media (max-width: 600px)`,
 		`grid-template-columns: minmax(0, 1fr)`,
-		`max-height: clamp(180px, 28vh, 320px)`,
+		`.column-body {`,
+		`overflow: visible`,
 		`overflow-x: hidden`,
 		`overflow-wrap: anywhere`,
 	} {
@@ -114,7 +115,12 @@ func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 		}
 	}
 
-	for _, obsolete := range []string{`grid-auto-flow: column`, `grid-auto-columns:`, `scroll-snap-type: x`} {
+	for _, obsolete := range []string{
+		`grid-auto-flow: column`,
+		`grid-auto-columns:`,
+		`scroll-snap-type: x`,
+		`max-height: clamp(180px, 28vh, 320px)`,
+	} {
 		if strings.Contains(string(styles), obsolete) {
 			t.Fatalf("horizontal board layout marker %q is still present", obsolete)
 		}
