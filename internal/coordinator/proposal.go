@@ -31,13 +31,16 @@ const (
 )
 
 type TaskDraft struct {
-	Key          string             `json:"key"`
-	Title        string             `json:"title"`
-	Body         string             `json:"body"`
-	Assignee     string             `json:"assignee"`
-	Runtime      model.Runtime      `json:"runtime"`
-	WorkflowRole model.WorkflowRole `json:"workflowRole"`
-	Priority     int                `json:"priority"`
+	Key           string             `json:"key"`
+	Title         string             `json:"title"`
+	Body          string             `json:"body"`
+	Assignee      string             `json:"assignee"`
+	Runtime       model.Runtime      `json:"runtime"`
+	WorkflowRole  model.WorkflowRole `json:"workflowRole"`
+	Priority      int                `json:"priority"`
+	Prerequisites []string           `json:"prerequisites"`
+	Dependents    []string           `json:"dependents"`
+	ParentTaskID  string             `json:"parentTaskId,omitempty"`
 }
 
 type Action struct {
@@ -69,16 +72,23 @@ type Proposal struct {
 }
 
 type IncidentSnapshot struct {
-	IncidentID      string          `json:"incidentId"`
-	Trigger         string          `json:"trigger"`
-	Severity        string          `json:"severity"`
-	Summary         string          `json:"summary"`
-	Details         map[string]any  `json:"details,omitempty"`
-	GraphRevision   int64           `json:"graphRevision"`
-	FocusTaskID     string          `json:"focusTaskId,omitempty"`
-	Nodes           []NodeSnapshot  `json:"nodes"`
-	Diagnostics     []IssueSnapshot `json:"diagnostics"`
-	AvailableAgents []AgentSnapshot `json:"availableAgents"`
+	IncidentID      string               `json:"incidentId"`
+	Trigger         string               `json:"trigger"`
+	Severity        string               `json:"severity"`
+	Summary         string               `json:"summary"`
+	Details         map[string]any       `json:"details,omitempty"`
+	GraphRevision   int64                `json:"graphRevision"`
+	FocusTaskID     string               `json:"focusTaskId,omitempty"`
+	Nodes           []NodeSnapshot       `json:"nodes"`
+	Dependencies    []DependencySnapshot `json:"dependencies"`
+	Diagnostics     []IssueSnapshot      `json:"diagnostics"`
+	AvailableAgents []AgentSnapshot      `json:"availableAgents"`
+}
+
+type DependencySnapshot struct {
+	PrerequisiteID string `json:"prerequisiteId"`
+	DependentID    string `json:"dependentId"`
+	Satisfied      bool   `json:"satisfied"`
 }
 
 type NodeSnapshot struct {
@@ -242,10 +252,25 @@ func validateAction(action Action, createdKeys map[string]bool) error {
 		if task.WorkflowRole != model.WorkflowRoleWorker && task.WorkflowRole != model.WorkflowRoleReviewer {
 			return errors.New("create_task workflowRole must be worker or reviewer")
 		}
+		if duplicateString(task.Prerequisites) || duplicateString(task.Dependents) {
+			return errors.New("create_task relationship IDs must be unique")
+		}
 	default:
 		return fmt.Errorf("unsupported action kind %q", action.Kind)
 	}
 	return nil
+}
+
+func duplicateString(values []string) bool {
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return true
+		}
+		seen[value] = true
+	}
+	return false
 }
 
 func proposalSchema(maxActions int) map[string]any {
@@ -278,13 +303,16 @@ func proposalSchema(maxActions int) map[string]any {
 						"reason":            map[string]any{"type": "string", "minLength": 1},
 						"task": map[string]any{
 							"type": "object", "additionalProperties": false,
-							"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority"},
+							"required": []string{"key", "title", "body", "assignee", "runtime", "workflowRole", "priority", "prerequisites", "dependents"},
 							"properties": map[string]any{
 								"key": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"},
 								"body": map[string]any{"type": "string"}, "assignee": map[string]any{"type": "string"},
-								"runtime":      map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
-								"workflowRole": map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
-								"priority":     map[string]any{"type": "integer"},
+								"runtime":       map[string]any{"type": "string", "enum": []string{"claude", "codex", "cline", "gemini"}},
+								"workflowRole":  map[string]any{"type": "string", "enum": []string{"worker", "reviewer"}},
+								"priority":      map[string]any{"type": "integer"},
+								"prerequisites": map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string"}},
+								"dependents":    map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string"}},
+								"parentTaskId":  map[string]any{"type": "string"},
 							},
 						},
 					},
