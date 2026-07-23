@@ -51,21 +51,130 @@ function setTheme(theme, persist = true) {
   );
 }
 
-function markdown(value = "") {
-  let safe = escapeHtml(value);
-  safe = safe.replace(/```([\s\S]*?)```/g, (_, code) => `<pre>${code.trim()}</pre>`);
-  safe = safe.replace(/`([^`]+)`/g, "<code>$1</code>");
-  safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  safe = safe.replace(/(^|\s)(https?:\/\/[^\s<]+|mailto:[^\s<]+)/g, (_, prefix, url) =>
-    `${prefix}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
-  safe = safe.split("\n").map((line) => {
-    if (line.startsWith("### ")) return `<h4>${line.slice(4)}</h4>`;
-    if (line.startsWith("## ")) return `<h3>${line.slice(3)}</h3>`;
-    if (line.startsWith("# ")) return `<h2>${line.slice(2)}</h2>`;
-    if (line.startsWith("- ")) return `<div>• ${line.slice(2)}</div>`;
-    return line || "<br>";
-  }).join("\n");
-  return safe;
+function renderMarkdownText(value = "") {
+  const source = String(value);
+  const links = /(^|[\s(])(https?:\/\/[^\s<]+|mailto:[^\s<]+)/g;
+  let cursor = 0;
+  let output = "";
+  for (const match of source.matchAll(links)) {
+    const url = match[2];
+    const urlStart = match.index + match[1].length;
+    let safe = escapeHtml(source.slice(cursor, urlStart));
+    safe = safe.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    safe = safe.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+    const safeURL = escapeHtml(url);
+    output += `${safe}<a href="${safeURL}" target="_blank" rel="noopener noreferrer">${safeURL}</a>`;
+    cursor = urlStart + url.length;
+  }
+  let tail = escapeHtml(source.slice(cursor));
+  tail = tail.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  tail = tail.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+  return output + tail;
+}
+
+function renderInlineMarkdown(value = "") {
+  return String(value).split(/(`[^`\n]+`)/g).map((part) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+    }
+    return renderMarkdownText(part);
+  }).join("");
+}
+
+function compactMarkdown(value = "") {
+  let inFence = false;
+  return String(value).replace(/\r\n?/g, "\n").split("\n").flatMap((rawLine) => {
+    const line = rawLine.trim();
+    if (/^```/.test(line)) {
+      inFence = !inFence;
+      return [];
+    }
+    if (!line) return [];
+    if (inFence) return [`<code>${escapeHtml(line)}</code>`];
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    if (heading) return [`<strong>${renderInlineMarkdown(heading[1])}</strong>`];
+    const unordered = line.match(/^[-*+]\s+(.+)$/);
+    if (unordered) return [`• ${renderInlineMarkdown(unordered[1])}`];
+    return [renderInlineMarkdown(line)];
+  }).join("<br>");
+}
+
+function markdown(value = "", options = {}) {
+  if (options.compact) return compactMarkdown(value);
+  const lines = String(value).replace(/\r\n?/g, "\n").split("\n");
+  const output = [];
+  let paragraph = [];
+  let list = null;
+  let code = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    output.push(`<p>${paragraph.map(renderInlineMarkdown).join("<br>")}</p>`);
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (!list) return;
+    output.push(`</${list}>`);
+    list = null;
+  };
+  const flushCode = () => {
+    if (code === null) return;
+    output.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+    code = null;
+  };
+
+  for (const rawLine of lines) {
+    if (code !== null) {
+      if (/^\s*```/.test(rawLine)) flushCode();
+      else code.push(rawLine);
+      continue;
+    }
+    if (/^\s*```/.test(rawLine)) {
+      flushParagraph();
+      closeList();
+      code = [];
+      continue;
+    }
+    if (!rawLine.trim()) {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+    const heading = rawLine.match(/^\s*(#{1,6})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      closeList();
+      const level = Math.min(6, heading[1].length + 1);
+      output.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    const unordered = rawLine.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = rawLine.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const nextList = unordered ? "ul" : "ol";
+      if (list !== nextList) {
+        closeList();
+        list = nextList;
+        output.push(`<${list}>`);
+      }
+      output.push(`<li>${renderInlineMarkdown((unordered || ordered)[1])}</li>`);
+      continue;
+    }
+    const quote = rawLine.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      flushParagraph();
+      closeList();
+      output.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
+      continue;
+    }
+    closeList();
+    paragraph.push(rawLine.trim());
+  }
+  flushParagraph();
+  closeList();
+  flushCode();
+  return output.join("");
 }
 
 function relativeTime(value) {
@@ -206,7 +315,7 @@ function cardHtml(task) {
   const progress = task.status !== "done" && task.status !== "archived" && task.subtasksTotal > 0
     ? `<span class="pill" title="Completed subtasks">${task.subtasksDone}/${task.subtasksTotal}</span>` : "";
   const summary = task.body?.trim()
-    ? `<div class="card-summary">${escapeHtml(task.body.trim())}</div>`
+    ? `<div class="card-summary markdown markdown-compact">${markdown(task.body.trim(), { compact: true })}</div>`
     : "";
   return `<article class="card status-${task.status} ${state.selected.has(task.id) ? "selected" : ""}" draggable="true" tabindex="0" data-task="${escapeHtml(task.id)}" data-task-version="${escapeHtml(task.updatedAt)}"
     aria-label="${escapeHtml(`${task.title}, ${STATUS_LABELS[task.status]}, ${owner}, ${task.runtime}`)}">
@@ -223,7 +332,7 @@ function cardHtml(task) {
     <div class="card-foot">
       ${task.priority ? `<span class="pill priority">P${task.priority}</span>` : ""}
       ${task.tenant ? `<span class="pill">${escapeHtml(task.tenant)}</span>` : ""}
-      ${task.commentsCount ? `<span title="Comments">💬 ${task.commentsCount}</span>` : ""}${task.relationshipsCount ? `<span title="Relationships">↔ ${task.relationshipsCount}</span>` : ""}
+      ${task.commentsCount ? `<span class="card-indicator" title="Comments" aria-label="${task.commentsCount} comment${task.commentsCount === 1 ? "" : "s"}"><span aria-hidden="true">💬</span> ${task.commentsCount}</span>` : ""}${task.relationshipsCount ? `<span class="card-indicator" title="Relationships" aria-label="${task.relationshipsCount} relationship${task.relationshipsCount === 1 ? "" : "s"}"><span aria-hidden="true">↔</span> ${task.relationshipsCount}</span>` : ""}
       ${task.status === "scheduled" ? `<span title="Scheduled time">${task.scheduledAt ? `After ${escapeHtml(new Date(task.scheduledAt).toLocaleString())}` : "On hold · no time"}</span>` : ""}
       <span class="updated">Updated ${relativeTime(task.updatedAt)}</span>
     </div>
@@ -494,7 +603,10 @@ function renderDrawer(detail) {
       ${run.summary ? `<div>${escapeHtml(run.summary)}</div>` : ""}${run.error ? `<div>${escapeHtml(run.error)}</div>` : ""}
     </div>`;
   }).join("");
-  const comments = detail.comments.map((comment) => `<div class="detail-row"><strong>${escapeHtml(comment.author)}</strong>${markdown(comment.body)}<div class="mono">${escapeHtml(comment.createdAt)}</div></div>`).join("");
+  const comments = detail.comments.map((comment) => `<article class="detail-row comment-row">
+    <header><strong>${escapeHtml(comment.author)}</strong><time class="mono" datetime="${escapeHtml(comment.createdAt)}">${escapeHtml(comment.createdAt)}</time></header>
+    <div class="markdown comment-body">${markdown(comment.body)}</div>
+  </article>`).join("");
   const attachments = detail.attachments.map((attachment) => `<div class="detail-row">
     <button class="icon-button compact" data-remove-attachment="${escapeHtml(attachment.id)}" aria-label="Remove ${escapeHtml(attachment.name)}" title="Remove attachment">×</button>
     <strong>${escapeHtml(attachment.name)}</strong>
@@ -548,7 +660,7 @@ function renderDrawer(detail) {
       <div><small>Last updated</small><strong>${relativeTime(task.updatedAt)}</strong></div>
     </div>
     ${task.status === "blocked" ? `<div class="detail-row"><strong>Blocked · ${escapeHtml(task.blockKind || "needs_input")}</strong><div>${escapeHtml(task.blockReason || "No reason recorded")}</div></div>` : ""}
-    ${task.result ? `<div class="detail-row"><strong>Result</strong><div>${markdown(task.result)}</div></div>` : ""}
+    ${task.result ? `<div class="detail-row"><strong>Result</strong><div class="markdown">${markdown(task.result)}</div></div>` : ""}
     ${editLocked ? '<div class="detail-row" role="note"><strong>Execution settings are locked while this task is running.</strong><div>Priority remains editable. Use comments for durable context, or terminate the run before changing the task specification.</div></div>' : ""}
     <label>Edit title<input id="edit-title" value="${escapeHtml(task.title)}"></label>
     <div class="drawer-grid drawer-routing-grid">
@@ -597,7 +709,11 @@ function renderDrawer(detail) {
     <div class="detail-list">${detail.children.map(dependency).join("") || '<small>No children</small>'}</div>
     <form id="add-child" class="link-form"><select required><option value="">Add dependent…</option>${taskOptions(task.id)}</select><button>Add</button></form>
     <h3>Comments</h3><div class="detail-list">${comments || '<small>No comments</small>'}</div>
-    <form id="comment-form" class="comment-form"><input required placeholder="Add durable context…"><button>Comment</button></form>
+    <form id="comment-form" class="comment-form">
+      <label class="sr-only" for="comment-body">Comment</label>
+      <textarea id="comment-body" name="comment" rows="3" required placeholder="Add durable context…"></textarea>
+      <button>Comment</button>
+    </form>
     <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
     <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
     <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
@@ -698,7 +814,7 @@ function bindDrawer(detail) {
     await openDrawer(taskId);
   }));
   $("#comment-form").addEventListener("submit", async (event) => {
-    event.preventDefault(); const input = $("input", event.currentTarget);
+    event.preventDefault(); const input = $("#comment-body", event.currentTarget);
     await api(boardPath(`/api/tasks/${taskId}/comments`), { method: "POST", body: JSON.stringify({ body: input.value, author: "dashboard" }) });
     await openDrawer(taskId);
   });
