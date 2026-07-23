@@ -69,3 +69,88 @@ func TestHasChangesDetectsCleanCommittedWorkRelativeToBase(t *testing.T) {
 		t.Fatalf("effective base was not honored: changed=%v err=%v", changed, err)
 	}
 }
+
+func TestInspectChangesMissingBaseStillReportsHead(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	worktree := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(t, repository, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(t, repository, "add", "README.md")
+	runWorkspaceGit(t, repository, "commit", "-q", "-m", "base")
+	head := runWorkspaceGit(t, repository, "rev-parse", "HEAD^{commit}")
+	runWorkspaceGit(t, repository, "worktree", "add", "-q", "--detach", worktree, head)
+
+	inspection, err := (&Manager{}).InspectChanges(ctx, model.RunWorkspace{
+		Kind: model.WorkspaceWorktree, Path: worktree, RepositoryPath: &repository,
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing its base commit") {
+		t.Fatalf("missing-base error = %v", err)
+	}
+	if inspection.HeadCommit != head {
+		t.Fatalf("inspection HEAD = %s, want %s", inspection.HeadCommit, head)
+	}
+}
+
+func TestSplitNullTerminatedPreservesWhitespacePaths(t *testing.T) {
+	actual := splitNullTerminated([]byte(" leading.txt\x00trailing.txt \x00   \x00\x00"))
+	expected := []string{" leading.txt", "trailing.txt ", "   "}
+	if len(actual) != len(expected) {
+		t.Fatalf("paths = %#v, want %#v", actual, expected)
+	}
+	for index := range expected {
+		if actual[index] != expected[index] {
+			t.Fatalf("paths = %#v, want %#v", actual, expected)
+		}
+	}
+}
+
+func TestCaptureChangeSetPreservesWhitespaceFilenames(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	worktree := filepath.Join(root, "worktree")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(t, repository, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(t, repository, "add", "README.md")
+	runWorkspaceGit(t, repository, "commit", "-q", "-m", "base")
+	base := runWorkspaceGit(t, repository, "rev-parse", "HEAD^{commit}")
+	runWorkspaceGit(t, repository, "worktree", "add", "-q", "--detach", worktree, base)
+	expected := []string{" leading.txt", "trailing.txt ", "   "}
+	for _, name := range expected {
+		if err := os.WriteFile(filepath.Join(worktree, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := (&Manager{}).CaptureChangeSet(ctx, model.RunWorkspace{
+		RunID: "run-whitespace", TaskID: "task-whitespace",
+		Kind: model.WorkspaceWorktree, Path: worktree,
+		RepositoryPath: &repository, BaseCommit: &base,
+	}, "task-whitespace", "preserve filenames")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.ChangedFiles) != len(expected) {
+		t.Fatalf("changed files = %#v, want %#v", snapshot.ChangedFiles, expected)
+	}
+	seen := make(map[string]bool, len(snapshot.ChangedFiles))
+	for _, name := range snapshot.ChangedFiles {
+		seen[name] = true
+	}
+	for _, name := range expected {
+		if !seen[name] {
+			t.Fatalf("changed files lost %q: %#v", name, snapshot.ChangedFiles)
+		}
+	}
+}

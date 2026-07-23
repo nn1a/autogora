@@ -31,7 +31,12 @@ type ChangeInspection struct {
 	HeadCommit string
 }
 
-func (m *Manager) InspectChanges(ctx context.Context, workspace model.RunWorkspace) (ChangeInspection, error) {
+func (m *Manager) inspectChangesFromCommit(
+	ctx context.Context,
+	workspace model.RunWorkspace,
+	startCommit string,
+	missingStartError string,
+) (ChangeInspection, error) {
 	if workspace.Kind == model.WorkspaceScratch {
 		entries, err := os.ReadDir(workspace.Path)
 		if err != nil {
@@ -60,20 +65,52 @@ func (m *Manager) InspectChanges(ctx context.Context, workspace model.RunWorkspa
 		return inspection, err
 	}
 	inspection.HeadCommit = head
-	if workspace.BaseCommit == nil || strings.TrimSpace(*workspace.BaseCommit) == "" {
-		return inspection, errors.New("prepared worktree is missing its base commit")
+	if strings.TrimSpace(startCommit) == "" {
+		return inspection, errors.New(missingStartError)
 	}
-	base, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
-		"rev-parse", "--verify", strings.TrimSpace(*workspace.BaseCommit)+"^{commit}")
+	start, err := gitTextWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"rev-parse", "--verify", strings.TrimSpace(startCommit)+"^{commit}")
 	if err != nil {
 		return inspection, err
 	}
-	inspection.Changed = inspection.Changed || head != base
+	inspection.Changed = inspection.Changed || !strings.EqualFold(head, start)
 	return inspection, nil
+}
+
+// InspectChanges reports whether the worktree differs from its persisted
+// output base. Completion capture deliberately uses this same base so the
+// final change set includes prerequisite integration and all recovered work.
+func (m *Manager) InspectChanges(ctx context.Context, workspace model.RunWorkspace) (ChangeInspection, error) {
+	start := ""
+	if workspace.BaseCommit != nil {
+		start = *workspace.BaseCommit
+	}
+	return m.inspectChangesFromCommit(ctx, workspace, start, "prepared worktree is missing its base commit")
+}
+
+// InspectChangesSince reports changes made after a supplied run-start commit.
+// This is intentionally separate from InspectChanges: a recovery attempt can
+// start at an adopted checkpoint while its final output base remains the
+// prerequisite-integrated commit used by CaptureChangeSet.
+func (m *Manager) InspectChangesSince(
+	ctx context.Context,
+	workspace model.RunWorkspace,
+	startCommit string,
+) (ChangeInspection, error) {
+	return m.inspectChangesFromCommit(ctx, workspace, startCommit, "run start commit is empty")
 }
 
 func (m *Manager) HasChanges(ctx context.Context, workspace model.RunWorkspace) (bool, error) {
 	inspection, err := m.InspectChanges(ctx, workspace)
+	return inspection.Changed, err
+}
+
+func (m *Manager) HasChangesSince(
+	ctx context.Context,
+	workspace model.RunWorkspace,
+	startCommit string,
+) (bool, error) {
+	inspection, err := m.InspectChangesSince(ctx, workspace, startCommit)
 	return inspection.Changed, err
 }
 
@@ -126,8 +163,8 @@ func boundedCommitSubject(taskID, title string) string {
 func splitNullTerminated(value []byte) []string {
 	result := make([]string, 0)
 	for _, item := range bytes.Split(value, []byte{0}) {
-		if text := strings.TrimSpace(string(item)); text != "" {
-			result = append(result, text)
+		if len(item) != 0 {
+			result = append(result, string(item))
 		}
 	}
 	return result
