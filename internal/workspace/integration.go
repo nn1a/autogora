@@ -345,7 +345,11 @@ func (m *Manager) IntegratePrerequisiteChangeSets(ctx context.Context, opened *s
 			"rev-parse", "--verify", "HEAD^{commit}")
 	}
 	result, err := m.integratePrerequisiteHandoffs(ctx, *claim.Workspace, handoffs)
-	if err != nil || result.EffectiveBaseCommit == "" {
+	if err != nil {
+		persistExceptionalIntegrationIncident(opened, claim.Task.Task.ID, err)
+		return result, err
+	}
+	if result.EffectiveBaseCommit == "" {
 		return result, err
 	}
 	if claim.Workspace.Kind != model.WorkspaceWorktree {
@@ -365,6 +369,12 @@ func (m *Manager) IntegratePrerequisiteChangeSets(ctx context.Context, opened *s
 // VerifyPrerequisiteChangeSets ensures a worker did not rewrite its final
 // history so that a pinned prerequisite disappeared after integration.
 func (m *Manager) VerifyPrerequisiteChangeSets(ctx context.Context, opened *store.Store, taskID string, workspace model.RunWorkspace, descendant string) error {
+	err := m.verifyPrerequisiteChangeSets(ctx, opened, taskID, workspace, descendant)
+	persistExceptionalIntegrationIncident(opened, taskID, err)
+	return err
+}
+
+func (m *Manager) verifyPrerequisiteChangeSets(ctx context.Context, opened *store.Store, taskID string, workspace model.RunWorkspace, descendant string) error {
 	handoffs, err := opened.ListPrerequisiteHandoffs(ctx, taskID)
 	if err != nil {
 		return err
