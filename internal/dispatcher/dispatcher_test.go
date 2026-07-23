@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
@@ -410,5 +411,258 @@ fi`)
 	}
 	if detail.Task.Status != model.TaskStatusDone || judged != 2 || spawned != 2 {
 		t.Fatalf("unexpected goal result: status=%s judged=%d spawned=%d detail=%#v", detail.Task.Status, judged, spawned, detail)
+	}
+}
+
+func TestDispatcherUsesConfiguredFallbackWithoutConsumingRetry(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	cliPath := buildAutogora(t)
+	primaryCommand := executableFixture(t, `
+printf '%s\n' 'quota exceeded' >&2
+exit 75`)
+	fallbackCommand := executableFixture(t, `
+test "$AUTOGORA_AGENT_PROFILE" = "claude-backup"
+test "$AUTOGORA_MODEL" = "claude-fallback-model"
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "fallback completed" >/dev/null`)
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{WorkerAgents: []string{"codex-primary"}},
+		Agents: []agentconfig.Agent{
+			{ID: "codex-primary", Runtime: model.RuntimeCodex, Command: primaryCommand, Model: "codex-primary-model", Enabled: true, MaxConcurrent: 1,
+				Roles: []agentconfig.Role{agentconfig.RoleWorker}, Fallbacks: []string{"claude-backup"}},
+			{ID: "claude-backup", Runtime: model.RuntimeClaude, Command: fallbackCommand, Model: "claude-fallback-model", Enabled: true, MaxConcurrent: 1,
+				Roles: []agentconfig.Role{agentconfig.RoleWorker}},
+		},
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "codex-primary"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "fallback work", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+
+	options := Options{DBPath: dbPath, CLIPath: cliPath, Board: "default", Once: true, MaxWorkers: 1,
+		RateLimitCooldown: durationValue(time.Hour), AutoDecompose: boolValue(false), AgentConfig: &config, Getenv: func(string) string { return "" }}
+	if err := Run(ctx, options); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryHealth, err := check.GetAgentHealth(ctx, "codex-primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check.Close()
+	if first.Task.Status != model.TaskStatusReady || first.Task.FailureCount != 0 || len(first.Runs) != 1 || first.Runs[0].Status != model.RunStatusRateLimited {
+		t.Fatalf("primary availability failure consumed retry or stranded task: %#v", first)
+	}
+	if primaryHealth.Status != model.AgentHealthRateLimited || primaryHealth.CooldownUntil == nil || primaryHealth.LastRunID == nil || *primaryHealth.LastRunID != first.Runs[0].ID {
+		t.Fatalf("primary health was not quarantined: %#v", primaryHealth)
+	}
+	if len(first.RunAgentConfigs) != 1 || first.RunAgentConfigs[0].Profile != "codex-primary" || first.RunAgentConfigs[0].Runtime != model.RuntimeCodex ||
+		first.RunAgentConfigs[0].Model != "codex-primary-model" || first.RunAgentConfigs[0].Source != "global_profile" || first.RunAgentConfigs[0].FallbackFrom != nil {
+		t.Fatalf("primary run configuration was not pinned: %#v", first.RunAgentConfigs)
+	}
+
+	if err := Run(ctx, options); err != nil {
+		t.Fatal(err)
+	}
+	check, err = manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	completed, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackHealth, err := check.GetAgentHealth(ctx, "claude-backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Task.Status != model.TaskStatusDone || completed.Task.FailureCount != 0 || len(completed.Runs) != 2 {
+		t.Fatalf("fallback did not complete cleanly: %#v", completed)
+	}
+	var fallbackConfig *model.RunAgentConfig
+	for index := range completed.RunAgentConfigs {
+		if completed.RunAgentConfigs[index].Profile == "claude-backup" {
+			fallbackConfig = &completed.RunAgentConfigs[index]
+			break
+		}
+	}
+	if fallbackConfig == nil || fallbackConfig.Runtime != model.RuntimeClaude || fallbackConfig.Model != "claude-fallback-model" ||
+		fallbackConfig.Source != "fallback" || fallbackConfig.FallbackFrom == nil || *fallbackConfig.FallbackFrom != "codex-primary" {
+		t.Fatalf("fallback run configuration was not audited: %#v", completed.RunAgentConfigs)
+	}
+	if fallbackHealth.Status != model.AgentHealthReady || fallbackHealth.LastRunID == nil || *fallbackHealth.LastRunID != fallbackConfig.RunID {
+		t.Fatalf("successful fallback health was not recorded: %#v", fallbackHealth)
+	}
+}
+
+func TestDispatcherQuarantinesMissingConfiguredCommandWithoutConsumingRetry(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	missingCommand := filepath.Join(t.TempDir(), "missing", "codex")
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{WorkerAgents: []string{"missing-codex"}},
+		Agents: []agentconfig.Agent{{ID: "missing-codex", Runtime: model.RuntimeCodex, Command: missingCommand, Model: "configured-model",
+			Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleWorker}}},
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "missing-codex"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "missing command", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+
+	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Board: "default", Once: true, MaxWorkers: 1,
+		AutoDecompose: boolValue(false), AgentConfig: &config, Getenv: func(string) string { return "" }}); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	health, err := check.GetAgentHealth(ctx, "missing-codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusReady || detail.Task.FailureCount != 0 || len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusSpawnFailed {
+		t.Fatalf("missing executable consumed retry or stranded task: %#v", detail)
+	}
+	if health.Status != model.AgentHealthMissing || health.LastRunID == nil || *health.LastRunID != detail.Runs[0].ID || health.LastError == nil {
+		t.Fatalf("missing executable health was not recorded: %#v", health)
+	}
+	if len(detail.RunAgentConfigs) != 1 || detail.RunAgentConfigs[0].Profile != "missing-codex" || detail.RunAgentConfigs[0].Source != "global_profile" {
+		t.Fatalf("missing agent run was not auditable: %#v", detail.RunAgentConfigs)
+	}
+}
+
+func TestDispatcherPreservesPartialWorktreeAndDoesNotRunFallback(t *testing.T) {
+	ctx := context.Background()
+	manager, dbPath := testManager(t)
+	repository := gitRepositoryFixture(t)
+	if _, err := manager.Update("default", boards.Update{DefaultWorkdir: store.OptionalString{Set: true, Value: &repository}}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "fallback-ran")
+	t.Setenv("AUTOGORA_TEST_FALLBACK_MARKER", marker)
+	primaryCommand := executableFixture(t, `
+printf '%s\n' 'unfinished change' > "$AUTOGORA_WORKSPACE/partial.txt"
+exit 75`)
+	fallbackCommand := executableFixture(t, `
+touch "$AUTOGORA_TEST_FALLBACK_MARKER"
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "fallback should not run" >/dev/null`)
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1, AllowWrites: true},
+		Defaults:      agentconfig.Defaults{WorkerAgents: []string{"primary-writer"}},
+		Agents: []agentconfig.Agent{
+			{ID: "primary-writer", Runtime: model.RuntimeCodex, Command: primaryCommand, Model: "writer-model", Enabled: true, MaxConcurrent: 1,
+				Roles: []agentconfig.Role{agentconfig.RoleWorker}, Fallbacks: []string{"fallback-writer"}},
+			{ID: "fallback-writer", Runtime: model.RuntimeClaude, Command: fallbackCommand, Model: "fallback-model", Enabled: true, MaxConcurrent: 1,
+				Roles: []agentconfig.Role{agentconfig.RoleWorker}},
+		},
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "primary-writer"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "preserve partial edits", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Close()
+	options := Options{DBPath: dbPath, CLIPath: buildAutogora(t), Board: "default", Once: true, MaxWorkers: 1, AllowWrites: true,
+		RateLimitCooldown: durationValue(time.Hour), AutoDecompose: boolValue(false), AgentConfig: &config, Getenv: func(string) string { return "" }}
+
+	if err := Run(ctx, options); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(ctx, options); err != nil {
+		t.Fatal(err)
+	}
+	check, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	detail, err := check.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || detail.Task.BlockReason == nil ||
+		!strings.Contains(*detail.Task.BlockReason, "partial changes remain") {
+		t.Fatalf("partial availability failure did not block for review: %#v", detail)
+	}
+	if len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked || len(detail.RunWorkspaces) != 1 {
+		t.Fatalf("partial run history is incomplete: %#v", detail)
+	}
+	workspace := detail.RunWorkspaces[0]
+	if workspace.Kind != model.WorkspaceWorktree || !workspace.Generated {
+		t.Fatalf("expected an isolated generated worktree: %#v", workspace)
+	}
+	contents, err := os.ReadFile(filepath.Join(workspace.Path, "partial.txt"))
+	if err != nil || string(contents) != "unfinished change\n" {
+		t.Fatalf("partial worktree was not preserved: contents=%q err=%v workspace=%#v", contents, err, workspace)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("fallback ran after partial edits were detected: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repository, "partial.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial edit leaked into the user checkout: %v", err)
+	}
+}
+
+func TestDecompositionProfileOverridesCannotRelaxConfiguredPolicy(t *testing.T) {
+	manager, _ := testManager(t)
+	profiles := []boards.Profile{{Name: "guarded", Runtime: model.RuntimeCodex, Model: "board-model", Disabled: true, MaxConcurrent: 2}}
+	if _, err := manager.Update("default", boards.Update{Orchestration: &boards.OrchestrationUpdate{Profiles: &profiles}}); err != nil {
+		t.Fatal(err)
+	}
+	config := agentconfig.Config{
+		SchemaVersion: agentconfig.SchemaVersion,
+		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1},
+		Defaults:      agentconfig.Defaults{WorkerAgents: []string{"guarded"}},
+		Agents: []agentconfig.Agent{{ID: "guarded", Runtime: model.RuntimeCodex, Command: "/configured/codex", Model: "global-model",
+			Enabled: true, MaxConcurrent: 4, Roles: []agentconfig.Role{agentconfig.RoleWorker}}},
+	}
+	configured, err := configuredProfiles(manager, "default", Options{AgentConfig: &config, Getenv: func(string) string { return "" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergeDecompositionProfiles(configured, []orchestration.ProfileRoute{{
+		Name: "guarded", Runtime: model.RuntimeClaude, Model: "cli-model", Disabled: false, MaxConcurrent: 20,
+	}})
+	if len(merged) != 1 {
+		t.Fatalf("unexpected merged profiles: %#v", merged)
+	}
+	profile := merged[0]
+	if profile.Runtime != model.RuntimeCodex || profile.Model != "board-model" || !profile.Disabled || profile.MaxConcurrent != 2 {
+		t.Fatalf("CLI decomposition override relaxed configured execution policy: %#v", profile)
 	}
 }

@@ -128,6 +128,8 @@ func TestClearExpiredAgentCooldowns(t *testing.T) {
 		{AgentID: "expired", Status: model.AgentHealthRateLimited, CooldownUntil: &expired},
 		{AgentID: "future", Status: model.AgentHealthRateLimited, CooldownUntil: &future},
 		{AgentID: "unhealthy", Status: model.AgentHealthUnhealthy, CooldownUntil: &expired},
+		{AgentID: "auth", Status: model.AgentHealthAuthRequired, CooldownUntil: &future},
+		{AgentID: "missing", Status: model.AgentHealthMissing},
 	} {
 		if _, err := store.SetAgentHealth(ctx, input); err != nil {
 			t.Fatal(err)
@@ -144,8 +146,8 @@ func TestClearExpiredAgentCooldowns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("cleared %d cooldowns, want 1", count)
+	if count != 2 {
+		t.Fatalf("cleared %d cooldowns, want 2", count)
 	}
 	cleared, err := store.GetAgentHealth(ctx, "expired")
 	if err != nil {
@@ -158,7 +160,12 @@ func TestClearExpiredAgentCooldowns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unhealthy.Status != model.AgentHealthUnhealthy || unhealthy.CooldownUntil == nil {
-		t.Fatalf("non-rate-limit cooldown changed: %+v", unhealthy)
+	if unhealthy.Status != model.AgentHealthUnknown || unhealthy.CooldownUntil != nil {
+		t.Fatalf("expired unhealthy cooldown was not cleared: %+v", unhealthy)
+	}
+	auth, _ := store.GetAgentHealth(ctx, "auth")
+	missing, _ := store.GetAgentHealth(ctx, "missing")
+	if !IsAgentUnavailable(auth, current) || !IsAgentUnavailable(missing, current) {
+		t.Fatalf("active availability failures became eligible: auth=%+v missing=%+v", auth, missing)
 	}
 }

@@ -222,6 +222,13 @@ func TestValidateRejectsInvalidRegistriesAndFallbackCycles(t *testing.T) {
 			value.Fallbacks = []string{"missing"}
 			return value
 		}()}}, want: "unknown fallback"},
+		{name: "fallback without worker role", config: Config{SchemaVersion: 1, Supervisor: Supervisor{MaxWorkers: 1}, Agents: []Agent{
+			func() Agent {
+				value := agent("worker", model.RuntimeCodex, RoleWorker)
+				value.Fallbacks = []string{"planner"}
+				return value
+			}(), agent("planner", model.RuntimeClaude, RolePlanner),
+		}}, want: "without the worker role"},
 		{name: "self fallback", config: Config{SchemaVersion: 1, Supervisor: Supervisor{MaxWorkers: 1}, Agents: []Agent{func() Agent {
 			value := agent("worker", model.RuntimeCodex, RoleWorker)
 			value.Fallbacks = []string{"worker"}

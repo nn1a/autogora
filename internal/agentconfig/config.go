@@ -287,8 +287,12 @@ func Validate(config Config) error {
 			if fallback == agent.ID {
 				return fmt.Errorf("agent %q cannot fall back to itself", agent.ID)
 			}
-			if _, exists := agents[fallback]; !exists {
+			target, exists := agents[fallback]
+			if !exists {
 				return fmt.Errorf("agent %q references unknown fallback %q", agent.ID, fallback)
+			}
+			if hasRole(agent, RoleWorker) && !hasRole(target, RoleWorker) {
+				return fmt.Errorf("worker agent %q references fallback %q without the worker role", agent.ID, fallback)
 			}
 		}
 	}

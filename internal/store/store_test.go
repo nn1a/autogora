@@ -219,11 +219,12 @@ func TestManagedBlockWaitsForProcessExit(t *testing.T) {
 	if requested.Task.Status != model.TaskStatusRunning || requested.Task.CurrentRunID == nil {
 		t.Fatalf("block request released the active worker: %+v", requested.Task)
 	}
-	blocked, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
+	blocked, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 75)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.Task.Status != model.TaskStatusBlocked || blocked.Task.CurrentRunID != nil || blocked.TerminalRequests[0].FinalizedAt == nil {
+	if blocked.Task.Status != model.TaskStatusBlocked || blocked.Task.CurrentRunID != nil || blocked.TerminalRequests[0].FinalizedAt == nil ||
+		blocked.Runs[0].ExitCode == nil || *blocked.Runs[0].ExitCode != 75 {
 		t.Fatalf("block was not finalized after exit: %+v", blocked)
 	}
 }

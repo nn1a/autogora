@@ -144,7 +144,8 @@ func (s *Store) ClearExpiredAgentCooldowns(ctx context.Context, current time.Tim
 	timestamp := current.UTC().Format("2006-01-02T15:04:05.000Z")
 	result, err := s.db.ExecContext(ctx, `UPDATE agent_health
 		SET status = 'unknown', cooldown_until = NULL, updated_at = ?
-		WHERE status = 'rate_limited' AND cooldown_until IS NOT NULL AND cooldown_until <= ?`, timestamp, timestamp)
+		WHERE status IN ('missing', 'auth_required', 'rate_limited', 'unhealthy')
+			AND cooldown_until IS NOT NULL AND cooldown_until <= ?`, timestamp, timestamp)
 	if err != nil {
 		return 0, fmt.Errorf("clear expired agent cooldowns: %w", err)
 	}
@@ -156,7 +157,11 @@ func (s *Store) ClearExpiredAgentCooldowns(ctx context.Context, current time.Tim
 func IsAgentUnavailable(health model.AgentHealth, current time.Time) bool {
 	switch health.Status {
 	case model.AgentHealthMissing, model.AgentHealthAuthRequired, model.AgentHealthUnhealthy:
-		return true
+		if health.CooldownUntil == nil {
+			return true
+		}
+		until, err := time.Parse(time.RFC3339Nano, *health.CooldownUntil)
+		return err != nil || current.Before(until)
 	case model.AgentHealthRateLimited:
 		if health.CooldownUntil == nil {
 			return true

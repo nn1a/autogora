@@ -19,6 +19,10 @@ type RecordRunAgentConfigInput struct {
 	Provider     string
 	Source       string
 	FallbackFrom *string
+	// AllowRuntimeOverride is reserved for the dispatcher before spawn. It lets
+	// an explicitly configured fallback agent use a different runtime while
+	// preserving the task's preferred profile route.
+	AllowRuntimeOverride bool
 }
 
 const runAgentConfigColumns = `run_id, task_id, profile, runtime, model, provider, source,
@@ -56,6 +60,17 @@ func (s *Store) ListTaskRunAgentConfigs(ctx context.Context, taskID string) ([]m
 		result = append(result, value)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) CountActiveAgentRuns(ctx context.Context, profile string) (int, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		return 0, errors.New("agent profile cannot be empty")
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_agent_configs c
+		JOIN task_runs r ON r.id = c.run_id WHERE c.profile = ? AND r.status = 'running'`, profile).Scan(&count)
+	return count, err
 }
 
 func normalizeRunAgentConfigInput(input RecordRunAgentConfigInput) RecordRunAgentConfigInput {
@@ -109,7 +124,7 @@ func (s *Store) RecordRunAgentConfig(ctx context.Context, scope RunScope, raw Re
 		if err != nil {
 			return err
 		}
-		if input.Runtime != run.Runtime {
+		if input.Runtime != run.Runtime && !input.AllowRuntimeOverride {
 			return fmt.Errorf("run agent config runtime %s does not match active run runtime %s", input.Runtime, run.Runtime)
 		}
 		existing, err := scanRunAgentConfig(tx.QueryRowContext(ctx, "SELECT "+runAgentConfigColumns+
@@ -123,6 +138,11 @@ func (s *Store) RecordRunAgentConfig(ctx context.Context, scope RunScope, raw Re
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		if input.Runtime != run.Runtime {
+			if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET runtime = ? WHERE id = ? AND status = 'running'", input.Runtime, run.ID); err != nil {
+				return fmt.Errorf("set fallback run runtime: %w", err)
+			}
 		}
 		timestamp := now()
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_agent_configs(

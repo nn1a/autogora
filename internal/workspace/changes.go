@@ -22,6 +22,28 @@ type ChangeSnapshot struct {
 	ChangedFiles   []string
 }
 
+func (m *Manager) HasChanges(ctx context.Context, workspace model.RunWorkspace) (bool, error) {
+	if workspace.Kind == model.WorkspaceScratch {
+		entries, err := os.ReadDir(workspace.Path)
+		if err != nil {
+			return false, err
+		}
+		return len(entries) > 0, nil
+	}
+	if workspace.Kind != model.WorkspaceWorktree || workspace.RepositoryPath == nil {
+		return false, nil
+	}
+	if err := validateWorktree(ctx, *workspace.RepositoryPath, workspace.Path); err != nil {
+		return false, err
+	}
+	output, err := gitOutputWithEnv(ctx, workspace.Path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return false, err
+	}
+	return len(output) > 0, nil
+}
+
 func gitOutputWithEnv(ctx context.Context, directory string, environment map[string]string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", directory}, args...)...)
 	command.Env = make([]string, 0, len(os.Environ())+len(environment))

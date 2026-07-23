@@ -171,3 +171,28 @@ func TestClaimRespectsAgentAvailabilityAndConcurrency(t *testing.T) {
 		t.Fatalf("skipped tasks changed state: second=%s paused=%s", secondDetail.Task.Status, pausedDetail.Task.Status)
 	}
 }
+
+func TestRecordRunAgentConfigCanPinDispatcherFallbackRuntime(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	claim := claimAgentConfigTask(t, opened, model.RuntimeCodex)
+	primary := "codex-primary"
+	config, err := opened.RecordRunAgentConfig(ctx, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, RecordRunAgentConfigInput{
+		Profile: "claude-backup", Runtime: model.RuntimeClaude, Model: "claude-model", Source: "fallback",
+		FallbackFrom: &primary, AllowRuntimeOverride: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := opened.GetRun(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Runtime != model.RuntimeClaude || run.Run.Runtime != model.RuntimeClaude || config.FallbackFrom == nil || *config.FallbackFrom != primary {
+		t.Fatalf("fallback runtime was not pinned: config=%#v run=%#v", config, run.Run)
+	}
+}

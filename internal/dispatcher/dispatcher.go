@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/notifications"
@@ -38,6 +40,7 @@ type Options struct {
 	HeartbeatMaxStale        time.Duration
 	CrashGrace               *time.Duration
 	RateLimitCooldown        *time.Duration
+	AgentRetryCooldown       *time.Duration
 	FailureLimit             int
 	NotificationLimit        int
 	NotificationTimeout      time.Duration
@@ -56,6 +59,7 @@ type Options struct {
 	ClineApprovalDir         string
 	WorkingDirectory         string
 	Getenv                   func(string) string
+	AgentConfig              *agentconfig.Config
 	OnLog                    func(string)
 }
 
@@ -82,6 +86,10 @@ func (o *Options) normalize() {
 	if o.RateLimitCooldown == nil {
 		value := time.Minute
 		o.RateLimitCooldown = &value
+	}
+	if o.AgentRetryCooldown == nil {
+		value := 5 * time.Minute
+		o.AgentRetryCooldown = &value
 	}
 	if o.NotificationLimit < 1 {
 		o.NotificationLimit = 25
@@ -110,6 +118,58 @@ func (o Options) log(format string, values ...any) {
 func parseTimestamp(value string) time.Time {
 	parsed, _ := time.Parse(time.RFC3339Nano, value)
 	return parsed
+}
+
+type agentAvailabilityFailure struct {
+	Status  model.AgentHealthStatus
+	Outcome model.RunStatus
+}
+
+func containsAny(value string, patterns ...string) bool {
+	for _, pattern := range patterns {
+		if strings.Contains(value, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyAgentAvailability(execution TurnExecution) (agentAvailabilityFailure, bool) {
+	if execution.SpawnError != nil {
+		message := strings.ToLower(execution.SpawnError.Error())
+		if errors.Is(execution.SpawnError, exec.ErrNotFound) || errors.Is(execution.SpawnError, os.ErrNotExist) ||
+			containsAny(message, "executable file not found", "no such file or directory", "cannot find the file") {
+			return agentAvailabilityFailure{Status: model.AgentHealthMissing, Outcome: model.RunStatusSpawnFailed}, true
+		}
+	}
+	message := strings.ToLower(execution.Output)
+	if execution.SpawnError != nil {
+		message += "\n" + strings.ToLower(execution.SpawnError.Error())
+	}
+	if execution.Code == 75 || containsAny(message,
+		"rate limit", "rate_limit", "too many requests", "resource_exhausted", "resource exhausted",
+		"quota exceeded", "usage limit", "usage_limit", "credit balance", "http 429", "status 429", `"status":429`) {
+		return agentAvailabilityFailure{Status: model.AgentHealthRateLimited, Outcome: model.RunStatusRateLimited}, true
+	}
+	if containsAny(message,
+		"authentication required", "authentication failed", "not logged in", "please log in", "please login",
+		"unauthorized", "invalid api key", "invalid_api_key", "api key not found", "missing api key",
+		"http 401", "status 401", `"status":401`) {
+		return agentAvailabilityFailure{Status: model.AgentHealthAuthRequired, Outcome: model.RunStatusFailed}, true
+	}
+	return agentAvailabilityFailure{}, false
+}
+
+func agentCooldown(status model.AgentHealthStatus, rateLimit, retry time.Duration) *string {
+	duration := retry
+	if status == model.AgentHealthRateLimited {
+		duration = rateLimit
+	}
+	if duration < 0 {
+		return nil
+	}
+	value := time.Now().Add(duration).UTC().Format(time.RFC3339Nano)
+	return &value
 }
 
 func recoverAbandonedRuns(ctx context.Context, opened *store.Store, board string, options Options) error {
@@ -199,27 +259,116 @@ func boardProfiles(configured []boards.Profile) []orchestration.ProfileRoute {
 	return result
 }
 
-func configuredProfiles(manager *boards.Manager, board string, options Options) ([]orchestration.ProfileRoute, error) {
-	metadata, err := manager.Read(board)
-	if err != nil {
-		return nil, err
-	}
-	profiles := boardProfiles(metadata.Orchestration.Profiles)
-	if options.DecompositionProfiles != nil {
-		profiles = append([]orchestration.ProfileRoute{}, options.DecompositionProfiles...)
-	}
-	return profiles, nil
+type configuredProfileSet struct {
+	Profiles       []orchestration.ProfileRoute
+	Commands       map[string]string
+	Sources        map[string]string
+	DefaultWorkers []string
+	Config         agentconfig.Config
 }
 
-func claimProfilePolicy(manager *boards.Manager, board string, options Options) ([]string, map[string]int, error) {
-	profiles, err := configuredProfiles(manager, board, options)
+func hasAgentRole(agent agentconfig.Agent, role agentconfig.Role) bool {
+	for _, candidate := range agent.Roles {
+		if candidate == role {
+			return true
+		}
+	}
+	return false
+}
+
+func concurrencyCap(global, board int) int {
+	switch {
+	case global > 0 && board > 0:
+		return min(global, board)
+	case global > 0:
+		return global
+	default:
+		return board
+	}
+}
+
+func configuredProfiles(manager *boards.Manager, board string, options Options) (configuredProfileSet, error) {
+	metadata, err := manager.Read(board)
+	if err != nil {
+		return configuredProfileSet{}, err
+	}
+	config := agentconfig.Default()
+	if options.AgentConfig != nil {
+		config = agentconfig.Normalize(*options.AgentConfig)
+		if err := agentconfig.Validate(config); err != nil {
+			return configuredProfileSet{}, fmt.Errorf("validate agent configuration: %w", err)
+		}
+	} else {
+		config, err = agentconfig.Load(agentconfig.Options{Getenv: options.Getenv})
+		if err != nil {
+			return configuredProfileSet{}, err
+		}
+	}
+	set := configuredProfileSet{
+		Profiles:       make([]orchestration.ProfileRoute, 0, len(config.Agents)+len(metadata.Orchestration.Profiles)),
+		Commands:       map[string]string{},
+		Sources:        map[string]string{},
+		DefaultWorkers: append([]string{}, config.Defaults.WorkerAgents...),
+		Config:         config,
+	}
+	indexes := map[string]int{}
+	for _, agent := range config.Agents {
+		if !hasAgentRole(agent, agentconfig.RoleWorker) {
+			continue
+		}
+		indexes[agent.ID] = len(set.Profiles)
+		set.Profiles = append(set.Profiles, orchestration.ProfileRoute{
+			Name: agent.ID, Runtime: agent.Runtime, Model: agent.Model, Provider: agent.Provider,
+			Disabled: !agent.Enabled, MaxConcurrent: agent.MaxConcurrent, Fallbacks: append([]string{}, agent.Fallbacks...),
+		})
+		set.Commands[agent.ID] = agent.Command
+		set.Sources[agent.ID] = "global_profile"
+	}
+	for _, profile := range boardProfiles(metadata.Orchestration.Profiles) {
+		index, registered := indexes[profile.Name]
+		if !registered {
+			indexes[profile.Name] = len(set.Profiles)
+			set.Profiles = append(set.Profiles, profile)
+			set.Sources[profile.Name] = "board_profile"
+			continue
+		}
+		global := set.Profiles[index]
+		// Runtime, disabled state, command, and the global concurrency cap are
+		// registry policy. A board may specialize routing metadata and lower
+		// concurrency without turning an unavailable executable back on.
+		if profile.Model != "" {
+			global.Model = profile.Model
+		}
+		if profile.Provider != "" {
+			global.Provider = profile.Provider
+		}
+		if profile.Description != "" {
+			global.Description = profile.Description
+		}
+		global.Disabled = global.Disabled || profile.Disabled
+		global.MaxConcurrent = concurrencyCap(global.MaxConcurrent, profile.MaxConcurrent)
+		global.Priority = profile.Priority
+		if len(profile.Fallbacks) > 0 {
+			global.Fallbacks = append([]string{}, profile.Fallbacks...)
+		}
+		set.Profiles[index] = global
+		set.Sources[profile.Name] = "board_profile"
+	}
+	set.Profiles = orchestration.ResolveProfileRoutes(nil, set.Profiles)
+	return set, nil
+}
+
+func claimProfilePolicy(ctx context.Context, manager *boards.Manager, opened *store.Store, board string, options Options) ([]string, map[string]int, error) {
+	configured, err := configuredProfiles(manager, board, options)
 	if err != nil {
 		return nil, nil, err
 	}
 	excluded := make([]string, 0)
 	limits := map[string]int{}
-	for _, profile := range profiles {
-		if profile.Disabled {
+	for _, profile := range configured.Profiles {
+		if _, available, availabilityErr := selectAvailableProfile(ctx, opened, profile.Name, configured.Profiles); availabilityErr != nil {
+			return nil, nil, availabilityErr
+		} else if !available {
 			excluded = append(excluded, profile.Name)
 			continue
 		}
@@ -230,47 +379,179 @@ func claimProfilePolicy(manager *boards.Manager, board string, options Options) 
 	return excluded, limits, nil
 }
 
-func resolveRunProfile(manager *boards.Manager, task model.Task, options Options) (orchestration.ProfileRoute, string, error) {
+func selectAvailableProfile(ctx context.Context, opened *store.Store, desired string, profiles []orchestration.ProfileRoute) (orchestration.ProfileRoute, bool, error) {
+	byName := make(map[string]orchestration.ProfileRoute, len(profiles))
+	for _, profile := range profiles {
+		if name := strings.TrimSpace(profile.Name); name != "" {
+			byName[name] = profile
+		}
+	}
+	queue, seen := []string{desired}, map[string]bool{}
+	for len(queue) > 0 {
+		candidateName := queue[0]
+		queue = queue[1:]
+		if seen[candidateName] {
+			continue
+		}
+		seen[candidateName] = true
+		candidate, exists := byName[candidateName]
+		if !exists {
+			continue
+		}
+		queue = append(queue, candidate.Fallbacks...)
+		if !orchestration.RunnableProfileRoute(candidate) {
+			continue
+		}
+		health, err := opened.GetAgentHealth(ctx, candidate.Name)
+		if err != nil {
+			return orchestration.ProfileRoute{}, false, err
+		}
+		if store.IsAgentUnavailable(health, time.Now()) {
+			continue
+		}
+		if candidate.MaxConcurrent > 0 {
+			active, err := opened.CountActiveAgentRuns(ctx, candidate.Name)
+			if err != nil {
+				return orchestration.ProfileRoute{}, false, err
+			}
+			if active >= candidate.MaxConcurrent {
+				continue
+			}
+		}
+		return candidate, true, nil
+	}
+	return orchestration.ProfileRoute{}, false, nil
+}
+
+type resolvedRunProfile struct {
+	orchestration.ProfileRoute
+	Source       string
+	FallbackFrom *string
+	Command      string
+}
+
+func resolveRunProfile(ctx context.Context, manager *boards.Manager, opened *store.Store, task model.Task, options Options) (resolvedRunProfile, error) {
 	name := string(task.Runtime) + "-worker"
 	if task.Assignee != nil && strings.TrimSpace(*task.Assignee) != "" {
 		name = strings.TrimSpace(*task.Assignee)
 	}
-	resolved := orchestration.ProfileRoute{Name: name, Runtime: task.Runtime}
-	source := "task_route"
-	profiles, err := configuredProfiles(manager, task.Board, options)
+	taskRoute := orchestration.ProfileRoute{Name: name, Runtime: task.Runtime}
+	configured, err := configuredProfiles(manager, task.Board, options)
 	if err != nil {
-		return orchestration.ProfileRoute{}, "", err
+		return resolvedRunProfile{}, err
 	}
-	for _, profile := range profiles {
-		if profile.Name != name {
-			continue
+	configuredDesired := false
+	for _, profile := range configured.Profiles {
+		if strings.TrimSpace(profile.Name) != "" {
+			configuredDesired = configuredDesired || profile.Name == name
 		}
-		if profile.Disabled {
-			return orchestration.ProfileRoute{}, "", fmt.Errorf("worker profile is disabled: %s", name)
-		}
-		if profile.Runtime == task.Runtime {
-			resolved, source = profile, "board_profile"
-		}
-		break
+	}
+	profiles := configured.Profiles
+	if !configuredDesired {
+		profiles = append(append([]orchestration.ProfileRoute{}, profiles...), taskRoute)
+	}
+	selected, available, err := selectAvailableProfile(ctx, opened, name, profiles)
+	if err != nil {
+		return resolvedRunProfile{}, err
+	}
+	if !available {
+		return resolvedRunProfile{}, fmt.Errorf("no available agent for profile %s", name)
+	}
+	source := configured.Sources[selected.Name]
+	if source == "" {
+		source = "board_profile"
+	}
+	if selected.Name != name {
+		source = "fallback"
+	} else if !configuredDesired {
+		source = "task_route"
 	}
 	getenv := options.Getenv
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	prefix := "AUTOGORA_" + strings.ToUpper(string(task.Runtime))
-	if strings.TrimSpace(resolved.Model) == "" {
-		resolved.Model = strings.TrimSpace(getenv(prefix + "_MODEL"))
-		if resolved.Model != "" {
-			source = "environment"
-		}
+	prefix := "AUTOGORA_" + strings.ToUpper(string(selected.Runtime))
+	if strings.TrimSpace(selected.Model) == "" {
+		selected.Model = strings.TrimSpace(getenv(prefix + "_MODEL"))
 	}
-	if strings.TrimSpace(resolved.Provider) == "" {
-		resolved.Provider = strings.TrimSpace(getenv(prefix + "_PROVIDER"))
+	if strings.TrimSpace(selected.Provider) == "" {
+		selected.Provider = strings.TrimSpace(getenv(prefix + "_PROVIDER"))
 	}
-	if resolved.Model == "" && source == "task_route" {
+	if selected.Model == "" && source == "task_route" {
 		source = "cli_default"
 	}
-	return resolved, source, nil
+	resolved := resolvedRunProfile{ProfileRoute: selected, Source: source, Command: configured.Commands[selected.Name]}
+	if selected.Name != name {
+		resolved.FallbackFrom = &name
+	}
+	return resolved, nil
+}
+
+func mergeDecompositionProfiles(configured configuredProfileSet, overrides []orchestration.ProfileRoute) []orchestration.ProfileRoute {
+	profiles := append([]orchestration.ProfileRoute{}, configured.Profiles...)
+	indexes := make(map[string]int, len(profiles))
+	for index, profile := range profiles {
+		indexes[profile.Name] = index
+	}
+	for _, override := range overrides {
+		override.Name = strings.TrimSpace(override.Name)
+		if override.Name == "" {
+			continue
+		}
+		_, exists := indexes[override.Name]
+		if !exists {
+			indexes[override.Name] = len(profiles)
+			profiles = append(profiles, override)
+			continue
+		}
+		// CLI decomposition routes may add ephemeral workers, but an existing
+		// global or board profile remains authoritative. Otherwise --profile,
+		// whose syntax cannot express the full execution policy, could erase a
+		// pinned model, disabled state, or concurrency cap.
+	}
+	return orchestration.ResolveProfileRoutes(nil, profiles)
+}
+
+func firstConfiguredAgent(config agentconfig.Config, ids []string, role agentconfig.Role) (agentconfig.Agent, bool) {
+	for _, id := range ids {
+		agent, found := config.Find(id)
+		if found && agent.Enabled && hasAgentRole(agent, role) {
+			return agent, true
+		}
+	}
+	return agentconfig.Agent{}, false
+}
+
+func plannerConfiguration(metadata boards.Metadata, configured configuredProfileSet, options Options) (model.Runtime, string, string, string) {
+	if options.PlannerRuntime != "" {
+		return options.PlannerRuntime, strings.TrimSpace(options.PlannerModel), strings.TrimSpace(options.PlannerProvider), ""
+	}
+	runtime := metadata.Orchestration.PlannerRuntime
+	modelName := strings.TrimSpace(metadata.Orchestration.PlannerModel)
+	provider := strings.TrimSpace(metadata.Orchestration.PlannerProvider)
+	command := ""
+	// A board with an explicitly pinned planner keeps that choice. New boards
+	// have an unpinned Codex default, so the global planner order supplies the
+	// actual runtime and model when one has been configured.
+	if modelName == "" && provider == "" {
+		if agent, found := firstConfiguredAgent(configured.Config, configured.Config.Defaults.PlannerAgents, agentconfig.RolePlanner); found {
+			runtime, modelName, provider, command = agent.Runtime, agent.Model, agent.Provider, agent.Command
+		}
+	}
+	if value := strings.TrimSpace(options.PlannerModel); value != "" {
+		modelName = value
+	}
+	if value := strings.TrimSpace(options.PlannerProvider); value != "" {
+		provider = value
+	}
+	return runtime, modelName, provider, command
+}
+
+func judgeConfiguration(metadata boards.Metadata, configured configuredProfileSet, options Options) (model.Runtime, string, string, string) {
+	if agent, found := firstConfiguredAgent(configured.Config, configured.Config.Defaults.JudgeAgents, agentconfig.RoleJudge); found {
+		return agent.Runtime, agent.Model, agent.Provider, agent.Command
+	}
+	return plannerConfiguration(metadata, configured, options)
 }
 
 func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) {
@@ -298,21 +579,16 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 		if options.AutoDecomposePerTick > 0 {
 			boardRemaining = min(remaining, options.AutoDecomposePerTick)
 		}
-		plannerRuntime := options.PlannerRuntime
-		if plannerRuntime == "" {
-			plannerRuntime = metadata.Orchestration.PlannerRuntime
+		configured, err := configuredProfiles(manager, board, options)
+		if err != nil {
+			options.log("auto-decompose profiles failed %s: %v", board, err)
+			continue
 		}
-		plannerModel, plannerProvider := strings.TrimSpace(options.PlannerModel), strings.TrimSpace(options.PlannerProvider)
-		if plannerModel == "" && options.PlannerRuntime == "" {
-			plannerModel = metadata.Orchestration.PlannerModel
-		}
-		if plannerProvider == "" && options.PlannerRuntime == "" {
-			plannerProvider = metadata.Orchestration.PlannerProvider
-		}
+		plannerRuntime, plannerModel, plannerProvider, plannerCommand := plannerConfiguration(metadata, configured, options)
 		planner := options.DecompositionPlanner
 		if planner == nil {
 			planner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: plannerRuntime, Model: plannerModel,
-				Provider: plannerProvider, CWD: options.WorkingDirectory, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
+				Provider: plannerProvider, Command: plannerCommand, CWD: options.WorkingDirectory, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
 			if err != nil {
 				options.log("auto-decompose planner failed %s: %v", board, err)
 				continue
@@ -330,19 +606,27 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 			opened.Close()
 			continue
 		}
-		configuredProfiles := boardProfiles(metadata.Orchestration.Profiles)
-		if options.DecompositionProfiles != nil {
-			configuredProfiles = options.DecompositionProfiles
-		}
-		profiles := orchestration.ResolveProfileRoutes(discovered, configuredProfiles)
+		decompositionProfiles := mergeDecompositionProfiles(configured, options.DecompositionProfiles)
+		profiles := orchestration.ResolveProfileRoutes(discovered, decompositionProfiles)
 		for _, task := range triage {
 			defaultName, orchestratorName := metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile
+			if defaultName == nil {
+				if globalDefault, found := firstConfiguredAgent(configured.Config, configured.DefaultWorkers, agentconfig.RoleWorker); found {
+					value := globalDefault.ID
+					defaultName = &value
+				}
+			}
 			fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, defaultName, orchestratorName, plannerRuntime)
 			if options.DefaultProfile != nil {
 				fallback = *options.DefaultProfile
 			}
 			if options.DefaultProfile == nil && metadata.Orchestration.DefaultProfile == nil && task.Assignee != nil && task.Runtime != model.RuntimeManual {
-				fallback = orchestration.ProfileRoute{Name: *task.Assignee, Runtime: task.Runtime}
+				for _, candidate := range profiles {
+					if candidate.Name == *task.Assignee && orchestration.RunnableProfileRoute(candidate) {
+						fallback = candidate
+						break
+					}
+				}
 			}
 			if options.OrchestratorProfile != nil {
 				orchestrator = *options.OrchestratorProfile
@@ -422,7 +706,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		_, _ = opened.FailRun(durable, scope, "Unable to register dispatcher ownership: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
 		return
 	}
-	profile, configSource, err := resolveRunProfile(manager, claim.Task.Task, options)
+	profile, err := resolveRunProfile(ctx, manager, opened, claim.Task.Task, options)
 	if err != nil {
 		durable, cancel := durableContext()
 		defer cancel()
@@ -433,7 +717,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return
 	}
 	configured, err := opened.RecordRunAgentConfig(ctx, scope, store.RecordRunAgentConfigInput{
-		Profile: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider, Source: configSource,
+		Profile: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider, Source: profile.Source,
+		FallbackFrom: profile.FallbackFrom, AllowRuntimeOverride: profile.Runtime != claim.Run.Runtime,
 	})
 	if err != nil {
 		durable, cancel := durableContext()
@@ -441,6 +726,8 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		_, _ = opened.FailRun(durable, scope, "Unable to pin agent configuration: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
 		return
 	}
+	claim.Run.Runtime = configured.Runtime
+	claim.Task.Task.Runtime = configured.Runtime
 	workspaces := workspace.New(manager)
 	workspaces.SetAllowWrites(options.AllowWrites)
 	if options.WorkingDirectory != "" {
@@ -478,7 +765,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	}
 	logPath := filepath.Join(logsRoot, prepared.Task.Task.ID+"-"+prepared.Run.ID+".log")
 	runnerOptions := RunnerOptions{DBPath: options.DBPath, CLIPath: options.CLIPath, Profile: configured.Profile,
-		Model: configured.Model, Provider: configured.Provider, AllowWrites: options.AllowWrites,
+		Command: profile.Command, Model: configured.Model, Provider: configured.Provider, AllowWrites: options.AllowWrites,
 		WorkspaceRoot: workspaceRoot, AttachmentsRoot: attachmentsRoot, LogsRoot: logsRoot,
 		ClineApprovalDir: clineApprovalDir, Getenv: options.Getenv}
 	taskID := prepared.Task.Task.ID
@@ -491,12 +778,23 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	runStarted := parseTimestamp(prepared.Run.ClaimedAt)
 	var goalPlanner orchestration.Planner
 	if goalMode && options.GoalJudge == nil {
+		metadata, metadataErr := manager.Read(prepared.Task.Task.Board)
+		profileSet, profileErr := configuredProfiles(manager, prepared.Task.Task.Board, options)
+		if metadataErr != nil || profileErr != nil {
+			durable, cancel := durableContext()
+			defer cancel()
+			if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: "Goal judge configuration failed: " + errors.Join(metadataErr, profileErr).Error(), Kind: model.BlockKindTransient}); requestErr == nil {
+				_, _ = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
+			}
+			return
+		}
 		plannerCWD := options.WorkingDirectory
 		if prepared.Workspace != nil {
 			plannerCWD = prepared.Workspace.Path
 		}
-		goalPlanner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: prepared.Task.Task.Runtime,
-			Model: configured.Model, Provider: configured.Provider, CWD: plannerCWD, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
+		judgeRuntime, judgeModel, judgeProvider, judgeCommand := judgeConfiguration(metadata, profileSet, options)
+		goalPlanner, err = orchestration.CreateCLIPlanner(orchestration.CLIPlannerOptions{Runtime: judgeRuntime,
+			Command: judgeCommand, Model: judgeModel, Provider: judgeProvider, CWD: plannerCWD, Timeout: options.PlannerTimeout, Getenv: options.Getenv})
 		if err != nil {
 			durable, cancel := durableContext()
 			defer cancel()
@@ -571,6 +869,14 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return
 		}
 		executionSucceeded := !execution.TimedOut && execution.SpawnError == nil && execution.Code == 0 && !execution.Canceled
+		if executionSucceeded {
+			lastRunID := prepared.Run.ID
+			if _, healthErr := opened.SetAgentHealth(durable, store.SetAgentHealthInput{
+				AgentID: configured.Profile, Status: model.AgentHealthReady, LastRunID: &lastRunID,
+			}); healthErr != nil {
+				options.log("agent health update failed %s: %v", configured.Profile, healthErr)
+			}
+		}
 		if terminalRequest != nil && terminalRequest.FinalizedAt == nil && executionSucceeded {
 			if goalMode && terminalRequest.Kind == "complete" {
 				if err := opened.DiscardRunTerminalRequest(durable, scope, "goal completion requires independent judgment"); err != nil {
@@ -593,22 +899,91 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		if execution.SpawnError != nil {
 			detail = execution.SpawnError.Error()
 		}
+		availability, agentUnavailable := classifyAgentAvailability(execution)
 		switch {
 		case execution.TimedOut || (runtimeLimit != nil && *runtimeLimit <= 0):
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusTimedOut, FailureLimit: options.FailureLimit})
 			cancel()
 			options.log("requeue/fail %s: %s", taskID, detail)
 			return
+		case execution.Canceled:
+			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{FailureLimit: options.FailureLimit})
+			cancel()
+			return
+		case agentUnavailable:
+			lastRunID, lastError := prepared.Run.ID, detail
+			cooldownUntil := agentCooldown(availability.Status, *options.RateLimitCooldown, *options.AgentRetryCooldown)
+			if _, healthErr := opened.SetAgentHealth(durable, store.SetAgentHealthInput{
+				AgentID: configured.Profile, Status: availability.Status, CooldownUntil: cooldownUntil,
+				LastError: &lastError, LastRunID: &lastRunID,
+			}); healthErr != nil {
+				countFailure := false
+				_, _ = opened.FailRun(durable, scope, "Unable to record agent availability: "+healthErr.Error(), store.FailRunOptions{
+					Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+					CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
+				})
+				cancel()
+				return
+			}
+			partial, partialErr := false, error(nil)
+			if options.AllowWrites && prepared.Workspace != nil {
+				switch prepared.Workspace.Kind {
+				case model.WorkspaceWorktree, model.WorkspaceScratch:
+					partial, partialErr = workspaces.HasChanges(durable, *prepared.Workspace)
+				case model.WorkspaceDir:
+					// A shared directory has no baseline from which to prove that this
+					// process made no edits. Preserve it and ask for review before a
+					// different agent writes to the same path.
+					partial = true
+				}
+			}
+			if partial || partialErr != nil {
+				reason := fmt.Sprintf("Agent %s became %s after work began; partial changes remain at %s", configured.Profile, availability.Status, prepared.Workspace.Path)
+				if partialErr != nil {
+					reason += "; Autogora could not verify the workspace state: " + partialErr.Error()
+				}
+				if terminalRequest != nil && terminalRequest.FinalizedAt == nil {
+					_ = opened.DiscardRunTerminalRequest(durable, scope, "agent became unavailable with partial work")
+				}
+				_, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
+				if requestErr == nil {
+					_, requestErr = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, execution.Code)
+				}
+				if requestErr != nil {
+					_ = opened.DiscardRunTerminalRequest(durable, scope, "partial-work block finalization failed")
+					countFailure := false
+					if _, failErr := opened.FailRun(durable, scope, reason, store.FailRunOptions{
+						Outcome: availability.Outcome, CountFailure: &countFailure, FailureLimit: options.FailureLimit,
+					}); failErr == nil {
+						_, _ = opened.BlockTask(durable, taskID, store.BlockInput{Reason: reason, Kind: model.BlockKindNeedsInput})
+					}
+					options.log("partial-work block fallback failed %s: %v", taskID, requestErr)
+				}
+				cancel()
+				options.log("preserved partial work for %s after %s became %s", taskID, configured.Profile, availability.Status)
+				return
+			}
+			next, fallbackErr := resolveRunProfile(durable, manager, opened, prepared.Task.Task, options)
+			fallbackAvailable := fallbackErr == nil && next.Name != configured.Profile
+			countFailure := false
+			cooldownSeconds := 0
+			if availability.Status == model.AgentHealthRateLimited && !fallbackAvailable {
+				cooldownSeconds = int(options.RateLimitCooldown.Seconds())
+			}
+			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: availability.Outcome,
+				CountFailure: &countFailure, CooldownSeconds: cooldownSeconds, FailureLimit: options.FailureLimit})
+			cancel()
+			if fallbackAvailable {
+				options.log("requeued %s for fallback %s after %s became %s", taskID, next.Name, configured.Profile, availability.Status)
+			} else {
+				options.log("paused %s because %s is %s and no fallback is available", taskID, configured.Profile, availability.Status)
+			}
+			return
 		case execution.SpawnError != nil:
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit})
 			cancel()
 			return
-		case execution.Code == 75:
-			countFailure := false
-			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{Outcome: model.RunStatusRateLimited, CountFailure: &countFailure, CooldownSeconds: int(options.RateLimitCooldown.Seconds()), FailureLimit: options.FailureLimit})
-			cancel()
-			return
-		case execution.Code != 0 || execution.Canceled:
+		case execution.Code != 0:
 			_, _ = opened.FailRun(durable, scope, detail, store.FailRunOptions{FailureLimit: options.FailureLimit})
 			cancel()
 			return
@@ -694,6 +1069,10 @@ func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []s
 		if err != nil {
 			return err
 		}
+		if _, err := opened.ClearExpiredAgentCooldowns(ctx, time.Now()); err != nil {
+			opened.Close()
+			return err
+		}
 		if _, err := opened.PromoteDueTasks(ctx, board, time.Now()); err != nil {
 			opened.Close()
 			return err
@@ -754,12 +1133,13 @@ func Run(ctx context.Context, options Options) error {
 				if ctx.Err() != nil || int(active.Load()) >= options.MaxWorkers {
 					break
 				}
-				excluded, profileLimits, err := claimProfilePolicy(manager, board, options)
+				opened, err := manager.OpenStore(ctx, board)
 				if err != nil {
 					return err
 				}
-				opened, err := manager.OpenStore(ctx, board)
+				excluded, profileLimits, err := claimProfilePolicy(ctx, manager, opened, board, options)
 				if err != nil {
+					opened.Close()
 					return err
 				}
 				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,

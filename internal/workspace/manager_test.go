@@ -51,6 +51,15 @@ func TestScratchWorkspaceIsBoundAndCleanedOnlyAtTrustedPath(t *testing.T) {
 	if info, err := os.Stat(prepared.Workspace.Path); err != nil || !info.IsDir() {
 		t.Fatalf("scratch workspace missing: %v", err)
 	}
+	if changed, err := New(manager).HasChanges(ctx, *prepared.Workspace); err != nil || changed {
+		t.Fatalf("fresh scratch workspace reported changes: changed=%v err=%v", changed, err)
+	}
+	if err := os.WriteFile(filepath.Join(prepared.Workspace.Path, "result.txt"), []byte("result\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := New(manager).HasChanges(ctx, *prepared.Workspace); err != nil || !changed {
+		t.Fatalf("scratch changes were not detected: changed=%v err=%v", changed, err)
+	}
 	if err := opened.MarkRunManaged(ctx, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}); err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +192,15 @@ func TestGitBoardCreatesPreservedWorktreeWithBranch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(prepared.Workspace.Path, "README.md")); err != nil {
 		t.Fatalf("worktree content missing: %v", err)
+	}
+	if changed, err := New(manager).HasChanges(ctx, *prepared.Workspace); err != nil || changed {
+		t.Fatalf("fresh worktree reported changes: changed=%v err=%v", changed, err)
+	}
+	if err := os.WriteFile(filepath.Join(prepared.Workspace.Path, "partial.txt"), []byte("partial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := New(manager).HasChanges(ctx, *prepared.Workspace); err != nil || !changed {
+		t.Fatalf("worker changes were not detected: changed=%v err=%v", changed, err)
 	}
 	if command := exec.Command("git", "-C", prepared.Workspace.Path, "symbolic-ref", "-q", "HEAD"); command.Run() == nil {
 		t.Fatal("worker worktree checked out a shared branch instead of a detached commit")

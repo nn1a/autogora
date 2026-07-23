@@ -266,7 +266,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 		}
 		return model.TaskDetail{}, fmt.Errorf("cannot finalize terminal run: %s", run.Status)
 	}
-	if exitCode != 0 {
+	if exitCode != 0 && request.Kind != "block" {
 		return model.TaskDetail{}, fmt.Errorf("cannot finalize terminal request after exit code %d", exitCode)
 	}
 	task, err := requireTask(ctx, s.db, run.TaskID)
