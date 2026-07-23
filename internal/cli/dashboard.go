@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -51,11 +52,15 @@ func (a *App) runDashboard(ctx context.Context, opts options) error {
 	if _, err := fmt.Fprintf(a.Stdout, "%s/?token=%s\n", server.URL, url.QueryEscape(server.Token)); err != nil {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = server.Close(shutdown)
-		return err
+		return errors.Join(err, server.Close(shutdown))
 	}
-	<-ctx.Done()
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case <-server.Done():
+		serveErr = server.Err()
+	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return server.Close(shutdown)
+	return errors.Join(serveErr, server.Close(shutdown))
 }

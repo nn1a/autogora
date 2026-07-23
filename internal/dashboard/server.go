@@ -48,6 +48,9 @@ type Server struct {
 	cancel        context.CancelFunc
 	workers       sync.WaitGroup
 	supervisor    *supervisor.Controller
+	serveDone     chan struct{}
+	serveMu       sync.Mutex
+	serveErr      error
 	operationsMu  sync.Mutex
 	operations    []operationRecord
 	runDispatcher func(context.Context, dispatcher.Options) error
@@ -85,12 +88,18 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 	serverContext, cancelServer := context.WithCancel(ctx)
 	service := &Server{
 		Token: token, manager: manager, options: options, ctx: serverContext, cancel: cancelServer,
-		runDispatcher: dispatcher.Run,
+		serveDone: make(chan struct{}), runDispatcher: dispatcher.Run,
 	}
 	service.supervisor = supervisor.New(supervisor.Options{DBPath: options.DBPath, CLIPath: options.CLIPath, OnLog: options.OnLog})
-	service.HTTP = &http.Server{Handler: service, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
+	service.HTTP = &http.Server{
+		Handler: service, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return serverContext
+		},
+	}
 	listener, err := net.Listen("tcp", net.JoinHostPort(options.Host, strconv.Itoa(options.Port)))
 	if err != nil {
+		cancelServer()
 		return nil, err
 	}
 	service.Listener = listener
@@ -104,15 +113,26 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 		service.supervisor.Start(serverContext, config)
 	}
 	go func() {
-		if err := service.HTTP.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && options.OnLog != nil {
+		err := service.HTTP.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		service.serveMu.Lock()
+		service.serveErr = err
+		service.serveMu.Unlock()
+		close(service.serveDone)
+		if err != nil && options.OnLog != nil {
 			options.OnLog("dashboard server failed: " + err.Error())
 		}
+		cancelServer()
 	}()
 	go func() {
 		<-serverContext.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = service.HTTP.Shutdown(shutdown)
+		if err := service.HTTP.Shutdown(shutdown); err != nil && options.OnLog != nil {
+			options.OnLog("dashboard shutdown failed: " + err.Error())
+		}
 	}()
 	return service, nil
 }
@@ -120,9 +140,35 @@ func Start(ctx context.Context, options Options) (*Server, error) {
 func (s *Server) Close(ctx context.Context) error {
 	s.cancel()
 	supervisorErr := s.supervisor.Stop(ctx)
-	err := s.HTTP.Shutdown(ctx)
-	s.workers.Wait()
-	return errors.Join(supervisorErr, err)
+	shutdownErr := s.HTTP.Shutdown(ctx)
+	if shutdownErr != nil {
+		return errors.Join(supervisorErr, shutdownErr)
+	}
+	workersDone := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(workersDone)
+	}()
+	var workersErr error
+	select {
+	case <-workersDone:
+	case <-ctx.Done():
+		workersErr = fmt.Errorf("wait for dashboard operations: %w", ctx.Err())
+	}
+	return errors.Join(supervisorErr, shutdownErr, workersErr)
+}
+
+// Done closes when the HTTP listener stops. Err reports a non-shutdown Serve
+// failure after Done closes, allowing command callers to distinguish an
+// operational listener failure from an intentional shutdown.
+func (s *Server) Done() <-chan struct{} {
+	return s.serveDone
+}
+
+func (s *Server) Err() error {
+	s.serveMu.Lock()
+	defer s.serveMu.Unlock()
+	return s.serveErr
 }
 
 func securityHeaders(response http.ResponseWriter) {

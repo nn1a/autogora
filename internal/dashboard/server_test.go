@@ -263,6 +263,69 @@ func TestAuthenticationAndEmbeddedAssets(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsEventStreamWithoutExhaustingShutdownDeadline(t *testing.T) {
+	server := startTestServer(t)
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/events/stream?token="+url.QueryEscape(testToken), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+	if stream.StatusCode != http.StatusOK || stream.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("unexpected stream response: %d %q", stream.StatusCode, stream.Header.Get("Content-Type"))
+	}
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Close(ctx); err != nil {
+		t.Fatalf("close with active event stream: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("event stream delayed shutdown for %s", elapsed)
+	}
+}
+
+func TestCloseBoundsWaitForDashboardOperations(t *testing.T) {
+	server := startTestServer(t)
+	release := make(chan struct{})
+	server.workers.Add(1)
+	go func() {
+		defer server.workers.Done()
+		<-release
+	}()
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	err := server.Close(ctx)
+	cancel()
+	close(release)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("operation wait ignored shutdown deadline for %s", elapsed)
+	}
+}
+
+func TestDoneReportsUnexpectedListenerFailure(t *testing.T) {
+	server := startTestServer(t)
+	if err := server.Listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-server.Done():
+	case <-time.After(time.Second):
+		t.Fatal("server did not report listener termination")
+	}
+	if err := server.Err(); err == nil || errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("unexpected listener failure was hidden: %v", err)
+	}
+}
+
 func TestGitHubImportAPIProvidesPreviewAndEnterpriseImport(t *testing.T) {
 	issue := `[{"id":"I_dashboard","number":42,"title":"Fix session retry","body":"Retry once.","url":"https://ghe.example.com/team/service/issues/42","state":"OPEN","labels":[{"name":"bug"}],"assignees":[],"author":{"login":"reporter"},"createdAt":"2026-07-01T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z"}]`
 	runner := &dashboardGitHubRunner{outputs: []setupcfg.CommandOutput{{Stdout: issue}, {Stdout: issue}}}
