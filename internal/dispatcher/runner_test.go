@@ -93,7 +93,11 @@ func TestBuildRunnerCommandsAreScopedAndDoNotLeakToken(t *testing.T) {
 					t.Fatalf("invalid Claude command: %#v", command)
 				}
 			case model.RuntimeCodex:
-				if !strings.Contains(joined, "read-only") || !strings.Contains(joined, "mcp_servers.autogora.required=true") {
+				if !strings.Contains(joined, "read-only") ||
+					!strings.Contains(joined, "mcp_servers.autogora.required=true") ||
+					!strings.Contains(joined, `mcp_servers.autogora.enabled_tools=["autogora_show","autogora_comment","autogora_heartbeat","autogora_complete","autogora_block"]`) ||
+					!strings.Contains(joined, `mcp_servers.autogora.tools.autogora_complete.approval_mode="approve"`) ||
+					!strings.Contains(joined, `mcp_servers.autogora.tools.autogora_block.approval_mode="approve"`) {
 					t.Fatalf("invalid Codex command: %#v", command)
 				}
 			}
@@ -111,7 +115,7 @@ func TestWriteOptInAndGoalContinuations(t *testing.T) {
 	codex := claimedTask(t, model.RuntimeCodex)
 	options.Model = "gpt-test"
 	continued, err := BuildGoalContinuationCommand(codex, options, "session-1", "continue")
-	if err != nil || strings.Join(continued.Args[:4], " ") != "exec --sandbox workspace-write resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") || !hasArgPair(continued.Args, "--model", "gpt-test") || countArg(continued.Args, "-c") != 3 {
+	if err != nil || strings.Join(continued.Args[:4], " ") != "exec --sandbox workspace-write resume" || !strings.Contains(strings.Join(continued.Args, " "), "session-1") || !hasArgPair(continued.Args, "--model", "gpt-test") || countArg(continued.Args, "-c") != 6 {
 		t.Fatalf("Codex continuation failed: %#v, %v", continued, err)
 	}
 	cline := claimedTask(t, model.RuntimeCline)
