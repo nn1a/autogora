@@ -37,12 +37,41 @@ Authentication and TLS settings come from gh. Configure each host first with
 "gh auth login --hostname HOST" or the corresponding GH_* token variables.
 `
 
+func rejectGitHubOptions(opts options) error {
+	allowedValues := map[string]bool{
+		"repo": true, "host": true, "issue": true, "state": true, "label": true,
+		"search": true, "limit": true, "tenant": true, "priority": true,
+		"board": true, "db": true,
+	}
+	for name := range opts.values {
+		if !allowedValues[name] {
+			return fmt.Errorf("unknown github import option --%s", name)
+		}
+	}
+	for name := range opts.flagSet {
+		if name != "dry-run" {
+			return fmt.Errorf("unknown github import option --%s", name)
+		}
+	}
+	for name, values := range opts.values {
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("--%s cannot be empty", name)
+			}
+		}
+	}
+	return nil
+}
+
 func (a *App) runGitHub(ctx context.Context, opts options) error {
 	if len(opts.positionals) == 0 {
 		return errors.New("github requires the import action")
 	}
 	if strings.ToLower(strings.TrimSpace(opts.positionals[0])) != "import" || len(opts.positionals) > 1 {
 		return errors.New("github supports: autogora github import [options]")
+	}
+	if err := rejectGitHubOptions(opts); err != nil {
+		return err
 	}
 	if len(opts.many("issue")) > 0 && (opts.present("state") || opts.present("label") || opts.present("search")) {
 		return errors.New("--issue cannot be combined with --state, --label, or --search")
@@ -81,8 +110,14 @@ func (a *App) runGitHub(ctx context.Context, opts options) error {
 		Labels: opts.many("label"), Search: opts.value("search"), Limit: limit, Numbers: numbers,
 		Tenant: stringPointer(opts.value("tenant")), Priority: priority, DryRun: opts.flags["dry-run"],
 	})
-	if err != nil {
+	if err != nil && !githubissues.IsPartialImportError(err) {
 		return err
 	}
-	return writeJSON(a.Stdout, result)
+	if writeErr := writeJSON(a.Stdout, result); writeErr != nil {
+		if err != nil {
+			return errors.Join(err, writeErr)
+		}
+		return writeErr
+	}
+	return err
 }

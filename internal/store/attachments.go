@@ -146,28 +146,14 @@ func (s *Store) AttachFile(ctx context.Context, taskID, sourcePath, displayName 
 }
 
 func (s *Store) AttachURL(ctx context.Context, taskID, rawURL, displayName string) (model.Attachment, error) {
-	if _, err := requireTask(ctx, s.db, taskID); err != nil {
-		return model.Attachment{}, err
-	}
-	parsed, err := url.ParseRequestURI(rawURL)
-	if err != nil || parsed.Host == "" {
-		return model.Attachment{}, errors.New("attachment URL must be valid")
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return model.Attachment{}, errors.New("attachment URL must use http or https")
-	}
-	if displayName == "" {
-		displayName = filepath.Base(parsed.Path)
-		if displayName == "." || displayName == "/" || displayName == "" {
-			displayName = parsed.Host
-		}
-	}
-	name, err := cleanAttachmentName(displayName)
+	normalized, name, err := normalizeAttachmentURL(rawURL, displayName)
 	if err != nil {
 		return model.Attachment{}, err
 	}
+	if _, err := requireTask(ctx, s.db, taskID); err != nil {
+		return model.Attachment{}, err
+	}
 	id := newID("a")
-	normalized := parsed.String()
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := requireTask(ctx, tx, taskID); err != nil {
 			return err
@@ -182,6 +168,77 @@ func (s *Store) AttachURL(ctx context.Context, taskID, rawURL, displayName strin
 		return model.Attachment{}, err
 	}
 	return scanAttachment(s.db.QueryRowContext(ctx, "SELECT id, task_id, kind, name, media_type, size, sha256, path, url, created_at FROM task_attachments WHERE id = ?", id))
+}
+
+func normalizeAttachmentURL(rawURL, displayName string) (string, string, error) {
+	parsed, err := url.ParseRequestURI(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", "", errors.New("attachment URL must be valid")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", "", errors.New("attachment URL must use http or https")
+	}
+	if displayName == "" {
+		displayName = filepath.Base(parsed.Path)
+		if displayName == "." || displayName == "/" || displayName == "" {
+			displayName = parsed.Host
+		}
+	}
+	name, err := cleanAttachmentName(displayName)
+	if err != nil {
+		return "", "", err
+	}
+	return parsed.String(), name, nil
+}
+
+// CreateTaskWithURLSource commits an idempotent external task and its source
+// provenance together. A valid result can never expose a task whose source URL
+// failed to attach, and an existing task receives at most one matching URL.
+func (s *Store) CreateTaskWithURLSource(ctx context.Context, input CreateTaskInput, rawURL, displayName string) (model.TaskDetail, bool, error) {
+	normalized, name, err := normalizeAttachmentURL(rawURL, displayName)
+	if err != nil {
+		return model.TaskDetail{}, false, err
+	}
+	var taskID string
+	created := true
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		if key := normalizedPointer(input.IdempotencyKey); key != nil {
+			err := tx.QueryRowContext(ctx,
+				"SELECT id FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'",
+				orFallback(input.Board, s.board), *key,
+			).Scan(&taskID)
+			if err == nil {
+				created = false
+			} else if err != sql.ErrNoRows {
+				return err
+			}
+		}
+		if taskID == "" {
+			var err error
+			taskID, err = s.createTask(ctx, tx, input)
+			if err != nil {
+				return err
+			}
+		}
+		var existing int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM task_attachments WHERE task_id = ? AND kind = 'url' AND url = ?", taskID, normalized).Scan(&existing); err != nil {
+			return err
+		}
+		if existing > 0 {
+			return nil
+		}
+		id := newID("a")
+		if _, err := tx.ExecContext(ctx, `INSERT INTO task_attachments(id, task_id, kind, name, media_type, size, sha256, path, url, created_at)
+			VALUES (?, ?, 'url', ?, NULL, NULL, NULL, NULL, ?, ?)`, id, taskID, name, normalized, now()); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, taskID, "attached", map[string]any{"attachmentId": id, "kind": "url", "name": name, "url": normalized}, nil)
+	})
+	if err != nil {
+		return model.TaskDetail{}, false, err
+	}
+	detail, err := s.GetTask(ctx, taskID)
+	return detail, created, err
 }
 
 func (s *Store) RemoveAttachment(ctx context.Context, taskID, attachmentID string) error {
