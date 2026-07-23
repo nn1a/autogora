@@ -74,6 +74,7 @@ type Options struct {
 	Now                      func() time.Time
 	AgentConfig              *agentconfig.Config
 	OnLog                    func(string)
+	testHooks                *dispatcherTestHooks
 }
 
 func (o *Options) normalize() {
@@ -577,20 +578,33 @@ func configuredProfiles(manager *boards.Manager, board string, options Options) 
 	return set, nil
 }
 
-func claimProfilePolicy(ctx context.Context, manager *boards.Manager, opened *store.Store, board string, options Options) ([]string, map[string]int, error) {
+func claimProfilePolicy(
+	ctx context.Context,
+	manager *boards.Manager,
+	opened *store.Store,
+	board string,
+	options Options,
+) (excluded []string, limits map[string]int, returnErr error) {
 	configured, err := configuredProfiles(manager, board, options)
 	if err != nil {
 		return nil, nil, err
 	}
-	excluded := make([]string, 0)
-	limits := map[string]int{}
+	excluded = make([]string, 0)
+	limits = map[string]int{}
 	healthRouter := agenthealth.New(manager, opened)
 	if opened.Board() != "default" {
 		coordinationStore, err := manager.OpenCoordinationStore(ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, markGlobalCoordinationError("open shared agent-health store", err)
 		}
-		defer coordinationStore.Close()
+		defer func() {
+			if closeErr := coordinationStore.Close(); closeErr != nil {
+				returnErr = errors.Join(
+					returnErr,
+					markGlobalCoordinationError("close shared agent-health store", closeErr),
+				)
+			}
+		}()
 		healthRouter = agenthealth.NewWithGlobal(manager, opened, coordinationStore)
 	}
 	for _, profile := range configured.Profiles {
@@ -639,10 +653,14 @@ func selectAvailableProfile(
 		if !orchestration.RunnableProfileRoute(candidate) {
 			continue
 		}
-		health, err := healthRouter.Get(
-			ctx, candidate.Name, registeredAgentHasRole(config, candidate.Name, agentconfig.RoleWorker),
-		)
+		globalRegistered := registeredAgentHasRole(config, candidate.Name, agentconfig.RoleWorker)
+		health, err := healthRouter.Get(ctx, candidate.Name, globalRegistered)
 		if err != nil {
+			if globalRegistered {
+				return orchestration.ProfileRoute{}, false, markGlobalCoordinationError(
+					"read shared agent health for "+candidate.Name, err,
+				)
+			}
 			return orchestration.ProfileRoute{}, false, err
 		}
 		if store.IsAgentUnavailable(health, time.Now()) {
@@ -1743,59 +1761,72 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	}
 }
 
-func selectedBoards(ctx context.Context, manager *boards.Manager, requested string) ([]string, error) {
-	if requested != "" {
-		board, err := manager.Resolve(requested)
+func selectedBoards(ctx context.Context, manager *boards.Manager, options Options) ([]string, error) {
+	if strings.TrimSpace(options.Board) != "" {
+		board, err := manager.Resolve(options.Board)
 		if err != nil {
 			return nil, err
 		}
 		return []string{board}, nil
 	}
-	metadata, err := manager.List(ctx, false)
+	discovered, err := options.discoverBoards(ctx)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]string, 0, len(metadata))
-	for _, board := range metadata {
-		if !board.Archived {
-			result = append(result, board.Slug)
+	result := make([]string, 0, len(discovered))
+	for _, board := range discovered {
+		if board == "default" || manager.Exists(board) {
+			result = append(result, board)
 		}
 	}
 	return result, nil
 }
 
-func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) error {
+func maintainGlobalCoordination(ctx context.Context, manager *boards.Manager, options Options) (err error) {
 	coordination, err := manager.OpenCoordinationStore(ctx)
+	if err != nil {
+		return markGlobalCoordinationError("open global coordination store for maintenance", err)
+	}
+	defer func() {
+		if closeErr := coordination.Close(); closeErr != nil {
+			err = errors.Join(err, markGlobalCoordinationError("close global coordination store after maintenance", closeErr))
+		}
+	}()
+	if _, clearErr := coordination.ClearExpiredAgentCooldowns(ctx, options.currentTime()); clearErr != nil {
+		return markGlobalCoordinationError("clear global agent cooldowns", clearErr)
+	}
+	return nil
+}
+
+func maintainBoard(ctx context.Context, manager *boards.Manager, board string, options Options) (err error) {
+	opened, err := options.openBoardStore(ctx, manager, board)
 	if err != nil {
 		return err
 	}
-	if _, clearErr := coordination.ClearExpiredAgentCooldowns(ctx, time.Now()); clearErr != nil {
-		return errors.Join(clearErr, coordination.Close())
+	defer func() {
+		err = errors.Join(err, opened.Close())
+	}()
+	current := options.currentTime()
+	if opened.Board() != "default" {
+		if _, err = opened.ClearExpiredAgentCooldowns(ctx, current); err != nil {
+			return err
+		}
 	}
-	if err := coordination.Close(); err != nil {
+	if _, err = opened.PromoteDueTasks(ctx, board, current); err != nil {
+		return err
+	}
+	if err = recoverAbandonedRuns(ctx, opened, board, options); err != nil {
+		return err
+	}
+	return nil
+}
+
+func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) error {
+	if err := maintainGlobalCoordination(ctx, manager, options); err != nil {
 		return err
 	}
 	for _, board := range boardSlugs {
-		opened, err := manager.OpenStore(ctx, board)
-		if err != nil {
-			return err
-		}
-		if opened.Board() != "default" {
-			_, err = opened.ClearExpiredAgentCooldowns(ctx, time.Now())
-		}
-		if err != nil {
-			opened.Close()
-			return err
-		}
-		if _, err := opened.PromoteDueTasks(ctx, board, time.Now()); err != nil {
-			opened.Close()
-			return err
-		}
-		if err := recoverAbandonedRuns(ctx, opened, board, options); err != nil {
-			opened.Close()
-			return err
-		}
-		if err := opened.Close(); err != nil {
+		if err := options.maintainOneBoard(ctx, manager, board); err != nil {
 			return err
 		}
 	}
@@ -1824,25 +1855,91 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	var active atomic.Int32
 	var workers sync.WaitGroup
 	workerFinished := make(chan struct{}, 1)
-	var workerErrorMu sync.Mutex
-	var workerError error
-	recordWorkerResult := func(err error) {
-		if err != nil {
-			workerErrorMu.Lock()
-			workerError = errors.Join(workerError, err)
-			workerErrorMu.Unlock()
-		}
+	type workerResult struct {
+		board      string
+		taskID     string
+		generation uint64
+		err        error
+	}
+	var workerResultMu sync.Mutex
+	var workerResults []workerResult
+	recordWorkerResult := func(result workerResult) {
+		workerResultMu.Lock()
+		workerResults = append(workerResults, result)
+		workerResultMu.Unlock()
 		select {
 		case workerFinished <- struct{}{}:
 		default:
 		}
 	}
-	takeWorkerError := func() error {
-		workerErrorMu.Lock()
-		defer workerErrorMu.Unlock()
-		err := workerError
-		workerError = nil
-		return err
+	takeWorkerResults := func() []workerResult {
+		workerResultMu.Lock()
+		defer workerResultMu.Unlock()
+		result := workerResults
+		workerResults = nil
+		return result
+	}
+	resilientWatch := resilientAllBoardWatch(options)
+	boardCircuits := newBoardFailureCircuit(options.Interval, options.Now)
+	reportBoardFailure := func(board, stage string, failure error) error {
+		if failure == nil {
+			return nil
+		}
+		wrapped := fmt.Errorf("%s for board %s: %w", stage, board, failure)
+		if isGlobalCoordinationError(failure) || !resilientWatch {
+			return wrapped
+		}
+		state := boardCircuits.failure(board)
+		options.log(
+			"paused board %s for %s after %s failure %d; retry at %s: %v",
+			board, state.Delay, stage, state.Failures,
+			state.RetryAt.Format(time.RFC3339Nano), failure,
+		)
+		return nil
+	}
+	reportBoardSuccess := func(board string, generation uint64) {
+		if boardCircuits.success(board, generation) {
+			options.log("resumed board %s after a successful dispatcher probe", board)
+		}
+	}
+	handleWorkerResults := func() error {
+		results := takeWorkerResults()
+		if len(results) == 0 {
+			return nil
+		}
+		boardErrors := make(map[string]error)
+		boardOrder := make([]string, 0)
+		successes := make(map[string][]uint64)
+		var processErrors error
+		for _, result := range results {
+			if result.err == nil {
+				successes[result.board] = append(successes[result.board], result.generation)
+				continue
+			}
+			wrapped := fmt.Errorf("worker %s on board %s: %w", result.taskID, result.board, result.err)
+			if isGlobalCoordinationError(result.err) || !resilientWatch {
+				processErrors = errors.Join(processErrors, wrapped)
+				continue
+			}
+			if _, exists := boardErrors[result.board]; !exists {
+				boardOrder = append(boardOrder, result.board)
+			}
+			boardErrors[result.board] = errors.Join(boardErrors[result.board], wrapped)
+		}
+		for board, generations := range successes {
+			if boardErrors[board] != nil {
+				continue
+			}
+			for _, generation := range generations {
+				reportBoardSuccess(board, generation)
+			}
+		}
+		for _, board := range boardOrder {
+			if err := reportBoardFailure(board, "worker execution", boardErrors[board]); err != nil {
+				processErrors = errors.Join(processErrors, err)
+			}
+		}
+		return processErrors
 	}
 	generatedClineApprovalDir := ""
 	planning := startPlanningQueue(ctx, manager, options)
@@ -1856,7 +1953,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		processes.StopAll()
 		workers.Wait()
 		if runErr == nil {
-			runErr = takeWorkerError()
+			runErr = handleWorkerResults()
 		}
 		if !planning.Wait(options.PlanningShutdownGrace) {
 			options.log("planner did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
@@ -1882,71 +1979,116 @@ func Run(ctx context.Context, options Options) (runErr error) {
 	}()
 
 	for {
-		if err := takeWorkerError(); err != nil {
+		if err := handleWorkerResults(); err != nil {
 			return err
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		boardSlugs, err := selectedBoards(ctx, manager, options.Board)
+		boardSlugs, err := selectedBoards(ctx, manager, options)
 		if err != nil {
 			return err
 		}
-		deliverBoardNotifications(ctx, manager, boardSlugs, options)
-		if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
+		boardCircuits.retain(boardSlugs)
+		passBoards := boardSlugs
+		if resilientWatch {
+			if err := maintainGlobalCoordination(ctx, manager, options); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			passBoards = nil
+			for _, board := range boardCircuits.eligible(boardSlugs) {
+				if err := options.maintainOneBoard(ctx, manager, board); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					if processErr := reportBoardFailure(board, "maintenance", err); processErr != nil {
+						return processErr
+					}
+					continue
+				}
+				passBoards = append(passBoards, board)
+			}
+		} else if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
+		deliverBoardNotifications(ctx, manager, passBoards, options)
 		var planningDone <-chan struct{}
 		if !options.Once || !oncePlanningWaited {
-			planningDone = planning.Enqueue(boardSlugs)
+			planningDone = planning.Enqueue(passBoards)
 		}
 		if !options.Once {
-			coordination.Enqueue(boardSlugs)
-			publication.Enqueue(boardSlugs)
+			coordination.Enqueue(passBoards)
+			publication.Enqueue(passBoards)
 		}
 		launched := false
 		foundInPass := true
 		for ctx.Err() == nil && int(active.Load()) < options.MaxWorkers && foundInPass {
 			foundInPass = false
-			claimOrder := rotatedBoardSlugs(boardSlugs, nextClaimBoard)
+			claimOrder := rotatedBoardSlugs(passBoards, nextClaimBoard)
 			for _, board := range claimOrder {
 				if ctx.Err() != nil || int(active.Load()) >= options.MaxWorkers {
 					break
 				}
+				if resilientWatch && !boardCircuits.beginProbe(board) {
+					continue
+				}
+				generation := boardCircuits.generation(board)
 				runOptions := options
 				if options.Autopilot {
-					metadata, metadataErr := manager.Read(board)
+					metadata, metadataErr := options.readBoardMetadata(manager, board)
 					if metadataErr != nil {
-						return metadataErr
+						if processErr := reportBoardFailure(board, "read automation settings", metadataErr); processErr != nil {
+							return processErr
+						}
+						continue
 					}
 					autopilot := metadata.Orchestration.Autopilot
 					if !autopilot.Enabled || !autopilot.AutoExecute {
+						reportBoardSuccess(board, generation)
 						continue
 					}
 					runOptions.AllowWrites = options.AllowWrites && autopilot.WorkspaceWrites
 				}
-				opened, err := manager.OpenStore(ctx, board)
+				opened, err := options.openBoardStore(ctx, manager, board)
 				if err != nil {
-					return err
+					if processErr := reportBoardFailure(board, "open task store", err); processErr != nil {
+						return processErr
+					}
+					continue
 				}
-				excluded, profileLimits, err := claimProfilePolicy(ctx, manager, opened, board, runOptions)
+				excluded, profileLimits, err := runOptions.boardClaimProfilePolicy(ctx, manager, opened, board)
 				if err != nil {
-					opened.Close()
-					return err
+					err = errors.Join(err, opened.Close())
+					if processErr := reportBoardFailure(board, "resolve claim profiles", err); processErr != nil {
+						return processErr
+					}
+					continue
 				}
-				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
+				claim, err := runOptions.claimBoardTask(ctx, opened, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
 					ExpectedUpdatedAt: options.ExpectedUpdatedAt,
 					ClaimTTLSeconds:   options.ClaimTTLSeconds, MaxInProgress: options.MaxInProgress, MaxInProgressPerAssignee: options.MaxInProgressPerAssignee,
 					MaxInProgressByAssignee: profileLimits, ExcludedAssignees: excluded})
 				if err != nil {
-					opened.Close()
-					return err
+					err = errors.Join(err, opened.Close())
+					if processErr := reportBoardFailure(board, "claim task", err); processErr != nil {
+						return processErr
+					}
+					continue
 				}
 				if claim == nil {
-					opened.Close()
+					if closeErr := opened.Close(); closeErr != nil {
+						if processErr := reportBoardFailure(board, "close task store after claim probe", closeErr); processErr != nil {
+							return processErr
+						}
+						continue
+					}
+					reportBoardSuccess(board, generation)
 					continue
 				}
 				approvalDir := options.ClineApprovalDir
@@ -1964,13 +2106,16 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				nextClaimBoard = boardAfter(claimOrder, board)
 				active.Add(1)
 				workers.Add(1)
-				go func(opened *store.Store, claim *model.ClaimedTask, approvalDir string, runOptions Options) {
+				go func(opened *store.Store, claim *model.ClaimedTask, approvalDir string, runOptions Options, generation uint64) {
 					defer workers.Done()
-					workerErr := runClaim(ctx, manager, opened, claim, runOptions, processes, approvalDir)
+					workerErr := runOptions.executeClaim(ctx, manager, opened, claim, processes, approvalDir)
 					closeErr := opened.Close()
 					active.Add(-1)
-					recordWorkerResult(errors.Join(workerErr, closeErr))
-				}(opened, claim, approvalDir, runOptions)
+					recordWorkerResult(workerResult{
+						board: claim.Task.Task.Board, taskID: claim.Task.Task.ID,
+						generation: generation, err: errors.Join(workerErr, closeErr),
+					})
+				}(opened, claim, approvalDir, runOptions, generation)
 				if options.Once {
 					break
 				}
@@ -1993,7 +2138,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 					return nil
 				case <-workerFinished:
 					timer.Stop()
-					if err := takeWorkerError(); err != nil {
+					if err := handleWorkerResults(); err != nil {
 						processes.StopAll()
 						workers.Wait()
 						return err
@@ -2008,7 +2153,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				}
 			}
 			workers.Wait()
-			if err := takeWorkerError(); err != nil {
+			if err := handleWorkerResults(); err != nil {
 				return err
 			}
 			if !launched && !oncePlanningWaited && planningDone != nil {
@@ -2021,7 +2166,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				}
 			}
 			if !launched && !onceCoordinationWaited {
-				coordinationDone := coordination.Enqueue(boardSlugs)
+				coordinationDone := coordination.Enqueue(passBoards)
 				if coordinationDone != nil {
 					select {
 					case <-ctx.Done():
@@ -2033,7 +2178,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				}
 				onceCoordinationWaited = true
 			}
-			publicationDone := publication.Enqueue(boardSlugs)
+			publicationDone := publication.Enqueue(passBoards)
 			if publicationDone != nil {
 				select {
 				case <-ctx.Done():
@@ -2041,7 +2186,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				case <-publicationDone:
 				}
 			}
-			deliverBoardNotifications(ctx, manager, boardSlugs, options)
+			deliverBoardNotifications(ctx, manager, passBoards, options)
 			return nil
 		}
 		timer := time.NewTimer(options.Interval)
@@ -2053,7 +2198,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			return nil
 		case <-workerFinished:
 			timer.Stop()
-			if err := takeWorkerError(); err != nil {
+			if err := handleWorkerResults(); err != nil {
 				processes.StopAll()
 				workers.Wait()
 				return err
