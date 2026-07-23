@@ -188,6 +188,28 @@ func TestAutomationCenterPreservesExpandedDetailsAndFocus(t *testing.T) {
 	}
 }
 
+func TestAutomationCenterTreatsEmptyCoordinationActionsAsManualEscalation(t *testing.T) {
+	javascript := dashboardAsset(t, "app.js")
+	for _, marker := range []string{
+		`const manualEscalation = proposalActions == null ||`,
+		`(Array.isArray(proposalActions) && proposalActions.length === 0)`,
+		`const canApprove = canDecide && !manualEscalation`,
+		`const manualHelp = automationHelp("manualEscalation")`,
+		`No automatic graph changes are proposed.`,
+		`자동으로 적용할 그래프 변경안이 없습니다.`,
+		`${escapeHtml(manualHelp.title)}`,
+		`${escapeHtml(manualHelp.description)}`,
+		`${manualEscalation ? "Dismiss" : "Reject"}`,
+		`Dismiss this manual escalation without changing the graph?`,
+		`Manual escalation dismissed; the task graph was not changed`,
+		`>Reanalyze</button>`,
+	} {
+		if !strings.Contains(javascript, marker) {
+			t.Fatalf("manual coordination escalation marker %q is missing", marker)
+		}
+	}
+}
+
 func TestAutomationCenterIsResponsiveWithoutDialogOverflow(t *testing.T) {
 	styles := dashboardAsset(t, "styles.css")
 	for _, marker := range []string{

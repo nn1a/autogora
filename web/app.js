@@ -1783,6 +1783,11 @@ const AUTOMATION_HELP = {
     recovery: "Planner handles normal Triage work. Coordinator only proposes recovery when the graph needs exceptional intervention.",
     recoveryAssist: "Assist mode waits for a person to approve, reject, or request a new analysis before changing the graph.",
     publishing: "Publication actions use the version currently shown. If another process changes it first, refresh and review the new state.",
+    manualEscalation: {
+      empty: "No automatic graph changes are proposed. Resolve the affected task manually, dismiss this escalation, or request a new analysis.",
+      title: "Manual resolution required",
+      description: "This proposal cannot be approved because it contains no automatic actions. Open the affected task and resolve it manually, dismiss the escalation, or request a new analysis.",
+    },
   },
   ko: {
     tabs: {
@@ -1803,6 +1808,68 @@ const AUTOMATION_HELP = {
     recovery: "Planner는 일반 Triage 작업을 처리합니다. Coordinator는 그래프에 예외적인 개입이 필요할 때만 복구안을 제시합니다.",
     recoveryAssist: "Assist 모드에서는 사람이 승인, 거절, 재분석을 선택한 뒤에만 그래프를 변경합니다.",
     publishing: "배포 작업은 현재 화면에 표시된 버전을 기준으로 처리합니다. 다른 프로세스가 먼저 변경했다면 새로 고친 뒤 변경된 상태를 다시 확인하세요.",
+    manualEscalation: {
+      empty: "자동으로 적용할 그래프 변경안이 없습니다. 영향을 받은 작업을 직접 해결하거나, 이 에스컬레이션을 Dismiss하거나, Reanalyze로 다시 분석하세요.",
+      title: "수동 해결이 필요합니다",
+      description: "이 제안에는 자동으로 실행할 작업이 없어 Approve할 수 없습니다. 영향을 받은 작업을 직접 해결하거나, 에스컬레이션을 Dismiss하거나, Reanalyze로 다시 분석하세요.",
+    },
+  },
+};
+
+const DASHBOARD_HELP = {
+  en: {
+    swarm: {
+      buttonTitle: "Advanced DAG template: parallel workers, verifier, and synthesizer",
+      buttonDescription: "Swarm creates an advanced parallel worker, verifier, and synthesizer DAG. It does not enable board automation or run Coordinator recovery.",
+      dialogLabel: "About Swarm",
+      heading: "Advanced DAG template",
+      description: "Swarm creates parallel worker tasks followed by verifier and synthesizer dependencies. It is separate from normal Autopilot execution and Coordinator recovery.",
+    },
+    focus: {
+      description: "Focus limits the board to a workflow stage group. Archive Focus also loads archived tasks.",
+      titles: {
+        all: "Show every visible workflow status",
+        planning: "Show Triage through Ready",
+        execution: "Show Running through Done",
+        archive: "Load and show only archived tasks",
+      },
+    },
+    view: {
+      description: "Overview shows full cards, Compact reduces card density, Flow separates workflow stages, and Graph diagrams task dependencies and hierarchy.",
+      titles: {
+        overview: "Responsive status grids with full task cards",
+        compact: "Denser status grids with condensed task cards",
+        flow: "Separate stage panels that emphasize workflow order",
+        graph: "Dependency and hierarchy diagram for the current board",
+      },
+    },
+  },
+  ko: {
+    swarm: {
+      buttonTitle: "고급 DAG 템플릿: 병렬 worker, verifier, synthesizer를 구성합니다",
+      buttonDescription: "Swarm은 병렬 worker 뒤에 verifier와 synthesizer를 실행하는 고급 DAG를 만듭니다. 보드 자동화를 활성화하거나 Coordinator 복구를 실행하지는 않습니다.",
+      dialogLabel: "Swarm 설명",
+      heading: "고급 DAG 템플릿",
+      description: "Swarm은 병렬 worker 작업을 만든 뒤 verifier와 synthesizer 의존성을 연결합니다. 일반 Autopilot 실행 및 Coordinator 복구와는 별도 기능입니다.",
+    },
+    focus: {
+      description: "Focus는 보드를 workflow stage 단위로 좁혀 보여줍니다. Archive를 선택하면 보관된 작업도 함께 불러옵니다.",
+      titles: {
+        all: "화면에 표시할 수 있는 모든 workflow 상태를 봅니다",
+        planning: "Triage부터 Ready까지 봅니다",
+        execution: "Running부터 Done까지 봅니다",
+        archive: "보관된 작업만 불러와 봅니다",
+      },
+    },
+    view: {
+      description: "Overview는 카드 전체를 보여주고, Compact는 카드 밀도를 높이며, Flow는 workflow stage를 나누고, Graph는 작업 의존성과 계층을 다이어그램으로 보여줍니다.",
+      titles: {
+        overview: "전체 task 카드를 반응형 상태 grid로 봅니다",
+        compact: "task 카드를 줄여 더 촘촘한 상태 grid로 봅니다",
+        flow: "workflow 순서를 강조한 stage panel로 나눠 봅니다",
+        graph: "현재 보드의 task 의존성과 계층을 다이어그램으로 봅니다",
+      },
+    },
   },
 };
 
@@ -1818,6 +1885,48 @@ const COORDINATION_ACTION_LABELS = {
 
 function automationHelp(key) {
   return AUTOMATION_HELP[state.automationHelpLanguage]?.[key] || AUTOMATION_HELP.en[key] || "";
+}
+
+function updateHelpLanguageButtons() {
+  const language = state.automationHelpLanguage;
+  const nextLanguage = language === "en" ? "Korean" : "English";
+  for (const selector of ["#help-language", "#automation-help-language"]) {
+    const button = $(selector);
+    if (!button) continue;
+    button.textContent = `Help · ${language.toUpperCase()}`;
+    button.setAttribute("aria-label", `Switch help text to ${nextLanguage}`);
+  }
+}
+
+function updateDashboardHelp() {
+  const language = state.automationHelpLanguage;
+  const help = DASHBOARD_HELP[language] || DASHBOARD_HELP.en;
+  updateHelpLanguageButtons();
+
+  const swarmButton = $("#new-swarm");
+  swarmButton.title = help.swarm.buttonTitle;
+  $("#swarm-button-help").textContent = help.swarm.buttonDescription;
+  const swarmHelp = $(".swarm-help");
+  swarmHelp.setAttribute("aria-label", help.swarm.dialogLabel);
+  swarmHelp.lang = language;
+  $("#swarm-help-title").textContent = help.swarm.heading;
+  $("#swarm-help-description").textContent = help.swarm.description;
+
+  $("#stage-focus-help").textContent = help.focus.description;
+  $$("[data-stage-focus]").forEach((button) => {
+    button.title = help.focus.titles[button.dataset.stageFocus] || "";
+  });
+  $("#board-view-help").textContent = help.view.description;
+  $$("[data-board-view]").forEach((button) => {
+    button.title = help.view.titles[button.dataset.boardView] || "";
+  });
+
+  for (const selector of [
+    "#swarm-button-help", "#swarm-help-title", "#swarm-help-description",
+    "#stage-focus-help", "#board-view-help",
+  ]) {
+    $(selector).lang = language;
+  }
 }
 
 function structuredValue(value) {
@@ -2160,7 +2269,10 @@ function coordinationActionDetails(action) {
 
 function coordinationActions(actions, proposalID) {
   actions = structuredValue(actions);
-  if (!Array.isArray(actions) || !actions.length) return '<p class="automation-empty">No graph changes proposed.</p>';
+  if (!Array.isArray(actions) || !actions.length) {
+    const manualHelp = automationHelp("manualEscalation");
+    return `<p class="automation-empty">${escapeHtml(manualHelp.empty)}</p>`;
+  }
   return `<ol class="automation-action-list">${actions.map((action, index) => {
     const details = coordinationActionDetails(action);
     return `<li>
@@ -2180,7 +2292,12 @@ function validationErrors(value) {
 }
 
 function coordinationProposalCard(proposal, incident, actionsAvailable) {
+  const proposalActions = structuredValue(proposal.actions);
+  const manualEscalation = proposalActions == null ||
+    (Array.isArray(proposalActions) && proposalActions.length === 0);
+  const manualHelp = automationHelp("manualEscalation");
   const canDecide = actionsAvailable && proposal.status === "awaiting_approval" && incident.status === "awaiting_approval";
+  const canApprove = canDecide && !manualEscalation;
   const canReanalyze = actionsAvailable && ["awaiting_approval", "approved"].includes(proposal.status) &&
     incident.status === "awaiting_approval";
   return `<section class="automation-proposal">
@@ -2188,9 +2305,11 @@ function coordinationProposalCard(proposal, incident, actionsAvailable) {
     <p class="automation-rationale">${escapeHtml(proposal.rationale || "No rationale supplied.")}</p>
     <div class="automation-agent-line">Coordinator: ${escapeHtml(proposal.coordinatorAgent || "unknown")} · ${escapeHtml(proposal.coordinatorModel || "CLI default")}${proposal.coordinatorProvider ? ` · ${escapeHtml(proposal.coordinatorProvider)}` : ""}</div>
     <h4>Proposed actions</h4>${coordinationActions(proposal.actions, proposal.id)}
+    ${manualEscalation ? `<div class="automation-help-callout is-attention"><strong>${escapeHtml(manualHelp.title)}</strong><p>${escapeHtml(manualHelp.description)}</p></div>` : ""}
     ${validationErrors(proposal.validationErrors)}
     ${(canDecide || canReanalyze) ? `<div class="automation-actions">
-      ${canDecide ? `<button type="button" class="primary" data-automation-focus="coordination:approve:${escapeHtml(proposal.id)}" data-coordination-action="approve" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Approve</button><button type="button" class="danger" data-automation-focus="coordination:reject:${escapeHtml(proposal.id)}" data-coordination-action="reject" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Reject</button>` : ""}
+      ${canApprove ? `<button type="button" class="primary" data-automation-focus="coordination:approve:${escapeHtml(proposal.id)}" data-coordination-action="approve" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Approve</button>` : ""}
+      ${canDecide ? `<button type="button" class="danger" data-automation-focus="coordination:reject:${escapeHtml(proposal.id)}" data-coordination-action="reject" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">${manualEscalation ? "Dismiss" : "Reject"}</button>` : ""}
       ${canReanalyze ? `<button type="button" data-automation-focus="coordination:retry:${escapeHtml(proposal.id)}" data-coordination-action="retry" data-proposal-id="${escapeHtml(proposal.id)}" data-proposal-version="${escapeHtml(proposal.updatedAt)}">Reanalyze</button>` : ""}
     </div>` : ""}
   </section>`;
@@ -2306,10 +2425,10 @@ function renderAutomationEvents(data) {
 function updateAutomationShell() {
   const language = state.automationHelpLanguage;
   const help = AUTOMATION_HELP[language] || AUTOMATION_HELP.en;
-  $("#automation-center-help").textContent = help.tabs[state.automationTab];
-  const languageButton = $("#automation-help-language");
-  languageButton.textContent = `Help · ${language.toUpperCase()}`;
-  languageButton.setAttribute("aria-label", `Switch help text to ${language === "en" ? "Korean" : "English"}`);
+  const centerHelp = $("#automation-center-help");
+  centerHelp.textContent = help.tabs[state.automationTab];
+  centerHelp.lang = language;
+  updateHelpLanguageButtons();
   $$("[data-activity-tab]", $("#automation-tabs")).forEach((button) => {
     const selected = button.dataset.activityTab === state.automationTab;
     button.setAttribute("aria-selected", String(selected));
@@ -2459,6 +2578,7 @@ function setAutomationTab(value, options = {}) {
 function toggleAutomationHelpLanguage() {
   state.automationHelpLanguage = state.automationHelpLanguage === "en" ? "ko" : "en";
   localStorage.setItem("autogora.automationHelpLanguage", state.automationHelpLanguage);
+  updateDashboardHelp();
   renderAutomationCenter();
 }
 
@@ -2569,9 +2689,14 @@ async function mutateCoordination(button) {
     await loadActivity();
     return;
   }
+  const proposalActions = structuredValue(proposal.actions);
+  const manualEscalation = proposalActions == null ||
+    (Array.isArray(proposalActions) && proposalActions.length === 0);
   const prompts = {
     approve: "Approve and apply this recovery proposal?",
-    reject: "Reject this recovery proposal?",
+    reject: manualEscalation
+      ? "Dismiss this manual escalation without changing the graph?"
+      : "Reject this recovery proposal?",
     retry: "Supersede this proposal and request a new analysis?",
   };
   if (!confirm(prompts[action])) return;
@@ -2583,7 +2708,9 @@ async function mutateCoordination(button) {
     }),
   }), {
     approve: "Recovery proposal approved",
-    reject: "Recovery proposal rejected",
+    reject: manualEscalation
+      ? "Manual escalation dismissed; the task graph was not changed"
+      : "Recovery proposal rejected",
     retry: "Recovery reanalysis scheduled",
   }[action]);
 }
@@ -3098,6 +3225,7 @@ function bindGlobalActions() {
     cancelAutomationLoad();
     setAutomationBusy(false);
   });
+  $("#help-language").addEventListener("click", toggleAutomationHelpLanguage);
   $("#automation-help-language").addEventListener("click", toggleAutomationHelpLanguage);
   $("#automation-tabs").addEventListener("click", (event) => {
     const tab = event.target.closest("[data-activity-tab]");
@@ -3309,7 +3437,7 @@ async function archiveBoard(event) {
 }
 
 async function main() {
-  setTheme(activeTheme, false); initializeSelects(); bindGlobalActions();
+  setTheme(activeTheme, false); initializeSelects(); updateDashboardHelp(); bindGlobalActions();
   try {
     await loadBoards();
     const configuration = await loadAgentConfiguration();

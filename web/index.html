@@ -46,12 +46,12 @@
       <div class="view-control">
         <span id="stage-focus-label" class="view-control-label">Focus</span>
         <div class="segmented-control" role="group" aria-labelledby="stage-focus-label" aria-describedby="stage-focus-help" data-board-control="focus">
-          <button type="button" class="compact" data-stage-focus="all" aria-pressed="true" title="Show every visible workflow stage">All stages</button>
-          <button type="button" class="compact" data-stage-focus="planning" aria-pressed="false" title="Show only Triage through Ready">Planning</button>
-          <button type="button" class="compact" data-stage-focus="execution" aria-pressed="false" title="Show only Running through Done">Execution</button>
+          <button type="button" class="compact" data-stage-focus="all" aria-pressed="true" title="Show every visible workflow status">All stages</button>
+          <button type="button" class="compact" data-stage-focus="planning" aria-pressed="false" title="Show Triage through Ready">Planning</button>
+          <button type="button" class="compact" data-stage-focus="execution" aria-pressed="false" title="Show Running through Done">Execution</button>
           <button type="button" class="compact" data-stage-focus="archive" aria-pressed="false" title="Load and show only archived tasks">Archive</button>
         </div>
-        <span id="stage-focus-help" class="sr-only">Focus shows one workflow stage at a time. Archive Focus also loads archived tasks.</span>
+        <span id="stage-focus-help" class="sr-only">Focus limits the board to a workflow stage group. Archive Focus also loads archived tasks.</span>
       </div>
       <div class="view-control">
         <span id="board-view-label" class="view-control-label">View</span>
@@ -64,6 +64,7 @@
         <span id="board-view-help" class="sr-only">Overview shows full cards, Compact reduces card density, Flow separates workflow stages, and Graph diagrams task dependencies and hierarchy.</span>
       </div>
       <small id="board-view-summary" class="board-view-summary" aria-live="polite">All stages · Overview</small>
+      <button id="help-language" type="button" class="ghost compact" aria-label="Switch help text to Korean">Help · EN</button>
       <button id="status-focus-clear" type="button" class="ghost compact hidden">Exit column focus</button>
     </section>
 
@@ -229,7 +230,7 @@
 
   <dialog id="agents-dialog" class="dialog-agents">
     <form id="agents-form" method="dialog" class="dialog-form">
-      <header><div><h2>Coding agent setup</h2><small id="agents-config-path" class="mono"></small></div><div class="section-actions"><button id="agents-reload" type="button" class="ghost compact">Reload</button><button type="button" data-close-dialog class="icon-button">×</button></div></header>
+      <header class="agents-header"><div class="agents-heading"><h2>Coding agent setup</h2><small id="agents-config-path" class="mono"></small></div><div class="section-actions"><button id="agents-reload" type="button" class="ghost compact">Reload</button><button type="button" data-close-dialog class="icon-button" aria-label="Close coding agent setup">×</button></div></header>
       <p class="dialog-intro">Autogora stores routing settings only. Authentication remains with each coding agent CLI. Detection checks PATH and <code>--version</code>; it never sends a prompt.</p>
       <section class="agent-presets" aria-labelledby="agent-presets-title">
         <div>
@@ -281,8 +282,8 @@
     <form id="swarm-form" method="dialog" class="dialog-form">
       <header><h2>Create task swarm</h2><button type="button" data-close-dialog class="icon-button">×</button></header>
       <section class="swarm-help" aria-label="About Swarm">
-        <strong>Advanced DAG template</strong>
-        <span>Swarm creates parallel worker tasks followed by verifier and synthesizer dependencies. It is separate from normal Autopilot execution and Coordinator recovery.</span>
+        <strong id="swarm-help-title">Advanced DAG template</strong>
+        <span id="swarm-help-description">Swarm creates parallel worker tasks followed by verifier and synthesizer dependencies. It is separate from normal Autopilot execution and Coordinator recovery.</span>
       </section>
       <label>Goal<textarea name="goal" rows="4" required></textarea></label>
       <label>Workers <small>comma-separated name:runtime</small><input name="workers" required placeholder="researcher:codex,architect:claude,reviewer:gemini"></label>
