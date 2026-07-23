@@ -117,14 +117,27 @@ func profileRoutes(values []boards.Profile) []orchestration.ProfileRoute {
 
 func globalWorkerProfileRoutes(config agentconfig.Config) []orchestration.ProfileRoute {
 	result := make([]orchestration.ProfileRoute, 0, len(config.Agents))
-	for _, agent := range config.Agents {
-		if !agentSupportsRole(agent, agentconfig.RoleWorker) {
-			continue
+	seen := map[string]bool{}
+	appendAgent := func(agent agentconfig.Agent) {
+		if seen[agent.ID] || !agentSupportsRole(agent, agentconfig.RoleWorker) {
+			return
 		}
+		seen[agent.ID] = true
 		result = append(result, orchestration.ProfileRoute{
 			Name: agent.ID, Runtime: agent.Runtime, Model: agent.Model, Provider: agent.Provider,
 			Disabled: !agent.Enabled, MaxConcurrent: agent.MaxConcurrent, Fallbacks: append([]string{}, agent.Fallbacks...),
 		})
+	}
+	for _, id := range config.Defaults.WorkerAgents {
+		if agent, found := config.Find(id); found {
+			appendAgent(agent)
+		}
+	}
+	for _, agent := range config.Agents {
+		if !agentSupportsRole(agent, agentconfig.RoleWorker) {
+			continue
+		}
+		appendAgent(agent)
 	}
 	return result
 }
@@ -202,7 +215,18 @@ func (s *Service) DecomposeTask(ctx context.Context, taskID string, plan *orches
 	if err != nil {
 		return orchestration.DecompositionResult{}, err
 	}
-	fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile, metadata.Orchestration.PlannerRuntime)
+	defaultProfile := metadata.Orchestration.DefaultProfile
+	if defaultProfile == nil {
+		config, configErr := agentconfig.Load(agentconfig.Options{})
+		if configErr != nil {
+			return orchestration.DecompositionResult{}, fmt.Errorf("load global agent configuration: %w", configErr)
+		}
+		if agent, found := firstGlobalAgent(config, config.Defaults.WorkerAgents, agentconfig.RoleWorker); found {
+			value := agent.ID
+			defaultProfile = &value
+		}
+	}
+	fallback, orchestrator := orchestration.SelectProfileRoutes(profiles, defaultProfile, metadata.Orchestration.OrchestratorProfile, metadata.Orchestration.PlannerRuntime)
 	planner, err := s.planner(metadata)
 	if err != nil {
 		return orchestration.DecompositionResult{}, err

@@ -227,6 +227,42 @@ func TestSharedServiceUsesBoardProfilesForExplicitDecomposition(t *testing.T) {
 	}
 }
 
+func TestSharedServiceUsesGlobalDefaultWorkerForSpecification(t *testing.T) {
+	isolateGlobalAgentConfig(t)
+	config := agentconfig.Default()
+	config.Defaults.WorkerAgents = []string{"global-coder"}
+	config.Agents = []agentconfig.Agent{{
+		ID: "global-coder", Runtime: model.RuntimeClaude, Command: "claude", Model: "global-model",
+		Enabled: true, MaxConcurrent: 1, Roles: []agentconfig.Role{agentconfig.RoleWorker},
+	}}
+	if err := agentconfig.Save(agentconfig.Options{}, config); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	manager, err := boards.NewManager(filepath.Join(t.TempDir(), "autogora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "Rough idea", Status: model.TaskStatusTriage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(opened, manager, "default").DecomposeTask(ctx, task.Task.ID, &orchestration.DecompositionPlan{
+		Fanout: false, RootTitle: "Specified task", RootBody: "Acceptance: complete the work.", Reason: "one worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Task.Task.Assignee == nil || *result.Task.Task.Assignee != "global-coder" || result.Task.Task.Runtime != model.RuntimeClaude {
+		t.Fatalf("global default worker was not applied: %#v", result.Task.Task)
+	}
+}
+
 func isolateGlobalAgentConfig(t *testing.T) {
 	t.Helper()
 	t.Setenv("AUTOGORA_CONFIG", filepath.Join(t.TempDir(), "config.json"))
