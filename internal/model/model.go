@@ -65,6 +65,26 @@ const (
 	RunStatusProtocolViolation RunStatus = "protocol_violation"
 )
 
+type AgentHealthStatus string
+
+const (
+	AgentHealthUnknown      AgentHealthStatus = "unknown"
+	AgentHealthReady        AgentHealthStatus = "ready"
+	AgentHealthMissing      AgentHealthStatus = "missing"
+	AgentHealthAuthRequired AgentHealthStatus = "auth_required"
+	AgentHealthRateLimited  AgentHealthStatus = "rate_limited"
+	AgentHealthUnhealthy    AgentHealthStatus = "unhealthy"
+)
+
+var AgentHealthStatuses = []AgentHealthStatus{
+	AgentHealthUnknown,
+	AgentHealthReady,
+	AgentHealthMissing,
+	AgentHealthAuthRequired,
+	AgentHealthRateLimited,
+	AgentHealthUnhealthy,
+}
+
 type WorkspaceKind string
 
 const (
@@ -147,6 +167,18 @@ type RunAgentConfig struct {
 	Source       string  `json:"source"`
 	FallbackFrom *string `json:"fallbackFrom"`
 	ConfiguredAt string  `json:"configuredAt"`
+}
+
+// AgentHealth records the latest runtime availability observation for one
+// configured agent. An empty UpdatedAt denotes a synthesized unknown state
+// for an agent that has not been checked yet.
+type AgentHealth struct {
+	AgentID       string            `json:"agentId"`
+	Status        AgentHealthStatus `json:"status"`
+	CooldownUntil *string           `json:"cooldownUntil"`
+	LastError     *string           `json:"lastError"`
+	LastRunID     *string           `json:"lastRunId"`
+	UpdatedAt     string            `json:"updatedAt"`
 }
 
 type TerminalRequest struct {
@@ -242,6 +274,15 @@ func ValidTaskStatus(value TaskStatus) bool {
 
 func ValidRuntime(value Runtime) bool {
 	for _, candidate := range Runtimes {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidAgentHealthStatus(value AgentHealthStatus) bool {
+	for _, candidate := range AgentHealthStatuses {
 		if candidate == value {
 			return true
 		}

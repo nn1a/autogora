@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 13
+const schemaVersion = 14
 
 type Store struct {
 	db              *sql.DB
@@ -395,6 +395,15 @@ CREATE TABLE IF NOT EXISTS run_agent_configs (
   configured_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_health (
+  agent_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('unknown', 'ready', 'missing', 'auth_required', 'rate_limited', 'unhealthy')),
+  cooldown_until TEXT,
+  last_error TEXT,
+  last_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS resource_leases (
   resource_key TEXT PRIMARY KEY,
   run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
@@ -500,6 +509,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(board, idempote
 CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, claimed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_workspaces_task ON run_workspaces(task_id, prepared_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_agent_configs_task ON run_agent_configs(task_id, configured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_health_due ON agent_health(status, cooldown_until);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);
