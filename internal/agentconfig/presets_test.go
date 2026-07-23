@@ -18,6 +18,13 @@ func TestBuiltinPresetsProduceValidUnpinnedConfigurations(t *testing.T) {
 		if presets[index].ID != wantID {
 			t.Fatalf("preset[%d].ID = %q, want %q", index, presets[index].ID, wantID)
 		}
+		if !strings.Contains(strings.ToLower(presets[index].Description), "recovery") {
+			t.Fatalf(
+				"preset %s does not explain its Coordinator recovery route: %q",
+				wantID,
+				presets[index].Description,
+			)
+		}
 		config, err := BuildPreset(wantID, nil)
 		if err != nil {
 			t.Fatalf("BuildPreset(%q): %v", wantID, err)

@@ -28,19 +28,19 @@ type PresetApplyOptions struct {
 var builtinPresets = []Preset{
 	singleRuntimePreset(
 		"codex",
-		"One Codex agent for planning, implementation, and judging.",
+		"One Codex agent for planning, implementation, exceptional recovery, and judging.",
 		"codex",
 		model.RuntimeCodex,
 	),
 	singleRuntimePreset(
 		"claude",
-		"One Claude agent for planning, implementation, and judging.",
+		"One Claude agent for planning, implementation, exceptional recovery, and judging.",
 		"claude",
 		model.RuntimeClaude,
 	),
 	dualRuntimePreset(
 		"codex-claude",
-		"Codex leads planning and implementation, Claude provides fallback capacity and first-pass judging.",
+		"Codex leads planning and implementation; Claude provides fallback capacity and first-pass recovery and judging.",
 		"codex",
 		model.RuntimeCodex,
 		"claude",
@@ -48,7 +48,7 @@ var builtinPresets = []Preset{
 	),
 	dualRuntimePreset(
 		"claude-codex",
-		"Claude leads planning and implementation, Codex provides fallback capacity and first-pass judging.",
+		"Claude leads planning and implementation; Codex provides fallback capacity and first-pass recovery and judging.",
 		"claude",
 		model.RuntimeClaude,
 		"codex",
