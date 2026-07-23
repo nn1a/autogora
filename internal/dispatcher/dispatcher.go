@@ -669,19 +669,11 @@ func selectAvailableProfile(
 			byName[name] = profile
 		}
 	}
-	queue, seen := []string{desired}, map[string]bool{}
-	for len(queue) > 0 {
-		candidateName := queue[0]
-		queue = queue[1:]
-		if seen[candidateName] {
-			continue
-		}
-		seen[candidateName] = true
+	for _, candidateName := range orderedWorkerProfileCandidates(desired, byName, config) {
 		candidate, exists := byName[candidateName]
 		if !exists {
 			continue
 		}
-		queue = append(queue, candidate.Fallbacks...)
 		if !orchestration.RunnableProfileRoute(candidate) {
 			continue
 		}
@@ -710,6 +702,55 @@ func selectAvailableProfile(
 		return candidate, true, nil
 	}
 	return orchestration.ProfileRoute{}, false, nil
+}
+
+// orderedWorkerProfileCandidates preserves a task's requested route and its
+// explicit breadth-first fallback graph, then broadens availability through
+// the configured Worker roster. The local seen set also bounds malformed
+// board-only fallback cycles without changing the validated global config.
+func orderedWorkerProfileCandidates(
+	desired string,
+	byName map[string]orchestration.ProfileRoute,
+	config agentconfig.Config,
+) []string {
+	candidates := make([]string, 0, len(byName))
+	seen := make(map[string]bool, len(byName))
+	appendCandidate := func(name string) bool {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return false
+		}
+		seen[name] = true
+		candidates = append(candidates, name)
+		return true
+	}
+
+	queue := []string{strings.TrimSpace(desired)}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if !appendCandidate(name) {
+			continue
+		}
+		if profile, exists := byName[strings.TrimSpace(name)]; exists {
+			queue = append(queue, profile.Fallbacks...)
+		}
+	}
+
+	appendRosterAgent := func(id string) {
+		agent, found := config.Find(id)
+		if !found || !agent.Enabled || !hasAgentRole(agent, agentconfig.RoleWorker) {
+			return
+		}
+		appendCandidate(agent.ID)
+	}
+	for _, id := range config.Defaults.WorkerAgents {
+		appendRosterAgent(id)
+	}
+	for _, agent := range config.Agents {
+		appendRosterAgent(agent.ID)
+	}
+	return candidates
 }
 
 type resolvedRunProfile struct {

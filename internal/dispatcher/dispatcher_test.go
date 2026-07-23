@@ -1728,9 +1728,10 @@ func TestDispatcherSkipsDisabledProfiles(t *testing.T) {
 	assignee := "paused"
 	task, _ := opened.CreateTask(ctx, store.CreateTaskInput{Title: "must stay queued", Assignee: &assignee, Runtime: model.RuntimeCodex})
 	opened.Close()
+	config := agentconfig.Default()
 	if err := Run(ctx, Options{DBPath: dbPath, CLIPath: "/tmp/autogora", Once: true, AutoDecompose: boolValue(false), Getenv: func(string) string {
 		return ""
-	}}); err != nil {
+	}, AgentConfig: &config}); err != nil {
 		t.Fatal(err)
 	}
 	check, _ := manager.OpenStore(ctx, "default")
