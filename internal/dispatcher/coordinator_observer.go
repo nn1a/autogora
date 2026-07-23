@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ const (
 	coordinatorDiagnosticDetailLimit   = 1024
 	coordinatorTaskTitleLimit          = 512
 	coordinatorObservationTaskLimit    = 5000
+	coordinatorConditionFingerprintKey = "conditionFingerprint"
 )
 
 type coordinatorCondition struct {
@@ -68,6 +70,174 @@ func coordinatorManagedTrigger(trigger model.CoordinationTrigger) bool {
 	}
 }
 
+func stableCoordinatorConditionDetails(details map[string]any) map[string]any {
+	stable := make(map[string]any, len(details))
+	for key, value := range details {
+		switch key {
+		case coordinatorConditionFingerprintKey, "observedAt":
+			// observedAt records when the same condition was sampled. Including
+			// it would make every graph-stall observation look like new work.
+			continue
+		default:
+			stable[key] = value
+		}
+	}
+	return stable
+}
+
+func coordinatorConditionFingerprint(condition coordinatorCondition) (string, error) {
+	return coordinatorIncidentFingerprint(
+		condition.trigger,
+		condition.rootTaskID,
+		condition.taskID,
+		condition.graphRevision,
+		condition.details,
+	)
+}
+
+func coordinatorIncidentFingerprint(
+	trigger model.CoordinationTrigger,
+	rootTaskID string,
+	taskID string,
+	graphRevision int64,
+	details map[string]any,
+) (string, error) {
+	payload := struct {
+		Trigger       model.CoordinationTrigger `json:"trigger"`
+		RootTaskID    string                    `json:"rootTaskId,omitempty"`
+		TaskID        string                    `json:"taskId,omitempty"`
+		GraphRevision int64                     `json:"graphRevision"`
+		Details       map[string]any            `json:"details"`
+	}{
+		Trigger: trigger, RootTaskID: strings.TrimSpace(rootTaskID),
+		TaskID: strings.TrimSpace(taskID), GraphRevision: graphRevision,
+		Details: stableCoordinatorConditionDetails(details),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	fingerprint := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", fingerprint), nil
+}
+
+func storedCoordinatorConditionFingerprint(incident model.CoordinationIncident) (string, error) {
+	details, err := decodeBoundedCoordinatorDetails(incident.Details)
+	if err != nil {
+		return "", err
+	}
+	if fingerprint, ok := details[coordinatorConditionFingerprintKey].(string); ok &&
+		strings.TrimSpace(fingerprint) != "" {
+		return strings.TrimSpace(fingerprint), nil
+	}
+	return coordinatorIncidentFingerprint(
+		incident.Trigger,
+		optionalString(incident.RootTaskID),
+		optionalString(incident.TaskID),
+		incident.GraphRevision,
+		details,
+	)
+}
+
+type coordinatorIntegrationIncidentDetails struct {
+	Code      string          `json:"code"`
+	BlockKind model.BlockKind `json:"blockKind"`
+	Reason    string          `json:"reason"`
+}
+
+func coordinatorIntegrationReasonMatches(actual, expected string) bool {
+	actual, expected = strings.TrimSpace(actual), strings.TrimSpace(expected)
+	if actual == expected {
+		return actual != ""
+	}
+	const truncationSuffix = "…"
+	return strings.HasSuffix(expected, truncationSuffix) &&
+		strings.HasPrefix(actual, strings.TrimSuffix(expected, truncationSuffix))
+}
+
+// integrationCoordinatorIncidentState separates a still-observed integration
+// failure from one that is safe to send to Coordinator. A conflict is retained
+// while its worker is still finalizing, but only the matching blocked/triage
+// state is actionable.
+func integrationCoordinatorIncidentState(
+	ctx context.Context,
+	opened *store.Store,
+	incident model.CoordinationIncident,
+) (keepOpen bool, actionable bool, err error) {
+	taskID := optionalString(incident.TaskID)
+	if taskID == "" {
+		return false, false, nil
+	}
+	detail, err := opened.GetTask(ctx, taskID)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "task not found") {
+			// Incidents intentionally outlive deleted tasks for audit. With no
+			// focus task left, the integration condition cannot remain active.
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	switch detail.Task.Status {
+	case model.TaskStatusRunning:
+		return true, false, nil
+	case model.TaskStatusDone, model.TaskStatusArchived:
+		return false, false, nil
+	case model.TaskStatusBlocked, model.TaskStatusTriage:
+		var expected coordinatorIntegrationIncidentDetails
+		if err := json.Unmarshal(incident.Details, &expected); err != nil {
+			return false, false, fmt.Errorf(
+				"decode integration coordination incident %s: %w", incident.ID, err,
+			)
+		}
+		relevantCode := expected.Code == workspace.IntegrationFailureConflict ||
+			expected.Code == workspace.IntegrationFailureHistoryRewrite
+		matchingKind := detail.Task.BlockKind != nil &&
+			*detail.Task.BlockKind == expected.BlockKind
+		matchingReason := detail.Task.BlockReason != nil &&
+			coordinatorIntegrationReasonMatches(*detail.Task.BlockReason, expected.Reason)
+		matching := relevantCode && matchingKind && matchingReason
+		return matching, matching, nil
+	default:
+		return false, false, nil
+	}
+}
+
+func reconcileOpenIntegrationIncidents(
+	ctx context.Context,
+	opened *store.Store,
+	incidents []model.CoordinationIncident,
+) ([]model.CoordinationIncident, error) {
+	result := make([]model.CoordinationIncident, 0, len(incidents))
+	for _, incident := range incidents {
+		if incident.Status != model.CoordinationIncidentOpen ||
+			incident.Trigger != model.CoordinationTriggerIntegrationConflict {
+			result = append(result, incident)
+			continue
+		}
+		keepOpen, _, err := integrationCoordinatorIncidentState(ctx, opened, incident)
+		if err != nil {
+			return nil, err
+		}
+		if keepOpen {
+			result = append(result, incident)
+			continue
+		}
+		resolved, err := opened.TransitionCoordinationIncident(
+			ctx,
+			incident.ID,
+			store.TransitionCoordinationIncidentInput{
+				ExpectedStatus: model.CoordinationIncidentOpen,
+				Status:         model.CoordinationIncidentResolved,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resolved)
+	}
+	return result, nil
+}
+
 // reconcileCoordinatorIncidents runs the deterministic observation half of
 // coordination. It never invokes a coding agent and does not change task or
 // graph state. A future coordination queue can consume the open incidents
@@ -97,14 +267,29 @@ func reconcileCoordinatorIncidents(
 	if err != nil {
 		return nil, err
 	}
+	active, err = reconcileOpenIntegrationIncidents(ctx, opened, active)
+	if err != nil {
+		return nil, err
+	}
 	activeByKey := make(map[string]model.CoordinationIncident, len(active))
+	dismissedByKey := make(map[string]model.CoordinationIncident)
+	latestByKey := make(map[string]bool)
 	for _, incident := range active {
+		key := coordinatorIncidentKey(
+			incident.Trigger, optionalString(incident.RootTaskID), optionalString(incident.TaskID),
+		)
+		if !latestByKey[key] {
+			latestByKey[key] = true
+			if incident.Status == model.CoordinationIncidentDismissed {
+				// ListCoordinationIncidents is newest first. An older dismissal
+				// must not suppress a condition that changed after that decision.
+				dismissedByKey[key] = incident
+			}
+		}
 		if !activeCoordinatorIncident(incident.Status) {
 			continue
 		}
-		activeByKey[coordinatorIncidentKey(
-			incident.Trigger, optionalString(incident.RootTaskID), optionalString(incident.TaskID),
-		)] = incident
+		activeByKey[key] = incident
 	}
 
 	conditions, err := detectCoordinatorConditions(ctx, opened, metadata, configured, options, active, current)
@@ -120,7 +305,25 @@ func reconcileCoordinatorIncidents(
 			observed = append(observed, existing)
 			continue
 		}
-		details, err := boundedCoordinatorDetails(condition.details)
+		fingerprint, err := coordinatorConditionFingerprint(condition)
+		if err != nil {
+			return nil, err
+		}
+		if dismissed, found := dismissedByKey[condition.key()]; found {
+			dismissedFingerprint, err := storedCoordinatorConditionFingerprint(dismissed)
+			if err != nil {
+				return nil, err
+			}
+			if dismissedFingerprint == fingerprint {
+				continue
+			}
+		}
+		detailsWithFingerprint := make(map[string]any, len(condition.details)+1)
+		for key, value := range condition.details {
+			detailsWithFingerprint[key] = value
+		}
+		detailsWithFingerprint[coordinatorConditionFingerprintKey] = fingerprint
+		details, err := boundedCoordinatorDetails(detailsWithFingerprint)
 		if err != nil {
 			return nil, err
 		}
@@ -762,9 +965,14 @@ func boundedCoordinatorDetails(details map[string]any) (json.RawMessage, error) 
 	if len(encoded) <= coordinatorIncidentDetailsLimit {
 		return encoded, nil
 	}
-	return json.Marshal(map[string]any{
+	fallback := map[string]any{
 		"truncated": true, "originalBytes": len(encoded),
-	})
+	}
+	if fingerprint, ok := details[coordinatorConditionFingerprintKey].(string); ok &&
+		strings.TrimSpace(fingerprint) != "" {
+		fallback[coordinatorConditionFingerprintKey] = strings.TrimSpace(fingerprint)
+	}
+	return json.Marshal(fallback)
 }
 
 func decodeBoundedCoordinatorDetails(raw json.RawMessage) (map[string]any, error) {

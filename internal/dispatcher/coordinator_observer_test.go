@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
+	"github.com/nn1a/autogora/internal/workspace"
 )
 
 func coordinatorTestConfig(agents ...agentconfig.Agent) agentconfig.Config {
@@ -70,6 +72,51 @@ func findCoordinatorIncident(
 		}
 	}
 	return nil
+}
+
+func createCoordinatorIntegrationIncident(
+	t *testing.T,
+	ctx context.Context,
+	opened *store.Store,
+	taskID string,
+	reason string,
+) model.CoordinationIncident {
+	t.Helper()
+	detail, err := opened.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph, err := opened.RelationshipGraph(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details, err := json.Marshal(map[string]any{
+		"code":      workspace.IntegrationFailureConflict,
+		"blockKind": model.BlockKindNeedsInput,
+		"reason":    reason,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTaskID, revision := graph.RootTaskID, graph.GraphRevision
+	incident, created, err := opened.CreateCoordinationIncident(
+		ctx,
+		store.CreateCoordinationIncidentInput{
+			Board: detail.Task.Board, RootTaskID: &rootTaskID, TaskID: &taskID,
+			Trigger:               model.CoordinationTriggerIntegrationConflict,
+			Severity:              model.CoordinationSeverityError,
+			ExpectedGraphRevision: &revision,
+			Summary:               "integration conflict",
+			Details:               details,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatalf("integration incident was not created: %+v", incident)
+	}
+	return incident
 }
 
 func TestCoordinatorObserverRepeatedBlockThresholdAndReconciliation(t *testing.T) {
@@ -134,6 +181,327 @@ func TestCoordinatorObserverRepeatedBlockThresholdAndReconciliation(t *testing.T
 	if err != nil || len(resolved) != 1 || resolved[0].ID != repeated.ID {
 		t.Fatalf("resolved repeated block incidents = %+v, %v", resolved, err)
 	}
+}
+
+func TestCoordinatorObserverSuppressesDismissedConditionUntilMaterialChange(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "dismiss one repeated condition", Assignee: &assignee, Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := store.BlockInput{Kind: model.BlockKindCapability, Reason: "compiler is unavailable"}
+	if _, err := opened.BlockTask(ctx, task.Task.ID, block); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.UnblockTask(ctx, task.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.BlockTask(ctx, task.Task.ID, block); err != nil {
+		t.Fatal(err)
+	}
+	observed := observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now())
+	incident := findCoordinatorIncident(observed, model.CoordinationTriggerRepeatedBlock)
+	if incident == nil {
+		t.Fatalf("repeated condition was not observed: %+v", observed)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(incident.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(fmt.Sprint(details[coordinatorConditionFingerprintKey])) == "" {
+		t.Fatalf("condition fingerprint missing from details: %#v", details)
+	}
+	if _, err := opened.TransitionCoordinationIncident(
+		ctx,
+		incident.ID,
+		store.TransitionCoordinationIncidentInput{
+			ExpectedStatus: model.CoordinationIncidentOpen,
+			Status:         model.CoordinationIncidentDismissed,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now().Add(time.Minute))
+	incidents, err := opened.ListCoordinationIncidents(ctx, store.CoordinationIncidentFilter{
+		Trigger: model.CoordinationTriggerRepeatedBlock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 || incidents[0].ID != incident.ID ||
+		incidents[0].Status != model.CoordinationIncidentDismissed {
+		t.Fatalf("unchanged dismissed condition was recreated: %+v", incidents)
+	}
+
+	todo := model.TaskStatusTodo
+	if _, err := opened.UpdateTask(ctx, task.Task.ID, store.UpdateTaskInput{Status: &todo}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.BlockTask(ctx, task.Task.ID, block); err != nil {
+		t.Fatal(err)
+	}
+	observed = observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now().Add(2*time.Minute))
+	reopened := findCoordinatorIncident(observed, model.CoordinationTriggerRepeatedBlock)
+	if reopened == nil || reopened.ID == incident.ID ||
+		reopened.Status != model.CoordinationIncidentOpen {
+		t.Fatalf("materially changed condition did not create a new incident: %+v", observed)
+	}
+}
+
+func TestCoordinatorObserverDismissedGraphStallIgnoresObservationTime(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "unchanged parked work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, task.Task.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.Orchestration.Autopilot.Coordination.IdleSeconds = 60
+	options := Options{AgentConfig: &config, Getenv: func(string) string { return "" }}
+	observed, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, updatedAt.Add(60*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident := findCoordinatorIncident(observed, model.CoordinationTriggerGraphStalled)
+	if incident == nil {
+		t.Fatalf("graph stall was not observed: %+v", observed)
+	}
+	if _, err := opened.TransitionCoordinationIncident(
+		ctx,
+		incident.ID,
+		store.TransitionCoordinationIncidentInput{
+			ExpectedStatus: model.CoordinationIncidentOpen,
+			Status:         model.CoordinationIncidentDismissed,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, updatedAt.Add(10*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	incidents, err := opened.ListCoordinationIncidents(ctx, store.CoordinationIncidentFilter{
+		Trigger: model.CoordinationTriggerGraphStalled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 || incidents[0].ID != incident.ID ||
+		incidents[0].Status != model.CoordinationIncidentDismissed {
+		t.Fatalf("observedAt recreated an unchanged graph stall: %+v", incidents)
+	}
+}
+
+func TestCoordinatorObserverReconcilesIntegrationIncidentLifecycle(t *testing.T) {
+	const reason = "merge conflict requires a decision"
+	cases := []struct {
+		name           string
+		setup          func(*testing.T, context.Context, *store.Store, string) model.Task
+		wantOpen       bool
+		wantActionable bool
+	}{
+		{
+			name: "running is retained but not actionable",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: taskID})
+				if err != nil || claim == nil {
+					t.Fatalf("claim running task: claim=%+v err=%v", claim, err)
+				}
+				return claim.Task.Task
+			},
+			wantOpen: true,
+		},
+		{
+			name: "matching blocked task is actionable",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				detail, err := opened.BlockTask(ctx, taskID, store.BlockInput{
+					Kind: model.BlockKindNeedsInput, Reason: reason,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+			wantOpen: true, wantActionable: true,
+		},
+		{
+			name: "matching triage task is actionable",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				block := store.BlockInput{Kind: model.BlockKindNeedsInput, Reason: reason}
+				if _, err := opened.BlockTask(ctx, taskID, block); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := opened.UnblockTask(ctx, taskID); err != nil {
+					t.Fatal(err)
+				}
+				detail, err := opened.BlockTask(ctx, taskID, block)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+			wantOpen: true, wantActionable: true,
+		},
+		{
+			name: "mismatched block is resolved",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				detail, err := opened.BlockTask(ctx, taskID, store.BlockInput{
+					Kind: model.BlockKindNeedsInput, Reason: "a different user decision",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+		},
+		{
+			name: "ready task is resolved",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				detail, err := opened.GetTask(ctx, taskID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+		},
+		{
+			name: "done task is resolved",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				status := model.TaskStatusDone
+				detail, err := opened.UpdateTask(ctx, taskID, store.UpdateTaskInput{Status: &status})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+		},
+		{
+			name: "archived task is resolved",
+			setup: func(t *testing.T, ctx context.Context, opened *store.Store, taskID string) model.Task {
+				status := model.TaskStatusArchived
+				detail, err := opened.UpdateTask(ctx, taskID, store.UpdateTaskInput{Status: &status})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return detail.Task
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			manager, _ := testManager(t)
+			opened, err := manager.OpenStore(ctx, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			config := coordinatorTestConfig(coordinatorWorker("worker"))
+			if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+				AgentID: "worker", Status: model.AgentHealthReady,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			assignee := "worker"
+			created, err := opened.CreateTask(ctx, store.CreateTaskInput{
+				Title: test.name, Assignee: &assignee, Runtime: model.RuntimeCodex,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := test.setup(t, ctx, opened, created.Task.ID)
+			incident := createCoordinatorIntegrationIncident(t, ctx, opened, task.ID, reason)
+			observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now())
+
+			current, err := opened.GetCoordinationIncident(ctx, incident.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := model.CoordinationIncidentResolved
+			if test.wantOpen {
+				wantStatus = model.CoordinationIncidentOpen
+			}
+			if current.Status != wantStatus {
+				t.Fatalf("integration incident status = %s, want %s", current.Status, wantStatus)
+			}
+			keepOpen, actionable, err := integrationCoordinatorIncidentState(ctx, opened, current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if keepOpen != test.wantOpen || actionable != test.wantActionable {
+				t.Fatalf(
+					"integration state keepOpen=%v actionable=%v, want %v/%v",
+					keepOpen, actionable, test.wantOpen, test.wantActionable,
+				)
+			}
+		})
+	}
+	t.Run("deleted focus task is resolved without failing the pass", func(t *testing.T) {
+		ctx := context.Background()
+		manager, _ := testManager(t)
+		opened, err := manager.OpenStore(ctx, "default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer opened.Close()
+		config := coordinatorTestConfig(coordinatorWorker("worker"))
+		assignee := "worker"
+		created, err := opened.CreateTask(ctx, store.CreateTaskInput{
+			Title: "deleted integration focus", Assignee: &assignee, Runtime: model.RuntimeCodex,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		incident := createCoordinatorIntegrationIncident(t, ctx, opened, created.Task.ID, reason)
+		if err := opened.DeleteTask(ctx, created.Task.ID); err != nil {
+			t.Fatal(err)
+		}
+		observeCoordinatorTestBoard(t, ctx, manager, opened, config, time.Now())
+		current, err := opened.GetCoordinationIncident(ctx, incident.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Status != model.CoordinationIncidentResolved {
+			t.Fatalf("deleted-task incident status = %s, want resolved", current.Status)
+		}
+	})
 }
 
 func TestCoordinatorObserverRetryExhaustionPreservesFailureDetails(t *testing.T) {
