@@ -1004,6 +1004,66 @@ dialog::backdrop { background: rgb(4 8 16 / 62%); backdrop-filter: blur(3px); }
   grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   gap: 9px;
 }
+.automation-readiness {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.automation-readiness-step {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.automation-readiness-step.is-ready { border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); }
+.automation-readiness-step.is-blocked { border-color: color-mix(in srgb, var(--warning) 45%, var(--line)); }
+.automation-readiness-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+}
+.automation-readiness-heading strong { overflow-wrap: anywhere; font-size: 13px; }
+.automation-readiness-step p {
+  min-height: 3.6em;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+  color: var(--text-subtle);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.automation-readiness-checks { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.automation-readiness-checks span {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 5px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+.automation-readiness-checks i {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+}
+.automation-readiness-checks .is-ready { color: var(--ok); }
+.automation-readiness-checks .is-blocked { color: var(--warning); }
 .automation-role-card {
   min-width: 0;
   padding: 13px;
@@ -1371,6 +1431,8 @@ hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .automation-record-header .activity-task-link { flex: 1 1 100%; }
   .automation-actions button { flex: 1 1 calc(50% - 4px); }
   .automation-role-card p { min-height: 0; }
+  .automation-readiness { grid-template-columns: 1fr; }
+  .automation-readiness-step p { min-height: 0; }
   .comment-form button, .attachment-form button, .link-form button { padding-inline: 11px; }
   .settings-callout, .section-heading { align-items: stretch; flex-direction: column; }
   .settings-callout button, .section-actions button { flex: 1 1 auto; }

@@ -1309,6 +1309,11 @@ function renderDrawer(detail) {
     <div>${change.changedFiles?.length ? escapeHtml(change.changedFiles.join(", ")) : "No changed files recorded"}</div>
     <div class="mono">${escapeHtml(change.worktreePath)}</div>
   </div>`).join("");
+  const prerequisiteHandoffs = (detail.prerequisiteHandoffs || []).map((handoff) => `<div class="detail-row" data-open-task="${escapeHtml(handoff.prerequisiteId)}">
+    <strong>Input · ${escapeHtml(taskTitle(handoff.prerequisiteId))}</strong>
+    <span class="mono">${escapeHtml(handoff.prerequisiteId)}${handoff.satisfiedRunId ? ` · run ${escapeHtml(handoff.satisfiedRunId)}` : ""}</span>
+    ${handoff.changeSet ? `<div>Change set ${escapeHtml(handoff.changeSet.id)} → ${escapeHtml(handoff.changeSet.headCommit)}</div><div class="mono">${escapeHtml(handoff.changeSet.durableRef)}</div>` : "<div>No Git change set in this handoff</div>"}
+  </div>`).join("");
   const workspaces = (detail.runWorkspaces || []).slice().reverse().map((workspace) => `<div class="detail-row"><strong>${escapeHtml(workspace.kind)} workspace</strong><span class="mono">${escapeHtml(workspace.runId)} · ${escapeHtml(workspace.path)}</span>${workspace.baseCommit ? `<div>Base ${escapeHtml(workspace.baseCommit)}</div>` : ""}</div>`).join("");
   const dependency = (item) => `<div class="detail-row" data-open-task="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span class="mono">${escapeHtml(item.id)} · ${escapeHtml(item.status)}</span></div>`;
   const graph = detail.relationshipGraph;
@@ -1443,6 +1448,7 @@ function renderDrawer(detail) {
       <h3>Attachments</h3><div class="detail-list">${attachments || '<small>No attachments</small>'}</div>
       <form id="attachment-form" class="attachment-form"><input type="file" multiple required><button>Upload</button></form>
       <h3>Run history</h3><div class="detail-list">${runRows || '<small>No runs</small>'}</div>
+      <h3>Prerequisite handoffs</h3><div class="detail-list">${prerequisiteHandoffs || '<small>No prerequisite handoffs</small>'}</div>
       <h3>Change results</h3><div class="detail-list">${changeSets || '<small>No change sets</small>'}</div>
       <h3>Run workspaces</h3><div class="detail-list">${workspaces || '<small>No prepared workspaces</small>'}</div>
       <h3>Recent events</h3><div class="detail-list">${events || '<small>No events</small>'}</div>
@@ -1776,13 +1782,18 @@ const AUTOMATION_HELP = {
       Supervisor: "Deterministic host service that keeps board automation running and enforces the global write policy. It does not select a coding-agent model.",
       Dispatcher: "Deterministic host service that assigns Ready tasks to workers and tracks execution. It does not select a coding-agent model for itself.",
       Planner: "Coding-agent role for the normal Triage path: clarify, decompose, and prepare runnable work.",
+      Finalizer: "Task role that verifies the deterministic prerequisite merge and produces the final change set. A coding resolver runs only for a real Git conflict.",
       Coordinator: "Coding-agent role for exceptional recovery when the task graph stalls, conflicts, or exhausts normal retries.",
       Publisher: "Deterministic host service that moves reviewed finalizer changes to the configured target. It does not select a coding-agent model.",
     },
-    boundary: "Supervisor, Dispatcher, and Publisher are deterministic host services with no coding-agent model. Planner and Coordinator invoke the configured coding-agent profile, runtime, model, and provider.",
+    boundary: "Supervisor, Dispatcher, and Publisher are deterministic host services with no coding-agent model. Planner and Coordinator invoke configured coding agents. Finalizer is a task role: the host merges prerequisite change sets, then its worker profile verifies the result.",
+    readiness: {
+      ready: "Eligible Triage cards can move through planning and execution without another manual command. Imported GitHub issues still wait for explicit review.",
+      blocked: "The automatic path has one or more blockers. Review the stage marked Blocked; imported GitHub issues always wait for explicit review.",
+    },
     recovery: "Planner handles normal Triage work. Coordinator only proposes recovery when the graph needs exceptional intervention.",
     recoveryAssist: "Assist mode waits for a person to approve, reject, or request a new analysis before changing the graph.",
-    publishing: "Publication actions use the version currently shown. If another process changes it first, refresh and review the new state.",
+    publishing: "Each handoff preserves the Finalizer task, run, immutable change set, and head commit. Publication actions use the version currently shown.",
     manualEscalation: {
       empty: "No automatic graph changes are proposed. Resolve the affected task manually, dismiss this escalation, or request a new analysis.",
       title: "Manual resolution required",
@@ -1801,13 +1812,18 @@ const AUTOMATION_HELP = {
       Supervisor: "보드 자동화를 유지하고 전역 쓰기 정책을 적용하는 결정론적 호스트 서비스입니다. 코딩 에이전트 모델을 선택하지 않습니다.",
       Dispatcher: "Ready 작업을 작업자에게 배정하고 실행을 추적하는 결정론적 호스트 서비스입니다. 자체 코딩 에이전트 모델을 선택하지 않습니다.",
       Planner: "일반 Triage 흐름에서 요구 사항을 명확히 하고 작업을 나눠 실행할 수 있게 준비하는 코딩 에이전트 역할입니다.",
+      Finalizer: "결정론적으로 병합한 선행 변경을 검증하고 최종 change set을 만드는 task 역할입니다. 실제 Git 충돌이 있을 때만 coding resolver를 실행합니다.",
       Coordinator: "작업 그래프가 멈추거나 충돌하고 일반 재시도를 소진했을 때 예외 복구를 담당하는 코딩 에이전트 역할입니다.",
       Publisher: "검토를 마친 finalizer 변경 사항을 설정한 대상으로 전달하는 결정론적 호스트 서비스입니다. 코딩 에이전트 모델을 선택하지 않습니다.",
     },
-    boundary: "Supervisor, Dispatcher, Publisher는 코딩 에이전트 모델 없이 동작하는 결정론적 호스트 서비스입니다. Planner와 Coordinator는 설정한 코딩 에이전트의 프로필, 런타임, 모델, 프로바이더를 사용합니다.",
+    boundary: "Supervisor, Dispatcher, Publisher는 coding agent model 없이 동작하는 결정론적 host service입니다. Planner와 Coordinator는 설정한 coding agent를 사용합니다. Finalizer는 task 역할이며 host가 prerequisite change set을 병합한 뒤 Worker profile로 결과를 검증합니다.",
+    readiness: {
+      ready: "조건을 충족한 Triage 카드는 별도 명령 없이 계획과 실행을 거쳐 완료될 수 있습니다. GitHub에서 가져온 issue는 항상 명시적인 검토를 기다립니다.",
+      blocked: "자동 경로를 막는 조건이 있습니다. Blocked로 표시된 단계를 확인하세요. GitHub에서 가져온 issue는 항상 명시적인 검토를 기다립니다.",
+    },
     recovery: "Planner는 일반 Triage 작업을 처리합니다. Coordinator는 그래프에 예외적인 개입이 필요할 때만 복구안을 제시합니다.",
     recoveryAssist: "Assist 모드에서는 사람이 승인, 거절, 재분석을 선택한 뒤에만 그래프를 변경합니다.",
-    publishing: "배포 작업은 현재 화면에 표시된 버전을 기준으로 처리합니다. 다른 프로세스가 먼저 변경했다면 새로 고친 뒤 변경된 상태를 다시 확인하세요.",
+    publishing: "각 handoff는 Finalizer task, run, immutable change set, head commit을 보존합니다. 화면에 표시된 최신 상태를 확인한 뒤 publication 작업을 실행하세요.",
     manualEscalation: {
       empty: "자동으로 적용할 그래프 변경안이 없습니다. 영향을 받은 작업을 직접 해결하거나, 이 에스컬레이션을 Dismiss하거나, Reanalyze로 다시 분석하세요.",
       title: "수동 해결이 필요합니다",
@@ -1967,7 +1983,7 @@ function readableFacts(value) {
 }
 
 function automationStatusClass(status = "") {
-  if (["running", "healthy", "resolved", "applied", "published", "no_change"].includes(status)) return "is-good";
+  if (["running", "ready", "configured", "healthy", "resolved", "applied", "published", "no_change"].includes(status)) return "is-good";
   if (["failed", "retry_required", "critical", "error", "unhealthy", "missing"].includes(status)) return "is-danger";
   if (["restarting", "manual_completion", "awaiting_approval", "blocked", "warning", "rate_limited", "auth_required"].includes(status)) return "is-attention";
   return "";
@@ -2071,6 +2087,41 @@ function coordinatorRoute(data) {
   };
 }
 
+function effectiveWorkerRoutes(data) {
+  return (data.effective.profiles || []).filter((profile) =>
+    profile && !profile.disabled && profile.name && profile.runtime && profile.runtime !== "manual");
+}
+
+function workerRouteUnavailable(profile) {
+  return ["missing", "auth_required", "rate_limited", "unhealthy"].includes(profile?.health?.status);
+}
+
+function finalizerRoute(data) {
+  const orchestration = data.metadata?.orchestration || {};
+  const profiles = effectiveWorkerRoutes(data);
+  const preferred = orchestration.finalizerProfile || orchestration.defaultProfile || "";
+  const selected = profiles.find((profile) => profile.name === preferred) ||
+    profiles.find((profile) => !workerRouteUnavailable(profile));
+  if (!selected) {
+    return {
+      profile: preferred || "Not configured", runtime: "", model: "", provider: "",
+      source: preferred ? "Board finalizer profile" : "Worker profile fallback", available: false,
+    };
+  }
+  return {
+    profile: selected.name,
+    runtime: selected.runtime,
+    model: selected.model,
+    provider: selected.provider,
+    source: orchestration.finalizerProfile && selected.name === orchestration.finalizerProfile
+      ? "Board finalizer profile"
+      : orchestration.defaultProfile && selected.name === orchestration.defaultProfile
+        ? "Board default profile"
+        : "Worker profile fallback",
+    available: !workerRouteUnavailable(selected),
+  };
+}
+
 function codingAgentFacts(route, policyLabel, policyValue, signalLabel, signalValue) {
   return [
     [policyLabel, policyValue],
@@ -2080,6 +2131,50 @@ function codingAgentFacts(route, policyLabel, policyValue, signalLabel, signalVa
     ["Provider", route.provider || "CLI default"],
     [signalLabel, signalValue],
   ];
+}
+
+function readinessStep(name, ready, detail, checks) {
+  return `<li class="automation-readiness-step ${ready ? "is-ready" : "is-blocked"}">
+    <div class="automation-readiness-heading"><strong>${escapeHtml(name)}</strong>${automationStatus(ready ? "ready" : "blocked")}</div>
+    <p>${escapeHtml(detail)}</p>
+    <div class="automation-readiness-checks">${checks.map(([label, passed]) =>
+      `<span class="${passed ? "is-ready" : "is-blocked"}"><i aria-hidden="true">${passed ? "✓" : "!"}</i>${escapeHtml(label)}</span>`).join("")}</div>
+  </li>`;
+}
+
+function automationReadiness(data, planner, workerRoutes) {
+  const orchestration = data.metadata?.orchestration || {};
+  const autopilot = orchestration.autopilot || {};
+  const supervisorReady = Boolean(data.supervisor.running);
+  const autopilotReady = Boolean(autopilot.enabled);
+  const plannerPolicyReady = Boolean(autopilot.autoPlan && orchestration.autoDecompose);
+  const dispatcherPolicyReady = Boolean(autopilot.autoExecute);
+  const plannerReady = Boolean(planner.available);
+  const workerReady = workerRoutes.some((profile) => !workerRouteUnavailable(profile));
+  const projectReady = Boolean(String(data.metadata?.defaultWorkdir || "").trim());
+  const writesReady = Boolean(data.supervisor.allowWrites && autopilot.workspaceWrites);
+  const planningReady = supervisorReady && autopilotReady && plannerPolicyReady && plannerReady;
+  const dispatchReady = supervisorReady && autopilotReady && dispatcherPolicyReady;
+  const executionReady = dispatchReady && workerReady && projectReady && writesReady;
+  const automaticReady = planningReady && executionReady;
+  return {
+    ready: automaticReady,
+    html: `<ol class="automation-readiness" aria-label="Automatic task path readiness">
+      ${readinessStep("Triage", true, "Dashboard tasks enter the automatic planning queue.", [["Eligible dashboard task", true]])}
+      ${readinessStep("Planner", planningReady, planningReady ? `${planner.profile} can prepare Triage work.` : "Enable planning and configure an available Planner.", [
+        ["Supervisor", supervisorReady], ["Autopilot", autopilotReady],
+        ["Triage planning", plannerPolicyReady], ["Planner route", plannerReady],
+      ])}
+      ${readinessStep("Dispatcher", dispatchReady, dispatchReady ? "Ready tasks can be claimed automatically." : "Start Supervisor and enable AutoExecute.", [
+        ["Supervisor", supervisorReady], ["Autopilot", autopilotReady], ["AutoExecute", dispatcherPolicyReady],
+      ])}
+      ${readinessStep("Worker", executionReady, executionReady ? `${workerRoutes.length} route${workerRoutes.length === 1 ? "" : "s"} can run code tasks.` : "Configure a Worker, project directory, and write policy for code tasks.", [
+        ["Worker route", workerReady], ["Project directory", projectReady], ["Global writes", Boolean(data.supervisor.allowWrites)],
+        ["Board writes", Boolean(autopilot.workspaceWrites)],
+      ])}
+      ${readinessStep("Done", automaticReady, automaticReady ? "Worker lifecycle completion can finalize the task." : "Resolve upstream blockers before unattended completion.", [["End-to-end path", automaticReady]])}
+    </ol>`,
+  };
 }
 
 function publicationRoleState(publications) {
@@ -2104,7 +2199,7 @@ function publicationRoleState(publications) {
 function roleCard({ name, kind, status, facts }) {
   const help = automationHelp("roles")?.[name] || AUTOMATION_HELP.en.roles[name];
   return `<article class="automation-role-card">
-    <header><div><span class="automation-role-kind ${kind === "Coding agent" ? "is-agent" : ""}">${escapeHtml(kind)}</span><h3>${escapeHtml(name)}</h3></div>${automationStatus(status)}</header>
+    <header><div><span class="automation-role-kind ${kind === "Coding agent" || kind === "Task role" ? "is-agent" : ""}">${escapeHtml(kind)}</span><h3>${escapeHtml(name)}</h3></div>${automationStatus(status)}</header>
     <p>${escapeHtml(help)}</p>
     <dl>${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
   </article>`;
@@ -2125,8 +2220,7 @@ function renderAutomationOverview(data) {
   const coordinationPolicy = coordination.policy || orchestration.autopilot?.coordination || {};
   const publicationPolicy = orchestration.autopilot?.publication || {};
   const autopilot = orchestration.autopilot || {};
-  const workerAgents = (data.effective.config?.agents || [])
-    .filter((agent) => agent.enabled && (agent.roles || []).includes("worker"));
+  const workerRoutes = effectiveWorkerRoutes(data);
   const publicationState = publicationRoleState(data.publications);
   const coordinationAttention = Number(coordination.activeCount || 0);
   const supervisorAttention = data.supervisor.lastError ? 1 : 0;
@@ -2135,10 +2229,22 @@ function renderAutomationOverview(data) {
     publicationState.approvals;
   const supervisor = supervisorPresentation(data.supervisor);
   const supervisorPolicy = data.supervisor.allowWrites ? "Workspace writes allowed" : "Read-only";
-  const dispatcherStatus = activeRuns.length ? "running" : autopilot.autoExecute ? "ready" : "manual";
+  const automaticBase = Boolean(data.supervisor.running && autopilot.enabled);
+  const dispatcherStatus = activeRuns.length ? "running" :
+    automaticBase && autopilot.autoExecute ? "ready" : "manual";
   const plannerQueue = Number(diagnostics.stats?.byStatus?.triage || 0);
   const planner = plannerRoute(data);
+  const plannerEnabled = Boolean(automaticBase && autopilot.autoPlan && orchestration.autoDecompose);
+  const plannerStatus = !plannerEnabled ? "manual" : planner.available ? (plannerQueue ? "ready" : "idle") : "missing";
+  const finalizer = finalizerRoute(data);
+  const finalizerTasks = state.tasks.filter((task) => task.workflowRole === "finalizer");
+  const finalizerRunning = finalizerTasks.filter((task) => task.status === "running").length;
+  const finalizerBlocked = finalizerTasks.filter((task) => task.status === "blocked").length;
+  const finalizerPending = finalizerTasks.filter((task) => ["todo", "ready", "scheduled"].includes(task.status)).length;
+  const finalizerStatus = !finalizer.available ? "missing" :
+    finalizerRunning ? "running" : finalizerBlocked ? "blocked" : finalizerPending ? "ready" : "idle";
   const coordinator = coordinatorRoute(data);
+  const readiness = automationReadiness(data, planner, workerRoutes);
   const roles = [
     roleCard({
       name: "Supervisor", kind: "Host service", status: supervisor.status,
@@ -2149,8 +2255,19 @@ function renderAutomationOverview(data) {
       facts: [["Policy", `AutoExecute ${autopilot.autoExecute ? "on" : "off"}`], ["Execution", "Deterministic host service · no model"], ["Active runs", String(activeRuns.length)]],
     }),
     roleCard({
-      name: "Planner", kind: "Coding agent", status: planner.available ? (plannerQueue ? "ready" : "idle") : "missing",
-      facts: codingAgentFacts(planner, "Policy", `AutoPlan ${autopilot.autoPlan ? "on" : "off"}`, "Triage queue", String(plannerQueue)),
+      name: "Planner", kind: "Coding agent", status: plannerStatus,
+      facts: codingAgentFacts(planner, "Policy", `AutoPlan ${autopilot.autoPlan && orchestration.autoDecompose ? "on" : "off"}`, "Triage queue", String(plannerQueue)),
+    }),
+    roleCard({
+      name: "Finalizer", kind: "Task role", status: finalizerStatus,
+      facts: [
+        ["Profile", `${finalizer.profile} · ${finalizer.source}`],
+        ["Runtime", finalizer.runtime || "Unavailable"],
+        ["Model", finalizer.model || "CLI default (unpinned)"],
+        ["Provider", finalizer.provider || "CLI default"],
+        ["Integration", "Host fan-in · resolver only on Git conflict"],
+        ["Tasks in view", `${finalizerTasks.length} total · ${finalizerRunning} running · ${finalizerBlocked} blocked`],
+      ],
     }),
     roleCard({
       name: "Coordinator", kind: "Coding agent", status: coordinator.available ? (coordinationAttention ? "warning" : "idle") : "missing",
@@ -2166,11 +2283,13 @@ function renderAutomationOverview(data) {
       <div class="activity-summary automation-summary">
         <div><small>Board policy</small><strong>${autopilot.enabled ? "Autopilot enabled" : "Manual control"}</strong><span>${autopilot.workspaceWrites && data.supervisor.allowWrites ? "Writes permitted" : "Read-only boundary"}</span></div>
         <div><small>Needs attention</small><strong>${attention}</strong><span>${approvals} approval${approvals === 1 ? "" : "s"}</span></div>
-        <div><small>Workers</small><strong>${workerAgents.length || 0} configured</strong><span>${activeRuns.length} active</span></div>
+        <div><small>Workers</small><strong>${workerRoutes.length || 0} configured</strong><span>${activeRuns.length} active</span></div>
         <div><small>Graph revision</small><strong>${coordination.graphState?.revision ?? "—"}</strong><span>${$("#connection").classList.contains("online") ? "Events connected" : "Events offline"}</span></div>
       </div>
     </section>
     ${data.supervisor.lastError ? `<div class="automation-warning"><strong>Supervisor error</strong><p>${escapeHtml(data.supervisor.lastError)}</p>${data.supervisor.nextAttemptAt ? `<small>Next attempt ${escapeHtml(new Date(data.supervisor.nextAttemptAt).toLocaleString())}</small>` : ""}</div>` : ""}
+    <div class="automation-help-callout ${readiness.ready ? "" : "is-attention"}"><strong>Automatic task path</strong><p>${escapeHtml(automationHelp("readiness")?.[readiness.ready ? "ready" : "blocked"])}</p></div>
+    <section class="activity-section"><h2 class="automation-section-title">Triage → Planner → Dispatcher → Worker → Done</h2>${readiness.html}</section>
     <div class="automation-help-callout"><strong>Host services vs coding agents</strong><p>${escapeHtml(automationHelp("boundary"))}</p></div>
     <section class="activity-section"><h2 class="automation-section-title">Roles</h2><div class="automation-role-grid">${roles}</div></section>`;
 }
@@ -2367,6 +2486,9 @@ function publicationCard(item, actionsAvailable) {
       <div><dt>Status</dt><dd>${escapeHtml(humanizeIdentifier(item.status))}</dd></div>
       <div><dt>Mode</dt><dd>${escapeHtml(humanizeIdentifier(item.mode))}</dd></div>
       <div><dt>Task</dt><dd class="mono">${escapeHtml(item.taskId)}</dd></div>
+      <div><dt>Finalizer run</dt><dd class="mono">${escapeHtml(item.runId || "—")}</dd></div>
+      <div><dt>Change set</dt><dd class="mono">${escapeHtml(item.changeSetId || "—")}</dd></div>
+      <div><dt>Head commit</dt><dd class="mono">${escapeHtml(item.headCommit || "—")}</dd></div>
       <div><dt>Branch</dt><dd>${escapeHtml(item.targetBranch || "—")}</dd></div>
       <div><dt>Remote</dt><dd>${escapeHtml(item.remote || "—")}</dd></div>
       <div><dt>URL</dt><dd>${link ? `<a data-automation-focus="publication:url:${escapeHtml(item.id)}" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.url)}</a>` : escapeHtml(item.url || "—")}</dd></div>
@@ -3357,12 +3479,13 @@ function openSettings() {
   const autopilot = settings.autopilot || {}; const coordination = autopilot.coordination || {}; const publication = autopilot.publication || {};
   form.elements.name.value = metadata.name; form.elements.description.value = metadata.description;
   form.elements.color.value = /^#[0-9a-f]{6}$/i.test(metadata.color) ? metadata.color : "#5b7cff";
-  form.elements.defaultWorkdir.value = metadata.defaultWorkdir || ""; form.elements.autoDecompose.checked = settings.autoDecompose;
+  form.elements.defaultWorkdir.value = metadata.defaultWorkdir || "";
   form.elements.autoPromoteChildren.checked = settings.autoPromoteChildren;
   form.elements.plannerRuntime.value = settings.plannerRuntime; form.elements.autoDecomposePerTick.value = settings.autoDecomposePerTick;
   form.elements.plannerModel.value = settings.plannerModel || ""; form.elements.plannerProvider.value = settings.plannerProvider || "";
   form.elements.defaultProfile.value = settings.defaultProfile || ""; form.elements.finalizerProfile.value = settings.finalizerProfile || "";
-  form.elements.autopilotEnabled.checked = Boolean(autopilot.enabled); form.elements.autoPlan.checked = Boolean(autopilot.autoPlan);
+  form.elements.autopilotEnabled.checked = Boolean(autopilot.enabled);
+  form.elements.autoPlan.checked = Boolean(autopilot.autoPlan && settings.autoDecompose);
   form.elements.autoExecute.checked = Boolean(autopilot.autoExecute); form.elements.workspaceWrites.checked = Boolean(autopilot.workspaceWrites);
   form.elements.coordinatorMode.value = coordination.mode || "observe";
   form.elements.coordinatorProfile.value = coordination.profile || ""; form.elements.publicationMode.value = publication.mode || "manual";
@@ -3377,14 +3500,15 @@ async function submitSettings(event) {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
     const profiles = readProfileEditor();
+    const autoPlan = data.get("autoPlan") === "on";
     await api(`/api/boards/${encodeURIComponent(state.board)}`, { method: "PATCH", body: JSON.stringify({
       name: data.get("name"), description: data.get("description"), color: data.get("color"), defaultWorkdir: data.get("defaultWorkdir") || null,
-      orchestration: { autoDecompose: data.get("autoDecompose") === "on", autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
+      orchestration: { autoDecompose: autoPlan, autoPromoteChildren: data.get("autoPromoteChildren") === "on", plannerRuntime: data.get("plannerRuntime"),
         plannerModel: data.get("plannerModel"), plannerProvider: data.get("plannerProvider"),
         autoDecomposePerTick: Number(data.get("autoDecomposePerTick")), defaultProfile: data.get("defaultProfile") || null,
         finalizerProfile: data.get("finalizerProfile") || null, profiles,
         autopilot: {
-          enabled: data.get("autopilotEnabled") === "on", autoPlan: data.get("autoPlan") === "on",
+          enabled: data.get("autopilotEnabled") === "on", autoPlan,
           autoExecute: data.get("autoExecute") === "on", workspaceWrites: data.get("workspaceWrites") === "on",
           coordination: { mode: data.get("coordinatorMode"), profile: data.get("coordinatorProfile") || null },
           publication: { mode: data.get("publicationMode"), targetBranch: data.get("publicationTargetBranch"), remote: data.get("publicationRemote"), requireApproval: data.get("publicationApproval") === "on" },

@@ -33,9 +33,10 @@ func TestAutomationCenterExplainsRolesAndPersistsHelpLanguage(t *testing.T) {
 	for _, marker := range []string{
 		`const AUTOMATION_HELP =`,
 		`Planner: "Coding-agent role for the normal Triage path`,
+		`Finalizer: "Task role that verifies the deterministic prerequisite merge`,
 		`Coordinator: "Coding-agent role for exceptional recovery`,
 		`Supervisor, Dispatcher, and Publisher are deterministic host services with no coding-agent model.`,
-		`Supervisor, Dispatcher, Publisher는 코딩 에이전트 모델 없이 동작하는 결정론적 호스트 서비스입니다.`,
+		`Supervisor, Dispatcher, Publisher는 coding agent model 없이 동작하는 결정론적 host service입니다.`,
 		`Planner는 일반 Triage 작업을 처리합니다.`,
 		`Coordinator는 그래프에 예외적인 개입이 필요할 때만 복구안을 제시합니다.`,
 		`localStorage.getItem("autogora.automationHelpLanguage")`,
@@ -141,6 +142,58 @@ func TestAutomationCenterShowsHostAndCodingAgentConfiguration(t *testing.T) {
 	} {
 		if !strings.Contains(javascript, marker) {
 			t.Fatalf("role configuration marker %q is missing", marker)
+		}
+	}
+}
+
+func TestAutomationCenterShowsAutomaticReadinessAndFinalizerTrace(t *testing.T) {
+	html := dashboardAsset(t, "index.html")
+	javascript := dashboardAsset(t, "app.js")
+	styles := dashboardAsset(t, "styles.css")
+
+	for _, marker := range []string{
+		`name="autoPlan" type="checkbox"> Plan eligible Triage tasks automatically`,
+		`name="finalizerProfile"`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Fatalf("automatic path setting marker %q is missing", marker)
+		}
+	}
+	if strings.Contains(html, `name="autoDecompose"`) {
+		t.Fatal("the WebUI still exposes a second Triage planning switch")
+	}
+
+	for _, marker := range []string{
+		`function automationReadiness(data, planner, workerRoutes)`,
+		`autopilot.autoPlan && orchestration.autoDecompose`,
+		`data.supervisor.running`,
+		`Triage → Planner → Dispatcher → Worker → Done`,
+		`function finalizerRoute(data)`,
+		`name: "Finalizer", kind: "Task role"`,
+		`Host fan-in · resolver only on Git conflict`,
+		`const prerequisiteHandoffs = (detail.prerequisiteHandoffs || [])`,
+		`<h3>Prerequisite handoffs</h3>`,
+		`<dt>Finalizer run</dt>`,
+		`<dt>Change set</dt>`,
+		`<dt>Head commit</dt>`,
+		`orchestration: { autoDecompose: autoPlan`,
+	} {
+		if !strings.Contains(javascript, marker) {
+			t.Fatalf("automatic path or integration trace marker %q is missing", marker)
+		}
+	}
+	if strings.Contains(javascript, `form.elements.autoDecompose.checked`) {
+		t.Fatal("the settings form still depends on a hidden duplicate planning switch")
+	}
+
+	for _, marker := range []string{
+		`.automation-readiness {`,
+		`grid-template-columns: repeat(5, minmax(0, 1fr));`,
+		`.automation-readiness-step.is-blocked`,
+		`.automation-readiness { grid-template-columns: 1fr; }`,
+	} {
+		if !strings.Contains(styles, marker) {
+			t.Fatalf("automatic path responsive style %q is missing", marker)
 		}
 	}
 }

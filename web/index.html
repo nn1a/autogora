@@ -189,7 +189,7 @@
           <div><strong id="autopilot-settings-title">Board Autopilot</strong><small>Supervisor automation is capped by both global and board permissions. Coordinator handles exceptional recovery, not normal dispatch.</small></div>
         </div>
         <label class="inline"><input name="autopilotEnabled" type="checkbox"> Enable Autopilot for this board</label>
-        <label class="inline"><input name="autoPlan" type="checkbox"> Plan triage tasks automatically</label>
+        <label class="inline"><input name="autoPlan" type="checkbox"> Plan eligible Triage tasks automatically</label>
         <label class="inline"><input name="autoExecute" type="checkbox"> Execute ready tasks automatically</label>
         <label class="inline"><input name="workspaceWrites" type="checkbox"> Permit workspace writes when the global policy also allows them</label>
         <div class="form-grid">
@@ -202,7 +202,6 @@
         </div>
       </section>
       <hr>
-      <label class="inline"><input name="autoDecompose" type="checkbox"> Automatically decompose triage cards</label>
       <label class="inline"><input name="autoPromoteChildren" type="checkbox"> Automatically promote unblocked decomposition children</label>
       <div class="form-grid">
         <label>Planner<select name="plannerRuntime"><option>codex</option><option>claude</option><option>cline</option><option>gemini</option></select></label>
