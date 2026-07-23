@@ -36,9 +36,10 @@ type RejectCoordinationProposalInput struct {
 }
 
 type SupersedeCoordinationProposalInput struct {
-	ExpectedUpdatedAt string
-	ClaimToken        string
-	Current           time.Time
+	ExpectedUpdatedAt        string
+	ReplacementGraphRevision *int64
+	ClaimToken               string
+	Current                  time.Time
 }
 
 func requireCoordinationApprovalID(id string) (string, error) {
@@ -403,6 +404,15 @@ func (s *Store) SupersedeCoordinationProposal(
 		if err := requireCoordinationProposalVersion(proposal, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
+		replacementRevision := incident.GraphRevision
+		if input.ReplacementGraphRevision != nil {
+			replacementRevision = *input.ReplacementGraphRevision
+			if _, err := requireBoardGraphRevision(
+				ctx, tx, incident.Board, replacementRevision,
+			); err != nil {
+				return err
+			}
+		}
 
 		var claimTimestamp string
 		switch incident.Status {
@@ -472,9 +482,12 @@ func (s *Store) SupersedeCoordinationProposal(
 
 		statement := `
 			UPDATE coordination_incidents
-			SET status = 'open', claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+			SET status = 'open', graph_revision = ?,
+				claim_token = NULL, claim_expires_at = NULL, updated_at = ?
 			WHERE id = ? AND status = ? AND graph_revision = ?`
-		arguments := []any{timestamp, incident.ID, incident.Status, incident.GraphRevision}
+		arguments := []any{
+			replacementRevision, timestamp, incident.ID, incident.Status, incident.GraphRevision,
+		}
 		if incident.Status == model.CoordinationIncidentCoordinating {
 			statement += " AND claim_token = ? AND claim_expires_at = ? AND claim_expires_at > ?"
 			arguments = append(arguments, incident.ClaimToken, *incident.ClaimExpiresAt, claimTimestamp)
@@ -494,6 +507,7 @@ func (s *Store) SupersedeCoordinationProposal(
 		proposal.Status = model.CoordinationProposalSuperseded
 		proposal.UpdatedAt = timestamp
 		incident.Status = model.CoordinationIncidentOpen
+		incident.GraphRevision = replacementRevision
 		incident.ClaimToken = ""
 		incident.ClaimExpiresAt = nil
 		incident.UpdatedAt = timestamp

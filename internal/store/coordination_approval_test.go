@@ -433,12 +433,16 @@ func TestSupersedeCoordinationProposalAllowsStaleGraph(t *testing.T) {
 		bumpApprovalGraph(t, opened)
 
 		superseded, err := opened.SupersedeCoordinationProposal(ctx, approved.Proposal.ID,
-			SupersedeCoordinationProposalInput{ExpectedUpdatedAt: approved.Proposal.UpdatedAt})
+			SupersedeCoordinationProposalInput{
+				ExpectedUpdatedAt:        approved.Proposal.UpdatedAt,
+				ReplacementGraphRevision: approvalRevision(1),
+			})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if superseded.Proposal.Status != model.CoordinationProposalSuperseded ||
-			superseded.Incident.Status != model.CoordinationIncidentOpen {
+			superseded.Incident.Status != model.CoordinationIncidentOpen ||
+			superseded.Incident.GraphRevision != 1 {
 			t.Fatalf("superseded approved pair = %+v", superseded)
 		}
 	})
