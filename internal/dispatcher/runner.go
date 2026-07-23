@@ -163,6 +163,9 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 	case model.RuntimeCodex:
 		commandJSON, _ := json.Marshal(cliPath)
 		argsJSON, _ := json.Marshal(serverArgs)
+		scopeEnvJSON, _ := json.Marshal([]string{
+			"AUTOGORA_BOARD", "AUTOGORA_TASK_ID", "AUTOGORA_RUN_ID", "AUTOGORA_CLAIM_TOKEN",
+		})
 		sandbox := "read-only"
 		if options.AllowWrites {
 			sandbox = "workspace-write"
@@ -172,6 +175,7 @@ func BuildRunnerCommand(claim model.ClaimedTask, options RunnerOptions, sessionI
 			"-c", "mcp_servers.autogora.command=" + string(commandJSON),
 			"-c", "mcp_servers.autogora.args=" + string(argsJSON),
 			"-c", "mcp_servers.autogora.required=true",
+			"-c", "mcp_servers.autogora.env_vars=" + string(scopeEnvJSON),
 			"-c", `mcp_servers.autogora.enabled_tools=["autogora_show","autogora_comment","autogora_heartbeat","autogora_complete","autogora_block"]`,
 			"-c", `mcp_servers.autogora.tools.autogora_complete.approval_mode="approve"`,
 			"-c", `mcp_servers.autogora.tools.autogora_block.approval_mode="approve"`,
