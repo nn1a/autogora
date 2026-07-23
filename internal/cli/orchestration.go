@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/orchestration"
 	"github.com/nn1a/autogora/internal/store"
@@ -120,34 +121,29 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 	if err != nil {
 		return err
 	}
-	profiles := []orchestration.ProfileRoute{}
-	seen := map[string]bool{}
 	discovered, err := opened.ListTasks(ctx, store.ListTaskFilter{IncludeArchived: true, Limit: 500})
 	if err != nil {
 		return err
 	}
-	for _, task := range discovered {
-		if task.Assignee != nil && task.Runtime != model.RuntimeManual && !seen[*task.Assignee] {
-			seen[*task.Assignee] = true
-			profiles = append(profiles, orchestration.ProfileRoute{Name: *task.Assignee, Runtime: task.Runtime})
-		}
-	}
+	configured := cliBoardProfileRoutes(metadata.Orchestration.Profiles)
 	for _, raw := range opts.many("profile") {
-		profile, err := parseRoutingProfile(raw, plannerRuntime)
+		profile, err := mergeExplicitProfileRoute(raw, configured, plannerRuntime)
 		if err != nil {
 			return err
 		}
-		if seen[profile.Name] {
-			for index := range profiles {
-				if profiles[index].Name == profile.Name {
-					profiles[index] = profile
-				}
+		replaced := false
+		for index := range configured {
+			if configured[index].Name == profile.Name {
+				configured[index] = profile
+				replaced = true
+				break
 			}
-		} else {
-			seen[profile.Name] = true
-			profiles = append(profiles, profile)
+		}
+		if !replaced {
+			configured = append(configured, profile)
 		}
 	}
+	profiles := orchestration.ResolveProfileRoutes(discovered, configured)
 	var explicitPlan *orchestration.DecompositionPlan
 	if opts.present("plan-json") {
 		explicitPlan = &orchestration.DecompositionPlan{}
@@ -165,32 +161,31 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 			}
 			entry.Value, err = orchestration.SpecifyTriageTask(ctx, opened, taskID, planner, explicit, opts.value("author"))
 		} else {
-			root, getErr := opened.GetTask(ctx, taskID)
+			_, getErr := opened.GetTask(ctx, taskID)
 			if getErr != nil {
 				err = getErr
 			} else {
-				fallback := orchestration.ProfileRoute{}
+				fallback, selectedOrchestrator := orchestration.SelectProfileRoutes(
+					profiles, metadata.Orchestration.DefaultProfile, metadata.Orchestration.OrchestratorProfile, plannerRuntime,
+				)
 				if opts.present("default-profile") {
-					fallback, err = parseRoutingProfile(opts.value("default-profile"), plannerRuntime)
-				} else if root.Task.Assignee != nil && root.Task.Runtime != model.RuntimeManual {
-					fallback = orchestration.ProfileRoute{Name: *root.Task.Assignee, Runtime: root.Task.Runtime}
-				} else if len(profiles) > 0 {
-					fallback = profiles[0]
-				} else {
-					fallback = orchestration.ProfileRoute{Name: string(plannerRuntime) + "-worker", Runtime: plannerRuntime}
+					fallback, err = mergeExplicitProfileRoute(opts.value("default-profile"), profiles, plannerRuntime)
+					if err == nil && !orchestration.RunnableProfileRoute(fallback) {
+						err = errors.New("--default-profile requires an enabled worker profile")
+					}
+					if err == nil && !opts.present("orchestrator-profile") {
+						selectedOrchestrator = fallback
+					}
 				}
-				var orchestratorProfile *orchestration.ProfileRoute
 				if err == nil && opts.present("orchestrator-profile") {
-					value, parseErr := parseRoutingProfile(opts.value("orchestrator-profile"), plannerRuntime)
-					err, orchestratorProfile = parseErr, &value
+					selectedOrchestrator, err = mergeExplicitProfileRoute(opts.value("orchestrator-profile"), profiles, plannerRuntime)
+					if err == nil && !orchestration.RunnableProfileRoute(selectedOrchestrator) {
+						err = errors.New("--orchestrator-profile requires an enabled worker profile")
+					}
 				}
 				if err == nil {
-					if orchestratorProfile == nil {
-						value := fallback
-						orchestratorProfile = &value
-					}
 					entry.Value, err = orchestration.DecomposeTriageTask(ctx, opened, taskID, orchestration.DecomposeOptions{
-						Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: orchestratorProfile,
+						Profiles: profiles, DefaultProfile: fallback, OrchestratorProfile: &selectedOrchestrator,
 						AutoPromoteChildren: &metadata.Orchestration.AutoPromoteChildren, Planner: planner, Plan: explicitPlan,
 					})
 				}
@@ -205,4 +200,40 @@ func (a *App) runOrchestration(ctx context.Context, command string, opts options
 		err = nil
 	}
 	return writeJSON(a.Stdout, results)
+}
+
+func cliBoardProfileRoutes(profiles []boards.Profile) []orchestration.ProfileRoute {
+	routes := make([]orchestration.ProfileRoute, 0, len(profiles))
+	for _, profile := range profiles {
+		routes = append(routes, orchestration.ProfileRoute{
+			Name: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider,
+			Description: profile.Description, Disabled: profile.Disabled, MaxConcurrent: profile.MaxConcurrent,
+			Priority: profile.Priority, Fallbacks: append([]string{}, profile.Fallbacks...),
+		})
+	}
+	return routes
+}
+
+// mergeExplicitProfileRoute applies the runtime and description supplied by a
+// CLI route while retaining board constraints. In particular, naming a
+// disabled board profile cannot silently turn it back on for one command.
+func mergeExplicitProfileRoute(raw string, profiles []orchestration.ProfileRoute, fallback model.Runtime) (orchestration.ProfileRoute, error) {
+	parsed, err := parseRoutingProfile(raw, fallback)
+	if err != nil {
+		return orchestration.ProfileRoute{}, err
+	}
+	parts := strings.Split(raw, ":")
+	for _, profile := range profiles {
+		if profile.Name != parsed.Name {
+			continue
+		}
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			profile.Runtime = parsed.Runtime
+		}
+		if len(parts) > 2 {
+			profile.Description = parsed.Description
+		}
+		return profile, nil
+	}
+	return parsed, nil
 }
