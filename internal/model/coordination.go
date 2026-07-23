@@ -92,6 +92,20 @@ var CoordinationProposalStatuses = []CoordinationProposalStatus{
 	CoordinationProposalFailed,
 }
 
+type CoordinationAttemptStatus string
+
+const (
+	CoordinationAttemptStarted   CoordinationAttemptStatus = "started"
+	CoordinationAttemptSucceeded CoordinationAttemptStatus = "succeeded"
+	CoordinationAttemptFailed    CoordinationAttemptStatus = "failed"
+)
+
+var CoordinationAttemptStatuses = []CoordinationAttemptStatus{
+	CoordinationAttemptStarted,
+	CoordinationAttemptSucceeded,
+	CoordinationAttemptFailed,
+}
+
 func ValidCoordinationTrigger(value CoordinationTrigger) bool {
 	for _, candidate := range CoordinationTriggers {
 		if candidate == value {
@@ -121,6 +135,15 @@ func ValidCoordinationIncidentStatus(value CoordinationIncidentStatus) bool {
 
 func ValidCoordinationProposalStatus(value CoordinationProposalStatus) bool {
 	for _, candidate := range CoordinationProposalStatuses {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidCoordinationAttemptStatus(value CoordinationAttemptStatus) bool {
+	for _, candidate := range CoordinationAttemptStatuses {
 		if candidate == value {
 			return true
 		}
@@ -160,4 +183,21 @@ type CoordinationProposal struct {
 	CreatedAt             string                     `json:"createdAt"`
 	UpdatedAt             string                     `json:"updatedAt"`
 	AppliedAt             *string                    `json:"appliedAt"`
+}
+
+// CoordinationAttempt records one logical Coordinator analysis call. Selected
+// agent fields remain empty when the external runtime did not report them.
+type CoordinationAttempt struct {
+	ID               string                    `json:"id"`
+	IncidentID       string                    `json:"incidentId"`
+	Board            string                    `json:"board"`
+	Status           CoordinationAttemptStatus `json:"status"`
+	SelectedAgent    string                    `json:"selectedAgent"`
+	SelectedRuntime  Runtime                   `json:"selectedRuntime"`
+	SelectedModel    string                    `json:"selectedModel"`
+	SelectedProvider string                    `json:"selectedProvider"`
+	SelectedSource   string                    `json:"selectedSource"`
+	Error            *string                   `json:"error"`
+	StartedAt        string                    `json:"startedAt"`
+	EndedAt          *string                   `json:"endedAt"`
 }

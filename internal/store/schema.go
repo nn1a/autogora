@@ -528,6 +528,29 @@ CREATE TABLE IF NOT EXISTS coordination_proposals (
   applied_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS coordination_attempts (
+  id TEXT PRIMARY KEY CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+  incident_id TEXT NOT NULL REFERENCES coordination_incidents(id) ON DELETE CASCADE
+    CHECK (length(CAST(incident_id AS BLOB)) BETWEEN 1 AND 128),
+  board TEXT NOT NULL CHECK (length(CAST(board AS BLOB)) BETWEEN 1 AND 128),
+  status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+  selected_agent TEXT NOT NULL DEFAULT '' CHECK (length(CAST(selected_agent AS BLOB)) <= 128),
+  selected_runtime TEXT NOT NULL DEFAULT '' CHECK (selected_runtime IN ('', 'claude', 'codex', 'cline', 'gemini', 'manual')),
+  selected_model TEXT NOT NULL DEFAULT '' CHECK (length(CAST(selected_model AS BLOB)) <= 256),
+  selected_provider TEXT NOT NULL DEFAULT '' CHECK (length(CAST(selected_provider AS BLOB)) <= 128),
+  selected_source TEXT NOT NULL DEFAULT '' CHECK (length(CAST(selected_source AS BLOB)) <= 128),
+  error TEXT CHECK (error IS NULL OR length(CAST(error AS BLOB)) <= 4096),
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  CHECK (
+    (status = 'started' AND ended_at IS NULL AND error IS NULL)
+    OR
+    (status = 'succeeded' AND ended_at IS NOT NULL AND error IS NULL)
+    OR
+    (status = 'failed' AND ended_at IS NOT NULL)
+  )
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -783,6 +806,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_incidents_active_dedupe
   ON coordination_incidents(board, trigger, IFNULL(root_task_id, ''), IFNULL(task_id, ''))
   WHERE status IN ('open', 'coordinating', 'awaiting_approval', 'applying');
 CREATE INDEX IF NOT EXISTS idx_coordination_proposals_incident ON coordination_proposals(incident_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_attempts_board_started ON coordination_attempts(board, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coordination_attempts_incident ON coordination_attempts(incident_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_subscriptions_task ON notification_subscriptions(task_id, platform, chat_id);
