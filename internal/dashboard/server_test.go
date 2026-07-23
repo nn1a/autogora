@@ -105,6 +105,67 @@ func TestAgentDetectionAPIUsesBoundedVersionChecks(t *testing.T) {
 	}
 }
 
+func TestAgentPresetAPIPreviewsDetectedConfigurationWithoutSaving(t *testing.T) {
+	calls := []string{}
+	server := startTestServerWithOptions(t, func(options *Options) {
+		options.AgentDetection = agentconfig.DetectOptions{
+			LookPath: func(name string) (string, error) {
+				if name == "codex" || name == "claude" {
+					return "/tools/" + name, nil
+				}
+				return "", errors.New("missing")
+			},
+			RunVersion: func(_ context.Context, executable string) (string, string, error) {
+				calls = append(calls, executable+" --version")
+				return filepath.Base(executable) + " test version", "", nil
+			},
+		}
+	})
+
+	response, value := apiRequest(t, server, http.MethodGet, "/api/agents/presets", nil)
+	if response.StatusCode != http.StatusOK || len(arrayValue(t, mapValue(t, value)["presets"])) != 4 {
+		t.Fatalf("unexpected preset catalog: %d %#v", response.StatusCode, value)
+	}
+
+	response, value = apiRequest(t, server, http.MethodPost, "/api/agents/presets", map[string]any{
+		"id": "codex-claude",
+		"config": map[string]any{
+			"schemaVersion": 1,
+			"supervisor":    map[string]any{"maxWorkers": 1},
+			"defaults": map[string]any{
+				"workerAgents": []string{"custom"}, "plannerAgents": []string{},
+				"coordinatorAgents": []string{}, "judgeAgents": []string{},
+			},
+			"agents": []any{map[string]any{
+				"id": "custom", "runtime": "codex", "command": "/custom/codex",
+				"enabled": true, "maxConcurrent": 1, "roles": []string{"worker"},
+			}},
+		},
+	})
+	preview := mapValue(t, value)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("preset preview failed: %d %#v", response.StatusCode, preview)
+	}
+	config := mapValue(t, preview["config"])
+	defaults := mapValue(t, config["defaults"])
+	if len(arrayValue(t, config["agents"])) != 3 ||
+		len(arrayValue(t, defaults["workerAgents"])) != 1 ||
+		len(arrayValue(t, defaults["coordinatorAgents"])) != 2 ||
+		len(arrayValue(t, preview["detections"])) != len(model.WorkerRuntimes) {
+		t.Fatalf("unexpected preset preview: %#v", preview)
+	}
+	joinedCalls := strings.Join(calls, "\n")
+	if len(calls) != 2 ||
+		!strings.Contains(joinedCalls, "/tools/claude --version") ||
+		!strings.Contains(joinedCalls, "/tools/codex --version") {
+		t.Fatalf("preset preview made unexpected calls: %#v", calls)
+	}
+	configResponse, configValue := apiRequest(t, server, http.MethodGet, "/api/config", nil)
+	if configResponse.StatusCode != http.StatusOK || mapValue(t, configValue)["exists"] != false {
+		t.Fatalf("preset preview persisted configuration: %d %#v", configResponse.StatusCode, configValue)
+	}
+}
+
 func apiRequest(t *testing.T, server *Server, method, path string, body any) (*http.Response, any) {
 	t.Helper()
 	var reader io.Reader

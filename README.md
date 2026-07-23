@@ -82,6 +82,11 @@ a prompt, contact a paid model, verify login state, or check subscription and
 quota availability. Confirm those conditions in each coding-agent CLI before
 enabling unattended work.
 
+The dialog's **Quick setup** selector previews the same built-in presets as the
+CLI. On first use it selects the best Codex/Claude combination found on `PATH`
+and fills the form without saving; review the generated roles and fallbacks,
+then choose **Save and apply**.
+
 The dialog and the `agents` subcommand write the same global `config.json`.
 Use `autogora agents path` to locate it. The file contains routing metadata,
 not credentials: agent ID, runtime, executable, model, provider, worker/planner/

@@ -30,6 +30,12 @@ type agentDetectionResponse struct {
 	Agents []agentconfig.Detection `json:"agents"`
 }
 
+type agentPresetPreviewResponse struct {
+	Preset     agentconfig.Preset      `json:"preset"`
+	Detections []agentconfig.Detection `json:"detections"`
+	Config     agentconfig.Config      `json:"config"`
+}
+
 type effectiveAgentProfile struct {
 	orchestration.ProfileRoute
 	Health     model.AgentHealth `json:"health"`
@@ -64,6 +70,18 @@ func decodeAgentConfig(request *http.Request) (agentconfig.Config, error) {
 	if err != nil {
 		return agentconfig.Config{}, err
 	}
+	return decodeAgentConfigBytes(body)
+}
+
+func decodeAgentConfigValue(value any) (agentconfig.Config, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return agentconfig.Config{}, fmt.Errorf("invalid agent configuration: %w", err)
+	}
+	return decodeAgentConfigBytes(body)
+}
+
+func decodeAgentConfigBytes(body []byte) (agentconfig.Config, error) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return agentconfig.Config{}, errors.New("invalid agent configuration: expected a JSON object")
@@ -145,6 +163,52 @@ func (s *Server) handleDetectAgents(response http.ResponseWriter, request *http.
 		Path: configResponse.Path, Exists: configResponse.Exists, Agents: detections,
 	})
 	return nil
+}
+
+func (s *Server) handleAgentPresets(response http.ResponseWriter, request *http.Request) error {
+	switch request.Method {
+	case http.MethodGet:
+		sendJSON(response, http.StatusOK, map[string]any{"presets": agentconfig.BuiltinPresets()})
+		return nil
+	case http.MethodPost:
+		body, err := readJSON(request)
+		if err != nil {
+			return err
+		}
+		id := stringValue(body["id"])
+		preset, found := agentconfig.FindPreset(id)
+		if !found {
+			return fmt.Errorf("invalid agent preset %q", id)
+		}
+		current, err := loadAgentConfigResponse()
+		if err != nil {
+			return err
+		}
+		if value, supplied := body["config"]; supplied {
+			current.Config, err = decodeAgentConfigValue(value)
+			if err != nil {
+				return err
+			}
+		}
+		detections, err := agentconfig.DetectSupportedAgents(request.Context(), current.Config, s.options.AgentDetection)
+		if err != nil {
+			return err
+		}
+		config, err := agentconfig.ApplyPreset(current.Config, preset.ID, agentconfig.PresetApplyOptions{
+			Detections: detections, ReplaceExisting: boolValue(body["replace"], false),
+		})
+		if err != nil {
+			return err
+		}
+		sendJSON(response, http.StatusOK, agentPresetPreviewResponse{
+			Preset: preset, Detections: detections, Config: config,
+		})
+		return nil
+	default:
+		response.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		sendJSON(response, http.StatusMethodNotAllowed, map[string]any{"error": "agent presets endpoint requires GET or POST"})
+		return nil
+	}
 }
 
 func (s *Server) handleSupervisor(response http.ResponseWriter, request *http.Request, segments []string) error {

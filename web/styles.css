@@ -557,7 +557,7 @@ dialog::backdrop { background: rgb(4 8 16 / 62%); backdrop-filter: blur(3px); }
 .run-log-output { clear: both; max-height: 280px; margin: 10px 0 0; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-subtle); background: var(--bg); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .activity-row { cursor: pointer; }
 .activity-row:hover { border-color: var(--line-strong); }
-.settings-callout, .supervisor-panel, .agent-defaults {
+.settings-callout, .supervisor-panel, .agent-presets, .agent-defaults {
   min-width: 0;
   display: flex;
   align-items: center;
@@ -568,16 +568,18 @@ dialog::backdrop { background: rgb(4 8 16 / 62%); backdrop-filter: blur(3px); }
   border-radius: 10px;
   background: var(--panel-2);
 }
-.settings-callout > div, .agent-defaults > div:first-child, .section-heading > div:first-child {
+.settings-callout > div, .agent-presets > div:first-child, .agent-defaults > div:first-child, .section-heading > div:first-child {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
-.settings-callout small, .agent-defaults small, .section-heading small { line-height: 1.4; }
-.supervisor-panel, .agent-defaults { align-items: stretch; flex-direction: column; }
+.settings-callout small, .agent-presets small, .agent-defaults small, .section-heading small { line-height: 1.4; }
+.supervisor-panel, .agent-presets, .agent-defaults { align-items: stretch; flex-direction: column; }
 .section-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+.agent-preset-controls { min-width: 0; display: grid; grid-template-columns: minmax(180px, .8fr) minmax(280px, 1.3fr) auto; gap: 10px; align-items: end; }
+.agent-preset-controls .inline { align-self: center; }
 .agent-supervisor-grid { min-width: 0; display: grid; grid-template-columns: minmax(190px, 1fr) minmax(130px, .55fr) minmax(240px, 1.2fr); gap: 10px; align-items: end; }
 .agent-default-grid { width: 100%; }
 .agent-editor { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
@@ -668,7 +670,8 @@ hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .profile-row-head { grid-template-columns: 1fr 1fr; }
   .profile-row-options { grid-template-columns: 1fr 1fr; }
   .profile-remove { width: 100%; }
-  .agent-supervisor-grid, .agent-fields, .agent-fields.secondary { grid-template-columns: 1fr 1fr; }
+  .agent-preset-controls, .agent-supervisor-grid, .agent-fields, .agent-fields.secondary { grid-template-columns: 1fr 1fr; }
+  .agent-preset-controls button { grid-column: 1 / -1; }
   .empty-guide { grid-template-columns: 1fr 1fr; }
   .empty-guide-intro { grid-column: 1 / -1; }
 }
@@ -697,7 +700,8 @@ hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
   .settings-callout, .section-heading { align-items: stretch; flex-direction: column; }
   .settings-callout button, .section-actions button { flex: 1 1 auto; }
   .section-actions { width: 100%; }
-  .agent-supervisor-grid, .agent-fields, .agent-fields.secondary, .agent-default-grid { grid-template-columns: 1fr; }
+  .agent-preset-controls, .agent-supervisor-grid, .agent-fields, .agent-fields.secondary, .agent-default-grid { grid-template-columns: 1fr; }
+  .agent-preset-controls button { grid-column: auto; }
   .agent-row-head { align-items: flex-start; flex-wrap: wrap; }
   .agent-row-title { flex: 1 1 calc(100% - 40px); flex-wrap: wrap; }
   .agent-row-remove { margin-left: auto; }

@@ -18,7 +18,7 @@ document.documentElement.dataset.theme = activeTheme;
 const state = {
   boards: [], board: localStorage.getItem("autogora.board") || "default", metadata: null,
   profiles: [], tasks: [], taskWindow: null, stats: null, diagnostics: null, selected: new Set(), drawerTask: null, cursor: 0, socket: null,
-  agentConfig: null, agentConfigExists: false, detections: [], effectiveAgents: [], supervisor: null, operations: [],
+  agentConfig: null, agentConfigExists: false, agentPresets: [], detections: [], effectiveAgents: [], supervisor: null, operations: [],
   drawerDirty: false, drawerVersion: null, drawerRequest: 0,
 };
 
@@ -966,7 +966,7 @@ function blankAgentConfig() {
   return {
     schemaVersion: 1,
     supervisor: { autoStart: false, maxWorkers: 1, allowWrites: false },
-    defaults: { workerAgents: [], plannerAgents: [], judgeAgents: [] },
+    defaults: { workerAgents: [], plannerAgents: [], coordinatorAgents: [], judgeAgents: [] },
     agents: [],
   };
 }
@@ -1013,7 +1013,7 @@ function agentEditorRow(agent = {}) {
       <label>Fallback agent IDs<input data-agent="fallbacks" value="${escapeHtml((agent.fallbacks || []).join(", "))}" placeholder="claude-backup"></label>
     </div>
     <div class="agent-roles"><span>Roles</span>
-      ${["worker", "planner", "judge"].map((role) => `<label class="inline"><input data-agent-role="${role}" type="checkbox"${roles.has(role) ? " checked" : ""}> ${role}</label>`).join("")}
+      ${["worker", "planner", "coordinator", "judge"].map((role) => `<label class="inline"><input data-agent-role="${role}" type="checkbox"${roles.has(role) ? " checked" : ""}> ${role}</label>`).join("")}
     </div>
     <div class="agent-detection-note">${escapeHtml(detectionNote)}</div>
   </article>`;
@@ -1026,6 +1026,7 @@ function renderAgentEditor(config = state.agentConfig || blankAgentConfig()) {
   form.elements.allowWrites.checked = Boolean(config.supervisor?.allowWrites);
   form.elements.workerAgents.value = (config.defaults?.workerAgents || []).join(", ");
   form.elements.plannerAgents.value = (config.defaults?.plannerAgents || []).join(", ");
+  form.elements.coordinatorAgents.value = (config.defaults?.coordinatorAgents || []).join(", ");
   form.elements.judgeAgents.value = (config.defaults?.judgeAgents || []).join(", ");
   $("#agent-list").innerHTML = (config.agents || []).map(agentEditorRow).join("")
     || '<div class="detail-row"><strong>No coding agents configured</strong><div>Detect installed CLIs or add one manually.</div></div>';
@@ -1067,6 +1068,7 @@ function readAgentEditor() {
     defaults: {
       workerAgents: commaIDs(form.elements.workerAgents.value),
       plannerAgents: commaIDs(form.elements.plannerAgents.value),
+      coordinatorAgents: commaIDs(form.elements.coordinatorAgents.value),
       judgeAgents: commaIDs(form.elements.judgeAgents.value),
     },
     agents,
@@ -1086,12 +1088,12 @@ function suggestedAgentConfig(config) {
     result.agents.push({
       id: detection.id, runtime: detection.runtime, command: detection.executable || detection.runtime,
       model: "", provider: "", enabled, maxConcurrent: 1,
-      roles: ["worker", "planner", "judge"], fallbacks: [],
+      roles: ["worker", "planner", "coordinator", "judge"], fallbacks: [],
     });
     if (enabled) added.push(detection.id);
   }
-  result.defaults ||= { workerAgents: [], plannerAgents: [], judgeAgents: [] };
-  for (const [key, role] of [["workerAgents", "worker"], ["plannerAgents", "planner"], ["judgeAgents", "judge"]]) {
+  result.defaults ||= { workerAgents: [], plannerAgents: [], coordinatorAgents: [], judgeAgents: [] };
+  for (const [key, role] of [["workerAgents", "worker"], ["plannerAgents", "planner"], ["coordinatorAgents", "coordinator"], ["judgeAgents", "judge"]]) {
     if (!(result.defaults[key] || []).length) {
       result.defaults[key] = result.agents.filter((agent) => agent.enabled && agent.roles.includes(role)).map((agent) => agent.id);
     }
@@ -1107,12 +1109,67 @@ function suggestedAgentConfig(config) {
   return { config: result, added };
 }
 
+function renderAgentPresets() {
+  const select = $("#agent-preset");
+  select.innerHTML = state.agentPresets.map((preset) =>
+    `<option value="${escapeHtml(preset.id)}">${escapeHtml(preset.id)}</option>`).join("");
+  if (!select.value && state.agentPresets.length) select.value = state.agentPresets[0].id;
+  updateAgentPresetDescription();
+}
+
+function updateAgentPresetDescription() {
+  const preset = state.agentPresets.find((item) => item.id === $("#agent-preset").value);
+  $("#agent-preset-description").textContent = preset?.description
+    || "Choose a common unpinned agent configuration, then review it before saving.";
+}
+
+function recommendedAgentPreset() {
+  const available = new Set(state.detections
+    .filter((item) => ["installed", "version_unavailable"].includes(item.state))
+    .map((item) => item.runtime));
+  if (available.has("codex") && available.has("claude")) return "codex-claude";
+  if (available.has("codex")) return "codex";
+  if (available.has("claude")) return "claude";
+  return state.agentPresets.some((preset) => preset.id === "codex-claude") ? "codex-claude" : state.agentPresets[0]?.id;
+}
+
+async function previewAgentPreset({ automatic = false } = {}) {
+  const select = $("#agent-preset");
+  const button = $("#apply-agent-preset");
+  if (!select.value) return;
+  try {
+    button.disabled = true;
+    button.textContent = "Preparing…";
+    const result = await api("/api/agents/presets", {
+      method: "POST",
+      body: JSON.stringify({
+        id: select.value,
+        replace: $("#agent-preset-replace").checked,
+        config: readAgentEditor(),
+      }),
+    });
+    state.detections = result.detections || [];
+    renderAgentEditor(result.config);
+    $("#agent-preset-description").textContent = `${result.preset.description} Review the generated agents, then choose Save and apply.`;
+    if (!automatic) toast(`Loaded ${result.preset.id} preset for review`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Use preset";
+  }
+}
+
 async function loadAgentConfiguration() {
-  const [configuration, supervisor] = await Promise.all([api("/api/config"), api("/api/supervisor")]);
+  const [configuration, supervisor, presetCatalog] = await Promise.all([
+    api("/api/config"), api("/api/supervisor"), api("/api/agents/presets"),
+  ]);
   state.agentConfig = configuration.config;
   state.agentConfigExists = configuration.exists;
+  state.agentPresets = presetCatalog.presets || [];
   state.supervisor = supervisor;
   $("#agents-config-path").textContent = configuration.path;
+  renderAgentPresets();
   renderAutomationChip();
   return configuration;
 }
@@ -1155,6 +1212,7 @@ async function detectAgents(addSuggestions = true) {
 async function openAgentSettings({ firstRun = false } = {}) {
   if (!state.agentConfig) await loadAgentConfiguration();
   if (firstRun) state.agentConfig.supervisor.autoStart = true;
+  renderAgentPresets();
   renderAgentEditor(state.agentConfig);
   renderSupervisorStatus();
   const dialog = $("#agents-dialog");
@@ -1163,7 +1221,15 @@ async function openAgentSettings({ firstRun = false } = {}) {
     const effective = await api(boardPath("/api/agents/effective"));
     state.effectiveAgents = effective.profiles || [];
   } catch (error) { state.effectiveAgents = []; }
-  await detectAgents(true);
+  await detectAgents(false);
+  const recommended = recommendedAgentPreset();
+  if (recommended) {
+    $("#agent-preset").value = recommended;
+    updateAgentPresetDescription();
+  }
+  if (firstRun && !(state.agentConfig.agents || []).length && recommended) {
+    await previewAgentPreset({ automatic: true });
+  }
 }
 
 async function submitAgentSettings(event) {
@@ -1200,7 +1266,7 @@ async function toggleSupervisor() {
 function removeAgentReferences(id) {
   if (!id) return;
   const form = $("#agents-form");
-  for (const name of ["workerAgents", "plannerAgents", "judgeAgents"]) {
+  for (const name of ["workerAgents", "plannerAgents", "coordinatorAgents", "judgeAgents"]) {
     form.elements[name].value = commaIDs(form.elements[name].value).filter((value) => value !== id).join(", ");
   }
   $$('[data-agent=fallbacks]', $("#agent-list")).forEach((input) => {
@@ -1303,6 +1369,8 @@ function bindGlobalActions() {
   });
   $("#agents-form").addEventListener("submit", submitAgentSettings);
   $("#detect-agents").addEventListener("click", () => detectAgents(true));
+  $("#agent-preset").addEventListener("change", updateAgentPresetDescription);
+  $("#apply-agent-preset").addEventListener("click", () => previewAgentPreset());
   $("#add-agent").addEventListener("click", () => {
     const empty = $("#agent-list .detail-row"); if (empty) empty.remove();
     $("#agent-list").insertAdjacentHTML("beforeend", agentEditorRow({ enabled: false, roles: ["worker"], maxConcurrent: 1 }));

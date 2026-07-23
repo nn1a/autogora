@@ -174,6 +174,17 @@
     <form id="agents-form" method="dialog" class="dialog-form">
       <header><div><h2>Coding agent setup</h2><small id="agents-config-path" class="mono"></small></div><button type="button" data-close-dialog class="icon-button">×</button></header>
       <p class="dialog-intro">Autogora stores routing settings only. Authentication remains with each coding agent CLI. Detection checks PATH and <code>--version</code>; it never sends a prompt.</p>
+      <section class="agent-presets" aria-labelledby="agent-presets-title">
+        <div>
+          <strong id="agent-presets-title">Quick setup</strong>
+          <small id="agent-preset-description">Choose a common unpinned agent configuration, then review it before saving.</small>
+        </div>
+        <div class="agent-preset-controls">
+          <label>Preset<select id="agent-preset"></select></label>
+          <label class="inline"><input id="agent-preset-replace" type="checkbox"> Replace matching agents and preferred orders</label>
+          <button id="apply-agent-preset" type="button">Use preset</button>
+        </div>
+      </section>
       <section class="supervisor-panel" aria-labelledby="supervisor-title">
         <div class="section-heading">
           <div><strong id="supervisor-title">Automatic orchestration</strong><small id="supervisor-status" aria-live="polite">Checking status…</small></div>
@@ -190,6 +201,7 @@
         <div class="form-grid agent-default-grid">
           <label>Workers<input name="workerAgents" placeholder="codex, claude"></label>
           <label>Planners<input name="plannerAgents" placeholder="codex, claude"></label>
+          <label>Coordinators<input name="coordinatorAgents" placeholder="claude, codex"></label>
           <label>Judges<input name="judgeAgents" placeholder="claude, codex"></label>
         </div>
       </section>

@@ -49,6 +49,8 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 			return s.handleEffectiveAgents(response, request)
 		case "detect":
 			return s.handleDetectAgents(response, request)
+		case "presets":
+			return s.handleAgentPresets(response, request)
 		}
 	}
 	if segments[1] == "supervisor" {

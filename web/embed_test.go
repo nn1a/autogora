@@ -41,6 +41,37 @@ func TestDashboardIncludesAgentOnboardingAndEffectiveRoutes(t *testing.T) {
 	}
 }
 
+func TestDashboardPreviewsAgentPresetsWithCoordinatorDefaults(t *testing.T) {
+	html, err := Files.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	javascript, err := Files.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`id="agent-preset"`,
+		`id="apply-agent-preset"`,
+		`name="coordinatorAgents"`,
+		`id="agent-preset-replace"`,
+	} {
+		if !strings.Contains(string(html), marker) {
+			t.Fatalf("agent preset marker %q is missing", marker)
+		}
+	}
+	for _, marker := range []string{
+		`/api/agents/presets`,
+		`recommendedAgentPreset`,
+		`coordinatorAgents`,
+		`["worker", "planner", "coordinator", "judge"]`,
+	} {
+		if !strings.Contains(string(javascript), marker) {
+			t.Fatalf("agent preset behavior %q is missing", marker)
+		}
+	}
+}
+
 func TestDashboardGroupsResponsiveWorkflowStages(t *testing.T) {
 	javascript, err := Files.ReadFile("app.js")
 	if err != nil {

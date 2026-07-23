@@ -153,6 +153,8 @@ autogora init --data-dir /absolute/previous/dataRoot
 
 Web UI는 전역 설정 파일이 없을 때 첫 화면에서 `Agents` 대화상자를 자동으로 연다. `Detect CLIs`는 `PATH`에서 `claude`, `codex`, `cline`, `gemini`를 찾고 각 실행 파일에 `--version`만 호출한다. prompt를 보내거나 유료 API를 호출하지 않으며 로그인, 구독 한도, quota도 확인하지 않는다. 자동 실행을 켜기 전에 각 CLI에서 인증과 사용 가능 여부를 따로 확인한다.
 
+`Quick setup`은 `PATH`에서 찾은 Codex와 Claude 조합에 맞는 preset을 먼저 선택한다. preset은 저장 전에 form에만 적용되므로 agent 역할과 fallback을 확인한 뒤 `Save and apply`를 누른다.
+
 ![첫 진입에서 coding agent와 supervisor를 설정하는 실제 화면](images/workflow-00-agent-setup.png)
 
 *사용할 agent와 역할, model, fallback, 동시 실행 수를 확인한 뒤 자동 orchestration 정책을 저장한다.*
