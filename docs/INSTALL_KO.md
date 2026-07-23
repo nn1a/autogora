@@ -1,12 +1,44 @@
 # Autogora 설치 및 업그레이드
 
-Autogora는 TUI, Web UI, SQLite 엔진을 포함한 단일 실행 파일이다. worker나 planner로 사용할 클라이언트만 설치하면 된다. Node.js, npm, Bun, Go, 별도 데이터베이스 서버는 필요하지 않다.
+Autogora는 아직 정식 릴리스 전이다. 현재는 소스에서 빌드하는 방법을 기본 설치 경로로 사용한다. 빌드한 단일 실행 파일에는 TUI, Web UI, SQLite 엔진이 들어 있다. 실행할 때 Node.js, npm, Bun, 별도 데이터베이스 서버나 Web UI 파일이 필요하지 않다.
 
-## 1. 릴리스 바이너리 설치
+## 1. 소스에서 빌드
 
-[GitHub Releases](https://github.com/nn1a/autogora/releases)에서 운영체제와 CPU에 맞는 파일 및 `checksums.txt`를 내려받는다.
+Go 1.25 이상과 Git을 준비한다. `make verify`의 race 검증에는 해당 플랫폼의 C 컴파일러도 필요하다.
 
-| 환경 | 릴리스 이름 |
+```bash
+git clone https://github.com/nn1a/autogora.git
+cd autogora
+make build
+./bin/autogora version
+```
+
+`make build`는 `CGO_ENABLED=0`으로 `bin/autogora`를 만든다. Linux나 macOS에서 시스템 `PATH`에 설치하려면 다음과 같이 복사한다.
+
+```bash
+sudo install -m 0755 ./bin/autogora /usr/local/bin/autogora
+autogora version
+```
+
+Windows에서는 Go 명령으로 실행 파일을 만들고 `bin` 디렉터리를 사용자 `PATH`에 추가한다.
+
+```powershell
+New-Item -ItemType Directory -Force .\bin | Out-Null
+go build -trimpath -buildvcs=false -ldflags "-s -w -buildid=" -o .\bin\autogora.exe .\cmd\autogora
+.\bin\autogora.exe version
+```
+
+변경 사항을 검증하려면 다음 명령을 실행한다.
+
+```bash
+make verify
+```
+
+## 2. 향후 릴리스 바이너리
+
+태그 릴리스가 시작되면 [GitHub Releases](https://github.com/nn1a/autogora/releases)에 아래 아카이브와 `checksums.txt`를 게시할 수 있도록 빌드 스크립트가 준비되어 있다. 아직 릴리스가 없다면 이 절차 대신 1절의 소스 빌드를 사용한다.
+
+| 환경 | 산출물 이름 |
 | --- | --- |
 | 일반 Linux x86-64 | `autogora_<version>_linux_amd64.tar.gz` |
 | 일반 Linux ARM64 | `autogora_<version>_linux_arm64.tar.gz` |
@@ -17,62 +49,50 @@ Autogora는 TUI, Web UI, SQLite 엔진을 포함한 단일 실행 파일이다. 
 | Windows x86-64 | `autogora_<version>_windows_amd64.tar.gz` |
 | Windows ARM64 | `autogora_<version>_windows_arm64.tar.gz` |
 
-Linux 바이너리는 `CGO_ENABLED=0`인 정적 실행 파일이다. glibc나 musl에 동적으로 연결하지 않으므로 별도 C 런타임 패키지가 필요 없다. Alpine에서는 `linux_musl_*` 산출물을 선택한다.
+Linux 산출물은 모두 `CGO_ENABLED=0`인 정적 실행 파일이며 glibc나 musl에 동적으로 연결하지 않는다. Alpine에서 구분이 필요한 배포 절차에는 `linux_musl_*` 이름의 산출물을 사용한다.
 
-Linux에서 체크섬을 검증하고 설치한다.
+릴리스 파일은 다음 명령으로 직접 만들 수 있다. 대상 `release/` 디렉터리는 비어 있어야 한다.
+
+```bash
+make release VERSION=v0.1.0
+```
+
+스크립트는 소스·VCS 경로, 디버그·심볼 테이블, Go build ID를 제거하고 gzip 헤더의 파일명과 시간도 남기지 않는다. 실행 파일이 기본 제한인 16MiB를 넘으면 빌드를 중단한다. 한도를 의도적으로 바꿀 때만 `MAX_BINARY_BYTES`를 지정한다.
+
+```bash
+MAX_BINARY_BYTES=18874368 make release VERSION=v0.1.0
+```
+
+릴리스 아카이브가 생긴 뒤에는 `checksums.txt`로 검증하고 압축을 푼다.
 
 ```bash
 grep 'autogora_<version>_<platform>_<architecture>.tar.gz' checksums.txt | sha256sum -c -
 tar -xzf autogora_<version>_<platform>_<architecture>.tar.gz
-sudo install -m 0755 \
-  autogora_<version>_<platform>_<architecture>/autogora \
-  /usr/local/bin/autogora
-autogora version
 ```
 
-macOS에서는 같은 `checksums.txt`를 다음과 같이 검증한다.
-
-```bash
-grep 'autogora_<version>_<platform>_<architecture>.tar.gz' checksums.txt | shasum -a 256 -c -
-```
-
-macOS가 내려받은 파일을 격리했다면 체크섬과 출처를 확인한 뒤 실행 파일의 quarantine 속성을 제거한다.
+macOS에서는 `sha256sum` 대신 `shasum -a 256 -c -`를 사용할 수 있다. 파일의 출처와 체크섬을 확인한 뒤 macOS 격리 속성을 지워야 한다면 다음 명령을 실행한다.
 
 ```bash
 xattr -d com.apple.quarantine /usr/local/bin/autogora
 ```
 
-Windows PowerShell에서는 기본 제공 `tar`로 압축을 풀고, `autogora.exe`가 있는 디렉터리를 사용자 `PATH`에 추가한다.
+## 3. 최초 실행과 데이터 위치
 
-```powershell
-Get-FileHash .\autogora_<version>_windows_amd64.tar.gz -Algorithm SHA256
-tar -xzf autogora_<version>_windows_amd64.tar.gz
-& ".\autogora_<version>_windows_amd64\autogora.exe" version
-```
-
-명령이 출력한 SHA-256 값을 `checksums.txt`의 같은 파일 행과 대조한다.
-
-## 2. 최초 실행
-
-데이터를 둘 프로젝트 디렉터리에서 초기화하고 대시보드를 연다.
+Autogora를 사용할 프로젝트에서 초기화한 뒤 Web UI 또는 TUI를 연다.
 
 ```bash
 cd /path/to/project
 autogora init
 autogora dashboard
-```
-
-대시보드 명령이 출력한 bootstrap URL을 브라우저에서 한 번 연다. 브라우저는 URL 토큰을 HTTP-only 세션 쿠키로 교환한 뒤 토큰 없는 URL로 이동한다. 기본 주소는 `127.0.0.1:8420`이며 Web UI 파일은 바이너리에 들어 있다.
-
-브라우저 없이 현재 터미널에서 보드를 열 수도 있다.
-
-```bash
+# 또는
 autogora tui
 ```
 
-별도 서버나 인증 토큰을 만들지 않고 현재 프로젝트의 SQLite DB를 직접 사용한다. 다른 보드는 `--board <slug>`, 다른 DB는 `--db <path>`로 선택한다.
+`dashboard`가 출력한 bootstrap URL을 브라우저에서 한 번 연다. 브라우저는 URL 토큰을 HTTP-only 세션 쿠키로 교환한 뒤 토큰 없는 URL로 이동한다. 기본 주소는 `127.0.0.1:8420`이다. Web UI 정적 파일은 실행 파일에 내장되어 있다.
 
-기본 데이터는 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장된다. 한 clone의 worktree들은 상태를 공유하고 다른 clone은 분리된다. 프로젝트의 어느 하위 디렉터리에서든 실제 경로를 확인할 수 있으며, `paths`는 디렉터리나 DB를 만들지 않는다.
+TUI는 별도 HTTP 서버 없이 현재 프로젝트의 SQLite DB를 직접 사용한다. 다른 보드는 `--board <slug>`, 다른 DB는 `--db <path>`로 선택한다.
+
+기본 데이터는 Git 작업 트리 밖의 운영체제별 사용자 데이터 디렉터리에 저장된다. 한 clone의 linked worktree는 상태를 공유하고, 다른 clone은 분리된다. `paths`는 디렉터리나 DB를 만들지 않고 실제 경로만 보여준다.
 
 ```bash
 autogora paths
@@ -84,7 +104,7 @@ autogora paths
 | macOS | `~/Library/Application Support/autogora` |
 | Windows | `%LOCALAPPDATA%\autogora` |
 
-프로젝트별 경로 내부는 다음 구조를 사용한다.
+프로젝트별 경로는 다음 구조를 사용한다.
 
 ```text
 <app-data-root>/projects/<project-name>-<hash>/
@@ -95,7 +115,7 @@ autogora paths
 └─ boards/<board-slug>/
 ```
 
-전체 Autogora 데이터 루트를 다른 디스크로 옮기려면 절대 경로의 `AUTOGORA_DATA_HOME`을 설정한다. 특정 명령만 다른 DB로 연결하려면 `--db` 또는 `AUTOGORA_DB`를 사용한다. 우선순위는 `--db`, `AUTOGORA_DB`, 저장된 프로젝트별 위치, 운영체제 기본 위치 순서다.
+전체 데이터 루트를 바꾸려면 절대 경로의 `AUTOGORA_DATA_HOME`을 설정한다. 특정 명령만 다른 DB로 연결하려면 `--db` 또는 `AUTOGORA_DB`를 사용한다. 우선순위는 `--db`, `AUTOGORA_DB`, 저장한 프로젝트별 위치, 운영체제 기본 위치 순서다.
 
 ```bash
 export AUTOGORA_DATA_HOME=/absolute/path/to/autogora-data
@@ -103,30 +123,83 @@ autogora dashboard --db /absolute/path/to/autogora.db
 autogora serve --db /absolute/path/to/autogora.db
 ```
 
-데이터가 반드시 저장소 디렉터리 안에 있어야 한다면 일반적인 `data/`나 `.git/` 내부 대신 프로젝트 루트의 `.autogora/`를 사용한다.
+데이터를 저장소 안에 두어야 한다면 일반 `data/`나 `.git/` 내부 대신 프로젝트 루트의 `.autogora/`를 사용한다.
 
 ```bash
 autogora init --data-dir .autogora
 autogora paths
 ```
 
-`.autogora/.gitignore`의 `*` 규칙은 SQLite DB와 WAL, 로그, 첨부파일, 작업 공간을 Git에서 제외한다. `.git` 내부에는 저장할 수 없다. 기본 위치로 돌아가려면 다음 명령을 사용한다.
+Autogora가 만드는 `.autogora/.gitignore`는 DB와 WAL, 로그, 첨부파일, 작업공간을 Git에서 제외한다. `.git` 내부 경로는 사용할 수 없다. 기본 위치로 돌아가려면 다음 명령을 실행한다.
 
 ```bash
 autogora init --reset-data-dir
 ```
 
-위치를 바꿔도 기존 데이터는 이동하거나 삭제되지 않으며 새 위치에 기본 보드가 생성된다. 기존 상태를 이어서 사용하려면 dispatcher와 dashboard를 종료하고 전체 데이터 루트를 복사한다.
-
-저장소를 이동하면 Git common directory가 바뀌어 새 프로젝트 ID와 빈 기본 위치가 선택된다. 기존 데이터는 그대로 남는다. 이전 `dataRoot`를 계속 사용하려면 이동한 저장소에서 다시 연결한다.
+위치를 바꿔도 기존 데이터는 이동하거나 삭제되지 않는다. 저장소를 이동하면 Git common directory가 달라져 새 프로젝트 ID를 사용한다. 이전 상태를 이어서 쓰려면 옛 데이터 루트를 다시 연결한다.
 
 ```bash
 autogora init --data-dir /absolute/previous/dataRoot
 ```
 
-## 3. 권장 자동 설정: Skill 설치와 MCP 등록
+## 4. coding agent와 supervisor 설정
 
-Autogora 바이너리는 `autogora-worker`, `autogora-orchestrator` Skill을 내장한다. 별도 저장소나 npm 패키지 없이 프로젝트 디렉터리에서 Skill과 MCP를 함께 설정한다. `--dry-run`으로 변경 내용을 확인한 뒤 적용한다.
+전역 agent 설정은 worker, planner, judge가 사용할 CLI와 모델을 한곳에서 관리한다. `autogora agents path`로 `config.json` 위치를 확인할 수 있으며, `AUTOGORA_CONFIG`에 절대 경로를 지정해 위치를 바꿀 수 있다. 이 파일에는 API 키나 로그인 토큰을 저장하지 않는다.
+
+Web UI는 전역 설정 파일이 없을 때 첫 화면에서 `Agents` 대화상자를 자동으로 연다. `Detect CLIs`는 `PATH`에서 `claude`, `codex`, `cline`, `gemini`를 찾고 각 실행 파일에 `--version`만 호출한다. prompt를 보내거나 유료 API를 호출하지 않으며 로그인, 구독 한도, quota도 확인하지 않는다. 자동 실행을 켜기 전에 각 CLI에서 인증과 사용 가능 여부를 따로 확인한다.
+
+![첫 진입에서 coding agent와 supervisor를 설정하는 실제 화면](images/workflow-00-agent-setup.png)
+
+*사용할 agent와 역할, model, fallback, 동시 실행 수를 확인한 뒤 자동 orchestration 정책을 저장한다.*
+
+CLI에서도 같은 설정을 관리할 수 있다.
+
+```bash
+# 먼저 결과를 확인한다. --save는 PATH에서 찾은 CLI를 전역 목록에 추가한다.
+autogora agents detect
+autogora agents detect --save
+
+autogora agents set claude-backup \
+  --runtime claude \
+  --model <model-id> \
+  --roles worker,planner,judge
+
+autogora agents set codex-primary \
+  --runtime codex \
+  --command codex \
+  --model <model-id> \
+  --roles worker,planner,judge \
+  --fallbacks claude-backup \
+  --max-concurrent 2
+
+autogora agents defaults \
+  --worker codex-primary,claude-backup \
+  --planner codex-primary,claude-backup \
+  --judge claude-backup,codex-primary
+
+autogora agents supervisor \
+  --auto-start=true \
+  --max-workers 2 \
+  --allow-writes=true
+```
+
+각 agent에는 다음 값을 저장한다.
+
+- ID, runtime, 실행 명령
+- model과 Cline 등에서 사용할 provider
+- `worker`, `planner`, `judge` 역할
+- agent별 최대 동시 실행 수
+- 사용 불가 시 순서대로 확인할 fallback agent
+
+role별 기본 목록은 우선순위를 정한다. worker는 실제 실행에서 `missing`, `auth_required`, `rate_limited`로 판정된 agent를 건너뛰고 fallback을 사용한다. rate limit은 재시도 횟수를 소모하지 않는다. 실행 도중 파일이 바뀌었거나 commit이 생겼다면 fallback을 시작하지 않고 해당 workspace를 보존한 채 `Blocked`로 전환한다.
+
+`auto-start`를 켜면 `autogora dashboard`와 `autogora tui`가 같은 프로세스 안에서 supervisor를 시작한다. 따라서 일반적인 Web/TUI 사용에는 별도 `autogora dispatch --watch` 프로세스가 필요 없다. Web UI의 `Agents` 대화상자에서 현재 supervisor를 시작하거나 멈출 수도 있다. 명시적인 배치 실행이 필요할 때는 `dispatch --once`, `dispatch --watch`, `dispatch --dry-run`을 계속 사용할 수 있다.
+
+전역 agent 설정은 runtime, 실행 명령, 활성 상태, 역할과 동시 실행 상한을 결정한다. Board settings의 profile은 같은 이름의 전역 agent에 model, provider, 설명, 우선순위, fallback을 지정하거나 동시 실행 상한을 더 낮출 수 있다. 전역 runtime이나 명령을 바꾸거나, 비활성 agent를 다시 켜거나, 전역 동시 실행 상한을 높일 수는 없다. 보드 전용 profile을 새로 만드는 것은 가능하다.
+
+## 5. Skill 설치와 MCP 등록
+
+Autogora는 `autogora-worker`, `autogora-orchestrator` Skill을 내장한다. 별도 저장소나 npm 패키지 없이 프로젝트에서 Skill과 MCP를 함께 설정할 수 있다. 적용 전 `--dry-run`으로 변경 내용을 확인한다.
 
 ```bash
 cd /path/to/project
@@ -147,24 +220,20 @@ autogora setup --client all
 | Claude Code | 프로젝트 `.claude/skills/` | local |
 | Gemini CLI | 프로젝트 `.agents/skills/` | project |
 
-Codex와 Gemini를 함께 선택하면 같은 `.agents/skills/` 대상은 한 번만 설치한다. 프로젝트 루트는 현재 위치에서 가장 가까운 `.git` 디렉터리를 기준으로 찾으며, `--project-dir`로 시작 위치를 명시할 수 있다.
-
 필요하면 Skill과 MCP를 따로 관리한다.
 
 ```bash
-# 내장 Skill만 설치·확인·제거
 autogora skills install --client codex
 autogora skills status --client codex
 autogora skills uninstall --client codex
 
-# MCP만 등록·확인·해제
 autogora mcp register --client codex --dry-run
 autogora mcp register --client codex
 autogora mcp status --client codex
 autogora mcp unregister --client codex
 ```
 
-사용자 전체에서 Skill을 공유하려면 `skills` 명령에 `--scope user`를 사용한다. 통합 설정에서는 Skill과 MCP 범위를 독립적으로 지정할 수 있다.
+사용자 범위에 Skill을 설치하려면 `skills` 명령에 `--scope user`를 사용한다. 통합 설정에서는 `--skill-scope`와 `--mcp-scope`를 따로 지정한다.
 
 ```bash
 autogora setup --client claude \
@@ -172,19 +241,18 @@ autogora setup --client claude \
   --mcp-scope project
 ```
 
-안전 규칙은 다음과 같다.
+설정 명령은 다음 규칙을 지킨다.
 
-- 각 Skill에는 manifest와 SHA-256이 저장된다. 수정했거나 Autogora가 관리하지 않는 파일은 자동으로 덮어쓰거나 지우지 않는다. 내용을 확인한 뒤에만 `--force`를 사용한다.
-- 같은 이름의 MCP 등록이 다른 바이너리 또는 데이터베이스를 가리키면 중단한다. 기존 등록을 확인한 뒤 교체할 때만 `--replace`를 사용한다.
-- `setup`은 Skill과 MCP 양쪽을 먼저 점검한다. 클라이언트 실행 파일 누락이나 충돌을 발견하면 아무것도 적용하지 않는다.
-- MCP 등록은 Autogora 바이너리와 데이터베이스의 절대 경로를 저장한다. 바이너리를 다른 경로로 옮기거나 데이터베이스 경로를 바꾸면 `mcp status`로 확인하고 `mcp register --replace`로 갱신한다.
-- 명령별 옵션은 `autogora help setup`, `autogora help skills`, `autogora help mcp`에서 확인한다.
+- 각 Skill의 manifest와 SHA-256을 저장하고, 수정했거나 Autogora가 관리하지 않는 파일을 자동으로 덮어쓰거나 지우지 않는다. 내용을 확인한 뒤에만 `--force`를 사용한다.
+- 같은 이름의 MCP 등록이 다른 바이너리나 DB를 가리키면 중단한다. 확인 후 교체할 때만 `--replace`를 사용한다.
+- `setup`은 Skill과 MCP 양쪽을 먼저 점검한다. 클라이언트 실행 파일 누락이나 충돌을 발견하면 적용하지 않는다.
+- MCP 등록은 Autogora 바이너리와 DB의 절대 경로를 저장한다. 경로가 바뀌면 `mcp status`로 확인하고 `mcp register --replace`로 갱신한다.
 
-Codex CLI의 네이티브 등록은 user 범위를 사용한다. `setup --scope project --client codex`처럼 하나의 project 범위를 양쪽에 강제하지 말고, 기본값을 사용하거나 `--skill-scope project --mcp-scope user`로 분리한다.
+자세한 옵션은 `autogora help setup`, `autogora help skills`, `autogora help mcp`에서 확인한다.
 
-## 4. 수동 MCP 연결
+### 수동 MCP 연결
 
-자동 설정을 사용할 수 없거나 설정 파일을 직접 관리할 때만 아래 절차를 사용한다. MCP 클라이언트에는 `autogora`의 절대 경로를 등록한다.
+자동 설정을 쓸 수 없을 때만 아래처럼 절대 경로를 직접 등록한다.
 
 ```bash
 AUTOGORA_BIN=$(command -v autogora)
@@ -203,11 +271,9 @@ gemini mcp add --scope project autogora "$AUTOGORA_BIN" serve -- \
 
 설정 파일을 직접 관리한다면 [Claude 예제](../examples/claude.mcp.json)와 [Codex 예제](../examples/codex.config.toml)의 절대 경로만 설치 위치에 맞게 바꾼다.
 
-## 5. MCP가 비활성화된 Cline 연결
+## 6. MCP가 비활성화된 Cline 연결
 
-수정된 Cline이 다음 계약을 만족하면 Autogora dispatcher가 MCP 없이 CLI로 상태를 전달한다.
-
-`autogora setup`, `skills`, `mcp`의 client 대상에는 Cline을 넣지 않는다. Cline은 전역 MCP/Skill 설치 대신 dispatcher가 실행마다 발급하는 task ID, run ID, claim token으로 CLI 브리지를 호출한다. 각 worker는 자신의 task만 완료하거나 수정할 수 있으며 MCP 기능이 없는 수정 버전에서도 동작한다.
+수정된 Cline이 다음 계약을 만족하면 dispatcher가 MCP 없이 scoped CLI로 lifecycle을 전달한다. Cline은 `setup`, `skills`, `mcp`의 client 대상에 포함하지 않는다.
 
 - `--json`, `--cwd <path>`, `--auto-approve <boolean>`을 받는다.
 - 마지막 위치 인자로 worker prompt를 받는다.
@@ -226,9 +292,9 @@ autogora create "수정된 Cline CLI 브리지 검증" \
 autogora dispatch --once
 ```
 
-dispatcher는 claim한 task, run, token과 일치하는 `autogora heartbeat`, `comment`, `complete`, `block` 명령을 prompt에 넣는다. 다른 task를 수정하는 lifecycle 명령은 거부된다. 전체 계약은 [Cline CLI 브리지 문서](../examples/cline-cli-bridge.md)에 있다.
+dispatcher는 실행마다 task ID, run ID, claim token을 발급하고 정확한 `autogora heartbeat`, `comment`, `complete`, `block` 명령을 prompt에 넣는다. 다른 task의 lifecycle을 바꾸려는 명령은 거부한다. 전체 계약은 [Cline CLI 브리지 문서](../examples/cline-cli-bridge.md)에 있다.
 
-Cline을 보조 planner로도 사용할 수 있다.
+Cline은 planner로도 사용할 수 있다.
 
 ```bash
 autogora specify <triage-task-id> --planner-runtime cline
@@ -237,45 +303,19 @@ autogora decompose <triage-task-id> \
   --profile "worker:cline:범위가 지정된 작업을 구현하고 검증한다"
 ```
 
-planner는 도구 없이 읽기 전용 구조화 결과를 출력한다. Cline의 최종 NDJSON 결과가 스키마를 통과해야 보드에 반영된다.
-
-## 6. 소스에서 빌드
-
-릴리스 바이너리를 사용하는 데 Go는 필요하지 않다. 소스 빌드에는 Go 1.25 이상을 사용한다. race 검증에는 해당 플랫폼의 C 컴파일러도 필요하다.
-
-```bash
-make build
-./bin/autogora version
-make verify
-```
-
-Go 환경에서는 다음 명령으로 설치할 수도 있다.
-
-```bash
-go install -trimpath -ldflags='-s -w -buildid=' \
-  github.com/nn1a/autogora/cmd/autogora@latest
-```
-
-모든 플랫폼용 릴리스 파일은 다음 명령으로 만든다. 출력할 `release/` 디렉터리는 비어 있어야 한다.
-
-```bash
-make release VERSION=v1.0.0
-```
-
-릴리스 스크립트는 경로·VCS 정보, 디버그·심볼 테이블, Go build ID를 제거하고 gzip 헤더의 원본 이름과 시간 정보도 남기지 않는다. 실행 파일이 기본 제한인 16MiB를 넘으면 빌드를 중단한다. 한도를 의도적으로 바꿀 때만 `MAX_BINARY_BYTES`를 지정한다.
-
-```bash
-MAX_BINARY_BYTES=18874368 make release VERSION=v1.0.0
-```
+planner는 도구를 쓰지 않고 구조화 결과를 출력한다. 최종 NDJSON 결과가 스키마를 통과해야 보드에 반영된다.
 
 ## 7. 업그레이드와 백업
 
-1. 실행 중인 `dashboard`와 `dispatch --watch` 프로세스를 정상 종료한다.
+현재 소스 설치를 갱신할 때는 다음 순서를 권장한다.
+
+1. 실행 중인 `dashboard`, `tui`, 별도 `dispatch --watch` 프로세스를 정상 종료한다.
 2. `autogora paths`로 확인한 `dataRoot` 전체를 백업한다.
-3. 새 아카이브의 체크섬을 검증한다.
-4. 기존 실행 파일만 새 바이너리로 교체한다.
-5. `autogora version`, `autogora diagnostics`를 실행하고 대시보드를 확인한다.
+3. Git에서 적용할 commit이나 tag를 확인하고 소스를 갱신한다.
+4. `make verify`, `make build`를 실행한다.
+5. 기존 실행 파일을 새 `bin/autogora`로 교체한다.
+6. `autogora version`, `autogora diagnostics`를 실행하고 Web UI 또는 TUI를 확인한다.
 
-데이터와 Web UI는 실행 파일과 분리된다. 새 바이너리는 데이터베이스를 열 때 필요한 스키마 마이그레이션을 수행한다. 여러 버전의 dispatcher나 dashboard가 같은 데이터베이스를 동시에 열지 않도록 관련 프로세스를 모두 종료한 뒤 교체한다.
+Web UI는 실행 파일에 내장되어 있고 DB, 로그, 첨부파일 같은 변경 데이터는 데이터 루트에 저장된다. 새 실행 파일은 DB를 열 때 필요한 스키마 migration을 수행한다. 서로 다른 버전의 dashboard나 dispatcher가 같은 DB를 동시에 열지 않도록 관련 프로세스를 모두 종료한 뒤 교체한다.
 
-문제가 있으면 기존 바이너리와 백업한 데이터 디렉터리로 함께 되돌린다. 실행 파일만 낮은 버전으로 바꾸고 새 스키마 데이터베이스를 그대로 여는 방식은 권장하지 않는다.
+문제가 생기면 이전 실행 파일과 함께 백업한 데이터 루트를 복구한다. 실행 파일만 낮은 버전으로 바꾸고 새 스키마 DB를 그대로 여는 방법은 권장하지 않는다.

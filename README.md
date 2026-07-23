@@ -6,35 +6,36 @@ Korean documentation: [installation and upgrades](docs/INSTALL_KO.md) · [practi
 
 ## Install
 
-Autogora is distributed as one native executable. It does not require Node.js,
-npm, Bun, Go, a separate SQLite library, or a Web UI installation at runtime.
-Download the archive for your OS and architecture from
-[GitHub Releases](https://github.com/nn1a/autogora/releases), verify it with
-`checksums.txt`, extract it, and place `autogora` on `PATH`.
-
-Linux and macOS example:
+Autogora is currently pre-release. Build it from source with Go 1.25 or later:
 
 ```bash
-tar -xzf autogora_<version>_<platform>_<architecture>.tar.gz
-sudo install -m 0755 autogora_<version>_<platform>_<architecture>/autogora /usr/local/bin/autogora
+git clone https://github.com/nn1a/autogora.git
+cd autogora
+make build
+./bin/autogora version
+sudo install -m 0755 ./bin/autogora /usr/local/bin/autogora
 autogora version
 autogora init
 ```
 
-Use the `linux_musl_amd64` or `linux_musl_arm64` archive when an explicitly
-labelled Alpine/musl artifact is preferred. Linux release binaries are built
-with `CGO_ENABLED=0`, are statically linked, and have no glibc or musl runtime
-dependency. See the [Korean install guide](docs/INSTALL_KO.md) for Windows,
-upgrades, source builds, and data locations.
+The resulting native executable embeds the TUI, Web UI, and SQLite engine. It
+does not require Node.js, npm, Bun, a separate database server, or separately
+installed Web assets at runtime. Claude Code, Codex, Cline, and Gemini CLI are
+needed only for the worker, planner, or judge routes you select.
+
+Future tagged versions are expected to publish archives and `checksums.txt` on
+[GitHub Releases](https://github.com/nn1a/autogora/releases). The release build
+script already produces Linux, explicitly labelled Linux/musl, macOS, and
+Windows archives. Linux artifacts use `CGO_ENABLED=0` and do not dynamically
+depend on glibc or musl. Until a release exists, use the source build above.
+See the [Korean install guide](docs/INSTALL_KO.md) for verification, data
+locations, and the release build procedure.
 
 Release builds trim source/VCS paths, strip debug and symbol tables, omit the
 Go build ID, enforce a 16 MiB binary-size budget, and use maximum gzip
 compression without gzip timestamp/name metadata. UPX and global inlining
 suppression are intentionally not used because their runtime and operational
 costs outweigh the small raw-binary savings for this SQLite-backed service.
-
-Claude Code, Codex, Cline, and Gemini CLI are needed only for the worker or
-planner runtimes you actually select.
 
 ## Project data location
 
@@ -68,6 +69,53 @@ An explicit `--db` or `AUTOGORA_DB` remains the highest-priority per-command
 override. Moving the repository itself produces a new path-based project ID;
 reconnect the old state with
 `autogora init --data-dir /absolute/previous/dataRoot` when that is intended.
+
+## Configure coding agents and automatic orchestration
+
+The dashboard opens the Agents dialog on the first visit when no global agent
+configuration exists. Its detection is intentionally narrow: it resolves the
+supported CLI names through `PATH` and runs only `--version`. It does not send
+a prompt, contact a paid model, verify login state, or check subscription and
+quota availability. Confirm those conditions in each coding-agent CLI before
+enabling unattended work.
+
+The dialog and the `agents` subcommand write the same global `config.json`.
+Use `autogora agents path` to locate it. The file contains routing metadata,
+not credentials: agent ID, runtime, executable, model, provider, worker/planner/
+judge roles, fallback order, per-agent concurrency, preferred role order, and
+supervisor settings.
+
+```bash
+# Inspect first; --save adds detected CLIs to the registry.
+autogora agents detect
+autogora agents detect --save
+
+autogora agents set claude-backup \
+  --runtime claude --model <model-id> \
+  --roles worker,planner,judge
+autogora agents set codex-primary \
+  --runtime codex --model <model-id> \
+  --roles worker,planner,judge \
+  --fallbacks claude-backup --max-concurrent 2
+autogora agents defaults \
+  --worker codex-primary,claude-backup \
+  --planner codex-primary,claude-backup \
+  --judge claude-backup,codex-primary
+autogora agents supervisor \
+  --auto-start=true --max-workers 2 --allow-writes=true
+```
+
+With `auto-start` enabled, `autogora dashboard` and `autogora tui` start the
+in-process supervisor. A separate `dispatch --watch` process is unnecessary.
+The dashboard can also start or stop its supervisor from the Agents dialog.
+Use `dispatch --once`, `dispatch --watch`, or `dispatch --dry-run` when an
+explicit CLI-runner lifecycle is preferable.
+
+Board profiles refine the global registry for one board. A matching board
+profile can pin a different model or provider, describe and prioritize the
+route, choose fallbacks, disable it, or lower its concurrency. It cannot change
+the globally registered runtime or command, enable a globally disabled agent,
+or raise the global concurrency cap. A board may also add a board-only route.
 
 ## Set up an agent client
 
@@ -173,17 +221,18 @@ width. It refreshes every two seconds while preserving the selected task.
 Use the arrow keys or `h/j/k/l` to navigate, `/` to search, `f` to filter by
 tenant, assignee, or runtime, `tab` to switch between overview, relationships,
 and activity, and `a` to include archived tasks. Press `?` for the complete key
-map.
+map. When the global supervisor has `autoStart` enabled, opening the TUI also
+starts orchestration with its configured worker and write limits.
 
 The create and edit form has Task, Agent, and Execution sections. It covers the
 Web form's title, description, status, priority, assignee, runtime, tenant,
-workspace, skills, and goal-mode fields. Board profiles come from the same
-board metadata and observed task routes as the Web API; choosing one fills both
-assignee and runtime and shows its pinned model or `CLI default`. Press `ctrl+s`
-to validate and save the form.
-Use the up and down arrow keys to change Status, Board profile, Runtime, and
-Workspace kind; press `space` to toggle Goal mode. The form also shows these
-controls next to the focused selection field.
+workspace, skills, and goal-mode fields. Its profile list uses the same
+effective global and board routes as the Web API; choosing one fills assignee
+and runtime and shows its pinned model or `CLI default`. Use `tab` and
+`shift+tab` between fields, `ctrl+left/right` between sections, and the up/down
+arrows to change Status, Board profile, Runtime, and Workspace kind. Press
+`space` to toggle Goal mode and `ctrl+s` to validate and save. The focused
+selection field repeats the relevant key hint.
 
 Press `space` for the searchable task action palette. It includes status moves,
 Specify, Decompose, Promote, Unblock, targeted dispatcher runs, active-run termination,
@@ -213,8 +262,13 @@ The dashboard includes:
 
 - responsive light/dark presentation with consistent controls and explicit
   task status, owner, runtime, and board-health cues;
-- all lifecycle columns, search, tenant/assignee filters, archived visibility,
-  and optional per-profile Running lanes;
+- Planning and Execution stages that each show four equal lifecycle columns in
+  one overview without page-level horizontal scrolling, then adapt to two or
+  one column on narrower screens;
+- search, tenant/assignee filters, archived visibility, and optional
+  per-profile Running lanes;
+- first-run coding-agent setup, safe PATH/`--version` detection, effective
+  profile and health views, and supervisor start/stop controls;
 - create/edit drawers, safe Markdown rendering, dependencies, comments, run
   history and termination, attachments, and recent events;
 - progress/comment/link badges, drag/drop transitions, targeted dispatcher runs,
@@ -247,7 +301,7 @@ autogora create "Inspect the authentication module" \
   --workspace "$PWD"
 ```
 
-Run one worker in read-only mode:
+Run one worker in read-only mode when the supervisor is not enabled:
 
 ```bash
 autogora dispatch --once
@@ -280,7 +334,8 @@ For a trusted coding workspace, explicitly allow writes:
 autogora dispatch --once --allow-writes
 ```
 
-Run a persistent local dispatcher with up to two workers:
+Run a persistent local dispatcher with up to two workers when you want an
+explicit process instead of the Web/TUI supervisor:
 
 ```bash
 autogora dispatch --watch --max-workers 2 --allow-writes
@@ -291,6 +346,15 @@ runtime limits. They recover dead or stale workers, terminate tasks that exceed
 `max_runtime_seconds`, and treat exit code 75 as a retry-neutral provider rate
 limit. Optional `--max-in-progress` and `--max-per-assignee` caps coordinate
 multiple dispatcher processes through the database.
+
+Worker launch and output can mark a profile `missing`, `auth_required`, or
+`rate_limited`. The dispatcher skips an unavailable profile and
+follows its explicit fallback chain, recording the selected source and
+`fallbackFrom` in run history. Rate limits use a cooldown and do not consume a
+task retry. Detection itself never asserts these health states; they come from
+real execution outcomes. If an unsuccessful worker has already changed or
+committed files, Autogora does not retry or start a fallback on top of that
+work. It blocks the task with the preserved workspace path for human review.
 
 Worker output is stored under the resolved board `logsRoot` shown by
 `autogora paths`.
@@ -363,6 +427,20 @@ checkout. The snapshot is retained at `refs/autogora/runs/<run-id>` and recorded
 in task details under `changeSets` with base/head commits and changed files. A
 managed worktree cannot become Done until this durable handoff exists.
 
+Each satisfied prerequisite edge pins the exact completion run and change set
+that the dependent must consume. Before starting a dependent in an isolated
+worktree, Autogora validates those durable refs and merges all direct
+prerequisite heads in deterministic order. It advances the dependent's
+effective base only after the whole fan-in succeeds, so the dependent change
+set reports its own files rather than repeating inherited parent changes.
+
+A merge conflict, changed or foreign durable ref, or dropped prerequisite
+history blocks the dependent for review without starting its worker or
+increasing `failureCount`. Autogora aborts the merge and preserves the run
+workspace. A shared `dir` workspace is accepted only when its current Git HEAD
+already contains every required prerequisite head; use a worktree when
+automatic fan-in is needed.
+
 ## Attachments and artifacts
 
 Files are copied into the active board's durable attachment root and limited to
@@ -399,13 +477,19 @@ atomic run kernel used by the dispatcher:
 
 ```bash
 autogora claim <task-id> --ttl 900
-autogora heartbeat <task-id> --note "verification in progress"
-autogora complete <task-id> --summary "verified and delivered"
+# Copy task.id, run.id, and claimToken from the claim response.
+export AUTOGORA_TASK_ID=<task-id>
+export AUTOGORA_RUN_ID=<run-id>
+export AUTOGORA_CLAIM_TOKEN=<claim-token>
+autogora heartbeat "$AUTOGORA_TASK_ID" --note "verification in progress"
+autogora complete "$AUTOGORA_TASK_ID" --summary "verified and delivered"
 ```
 
 `claim` prepares and prints the resolved workspace plus the scoped claim token.
-Manually claimed runs without a dispatcher process finalize terminal calls
-synchronously. Dispatcher-managed runs use the two-phase rule described below.
+For a manually claimed worktree, CLI and MCP completion first capture and pin
+the final change set, then finalize synchronously. If capture fails, Autogora
+blocks the task and preserves the workspace instead of declaring it Done.
+Dispatcher-managed runs use the two-phase rule described below.
 Use `reassign <id>... <profile>` for partial-failure bulk routing, and
 `list --mine` with `AUTOGORA_PROFILE` or `AUTOGORA_WORKER_ID` for
 profile-local views.
@@ -465,14 +549,20 @@ final `run_result`/`done` NDJSON text or Gemini's headless JSON `response`, pars
 it as JSON, and applies the same domain validation before any board mutation.
 Gemini planners also receive a temporary deny-all tool policy.
 
-Board settings can pin a planner model and configure each worker profile's
-runtime, model, optional Cline provider, enabled state, priority, concurrency
-limit, and explicit fallback list. Leaving a model blank is an intentional
-`CLI default (unpinned)` choice. The dispatcher snapshots the resolved profile,
-runtime, requested model, provider, and configuration source for every run, so
-later profile edits do not rewrite execution history. The same values are
-available to workers as `AUTOGORA_AGENT_PROFILE`, `AUTOGORA_MODEL`, and
-`AUTOGORA_PROVIDER`.
+The global agent registry is authoritative for executable availability,
+runtime, command, role eligibility, preferred worker/planner/judge order, and
+maximum concurrency. Board settings may add a board-only worker profile or
+specialize a matching global profile as described above. A board-pinned planner
+model/provider takes precedence; otherwise the first enabled preferred global
+planner supplies its runtime, command, model, and provider. Goal mode uses the
+preferred global judge and falls back to the resolved planner when no judge is
+configured.
+
+Leaving a model blank is an intentional `CLI default (unpinned)` choice. The
+dispatcher snapshots the resolved profile, runtime, requested model, provider,
+configuration source, and `fallbackFrom` for every run, so later settings edits
+do not rewrite execution history. The same values are available to workers as
+`AUTOGORA_AGENT_PROFILE`, `AUTOGORA_MODEL`, and `AUTOGORA_PROVIDER`.
 
 ```bash
 autogora specify <triage-id> --planner-runtime codex --planner-model <model-id>
@@ -547,20 +637,23 @@ Autogora keeps two relation types separate:
 - parent task/subtask hierarchy records which goal owns a unit of work;
 - prerequisite/dependent links form the acyclic execution DAG and gate claims.
 
-Dependency completion is stored on each edge as a durable handoff. Archiving or
-reopening a completed prerequisite does not retroactively invalidate work that
-already consumed that handoff. To require a fresh completion, unlink and relink
-the dependency. An unfinished prerequisite cannot be attached to a task that is
-already running; completed prerequisites may be attached without interrupting it.
+Dependency completion is stored on each edge as a durable handoff that pins the
+exact completion run and, when present, its change set. A later rerun of the
+prerequisite cannot silently replace what the dependent consumes. Archiving or
+reopening a completed prerequisite does not retroactively invalidate the
+handoff; unlink and relink the dependency to require a fresh completion. The
+prerequisite set of a running dependent is immutable, and a prerequisite cannot
+be deleted while such a run is active.
 
 `decompose` atomically records every generated task under the triage root, applies
 the dependency DAG, and makes the root depend on all terminal subtasks. Use
 `autogora graph <task-id>` or `autogora_graph` to inspect the combined topology
 and topological phases. A worker receives the root goal, current node, completed
-prerequisite handoffs, direct dependents, and a metadata-only phase map. Bodies,
-workspaces, attachments, and unfinished results from other nodes are not copied
-into worker context. The dispatcher still rechecks the dependency gate inside
-the same transaction that claims a task.
+direct prerequisite handoffs, direct dependents, and a metadata-only phase map.
+Each handoff contains its pinned summary, metadata, and change-set provenance.
+Bodies, workspaces, attachments, and unfinished results from other nodes are
+not copied into worker context. The dispatcher still rechecks the dependency
+gate inside the same transaction that claims a task.
 
 Relationship responses remain bounded at 500 nodes. Larger connected graphs no
 longer fail worker startup: Autogora returns the exact total node and phase
