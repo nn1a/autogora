@@ -398,6 +398,16 @@ func detectCoordinatorConditions(
 	for _, active := range activeRuns {
 		activeRunIDs[active.Run.ID] = true
 	}
+	planningObservations := map[string]store.AutoDecomposeObservation{}
+	planningEnabled := autoDecomposeEnabled(metadata, options)
+	if planningEnabled {
+		planningObservations, err = opened.ListAutoDecomposeObservations(
+			ctx, current, store.AutoDecomposeMaxAttempts,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
 	graphs := map[string]model.RelationshipGraph{}
 	graphFor := func(taskID string) (model.RelationshipGraph, error) {
 		if graph, found := graphs[taskID]; found {
@@ -483,7 +493,15 @@ func detectCoordinatorConditions(
 				}
 			}
 		}
-		if coordinatorTaskIntentionallyWaiting(task, current) {
+		planning, plannerOwned := planningObservations[task.ID]
+		plannerOwned = plannerOwned && planning.PlannerOwned() &&
+			!isGitHubImportedTask(task) && !isRepeatedBlockTriage(task)
+		if plannerOwned {
+			// The planning queue owns Triage from initial discovery through
+			// retry/backoff and a live final attempt. Only persisted exhaustion
+			// hands the same task to exceptional coordination.
+			intentionallyWaiting++
+		} else if coordinatorTaskIntentionallyWaiting(task, current) {
 			intentionallyWaiting++
 		} else {
 			actionable = append(actionable, task)
@@ -628,6 +646,7 @@ func detectCoordinatorConditions(
 			"intentionallyWaiting": intentionallyWaiting, "byStatus": byStatus,
 			"idleSeconds": int(idle.Seconds()), "lastTaskActivityAt": latestActivity.Format(time.RFC3339Nano),
 			"observedAt": current.Format(time.RFC3339Nano), "activeRuns": len(activeRuns),
+			"taskUpdatedAt": focus.UpdatedAt,
 		},
 	)
 	if err != nil {

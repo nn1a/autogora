@@ -906,15 +906,7 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 			options.log("auto-decompose metadata failed %s: %v", board, err)
 			continue
 		}
-		enabled := metadata.Orchestration.AutoDecompose
-		if options.Autopilot {
-			autopilot := metadata.Orchestration.Autopilot
-			enabled = enabled && autopilot.Enabled && autopilot.AutoPlan
-		}
-		if options.AutoDecompose != nil {
-			enabled = *options.AutoDecompose
-		}
-		if !enabled {
+		if !autoDecomposeEnabled(metadata, options) {
 			continue
 		}
 		boardRemaining := min(remaining, metadata.Orchestration.AutoDecomposePerTick)
@@ -933,14 +925,6 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 			continue
 		}
 		planner := options.DecompositionPlanner
-		if planner == nil {
-			planner, err = createRolePlanner(manager, opened, metadata, configured, options, agentconfig.RolePlanner, options.WorkingDirectory)
-			if err != nil {
-				options.log("auto-decompose planner failed %s: %v", board, err)
-				opened.Close()
-				continue
-			}
-		}
 		discovered, discoverErr := opened.ListTasks(ctx, store.ListTaskFilter{IncludeArchived: true, Limit: 500})
 		if discoverErr != nil {
 			options.log("auto-decompose list failed %s: %v", board, discoverErr)
@@ -950,6 +934,7 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 		decompositionProfiles := mergeDecompositionProfiles(configured, options.DecompositionProfiles)
 		cursor := diagnostics.triageCursor(board)
 		scanned := 0
+		plannerSetupFailed := false
 		for remaining > 0 && boardRemaining > 0 && scanned < autoDecomposeCandidateScanLimit {
 			pageLimit := min(autoDecomposeCandidatePageSize, autoDecomposeCandidateScanLimit-scanned)
 			triage, listErr := opened.ListTasks(ctx, store.ListTaskFilter{
@@ -983,11 +968,12 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 				if isRepeatedBlockTriage(task) {
 					continue
 				}
+				claimTTL := autoDecomposeClaimTTL(options)
 				decision, claimErr := opened.ClaimAutoDecompose(
 					ctx,
 					task.ID,
 					store.AutoDecomposeMaxAttempts,
-					autoDecomposeClaimTTL(options),
+					claimTTL,
 					options.currentTime(),
 				)
 				if claimErr != nil {
@@ -998,6 +984,32 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 					continue
 				}
 				planningClaim := *decision.Claim
+				if planner == nil {
+					planner, err = createRolePlanner(
+						manager,
+						opened,
+						metadata,
+						configured,
+						options,
+						agentconfig.RolePlanner,
+						options.WorkingDirectory,
+					)
+					if err != nil {
+						setupErr := fmt.Errorf("configure Planner: %w", err)
+						shouldStop := failAutoDecomposeClaim(
+							ctx, opened, planningClaim, setupErr, options,
+						)
+						diagnostics.advancePlanningBoard(orderedBoards, board)
+						remaining--
+						boardRemaining--
+						plannerSetupFailed = true
+						if shouldStop {
+							opened.Close()
+							return
+						}
+						break
+					}
+				}
 				// The board roster is intentionally bounded. Include the current
 				// candidate so a task beyond that snapshot keeps its explicit route.
 				taskRoster := make([]model.Task, len(discovered)+1)
@@ -1029,43 +1041,26 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 					finalizer = fallback
 				}
 				value := metadata.Orchestration.AutoPromoteChildren
-				result, err := orchestration.DecomposeTriageTask(ctx, opened, task.ID, orchestration.DecomposeOptions{
-					Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &finalizer, AutoPromoteChildren: &value, Planner: planner,
+				leaseGuard := startAutoDecomposeLeaseGuard(
+					ctx, opened, planningClaim, claimTTL, options,
+				)
+				result, err := orchestration.DecomposeTriageTask(leaseGuard.ctx, opened, task.ID, orchestration.DecomposeOptions{
+					Profiles: profiles, DefaultProfile: fallback, FinalizerProfile: &finalizer,
+					AutoPromoteChildren: &value, AutoDecomposeClaim: &planningClaim,
+					Planner: leaseGuard.planner(planner),
 				})
 				if err != nil {
-					persistCtx := ctx
-					cancelPersist := func() {}
-					if ctx.Err() != nil {
-						persistCtx, cancelPersist = context.WithTimeout(context.Background(), 2*time.Second)
-					}
-					failure, failureErr := opened.FailAutoDecompose(persistCtx, planningClaim, err.Error(), options.currentTime())
-					cancelPersist()
-					switch {
-					case failureErr != nil:
-						options.log("auto-decompose failure persistence failed %s: %v", task.ID, failureErr)
-					case failure.Eligibility == store.AutoDecomposeInvalidated:
-						options.log("auto-decompose result ignored %s because the Triage task changed", task.ID)
-					case failure.Eligibility == store.AutoDecomposeExhausted:
-						options.log(
-							"auto-decompose exhausted %s after %d/%d attempts: %v",
-							task.ID, failure.Attempt, failure.MaxAttempts, err,
-						)
-					case failure.RetryAt != nil:
-						options.log(
-							"auto-decompose failed %s (attempt %d/%d, retry after %s): %v",
-							task.ID, failure.Attempt, failure.MaxAttempts, *failure.RetryAt, err,
-						)
-					default:
-						options.log("auto-decompose failed %s: %v", task.ID, err)
-					}
-					if ctx.Err() != nil {
+					leaseGuard.stopHeartbeat()
+					shouldStop := failAutoDecomposeClaim(
+						ctx, opened, planningClaim, err, options,
+					)
+					leaseGuard.Stop()
+					if shouldStop {
 						opened.Close()
 						return
 					}
 				} else {
-					if _, completeErr := opened.CompleteAutoDecompose(ctx, planningClaim); completeErr != nil {
-						options.log("auto-decompose completion persistence failed %s: %v", task.ID, completeErr)
-					}
+					leaseGuard.Stop()
 					action := "specified"
 					if result.Fanout {
 						action = "decomposed"
@@ -1080,6 +1075,9 @@ func decomposeBoardTriage(ctx context.Context, manager *boards.Manager, boardSlu
 				}
 			}
 			if remaining <= 0 || boardRemaining <= 0 {
+				break
+			}
+			if plannerSetupFailed {
 				break
 			}
 			if reachedEnd {

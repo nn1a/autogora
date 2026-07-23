@@ -463,6 +463,15 @@ func (s *Store) ReserveCoordinationAttempt(
 		default:
 			return nil
 		}
+		blocked, blockErr := graphStalledClaimBlockedByAutoDecompose(
+			ctx, tx, incident, current,
+		)
+		if blockErr != nil {
+			return blockErr
+		}
+		if blocked {
+			return nil
+		}
 		if hasExisting {
 			return &CoordinationStateConflictError{
 				Kind: "attempt", ID: input.ID,

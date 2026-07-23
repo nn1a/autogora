@@ -385,6 +385,7 @@ type DecomposeOptions struct {
 	DefaultProfile      ProfileRoute
 	FinalizerProfile    *ProfileRoute
 	AutoPromoteChildren *bool
+	AutoDecomposeClaim  *store.AutoDecomposeClaim
 	Planner             Planner
 	Plan                *DecompositionPlan
 	ExpectedUpdatedAt   *string
@@ -445,6 +446,19 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 		return DecompositionResult{}, err
 	}
 	if !plan.Fanout {
+		if options.AutoDecomposeClaim != nil {
+			specified, err := opened.ApplyAutoDecomposeSpecification(
+				ctx,
+				store.AutoDecomposeSpecificationInput{
+					TaskID: taskID, Title: plan.RootTitle, Body: plan.RootBody,
+					Author: "decomposer", Assignee: options.DefaultProfile.Name,
+					Runtime: options.DefaultProfile.Runtime, Claim: *options.AutoDecomposeClaim,
+				},
+			)
+			return DecompositionResult{
+				Fanout: false, Reason: plan.Reason, Task: specified,
+			}, err
+		}
 		specified, err := opened.SpecifyTaskWithVersion(ctx, taskID, plan.RootTitle, plan.RootBody, "decomposer", &plannedVersion)
 		if err == nil && strings.TrimSpace(options.DefaultProfile.Name) != "" && options.DefaultProfile.Runtime != model.RuntimeManual && model.ValidRuntime(options.DefaultProfile.Runtime) {
 			assignee, runtime := options.DefaultProfile.Name, options.DefaultProfile.Runtime
@@ -471,7 +485,8 @@ func DecomposeTriageTask(ctx context.Context, opened *store.Store, taskID string
 	}
 	graph, err := opened.ApplyTaskGraph(ctx, store.TaskGraphInput{
 		RootTaskID: taskID, ExpectedUpdatedAt: &plannedVersion, RootTitle: plan.RootTitle, RootBody: plan.RootBody,
-		FinalizerAssignee: finalizer.Name, FinalizerRuntime: finalizer.Runtime,
+		AutoDecomposeClaim: options.AutoDecomposeClaim,
+		FinalizerAssignee:  finalizer.Name, FinalizerRuntime: finalizer.Runtime,
 		AutoPromoteChildren: options.AutoPromoteChildren, Nodes: nodes, Dependencies: plan.Dependencies,
 	})
 	if err != nil {

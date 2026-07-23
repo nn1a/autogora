@@ -897,6 +897,216 @@ func TestCoordinatorObserverGraphStalledWaitsForIdleAndReconciles(t *testing.T) 
 	}
 }
 
+func TestCoordinatorObserverGraphStalledDefersForPlanningClaimUntilExhausted(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	planning, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "goal being auto-decomposed", Status: model.TaskStatusTriage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, planning.Task.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimAt := updatedAt.Add(time.Second)
+	decision, err := opened.ClaimAutoDecompose(
+		ctx, planning.Task.ID, store.AutoDecomposeMaxAttempts, 5*time.Minute, claimAt,
+	)
+	if err != nil || decision.Eligibility != store.AutoDecomposeClaimed ||
+		decision.Claim == nil {
+		t.Fatalf("claim auto-decompose: decision=%+v err=%v", decision, err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.Orchestration.Autopilot.Coordination.IdleSeconds = 30
+	options := Options{
+		AgentConfig: &config, AutoDecompose: boolValue(true),
+		Getenv: func(string) string { return "" },
+	}
+	observedAt := claimAt.Add(31 * time.Second)
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, observedAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled != nil {
+		t.Fatalf("active Planner claim opened graph_stalled: %+v", stalled)
+	}
+
+	planningClaim := *decision.Claim
+	failedAt := observedAt.Add(time.Second)
+	var failure store.AutoDecomposeFailureResult
+	for attempt := 1; attempt <= store.AutoDecomposeMaxAttempts; attempt++ {
+		failure, err = opened.FailAutoDecompose(
+			ctx, planningClaim, "planner unavailable", failedAt,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt == store.AutoDecomposeMaxAttempts {
+			break
+		}
+		if failure.Eligibility != store.AutoDecomposeBackoff ||
+			failure.RetryAt == nil {
+			t.Fatalf("Planner backoff %d = %+v", attempt, failure)
+		}
+		retryAt, parseErr := time.Parse(time.RFC3339Nano, *failure.RetryAt)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		decision, err = opened.ClaimAutoDecompose(
+			ctx, planning.Task.ID, store.AutoDecomposeMaxAttempts,
+			5*time.Minute, retryAt,
+		)
+		if err != nil || decision.Claim == nil {
+			t.Fatalf("reclaim Planner attempt %d: decision=%+v err=%v", attempt+1, decision, err)
+		}
+		planningClaim = *decision.Claim
+		failedAt = retryAt
+	}
+	if failure.Eligibility != store.AutoDecomposeExhausted {
+		t.Fatalf("exhaust final Planner claim: result=%+v", failure)
+	}
+	incidents, err = reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, options, failedAt.Add(31*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled == nil {
+		t.Fatalf("exhausted Planner task did not become graph_stalled: %+v", incidents)
+	}
+}
+
+func TestCoordinatorObserverPlanningOwnershipFollowsAutoPlanPolicy(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "new rough goal", Status: model.TaskStatusTriage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, task.Task.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.Orchestration.Autopilot.Coordination.IdleSeconds = 30
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	enabled := Options{
+		AgentConfig: &config, AutoDecompose: boolValue(true),
+		Getenv: func(string) string { return "" },
+	}
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, enabled, updatedAt.Add(30*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled != nil {
+		t.Fatalf("new AutoPlan-owned Triage opened graph_stalled: %+v", stalled)
+	}
+
+	disabled := enabled
+	disabled.AutoDecompose = boolValue(false)
+	incidents, err = reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata, disabled, updatedAt.Add(31*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled)
+	if stalled == nil || stalled.TaskID == nil || *stalled.TaskID != task.Task.ID {
+		t.Fatalf("disabled AutoPlan graph stall = %+v", stalled)
+	}
+}
+
+func TestCoordinatorObserverActivePlanningDoesNotHideUnrelatedStall(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	parked, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "unrelated parked work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planning, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "goal with active Planner", Status: model.TaskStatusTriage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, planning.Task.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := opened.ClaimAutoDecompose(
+		ctx, planning.Task.ID, store.AutoDecomposeMaxAttempts,
+		5*time.Minute, updatedAt.Add(time.Second),
+	)
+	if err != nil || decision.Claim == nil {
+		t.Fatalf("claim Planner: decision=%+v err=%v", decision, err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.Orchestration.Autopilot.Coordination.IdleSeconds = 30
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx, manager, opened, metadata,
+		Options{
+			AgentConfig: &config, AutoDecompose: boolValue(true),
+			Getenv: func(string) string { return "" },
+		},
+		updatedAt.Add(31*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled)
+	if stalled == nil || stalled.TaskID == nil || *stalled.TaskID != parked.Task.ID {
+		t.Fatalf("unrelated graph stall hidden by Planner: %+v", stalled)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(stalled.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["taskUpdatedAt"] != parked.Task.UpdatedAt {
+		t.Fatalf("graph stall task version = %#v, want %s", details, parked.Task.UpdatedAt)
+	}
+}
+
 func TestCoordinatorObserverDefersGraphStallUntilStaleRunRecoveryCompletes(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)

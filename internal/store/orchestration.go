@@ -30,6 +30,7 @@ type TaskGraphDependency struct {
 type TaskGraphInput struct {
 	RootTaskID          string
 	ExpectedUpdatedAt   *string
+	AutoDecomposeClaim  *AutoDecomposeClaim
 	RootTitle           string
 	RootBody            string
 	FinalizerAssignee   string
@@ -129,6 +130,13 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		if root.Status != model.TaskStatusTriage {
 			return fmt.Errorf("task is not in triage: %s", input.RootTaskID)
 		}
+		if input.AutoDecomposeClaim != nil {
+			if err := requireLiveAutoDecomposeClaim(
+				ctx, tx, root, *input.AutoDecomposeClaim,
+			); err != nil {
+				return err
+			}
+		}
 		for _, node := range input.Nodes {
 			workspace := (*string)(nil)
 			if root.WorkspaceKind == model.WorkspaceDir {
@@ -200,10 +208,16 @@ func (s *Store) ApplyTaskGraph(ctx context.Context, input TaskGraphInput) (TaskG
 		for position, node := range input.Nodes {
 			subtasks = append(subtasks, map[string]any{"key": node.Key, "taskId": tasksByKey[node.Key], "position": position})
 		}
-		return appendEvent(ctx, tx, root.ID, "decomposed", map[string]any{
+		if err := appendEvent(ctx, tx, root.ID, "decomposed", map[string]any{
 			"childIds": childIDs, "leafIds": leafIDs, "subtasks": subtasks,
 			"dependencies": input.Dependencies, "autoPromoteChildren": autoPromote,
-		}, nil)
+		}, nil); err != nil {
+			return err
+		}
+		if input.AutoDecomposeClaim != nil {
+			return consumeAutoDecomposeClaim(ctx, tx, *input.AutoDecomposeClaim)
+		}
+		return nil
 	})
 	if err != nil {
 		return TaskGraphResult{}, err

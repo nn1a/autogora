@@ -21,6 +21,12 @@ const (
 	maxAutoDecomposeClaimTTL = 15 * time.Minute
 )
 
+var (
+	ErrAutoDecomposeClaimNotOwner = errors.New("auto-decompose claim is owned by another caller")
+	ErrAutoDecomposeClaimExpired  = errors.New("auto-decompose claim has expired")
+	ErrAutoDecomposeTaskChanged   = errors.New("auto-decompose task changed while planning")
+)
+
 type AutoDecomposeEligibility string
 
 const (
@@ -199,6 +205,20 @@ func (s *Store) ClaimAutoDecompose(
 			}
 			return nil
 		}
+		coordinationRetryAt, blocked, err := autoDecomposeClaimBlockedByGraphStall(
+			ctx, tx, task.Board, task.ID, task.UpdatedAt, current,
+		)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			decision = AutoDecomposeDecision{
+				Eligibility: AutoDecomposeBusy,
+				MaxAttempts: maxAttempts,
+				RetryAt:     coordinationRetryAt,
+			}
+			return nil
+		}
 
 		state, stateErr := scanAutoDecomposeState(tx.QueryRowContext(ctx,
 			"SELECT "+autoDecomposeStateColumns+" FROM auto_decompose_state WHERE task_id = ?",
@@ -331,6 +351,171 @@ func (s *Store) GetAutoDecomposeState(ctx context.Context, taskID string) (*Auto
 	return &value, nil
 }
 
+// RenewAutoDecomposeClaim atomically proves that the caller still owns a live
+// claim for the same Triage task version, then extends that lease without
+// charging another attempt. An expired claim cannot be revived because another
+// scheduler may already be reclaiming it.
+func (s *Store) RenewAutoDecomposeClaim(
+	ctx context.Context,
+	claim AutoDecomposeClaim,
+	claimTTL time.Duration,
+	current time.Time,
+) (renewed AutoDecomposeClaim, err error) {
+	claim.TaskID = strings.TrimSpace(claim.TaskID)
+	claim.TaskUpdatedAt = strings.TrimSpace(claim.TaskUpdatedAt)
+	claim.Token = strings.TrimSpace(claim.Token)
+	switch {
+	case claim.TaskID == "" || claim.Token == "":
+		return AutoDecomposeClaim{}, errors.New("auto-decompose claim renewal requires a claim")
+	case claim.TaskUpdatedAt == "":
+		return AutoDecomposeClaim{}, errors.New("auto-decompose claim renewal requires a task version")
+	case claimTTL < minAutoDecomposeClaimTTL || claimTTL > maxAutoDecomposeClaimTTL:
+		return AutoDecomposeClaim{}, fmt.Errorf(
+			"auto-decompose claim renewal TTL must be between %s and %s",
+			minAutoDecomposeClaimTTL, maxAutoDecomposeClaimTTL,
+		)
+	}
+	timestamp, err := autoDecomposeTimestamp(current)
+	if err != nil {
+		return AutoDecomposeClaim{}, err
+	}
+	expiresAt, err := autoDecomposeTimestamp(current.UTC().Add(claimTTL))
+	if err != nil {
+		return AutoDecomposeClaim{}, err
+	}
+	current = current.UTC()
+
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+		state, stateErr := scanAutoDecomposeState(tx.QueryRowContext(ctx,
+			"SELECT "+autoDecomposeStateColumns+" FROM auto_decompose_state WHERE task_id = ?",
+			claim.TaskID,
+		))
+		if errors.Is(stateErr, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, claim.TaskID)
+		}
+		if stateErr != nil {
+			return fmt.Errorf("read auto-decompose claim for %s: %w", claim.TaskID, stateErr)
+		}
+		if state.ClaimToken == nil || *state.ClaimToken != claim.Token {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, claim.TaskID)
+		}
+		if state.TaskUpdatedAt != claim.TaskUpdatedAt {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeTaskChanged, claim.TaskID)
+		}
+		task, taskErr := requireTask(ctx, tx, claim.TaskID)
+		if taskErr != nil {
+			return taskErr
+		}
+		if task.Status != model.TaskStatusTriage || task.UpdatedAt != claim.TaskUpdatedAt {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeTaskChanged, claim.TaskID)
+		}
+		if state.ClaimExpiresAt == nil {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, claim.TaskID)
+		}
+		previousExpiry, parseErr := parseAutoDecomposeTimestamp("claim expiry", *state.ClaimExpiresAt)
+		if parseErr != nil {
+			return parseErr
+		}
+		if !previousExpiry.After(current) {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimExpired, claim.TaskID)
+		}
+		// A clock adjustment must never shorten a lease that is already longer.
+		if previousExpiry.After(current.Add(claimTTL)) {
+			expiresAt = previousExpiry.UTC().Format(time.RFC3339Nano)
+		}
+		update, updateErr := tx.ExecContext(ctx, `
+			UPDATE auto_decompose_state
+			SET claim_expires_at = ?, updated_at = ?
+			WHERE task_id = ? AND task_updated_at = ?
+				AND claim_token = ? AND claim_expires_at = ?
+		`, expiresAt, timestamp, claim.TaskID, claim.TaskUpdatedAt,
+			claim.Token, *state.ClaimExpiresAt)
+		if updateErr != nil {
+			return fmt.Errorf("renew auto-decompose claim for %s: %w", claim.TaskID, updateErr)
+		}
+		changed, rowsErr := update.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if changed != 1 {
+			return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, claim.TaskID)
+		}
+		renewed = AutoDecomposeClaim{
+			TaskID: claim.TaskID, TaskUpdatedAt: claim.TaskUpdatedAt,
+			Token: claim.Token, Attempt: state.Attempts,
+			MaxAttempts: state.MaxAttempts, ExpiresAt: expiresAt,
+		}
+		return nil
+	})
+	return renewed, err
+}
+
+// requireLiveAutoDecomposeClaim fences a result mutation inside the same
+// transaction that will apply it. If another scheduler reclaimed the lease,
+// its replacement token is visible before any task or graph state is changed.
+func requireLiveAutoDecomposeClaim(
+	ctx context.Context,
+	tx *sql.Tx,
+	task model.Task,
+	claim AutoDecomposeClaim,
+) error {
+	if strings.TrimSpace(claim.TaskID) != task.ID ||
+		strings.TrimSpace(claim.TaskUpdatedAt) == "" ||
+		strings.TrimSpace(claim.Token) == "" {
+		return errors.New("auto-decompose result application requires its original claim")
+	}
+	if task.UpdatedAt != claim.TaskUpdatedAt {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeTaskChanged, task.ID)
+	}
+	state, err := scanAutoDecomposeState(tx.QueryRowContext(ctx,
+		"SELECT "+autoDecomposeStateColumns+" FROM auto_decompose_state WHERE task_id = ?",
+		task.ID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, task.ID)
+	}
+	if err != nil {
+		return fmt.Errorf("read auto-decompose result fence for %s: %w", task.ID, err)
+	}
+	if state.TaskUpdatedAt != claim.TaskUpdatedAt {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeTaskChanged, task.ID)
+	}
+	if state.ClaimToken == nil || *state.ClaimToken != claim.Token ||
+		state.ClaimExpiresAt == nil {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, task.ID)
+	}
+	expiresAt, err := parseAutoDecomposeTimestamp("claim expiry", *state.ClaimExpiresAt)
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(time.Now().UTC()) {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimExpired, task.ID)
+	}
+	return nil
+}
+
+func consumeAutoDecomposeClaim(
+	ctx context.Context,
+	tx *sql.Tx,
+	claim AutoDecomposeClaim,
+) error {
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM auto_decompose_state
+		WHERE task_id = ? AND task_updated_at = ? AND claim_token = ?
+	`, claim.TaskID, claim.TaskUpdatedAt, claim.Token)
+	if err != nil {
+		return fmt.Errorf("consume auto-decompose claim for %s: %w", claim.TaskID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: %s", ErrAutoDecomposeClaimNotOwner, claim.TaskID)
+	}
+	return nil
+}
+
 func normalizeAutoDecomposeFailure(claim AutoDecomposeClaim, failure string, current time.Time) (string, string, error) {
 	if strings.TrimSpace(claim.TaskID) == "" || strings.TrimSpace(claim.Token) == "" {
 		return "", "", errors.New("auto-decompose failure requires a claim")
@@ -442,29 +627,4 @@ func (s *Store) FailAutoDecompose(
 		return nil
 	})
 	return result, err
-}
-
-// CompleteAutoDecompose removes only the caller's claim. If an expired claim
-// was replaced, its late result cannot release the newer planner invocation.
-func (s *Store) CompleteAutoDecompose(ctx context.Context, claim AutoDecomposeClaim) (bool, error) {
-	if strings.TrimSpace(claim.TaskID) == "" || strings.TrimSpace(claim.Token) == "" {
-		return false, errors.New("auto-decompose completion requires a claim")
-	}
-	removed := false
-	err := s.withWrite(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx,
-			"DELETE FROM auto_decompose_state WHERE task_id = ? AND claim_token = ?",
-			claim.TaskID, claim.Token,
-		)
-		if err != nil {
-			return fmt.Errorf("complete auto-decompose claim for %s: %w", claim.TaskID, err)
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		removed = count == 1
-		return nil
-	})
-	return removed, err
 }

@@ -642,6 +642,16 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 			if incident.ClaimToken != "" || incident.ClaimExpiresAt != nil {
 				return fmt.Errorf("open coordination incident %s has an invalid claim", id)
 			}
+			blocked, blockErr := graphStalledClaimBlockedByAutoDecompose(
+				ctx, tx, incident, current,
+			)
+			if blockErr != nil {
+				return blockErr
+			}
+			if blocked {
+				claimedIncident = incident
+				return nil
+			}
 			updateResult, err = tx.ExecContext(ctx, `
 				UPDATE coordination_incidents
 				SET status = 'coordinating', claim_token = ?, claim_expires_at = ?, updated_at = ?
@@ -657,6 +667,16 @@ func (s *Store) ClaimCoordinationIncident(ctx context.Context, id string, input 
 				return expiryErr
 			}
 			if !expired {
+				claimedIncident = incident
+				return nil
+			}
+			blocked, blockErr := graphStalledClaimBlockedByAutoDecompose(
+				ctx, tx, incident, current,
+			)
+			if blockErr != nil {
+				return blockErr
+			}
+			if blocked {
 				claimedIncident = incident
 				return nil
 			}

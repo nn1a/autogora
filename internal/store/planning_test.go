@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -157,6 +158,304 @@ func TestAutoDecomposeClaimSerializesConcurrentSchedulers(t *testing.T) {
 	}
 	if state == nil || state.Attempts != 1 || state.ClaimToken == nil {
 		t.Fatalf("durable concurrent state = %+v", state)
+	}
+}
+
+func TestRenewAutoDecomposeClaimExtendsLeaseWithoutChargingAttempt(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Long planner retains ownership")
+	start := time.Date(2040, 2, 4, 5, 6, 7, 0, time.UTC)
+
+	decision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, 2*time.Second, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := requirePlanningClaim(t, decision, 1)
+	renewAt := start.Add(1500 * time.Millisecond)
+	renewed, err := opened.RenewAutoDecomposeClaim(
+		ctx, claim, 2*time.Second, renewAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry, err := time.Parse(time.RFC3339Nano, renewed.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := renewAt.Add(2 * time.Second); !expiry.Equal(want) {
+		t.Fatalf("renewed expiry = %s, want %s", expiry, want)
+	}
+	busy, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, 2*time.Second, start.Add(2500*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if busy.Eligibility != AutoDecomposeBusy || busy.Attempts != 1 ||
+		busy.RetryAt == nil || *busy.RetryAt != renewed.ExpiresAt {
+		t.Fatalf("renewed claim decision = %+v, want one busy attempt through %s", busy, renewed.ExpiresAt)
+	}
+	state, err := opened.GetAutoDecomposeState(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.Attempts != 1 || state.ClaimToken == nil ||
+		*state.ClaimToken != claim.Token {
+		t.Fatalf("renewal changed attempt ownership: %+v", state)
+	}
+
+	notShortened, err := opened.RenewAutoDecomposeClaim(
+		ctx, renewed, 2*time.Second, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notShortened.ExpiresAt != renewed.ExpiresAt {
+		t.Fatalf("backward clock shortened lease from %s to %s", renewed.ExpiresAt, notShortened.ExpiresAt)
+	}
+}
+
+func TestRenewAutoDecomposeClaimRejectsExpiredAndStaleOwners(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Expired planner cannot revive ownership")
+	start := time.Date(2040, 2, 5, 6, 7, 8, 0, time.UTC)
+
+	firstDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := requirePlanningClaim(t, firstDecision, 1)
+	if _, err := opened.RenewAutoDecomposeClaim(
+		ctx, first, time.Second, start.Add(time.Second),
+	); !errors.Is(err, ErrAutoDecomposeClaimExpired) {
+		t.Fatalf("expired renewal error = %v", err)
+	}
+
+	secondDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := requirePlanningClaim(t, secondDecision, 2)
+	if second.Token == first.Token {
+		t.Fatal("reclaimed planner reused the expired capability token")
+	}
+	if _, err := opened.RenewAutoDecomposeClaim(
+		ctx, first, time.Second, start.Add(1100*time.Millisecond),
+	); !errors.Is(err, ErrAutoDecomposeClaimNotOwner) {
+		t.Fatalf("stale-token renewal error = %v", err)
+	}
+	state, err := opened.GetAutoDecomposeState(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.ClaimToken == nil || *state.ClaimToken != second.Token ||
+		state.Attempts != 2 {
+		t.Fatalf("stale renewal disturbed new owner: %+v", state)
+	}
+}
+
+func TestRenewAutoDecomposeClaimRejectsEditedTaskVersion(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Original planner input")
+	start := time.Date(2040, 2, 6, 7, 8, 9, 0, time.UTC)
+
+	decision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Minute, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := requirePlanningClaim(t, decision, 1)
+	revised := "Use the revised acceptance criteria."
+	if _, err := opened.UpdateTask(
+		ctx, task.Task.ID, UpdateTaskInput{Body: &revised},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.RenewAutoDecomposeClaim(
+		ctx, claim, time.Minute, start.Add(time.Second),
+	); !errors.Is(err, ErrAutoDecomposeTaskChanged) {
+		t.Fatalf("edited-task renewal error = %v", err)
+	}
+	recovered, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Minute, start.Add(2*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredClaim := requirePlanningClaim(t, recovered, 1)
+	if recoveredClaim.TaskUpdatedAt == claim.TaskUpdatedAt ||
+		recoveredClaim.Token == claim.Token {
+		t.Fatalf("edited task did not receive fresh ownership: old=%+v new=%+v", claim, recoveredClaim)
+	}
+}
+
+func TestAutoDecomposeSpecificationFencesAndConsumesClaimAtomically(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Atomic specification")
+	start := time.Now().UTC()
+
+	firstDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := requirePlanningClaim(t, firstDecision, 1)
+	secondDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := requirePlanningClaim(t, secondDecision, 2)
+	input := AutoDecomposeSpecificationInput{
+		TaskID: task.Task.ID, Title: "Executable specification",
+		Body:   "Acceptance: claim and task update commit together.",
+		Author: "decomposer", Assignee: "codex", Runtime: model.RuntimeCodex,
+		Claim: first,
+	}
+	if _, err := opened.ApplyAutoDecomposeSpecification(
+		ctx, input,
+	); !errors.Is(err, ErrAutoDecomposeClaimNotOwner) {
+		t.Fatalf("stale specification error = %v", err)
+	}
+	unchanged, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Task.Status != model.TaskStatusTriage ||
+		unchanged.Task.Title != task.Task.Title {
+		t.Fatalf("stale specification partially changed task: %+v", unchanged.Task)
+	}
+
+	input.Claim = second
+	specified, err := opened.ApplyAutoDecomposeSpecification(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if specified.Task.Status != model.TaskStatusReady ||
+		specified.Task.Assignee == nil || *specified.Task.Assignee != "codex" ||
+		specified.Task.Runtime != model.RuntimeCodex {
+		t.Fatalf("atomic specification result = %+v", specified.Task)
+	}
+	state, err := opened.GetAutoDecomposeState(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != nil {
+		t.Fatalf("successful specification did not consume claim: %+v", state)
+	}
+}
+
+func TestAutoDecomposeResultFenceRejectsExpiredUnreclaimedClaim(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Expired result fence")
+	decision, err := opened.ClaimAutoDecompose(
+		ctx,
+		task.Task.ID,
+		3,
+		time.Second,
+		time.Now().UTC().Add(-2*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := requirePlanningClaim(t, decision, 1)
+	_, err = opened.ApplyAutoDecomposeSpecification(
+		ctx,
+		AutoDecomposeSpecificationInput{
+			TaskID: task.Task.ID, Title: "Must not apply",
+			Body: "This result outlived its lease.", Author: "decomposer",
+			Assignee: "codex", Runtime: model.RuntimeCodex, Claim: claim,
+		},
+	)
+	if !errors.Is(err, ErrAutoDecomposeClaimExpired) {
+		t.Fatalf("expired result fence error = %v", err)
+	}
+	unchanged, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Task.Status != model.TaskStatusTriage ||
+		unchanged.Task.Title != task.Task.Title {
+		t.Fatalf("expired result changed task: %+v", unchanged.Task)
+	}
+}
+
+func TestAutoDecomposeGraphFencesAndConsumesClaimAtomically(t *testing.T) {
+	ctx := context.Background()
+	opened := openPlanningTestStore(t, ":memory:")
+	task := createPlanningTask(t, opened, "Atomic graph")
+	start := time.Now().UTC()
+
+	firstDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := requirePlanningClaim(t, firstDecision, 1)
+	secondDecision, err := opened.ClaimAutoDecompose(
+		ctx, task.Task.ID, 3, time.Second, start.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := requirePlanningClaim(t, secondDecision, 2)
+	input := TaskGraphInput{
+		RootTaskID: task.Task.ID, ExpectedUpdatedAt: &task.Task.UpdatedAt,
+		AutoDecomposeClaim: &first,
+		RootTitle:          "Fenced graph", RootBody: "Acceptance: graph commits atomically.",
+		FinalizerAssignee: "claude", FinalizerRuntime: model.RuntimeClaude,
+		Nodes: []TaskGraphNode{{
+			Key: "worker", Title: "Implement", Body: "Implement the feature.",
+			Assignee: "codex", Runtime: model.RuntimeCodex,
+		}},
+	}
+	if _, err := opened.ApplyTaskGraph(
+		ctx, input,
+	); !errors.Is(err, ErrAutoDecomposeClaimNotOwner) {
+		t.Fatalf("stale graph error = %v", err)
+	}
+	unchanged, err := opened.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Task.Status != model.TaskStatusTriage ||
+		unchanged.Task.Title != task.Task.Title {
+		t.Fatalf("stale graph partially changed root: %+v", unchanged.Task)
+	}
+	if len(unchanged.Subtasks) != 0 {
+		t.Fatalf("stale graph left children: %+v", unchanged.Subtasks)
+	}
+
+	input.AutoDecomposeClaim = &second
+	graph, err := opened.ApplyTaskGraph(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Root.Task.Status == model.TaskStatusTriage ||
+		len(graph.ChildIDs) != 1 {
+		t.Fatalf("atomic graph result = %+v", graph)
+	}
+	state, err := opened.GetAutoDecomposeState(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != nil {
+		t.Fatalf("successful graph did not consume claim: %+v", state)
 	}
 }
 

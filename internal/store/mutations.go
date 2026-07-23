@@ -291,6 +291,83 @@ func (s *Store) SpecifyTaskWithVersion(ctx context.Context, taskID, title, body,
 	return s.GetTask(ctx, taskID)
 }
 
+type AutoDecomposeSpecificationInput struct {
+	TaskID   string
+	Title    string
+	Body     string
+	Author   string
+	Assignee string
+	Runtime  model.Runtime
+	Claim    AutoDecomposeClaim
+}
+
+// ApplyAutoDecomposeSpecification atomically fences a Planner result, applies
+// its executable route, promotes the task, and consumes the planning claim.
+// A reclaimed Planner can therefore never leave a partially specified task.
+func (s *Store) ApplyAutoDecomposeSpecification(
+	ctx context.Context,
+	input AutoDecomposeSpecificationInput,
+) (model.TaskDetail, error) {
+	input.TaskID = strings.TrimSpace(input.TaskID)
+	input.Title = strings.TrimSpace(input.Title)
+	input.Body = strings.TrimSpace(input.Body)
+	input.Author = strings.TrimSpace(input.Author)
+	input.Assignee = strings.TrimSpace(input.Assignee)
+	switch {
+	case input.TaskID == "":
+		return model.TaskDetail{}, errors.New("auto-decompose specification requires a task ID")
+	case input.Title == "":
+		return model.TaskDetail{}, errors.New("specified task title cannot be empty")
+	case input.Body == "":
+		return model.TaskDetail{}, errors.New("specified task body cannot be empty")
+	case input.Assignee == "":
+		return model.TaskDetail{}, errors.New("auto-decompose specification requires an assignee")
+	case input.Runtime == model.RuntimeManual || !model.ValidRuntime(input.Runtime):
+		return model.TaskDetail{}, fmt.Errorf("invalid auto-decompose runtime: %s", input.Runtime)
+	}
+	if input.Author == "" {
+		input.Author = "decomposer"
+	}
+	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+		task, err := requireTask(ctx, tx, input.TaskID)
+		if err != nil {
+			return err
+		}
+		if task.Status != model.TaskStatusTriage {
+			return fmt.Errorf("task is not in triage: %s", input.TaskID)
+		}
+		if err := requireLiveAutoDecomposeClaim(ctx, tx, task, input.Claim); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tasks
+			SET title = ?, body = ?, assignee = ?, runtime = ?, status = 'todo',
+			    block_kind = NULL, block_reason = NULL, updated_at = ?
+			WHERE id = ?
+		`, input.Title, input.Body, input.Assignee, input.Runtime, now(), input.TaskID); err != nil {
+			return err
+		}
+		if err := appendEvent(ctx, tx, input.TaskID, "specified", map[string]any{
+			"author": input.Author, "title": input.Title,
+		}, nil); err != nil {
+			return err
+		}
+		if err := appendEvent(ctx, tx, input.TaskID, "updated", map[string]any{
+			"fields": []string{"assignee", "runtime"},
+		}, nil); err != nil {
+			return err
+		}
+		if err := recomputeReady(ctx, tx, input.TaskID); err != nil {
+			return err
+		}
+		return consumeAutoDecomposeClaim(ctx, tx, input.Claim)
+	})
+	if err != nil {
+		return model.TaskDetail{}, err
+	}
+	return s.GetTask(ctx, input.TaskID)
+}
+
 func (s *Store) ArchiveTask(ctx context.Context, taskID string) (model.TaskDetail, error) {
 	return s.ArchiveTaskWithVersion(ctx, taskID, nil)
 }
