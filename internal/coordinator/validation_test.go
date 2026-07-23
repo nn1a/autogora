@@ -230,3 +230,58 @@ func TestValidateAgainstSnapshotRejectsStaleProposalEnvelope(t *testing.T) {
 		t.Fatalf("stale envelope validation = %#v", result)
 	}
 }
+
+func TestValidateAgainstSnapshotTreatsMoveToTriageAsFreshReplanning(t *testing.T) {
+	snapshot := validationSnapshot()
+	proposal := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 4,
+		Summary: "Replan blocked work", Rationale: "The old plan cannot proceed.",
+		Actions: []Action{
+			{
+				Kind: ActionMoveToTriage, TaskID: "blocked", ExpectedUpdatedAt: "v2",
+				Reason: "replace the failed plan",
+			},
+			{
+				Kind: ActionUnblockTask, TaskID: "blocked", ExpectedUpdatedAt: "v2",
+				Reason: "redundant after fresh triage",
+			},
+		},
+	}
+	result := ValidateAgainstSnapshot(proposal, snapshot, 3)
+	found := false
+	for _, issue := range result.Issues {
+		found = found || (issue.ActionIndex == 1 && issue.Code == "not_blocked")
+	}
+	if result.Valid || !found {
+		t.Fatalf("move_to_triage retained stale block state: %#v", result)
+	}
+}
+
+func TestValidateAgainstSnapshotRejectsRecoveryTaskUnderControlParent(t *testing.T) {
+	snapshot := validationSnapshot()
+	snapshot.Nodes = append(snapshot.Nodes, NodeSnapshot{
+		ID: "control", Title: "Approval gate", Status: model.TaskStatusTodo,
+		WorkflowRole: model.WorkflowRoleControl, Runtime: model.RuntimeManual, UpdatedAt: "v4",
+	})
+	proposal := Proposal{
+		IncidentID: "ci1", ExpectedGraphRevision: 4,
+		Summary: "Add recovery task", Rationale: "Exercise control-task isolation.",
+		Actions: []Action{{
+			Kind: ActionCreateTask, Reason: "recover",
+			ExpectedTaskVersions: map[string]string{"control": "v4"},
+			Task: &TaskDraft{
+				Key: "recovery", Title: "Recovery", Body: "Repair the blocked work.",
+				Assignee: "claude", Runtime: model.RuntimeClaude, WorkflowRole: model.WorkflowRoleWorker,
+				ParentTaskID: "control",
+			},
+		}},
+	}
+	result := ValidateAgainstSnapshot(proposal, snapshot, 3)
+	found := false
+	for _, issue := range result.Issues {
+		found = found || issue.Code == "control_task"
+	}
+	if result.Valid || !found {
+		t.Fatalf("control parent accepted: %#v", result)
+	}
+}

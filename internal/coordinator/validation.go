@@ -171,6 +171,10 @@ func ValidateAgainstSnapshot(proposal Proposal, snapshot IncidentSnapshot, maxAc
 					addIssue(index, "unknown_parent_task", "parentTaskId is not present in the bounded incident snapshot")
 				} else if parent.UpdatedAt != action.ExpectedTaskVersions[task.ParentTaskID] {
 					addIssue(index, "stale_parent_task", fmt.Sprintf("parent task changed at %s", parent.UpdatedAt))
+				} else if parent.WorkflowRole == model.WorkflowRoleControl {
+					addIssue(index, "control_task", "control tasks cannot own Coordinator-created recovery work")
+				} else if parent.Status == model.TaskStatusArchived {
+					addIssue(index, "archived_parent_task", "archived tasks cannot own Coordinator-created recovery work")
 				}
 			}
 		}
@@ -193,7 +197,8 @@ func ValidateAgainstSnapshot(proposal Proposal, snapshot IncidentSnapshot, maxAc
 			nodes[action.TaskID] = node
 		case ActionMoveToTriage:
 			node := nodes[action.TaskID]
-			node.Status = model.TaskStatusTriage
+			node.Status, node.BlockKind, node.BlockReason = model.TaskStatusTriage, nil, nil
+			node.BlockRecurrences, node.FailureCount = 0, 0
 			nodes[action.TaskID] = node
 		case ActionAddDependency:
 			edge := DependencySnapshot{PrerequisiteID: action.PrerequisiteID, DependentID: action.DependentID}
