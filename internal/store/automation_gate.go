@@ -463,32 +463,35 @@ func (p *AutomationPermit) Close() error {
 	return p.closeErr
 }
 
+// readAutomationPermitState requires the authority's shared operating-system
+// lock. It reads the exact unreleased session expiry and samples boundaryNow
+// only after the authority query has completed.
 func readAutomationPermitState(
 	ctx context.Context,
 	q querier,
 	lease AutomationDispatcherSessionLease,
-	current string,
-) (automationGateRecord, bool, error) {
+	boundaryNow func() time.Time,
+) (automationGateRecord, time.Time, error) {
 	var record automationGateRecord
-	var active, helpersStopped, externalWritesStopped, sessionLive int
+	var active, helpersStopped, externalWritesStopped int
 	var activatedAt, clearedAt sql.NullString
 	var confirmationStartedAt, actor, reason sql.NullString
+	var sessionExpiresAt sql.NullString
 	err := q.QueryRowContext(ctx, `
 		SELECT g.active, g.generation, g.permit_token, g.activated_at,
 			g.cleared_at, g.confirmation_started_at, g.confirmation_actor,
 			g.confirmation_reason, g.confirmation_helpers_stopped,
 			g.confirmation_external_writes_stopped,
-			EXISTS(
-				SELECT 1 FROM automation_dispatcher_sessions s
+			(
+				SELECT s.expires_at FROM automation_dispatcher_sessions s
 				WHERE s.session_id = ? AND s.board = ? AND s.lease_token = ?
-					AND s.released_at IS NULL AND s.expires_at > ?
+					AND s.released_at IS NULL
 			)
 		FROM automation_quarantine_gate g WHERE g.singleton = 1
 	`,
 		lease.SessionID,
 		lease.Board,
 		lease.leaseToken,
-		current,
 	).Scan(
 		&active,
 		&record.Generation,
@@ -500,10 +503,13 @@ func readAutomationPermitState(
 		&reason,
 		&helpersStopped,
 		&externalWritesStopped,
-		&sessionLive,
+		&sessionExpiresAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return automationGateRecord{}, false, ErrAutomationGateNotReady
+		return automationGateRecord{}, time.Time{}, ErrAutomationGateNotReady
+	}
+	if err != nil {
+		return automationGateRecord{}, time.Time{}, err
 	}
 	record.Active = active != 0
 	record.ActivatedAt = stringPointer(activatedAt)
@@ -513,7 +519,37 @@ func readAutomationPermitState(
 	record.ConfirmationReason = stringPointer(reason)
 	record.ConfirmationHelpersStopped = helpersStopped != 0
 	record.ConfirmationExternalWritesOff = externalWritesStopped != 0
-	return record, sessionLive != 0, err
+	if !sessionExpiresAt.Valid {
+		return automationGateRecord{}, time.Time{}, ErrAutomationHostNotIdle
+	}
+	expiresAt, err := time.Parse(
+		automationTimestampLayout,
+		sessionExpiresAt.String,
+	)
+	if err != nil ||
+		expiresAt.UTC().Format(automationTimestampLayout) != sessionExpiresAt.String {
+		return automationGateRecord{}, time.Time{}, ErrAutomationHostNotIdle
+	}
+	if boundaryNow == nil {
+		return automationGateRecord{}, time.Time{}, ErrAutomationHostNotIdle
+	}
+	if err := validateAutomationSessionExpiry(
+		expiresAt,
+		boundaryNow().UTC(),
+	); err != nil {
+		return automationGateRecord{}, time.Time{}, err
+	}
+	return record, expiresAt, nil
+}
+
+func validateAutomationSessionExpiry(
+	expiresAt time.Time,
+	boundary time.Time,
+) error {
+	if expiresAt.IsZero() || boundary.IsZero() || !expiresAt.After(boundary) {
+		return ErrAutomationHostNotIdle
+	}
+	return nil
 }
 
 // AcquireAutomationPermitForSession waits context-sensitively for a shared
@@ -535,18 +571,14 @@ func (s *Store) AcquireAutomationPermitForSession(
 	if err != nil {
 		return nil, fmt.Errorf("acquire automation permit: %w", err)
 	}
-	current := time.Now().UTC().Format(automationTimestampLayout)
-	record, sessionLive, err := readAutomationPermitState(
+	record, _, err := readAutomationPermitState(
 		ctx,
 		runtime.authorityDB,
 		lease,
-		current,
+		time.Now,
 	)
 	if err != nil {
 		return nil, errors.Join(err, lock.Close())
-	}
-	if !sessionLive {
-		return nil, errors.Join(ErrAutomationHostNotIdle, lock.Close())
 	}
 	if record.Active {
 		return nil, errors.Join(
@@ -596,21 +628,32 @@ func (s *Store) validateAutomationPermitLocked(
 	ctx context.Context,
 	permit *AutomationPermit,
 ) error {
+	_, err := s.validateAutomationPermitLockedWithExpiry(ctx, permit)
+	return err
+}
+
+// validateAutomationPermitLockedWithExpiry requires permit.mu. The returned
+// canonical expiry lets an exact caller recheck the time boundary without
+// another authority query while the permit's shared lock is still held.
+func (s *Store) validateAutomationPermitLockedWithExpiry(
+	ctx context.Context,
+	permit *AutomationPermit,
+) (time.Time, error) {
 	runtime, err := s.automationRuntime()
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if permit.self != permit ||
 		permit.closed || permit.lock == nil || permit.token == "" {
-		return ErrAutomationPermitClosed
+		return time.Time{}, ErrAutomationPermitClosed
 	}
 	if permit.sessionID == "" || permit.sessionBoard == "" || permit.sessionToken == "" {
-		return ErrAutomationHostNotIdle
+		return time.Time{}, ErrAutomationHostNotIdle
 	}
 	if permit.authorityPath != runtime.authorityPath || permit.lockPath != runtime.lockPath {
-		return errors.New("automation permit belongs to another authority")
+		return time.Time{}, errors.New("automation permit belongs to another authority")
 	}
-	record, sessionLive, err := readAutomationPermitState(
+	record, expiresAt, err := readAutomationPermitState(
 		ctx,
 		runtime.authorityDB,
 		AutomationDispatcherSessionLease{
@@ -618,21 +661,18 @@ func (s *Store) validateAutomationPermitLocked(
 			leaseToken: permit.sessionToken,
 			Board:      permit.sessionBoard,
 		},
-		time.Now().UTC().Format(automationTimestampLayout),
+		time.Now,
 	)
 	if err != nil {
-		return err
-	}
-	if !sessionLive {
-		return ErrAutomationHostNotIdle
+		return time.Time{}, err
 	}
 	if record.Active {
-		return &AutomationQuarantinedError{Generation: record.Generation}
+		return time.Time{}, &AutomationQuarantinedError{Generation: record.Generation}
 	}
 	if record.Generation != permit.generation || record.PermitToken != permit.token {
-		return ErrAutomationGateConflict
+		return time.Time{}, ErrAutomationGateConflict
 	}
-	return nil
+	return expiresAt, nil
 }
 
 // WithAutomationPermit revalidates a session-bound permit and keeps concurrent

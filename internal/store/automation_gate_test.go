@@ -58,6 +58,23 @@ func copyAutomationPermitForTest(permit *AutomationPermit) *AutomationPermit {
 	return copied.Interface().(*AutomationPermit)
 }
 
+type automationPermitQueryHook struct {
+	querier
+	afterQueryRow func()
+}
+
+func (q automationPermitQueryHook) QueryRowContext(
+	ctx context.Context,
+	query string,
+	args ...any,
+) *sql.Row {
+	row := q.querier.QueryRowContext(ctx, query, args...)
+	if q.afterQueryRow != nil {
+		q.afterQueryRow()
+	}
+	return row
+}
+
 func activateAutomationTestSource(
 	t *testing.T,
 	opened *Store,
@@ -1379,6 +1396,183 @@ func TestAutomationPermitRejectsExpiredReleasedAndWrongSession(t *testing.T) {
 	}
 	if _, err := opened.AcquireAutomationPermitForSession(ctx, expired); !errors.Is(err, ErrAutomationHostNotIdle) {
 		t.Fatalf("expired session permit error = %v", err)
+	}
+}
+
+func TestAutomationPermitExpiryUsesPostQueryBoundary(t *testing.T) {
+	ctx := context.Background()
+	opened := openAutomationTestStore(t)
+	lease := registerAutomationTestSession(
+		t,
+		opened,
+		"default",
+		"dispatcher-query-boundary",
+	)
+	expiresAt := time.Date(
+		2026,
+		time.July,
+		24,
+		12,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	if _, err := opened.db.ExecContext(ctx, `
+		UPDATE automation_dispatcher_sessions
+		SET expires_at = ?
+		WHERE session_id = ?
+	`, expiresAt.Format(automationTimestampLayout), lease.SessionID); err != nil {
+		t.Fatal(err)
+	}
+
+	boundary := expiresAt.Add(-time.Second)
+	queryCompleted := false
+	clockCalls := 0
+	query := automationPermitQueryHook{
+		querier: opened.automation.authorityDB,
+		afterQueryRow: func() {
+			// Advancing this injected boundary models an authority query that
+			// begins while the lease is live and completes after it expires.
+			boundary = expiresAt
+			queryCompleted = true
+		},
+	}
+	_, _, err := readAutomationPermitState(
+		ctx,
+		query,
+		lease,
+		func() time.Time {
+			clockCalls++
+			if !queryCompleted {
+				t.Fatal("expiry boundary was sampled before the authority query")
+			}
+			return boundary
+		},
+	)
+	if !errors.Is(err, ErrAutomationHostNotIdle) {
+		t.Fatalf("post-query expiry error = %v", err)
+	}
+	if clockCalls != 1 {
+		t.Fatalf("boundary clock calls = %d, want 1", clockCalls)
+	}
+}
+
+func TestAutomationPermitExactExpiryValidation(t *testing.T) {
+	ctx := context.Background()
+	opened := openAutomationTestStore(t)
+	lease := registerAutomationTestSession(
+		t,
+		opened,
+		"default",
+		"dispatcher-exact-expiry",
+	)
+	permit, err := opened.AcquireAutomationPermitForSession(ctx, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := permit.Close(); err != nil {
+			t.Errorf("close permit: %v", err)
+		}
+	}()
+
+	permit.mu.Lock()
+	expiresAt, err := opened.validateAutomationPermitLockedWithExpiry(
+		ctx,
+		permit,
+	)
+	permit.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := time.Parse(automationTimestampLayout, lease.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expiresAt.Equal(expected) {
+		t.Fatalf("exact expiry = %s, want %s", expiresAt, expected)
+	}
+	if err := validateAutomationSessionExpiry(
+		expiresAt,
+		expiresAt.Add(-time.Nanosecond),
+	); err != nil {
+		t.Fatalf("live boundary validation: %v", err)
+	}
+	if err := validateAutomationSessionExpiry(
+		expiresAt,
+		expiresAt,
+	); !errors.Is(err, ErrAutomationHostNotIdle) {
+		t.Fatalf("exact expiry boundary error = %v", err)
+	}
+}
+
+func TestAutomationPermitSessionExpiryRowFailsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("missing exact session", func(t *testing.T) {
+		opened := openAutomationTestStore(t)
+		lease := registerAutomationTestSession(
+			t,
+			opened,
+			"default",
+			"dispatcher-missing-exact-session",
+		)
+		lease.SessionID += "-other"
+		if _, err := opened.AcquireAutomationPermitForSession(
+			ctx,
+			lease,
+		); !errors.Is(err, ErrAutomationHostNotIdle) {
+			t.Fatalf("missing exact session error = %v", err)
+		}
+	})
+
+	t.Run("released session", func(t *testing.T) {
+		opened := openAutomationTestStore(t)
+		lease := registerAutomationTestSession(
+			t,
+			opened,
+			"default",
+			"dispatcher-released-exact-session",
+		)
+		released, err := opened.ReleaseAutomationDispatcherSession(ctx, lease)
+		if err != nil || !released {
+			t.Fatalf("release session = %v, err=%v", released, err)
+		}
+		if _, err := opened.AcquireAutomationPermitForSession(
+			ctx,
+			lease,
+		); !errors.Is(err, ErrAutomationHostNotIdle) {
+			t.Fatalf("released exact session error = %v", err)
+		}
+	})
+
+	for _, expiresAt := range []string{
+		"not-a-timestamp",
+		"2026-07-24T12:00:00Z",
+	} {
+		t.Run("malformed "+expiresAt, func(t *testing.T) {
+			opened := openAutomationTestStore(t)
+			lease := registerAutomationTestSession(
+				t,
+				opened,
+				"default",
+				"dispatcher-malformed-expiry",
+			)
+			if _, err := opened.db.ExecContext(ctx, `
+				UPDATE automation_dispatcher_sessions
+				SET expires_at = ?
+				WHERE session_id = ?
+			`, expiresAt, lease.SessionID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := opened.AcquireAutomationPermitForSession(
+				ctx,
+				lease,
+			); !errors.Is(err, ErrAutomationHostNotIdle) {
+				t.Fatalf("malformed session expiry error = %v", err)
+			}
+		})
 	}
 }
 
