@@ -603,12 +603,8 @@ func (e *Engine) publishLocalFF(
 		if _, err := e.command(ctx, publication.repository,
 			"fast-forward target branch", "git", "update-ref",
 			publication.targetRef, publication.head, publication.targetHead); err != nil {
-			var execution *Error
-			if errors.As(err, &execution) &&
-				(execution.Kind == ErrorCommandTimeout ||
-					execution.Kind == ErrorCanceled ||
-					execution.Kind == ErrorTeardownUnconfirmed) {
-				return result, err
+			if controlErr := commandControlError(err); controlErr != nil {
+				return result, controlErr
 			}
 			return result, semanticError(
 				ErrorSourceChanged, "fast-forward target branch", ErrSourceChanged,
@@ -640,12 +636,8 @@ func (e *Engine) publishLocalFF(
 		}
 		if _, err := e.command(ctx, targetWorktree, "fast-forward checked-out target",
 			"git", "merge", "--ff-only", "--no-edit", publication.head); err != nil {
-			var execution *Error
-			if errors.As(err, &execution) &&
-				(execution.Kind == ErrorCommandTimeout ||
-					execution.Kind == ErrorCanceled ||
-					execution.Kind == ErrorTeardownUnconfirmed) {
-				return result, err
+			if controlErr := commandControlError(err); controlErr != nil {
+				return result, controlErr
 			}
 			return result, semanticError(
 				ErrorNonFastForward, "fast-forward checked-out target",

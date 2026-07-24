@@ -44,6 +44,19 @@ func (r *recordingExecRunner) Run(
 	return (ExecRunner{}).Run(ctx, directory, file, args...)
 }
 
+func (r *recordingExecRunner) RunGated(
+	ctx context.Context,
+	directory string,
+	file string,
+	gate CommandReleaseGate,
+	args ...string,
+) (CommandOutput, error) {
+	r.commands = append(r.commands, recordedCommand{
+		file: file, args: append([]string(nil), args...),
+	})
+	return (ExecRunner{}).RunGated(ctx, directory, file, gate, args...)
+}
+
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -175,6 +188,92 @@ func TestLocalFFUncheckedTargetUsesCompareAndSwap(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("compare-and-swap update-ref was not used: %+v", runner.commands)
+	}
+}
+
+func TestLocalFFCompareAndSwapStartDenialRemainsControlError(t *testing.T) {
+	fixture := newGitFixture(t)
+	runGit(t, fixture.repository, "branch", "release", fixture.base)
+	fixture.publication.TargetBranch = "release"
+	runner := &recordingExecRunner{}
+	gateCause := errors.New("publication authorization changed")
+	_, err := Execute(
+		context.Background(),
+		fixture.publication,
+		Options{
+			Runner: runner,
+			ReleaseGate: func(
+				_ context.Context,
+				release CommandRelease,
+			) (bool, error) {
+				command := runner.commands[len(runner.commands)-1]
+				if command.file == "git" && len(command.args) > 0 &&
+					command.args[0] == "update-ref" {
+					return false, gateCause
+				}
+				return release()
+			},
+		},
+	)
+	var startErr *CommandStartError
+	var execution *Error
+	if !errors.As(err, &startErr) || startErr.Released ||
+		!errors.As(err, &execution) ||
+		execution.Kind != ErrorCommandStartBlocked ||
+		!errors.Is(err, gateCause) ||
+		errors.Is(err, ErrSourceChanged) {
+		t.Fatalf(
+			"compare-and-swap start error=%v start=%#v execution=%#v",
+			err,
+			startErr,
+			execution,
+		)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"release",
+	); current != fixture.base {
+		t.Fatalf("denied compare-and-swap moved release to %s", current)
+	}
+}
+
+func TestLocalFFMergeStartDenialRemainsControlError(t *testing.T) {
+	fixture := newGitFixture(t)
+	runner := &recordingExecRunner{}
+	gateCause := errors.New("publication authorization changed")
+	_, err := Execute(
+		context.Background(),
+		fixture.publication,
+		Options{
+			Runner: runner,
+			ReleaseGate: func(
+				_ context.Context,
+				release CommandRelease,
+			) (bool, error) {
+				command := runner.commands[len(runner.commands)-1]
+				if command.file == "git" && len(command.args) > 0 &&
+					command.args[0] == "merge" {
+					return false, gateCause
+				}
+				return release()
+			},
+		},
+	)
+	var startErr *CommandStartError
+	if !errors.As(err, &startErr) || startErr.Released ||
+		!errors.Is(err, gateCause) ||
+		errors.Is(err, ErrNonFastForward) {
+		t.Fatalf("merge start error=%v detail=%#v", err, startErr)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"main",
+	); current != fixture.base {
+		t.Fatalf("denied merge moved main to %s", current)
 	}
 }
 

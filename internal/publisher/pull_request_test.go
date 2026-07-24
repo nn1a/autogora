@@ -26,9 +26,10 @@ func (e fakeExitError) Error() string { return "exit status" }
 func (e fakeExitError) ExitCode() int { return e.code }
 
 type scriptedRunner struct {
-	t     *testing.T
-	steps []expectedCommand
-	index int
+	t          *testing.T
+	steps      []expectedCommand
+	index      int
+	gatedCalls int
 }
 
 func (r *scriptedRunner) Run(
@@ -55,6 +56,40 @@ func (r *scriptedRunner) Run(
 		)
 	}
 	return step.output, step.err
+}
+
+func (r *scriptedRunner) RunGated(
+	ctx context.Context,
+	directory string,
+	file string,
+	gate CommandReleaseGate,
+	args ...string,
+) (CommandOutput, error) {
+	r.t.Helper()
+	r.gatedCalls++
+	releaseCalled := false
+	released, gateErr := gate(ctx, func() (bool, error) {
+		releaseCalled = true
+		return true, nil
+	})
+	if released && !releaseCalled {
+		gateErr = errors.Join(
+			gateErr,
+			errors.New("test gate reported release without invoking it"),
+		)
+		released = false
+	}
+	if !released {
+		return CommandOutput{}, newCommandStartError(false, gateErr)
+	}
+	output, runErr := r.Run(ctx, directory, file, args...)
+	if gateErr != nil {
+		return output, newCommandStartError(
+			true,
+			errors.Join(gateErr, runErr),
+		)
+	}
+	return output, runErr
 }
 
 func (r *scriptedRunner) assertDone() {
@@ -366,4 +401,193 @@ func TestPullRequestRefusesRemoteBranchCollision(t *testing.T) {
 		t.Fatalf("remote collision error = %v", err)
 	}
 	runner.assertDone()
+}
+
+func TestPullRequestReleaseGateRunsForEveryCommand(t *testing.T) {
+	fixture := newFakePullRequestFixture(t)
+	steps := fakePullRequestPreflight(fixture)
+	ref := "refs/heads/" + fixture.branch
+	url := "https://example.test/owner/repo/pull/7"
+	steps = append(steps,
+		expectedCommand{
+			directory: fixture.repository, file: "git",
+			args: []string{
+				"for-each-ref", "--format=%(objectname)%00%(refname)", "--", ref,
+			},
+			output: CommandOutput{Stdout: fixture.head + "\x00" + ref + "\n"},
+		},
+		expectedCommand{
+			directory: fixture.repository, file: "git",
+			args: []string{"ls-remote", "--heads", "origin", ref},
+			output: CommandOutput{
+				Stdout: fixture.head + "\t" + ref + "\n",
+			},
+		},
+		expectedCommand{
+			directory: fixture.repository, file: "gh",
+			args: []string{
+				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
+			},
+			output: CommandOutput{Stdout: `[{"url":"` + url +
+				`","headRefOid":"` + fixture.head + `"}]`},
+		},
+	)
+	runner := &scriptedRunner{t: t, steps: steps}
+	gateCalls := 0
+	result, err := Execute(
+		context.Background(),
+		fixture.publication,
+		Options{
+			Runner: runner,
+			ReleaseGate: func(
+				_ context.Context,
+				release CommandRelease,
+			) (bool, error) {
+				gateCalls++
+				return release()
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.assertDone()
+	if result.Status != ResultAlreadyPublished ||
+		gateCalls != len(steps) || runner.gatedCalls != len(steps) {
+		t.Fatalf(
+			"gated result=%+v gateCalls=%d runnerCalls=%d commands=%d",
+			result,
+			gateCalls,
+			runner.gatedCalls,
+			len(steps),
+		)
+	}
+}
+
+func TestNthCommandGateDenialPreservesControlError(t *testing.T) {
+	fixture := newFakePullRequestFixture(t)
+	steps := fakeValidationSteps(fixture)
+	const denyAt = 7
+	runner := &scriptedRunner{t: t, steps: steps}
+	gateCause := errors.New("publication permit was revoked")
+	gateCalls := 0
+	_, err := Execute(
+		context.Background(),
+		fixture.publication,
+		Options{
+			Runner: runner,
+			ReleaseGate: func(
+				_ context.Context,
+				release CommandRelease,
+			) (bool, error) {
+				gateCalls++
+				if gateCalls == denyAt {
+					return false, gateCause
+				}
+				return release()
+			},
+		},
+	)
+	var startErr *CommandStartError
+	var execution *Error
+	if !errors.As(err, &startErr) || startErr.Released ||
+		!errors.As(err, &execution) ||
+		execution.Kind != ErrorCommandStartBlocked ||
+		!errors.Is(err, gateCause) ||
+		errors.Is(err, ErrInvalidInput) {
+		t.Fatalf(
+			"denied command error=%v start=%#v execution=%#v",
+			err,
+			startErr,
+			execution,
+		)
+	}
+	if gateCalls != denyAt || runner.gatedCalls != denyAt ||
+		runner.index != denyAt-1 {
+		t.Fatalf(
+			"denial boundary gates=%d runnerGates=%d commands=%d",
+			gateCalls,
+			runner.gatedCalls,
+			runner.index,
+		)
+	}
+}
+
+func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
+	fixture := newFakePullRequestFixture(t)
+	steps := fakePullRequestPreflight(fixture)
+	ref := "refs/heads/" + fixture.branch
+	createArgs := []string{
+		"pr", "create", "--base", "main", "--head", fixture.branch,
+		"--title", "Autogora: publish Task / Unsafe Name",
+		"--body", pullRequestBody(validatedPublication{
+			publication: fixture.publication, head: fixture.head,
+		}),
+	}
+	steps = append(steps,
+		expectedCommand{
+			directory: fixture.repository, file: "git",
+			args: []string{
+				"for-each-ref", "--format=%(objectname)%00%(refname)", "--", ref,
+			},
+			output: CommandOutput{Stdout: fixture.head + "\x00" + ref + "\n"},
+		},
+		expectedCommand{
+			directory: fixture.repository, file: "git",
+			args: []string{"ls-remote", "--heads", "origin", ref},
+			output: CommandOutput{
+				Stdout: fixture.head + "\t" + ref + "\n",
+			},
+		},
+		expectedCommand{
+			directory: fixture.repository, file: "gh",
+			args: []string{
+				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
+			},
+			output: CommandOutput{Stdout: "[]\n"},
+		},
+		expectedCommand{
+			directory: fixture.repository,
+			file:      "gh",
+			args:      createArgs,
+		},
+	)
+	denyAt := len(steps)
+	runner := &scriptedRunner{t: t, steps: steps}
+	gateCause := errors.New("create authorization was revoked")
+	gateCalls := 0
+	_, err := Execute(
+		context.Background(),
+		fixture.publication,
+		Options{
+			Runner: runner,
+			ReleaseGate: func(
+				_ context.Context,
+				release CommandRelease,
+			) (bool, error) {
+				gateCalls++
+				if gateCalls == denyAt {
+					return false, gateCause
+				}
+				return release()
+			},
+		},
+	)
+	var startErr *CommandStartError
+	if !errors.As(err, &startErr) || startErr.Released ||
+		!errors.Is(err, gateCause) ||
+		errors.Is(err, ErrCommandFailed) {
+		t.Fatalf("create start error=%v detail=%#v", err, startErr)
+	}
+	if gateCalls != denyAt || runner.gatedCalls != denyAt ||
+		runner.index != denyAt-1 {
+		t.Fatalf(
+			"create denial reconciled: gates=%d runnerGates=%d commands=%d",
+			gateCalls,
+			runner.gatedCalls,
+			runner.index,
+		)
+	}
 }

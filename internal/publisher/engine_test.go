@@ -79,6 +79,145 @@ func (r outputRunner) Run(
 	return r.output, r.err
 }
 
+type countingRunner struct {
+	calls int
+}
+
+func (r *countingRunner) Run(
+	context.Context,
+	string,
+	string,
+	...string,
+) (CommandOutput, error) {
+	r.calls++
+	return CommandOutput{}, nil
+}
+
+type gatedOutputRunner struct {
+	runCalls   int
+	gatedCalls int
+	output     CommandOutput
+	err        error
+}
+
+func (r *gatedOutputRunner) Run(
+	context.Context,
+	string,
+	string,
+	...string,
+) (CommandOutput, error) {
+	r.runCalls++
+	return r.output, r.err
+}
+
+func (r *gatedOutputRunner) RunGated(
+	context.Context,
+	string,
+	string,
+	CommandReleaseGate,
+	...string,
+) (CommandOutput, error) {
+	r.gatedCalls++
+	return r.output, r.err
+}
+
+func TestConfiguredReleaseGateRejectsNonGatedRunner(t *testing.T) {
+	runner := &countingRunner{}
+	gateCalls := 0
+	engine := New(Options{
+		Runner: runner,
+		ReleaseGate: func(
+			context.Context,
+			CommandRelease,
+		) (bool, error) {
+			gateCalls++
+			return true, nil
+		},
+	})
+	_, err := engine.run(context.Background(), ".", "ignored")
+	if !errors.Is(err, ErrCommandStartBlocked) {
+		t.Fatalf("unsupported gated runner error = %v", err)
+	}
+	var startErr *CommandStartError
+	var execution *Error
+	if !errors.As(err, &startErr) || startErr.Released ||
+		!errors.As(err, &execution) ||
+		execution.Kind != ErrorCommandStartBlocked {
+		t.Fatalf("unsupported gated runner detail = %#v, %#v", startErr, execution)
+	}
+	if runner.calls != 0 || gateCalls != 0 {
+		t.Fatalf("unsupported runner crossed gate: runs=%d gates=%d", runner.calls, gateCalls)
+	}
+}
+
+func TestUngatedEngineKeepsUsingCommandRunner(t *testing.T) {
+	runner := &gatedOutputRunner{
+		output: CommandOutput{Stdout: "ungated"},
+	}
+	result, err := New(Options{Runner: runner}).run(
+		context.Background(),
+		".",
+		"ignored",
+	)
+	if err != nil || result.stdout != "ungated" ||
+		runner.runCalls != 1 || runner.gatedCalls != 0 {
+		t.Fatalf(
+			"ungated result=%+v err=%v run=%d gated=%d",
+			result,
+			err,
+			runner.runCalls,
+			runner.gatedCalls,
+		)
+	}
+}
+
+func TestEnginePrioritizesTeardownWhilePreservingCommandStartError(
+	t *testing.T,
+) {
+	gateCause := errors.New("gate release response was lost")
+	runner := &gatedOutputRunner{
+		output: CommandOutput{
+			Stdout:          strings.Repeat("x", MaxCommandOutputBytes),
+			StdoutTruncated: true,
+		},
+		err: newCommandStartError(
+			true,
+			errors.Join(gateCause, ErrTeardownUnconfirmed),
+		),
+	}
+	engine := New(Options{
+		Runner: runner,
+		ReleaseGate: func(
+			context.Context,
+			CommandRelease,
+		) (bool, error) {
+			return false, errors.New("unused fake gate")
+		},
+	})
+	_, err := engine.run(context.Background(), ".", "ignored")
+	var startErr *CommandStartError
+	var execution *Error
+	if !errors.As(err, &startErr) || !startErr.Released ||
+		!errors.As(err, &execution) ||
+		execution.Kind != ErrorTeardownUnconfirmed ||
+		!errors.Is(err, ErrCommandStartUncertain) ||
+		!errors.Is(err, ErrTeardownUnconfirmed) ||
+		!errors.Is(err, gateCause) {
+		t.Fatalf(
+			"ordered command-start error=%v start=%#v execution=%#v",
+			err,
+			startErr,
+			execution,
+		)
+	}
+	if control := commandControlError(err); control == nil {
+		t.Fatal("command start uncertainty was not preserved as a control error")
+	}
+	if runner.runCalls != 0 || runner.gatedCalls != 1 {
+		t.Fatalf("runner path calls: run=%d gated=%d", runner.runCalls, runner.gatedCalls)
+	}
+}
+
 func TestRunnerOutputAndErrorsAreBounded(t *testing.T) {
 	engine := New(Options{Runner: outputRunner{
 		output: CommandOutput{Stdout: strings.Repeat("x", MaxCommandOutputBytes+100)},

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -51,30 +52,36 @@ type Result struct {
 type ErrorKind string
 
 const (
-	ErrorInvalidInput        ErrorKind = "invalid_input"
-	ErrorManualMode          ErrorKind = "manual_mode"
-	ErrorRepository          ErrorKind = "repository"
-	ErrorSourceChanged       ErrorKind = "source_changed"
-	ErrorNonFastForward      ErrorKind = "non_fast_forward"
-	ErrorDirtyWorktree       ErrorKind = "dirty_worktree"
-	ErrorRemoteConflict      ErrorKind = "remote_conflict"
-	ErrorCommandTimeout      ErrorKind = "command_timeout"
-	ErrorTeardownUnconfirmed ErrorKind = "teardown_unconfirmed"
-	ErrorCommandFailed       ErrorKind = "command_failed"
-	ErrorCanceled            ErrorKind = "canceled"
+	ErrorInvalidInput          ErrorKind = "invalid_input"
+	ErrorManualMode            ErrorKind = "manual_mode"
+	ErrorRepository            ErrorKind = "repository"
+	ErrorSourceChanged         ErrorKind = "source_changed"
+	ErrorNonFastForward        ErrorKind = "non_fast_forward"
+	ErrorDirtyWorktree         ErrorKind = "dirty_worktree"
+	ErrorRemoteConflict        ErrorKind = "remote_conflict"
+	ErrorCommandTimeout        ErrorKind = "command_timeout"
+	ErrorTeardownUnconfirmed   ErrorKind = "teardown_unconfirmed"
+	ErrorCommandFailed         ErrorKind = "command_failed"
+	ErrorCanceled              ErrorKind = "canceled"
+	ErrorCommandStartBlocked   ErrorKind = "command_start_blocked"
+	ErrorCommandStartUncertain ErrorKind = "command_start_uncertain"
 )
 
 var (
-	ErrInvalidInput        = errors.New("invalid publication input")
-	ErrManualMode          = errors.New("manual publication cannot be executed")
-	ErrRepository          = errors.New("publication repository validation failed")
-	ErrSourceChanged       = errors.New("publication source no longer matches its snapshot")
-	ErrNonFastForward      = errors.New("publication is not a fast-forward")
-	ErrDirtyWorktree       = errors.New("publication target worktree is dirty")
-	ErrRemoteConflict      = errors.New("publication remote branch or pull request conflicts")
-	ErrCommandTimeout      = errors.New("publication command timed out")
-	ErrCommandFailed       = errors.New("publication command failed")
-	ErrTeardownUnconfirmed = processguard.ErrTeardownUnconfirmed
+	ErrInvalidInput          = errors.New("invalid publication input")
+	ErrManualMode            = errors.New("manual publication cannot be executed")
+	ErrRepository            = errors.New("publication repository validation failed")
+	ErrSourceChanged         = errors.New("publication source no longer matches its snapshot")
+	ErrNonFastForward        = errors.New("publication is not a fast-forward")
+	ErrDirtyWorktree         = errors.New("publication target worktree is dirty")
+	ErrRemoteConflict        = errors.New("publication remote branch or pull request conflicts")
+	ErrCommandTimeout        = errors.New("publication command timed out")
+	ErrCommandFailed         = errors.New("publication command failed")
+	ErrTeardownUnconfirmed   = processguard.ErrTeardownUnconfirmed
+	ErrCommandStartBlocked   = errors.New("publication command start was blocked")
+	ErrCommandStartUncertain = errors.New(
+		"publication command start result is uncertain",
+	)
 )
 
 type Error struct {
@@ -122,6 +129,73 @@ type CommandOutput struct {
 // involved.
 type CommandRunner interface {
 	Run(ctx context.Context, directory, file string, args ...string) (CommandOutput, error)
+}
+
+// CommandRelease opens the one-shot fence in front of an already-started
+// process guard. The boolean reports whether the target may have started even
+// when release itself returns an error.
+type CommandRelease func() (bool, error)
+
+// CommandReleaseGate serializes the final target release with the caller's
+// durable authorization boundary. Implementations must invoke release while
+// that boundary is held and return its released state.
+type CommandReleaseGate func(context.Context, CommandRelease) (bool, error)
+
+// GatedCommandRunner supports a process-start fence. A configured ReleaseGate
+// is never downgraded to CommandRunner.Run.
+type GatedCommandRunner interface {
+	CommandRunner
+	RunGated(
+		ctx context.Context,
+		directory string,
+		file string,
+		gate CommandReleaseGate,
+		args ...string,
+	) (CommandOutput, error)
+}
+
+// CommandStartError preserves whether this command's target crossed its start
+// fence. Released is command-scoped: callers coordinating a multi-command
+// publication must separately retain attempt-wide side-effect uncertainty.
+// Err is the original gate, release, abort, or teardown cause.
+type CommandStartError struct {
+	Released bool
+	Err      error
+}
+
+func (e *CommandStartError) Error() string {
+	if e == nil {
+		return ""
+	}
+	sentinel := ErrCommandStartBlocked
+	if e.Released {
+		sentinel = ErrCommandStartUncertain
+	}
+	if e.Err == nil {
+		return sentinel.Error()
+	}
+	return sentinel.Error() + ": " + e.Err.Error()
+}
+
+func (e *CommandStartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *CommandStartError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	if e.Released {
+		return target == ErrCommandStartUncertain
+	}
+	return target == ErrCommandStartBlocked
+}
+
+func newCommandStartError(released bool, cause error) *CommandStartError {
+	return &CommandStartError{Released: released, Err: cause}
 }
 
 type limitedBuffer struct {
@@ -177,6 +251,118 @@ func (ExecRunner) Run(
 	}, err
 }
 
+func (ExecRunner) RunGated(
+	ctx context.Context,
+	directory string,
+	file string,
+	gate CommandReleaseGate,
+	args ...string,
+) (CommandOutput, error) {
+	if gate == nil {
+		return (ExecRunner{}).Run(ctx, directory, file, args...)
+	}
+	command, err := processguard.NewFencedCommandContext(
+		ctx,
+		MaxCommandTimeout,
+		file,
+		args...,
+	)
+	if err != nil {
+		return CommandOutput{}, newCommandStartError(false, err)
+	}
+	defer command.Close()
+	command.Command.Dir = directory
+	command.Command.Env = commandEnvironment()
+	stdout := limitedBuffer{limit: MaxCommandOutputBytes}
+	stderr := limitedBuffer{limit: MaxCommandOutputBytes}
+	command.Command.Stdout = &stdout
+	command.Command.Stderr = &stderr
+	output := func() CommandOutput {
+		return CommandOutput{
+			Stdout: stdout.String(), Stderr: stderr.String(),
+			StdoutTruncated: stdout.truncated, StderrTruncated: stderr.truncated,
+		}
+	}
+	if err := command.Start(); err != nil {
+		return output(), newCommandStartError(false, err)
+	}
+
+	releaseState := struct {
+		sync.Mutex
+		active    bool
+		called    bool
+		committed bool
+		err       error
+	}{active: true}
+	release := CommandRelease(func() (bool, error) {
+		releaseState.Lock()
+		defer releaseState.Unlock()
+		if !releaseState.active {
+			return releaseState.committed, errors.New(
+				"command release callback is no longer active",
+			)
+		}
+		if releaseState.called {
+			err := errors.New(
+				"command release callback was already invoked",
+			)
+			releaseState.err = errors.Join(releaseState.err, err)
+			return releaseState.committed, err
+		}
+		releaseState.called = true
+		released, err := command.Release()
+		releaseState.committed = released
+		releaseState.err = err
+		return released, err
+	})
+	gateReleased, gateErr := gate(ctx, release)
+	releaseState.Lock()
+	releaseState.active = false
+	releaseCalled := releaseState.called
+	releaseCommitted := releaseState.committed
+	releaseErr := releaseState.err
+	releaseState.Unlock()
+	if gateReleased && !releaseCalled {
+		gateErr = errors.Join(
+			gateErr,
+			errors.New("command release gate reported release without invoking it"),
+		)
+	}
+	if gateReleased != releaseCommitted {
+		gateErr = errors.Join(
+			gateErr,
+			errors.New("command release gate returned an inconsistent release state"),
+		)
+	}
+
+	if !gateReleased || !releaseCommitted {
+		abortErr := command.AbortStart()
+		command.Close()
+		waitErr := command.Wait()
+		cause := errors.Join(gateErr, releaseErr, abortErr, waitErr)
+		if cause == nil {
+			cause = errors.New("command release gate rejected target start")
+		}
+		return output(), newCommandStartError(releaseCommitted, cause)
+	}
+
+	// Waiting here, after gate has returned, prevents a long-running command
+	// from retaining the caller's authorization lock.
+	if gateErr != nil || releaseErr != nil {
+		// Release may have crossed the execution boundary. Stop the target
+		// promptly, then wait for guarded descendant teardown before reporting
+		// the uncertain start.
+		command.Close()
+		waitErr := command.Wait()
+		return output(), newCommandStartError(
+			true,
+			errors.Join(gateErr, releaseErr, waitErr),
+		)
+	}
+	waitErr := command.Wait()
+	return output(), waitErr
+}
+
 func commandEnvironment() []string {
 	overrides := map[string]string{
 		"GIT_TERMINAL_PROMPT": "0",
@@ -203,11 +389,13 @@ func commandEnvironment() []string {
 type Options struct {
 	Runner         CommandRunner
 	CommandTimeout time.Duration
+	ReleaseGate    CommandReleaseGate
 }
 
 type Engine struct {
 	runner         CommandRunner
 	commandTimeout time.Duration
+	releaseGate    CommandReleaseGate
 }
 
 func New(options Options) *Engine {
@@ -222,7 +410,10 @@ func New(options Options) *Engine {
 	if timeout > MaxCommandTimeout {
 		timeout = MaxCommandTimeout
 	}
-	return &Engine{runner: runner, commandTimeout: timeout}
+	return &Engine{
+		runner: runner, commandTimeout: timeout,
+		releaseGate: options.ReleaseGate,
+	}
 }
 
 func Execute(
@@ -246,23 +437,52 @@ func (e *Engine) run(
 ) (commandResult, error) {
 	runCtx, cancel := context.WithTimeout(ctx, e.commandTimeout)
 	defer cancel()
-	output, err := e.runner.Run(runCtx, directory, file, args...)
+	var output CommandOutput
+	var err error
+	if e.releaseGate == nil {
+		output, err = e.runner.Run(runCtx, directory, file, args...)
+	} else if runner, ok := e.runner.(GatedCommandRunner); ok {
+		output, err = runner.RunGated(
+			runCtx,
+			directory,
+			file,
+			e.releaseGate,
+			args...,
+		)
+	} else {
+		err = newCommandStartError(
+			false,
+			errors.New("configured command release gate requires a gated command runner"),
+		)
+	}
 	output = normalizeOutput(output)
+	result := commandResult{stdout: output.Stdout, stderr: output.Stderr}
+	if err != nil {
+		if errors.Is(err, processguard.ErrTeardownUnconfirmed) {
+			return result, &Error{
+				Kind: ErrorTeardownUnconfirmed, Operation: "run command",
+				Err: errors.Join(ErrCommandFailed, err),
+			}
+		}
+		var startErr *CommandStartError
+		if errors.As(err, &startErr) {
+			kind := ErrorCommandStartBlocked
+			if startErr.Released {
+				kind = ErrorCommandStartUncertain
+			}
+			return result, &Error{
+				Kind: kind, Operation: "start command", Err: err,
+			}
+		}
+	}
 	if output.StdoutTruncated {
 		return commandResult{}, &Error{
 			Kind: ErrorCommandFailed, Operation: "read command output",
 			Err: fmt.Errorf("%w: stdout exceeded %d bytes", ErrCommandFailed, MaxCommandOutputBytes),
 		}
 	}
-	result := commandResult{stdout: output.Stdout, stderr: output.Stderr}
 	if err == nil {
 		return result, nil
-	}
-	if errors.Is(err, processguard.ErrTeardownUnconfirmed) {
-		return result, &Error{
-			Kind: ErrorTeardownUnconfirmed, Operation: "run command",
-			Err: errors.Join(ErrCommandFailed, err),
-		}
 	}
 	if parentErr := ctx.Err(); parentErr != nil {
 		return result, &Error{Kind: ErrorCanceled, Operation: "run command", Err: parentErr}
@@ -350,11 +570,17 @@ func semanticError(kind ErrorKind, operation string, sentinel error, detail stri
 }
 
 func commandControlError(err error) error {
+	var startErr *CommandStartError
+	if errors.As(err, &startErr) {
+		return err
+	}
 	var execution *Error
 	if errors.As(err, &execution) &&
 		(execution.Kind == ErrorCommandTimeout ||
 			execution.Kind == ErrorCanceled ||
-			execution.Kind == ErrorTeardownUnconfirmed) {
+			execution.Kind == ErrorTeardownUnconfirmed ||
+			execution.Kind == ErrorCommandStartBlocked ||
+			execution.Kind == ErrorCommandStartUncertain) {
 		return err
 	}
 	return nil

@@ -3,7 +3,6 @@ package publisher
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -321,12 +320,8 @@ func (e *Engine) createPullRequest(
 	if err == nil {
 		return createdPullRequestURL(output.stdout)
 	}
-	var execution *Error
-	if errors.As(err, &execution) &&
-		(execution.Kind == ErrorCommandTimeout ||
-			execution.Kind == ErrorCanceled ||
-			execution.Kind == ErrorTeardownUnconfirmed) {
-		return "", err
+	if controlErr := commandControlError(err); controlErr != nil {
+		return "", controlErr
 	}
 	records, listErr := e.listPullRequests(ctx, publication, branch)
 	if listErr != nil {
