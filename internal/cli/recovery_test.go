@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/operatorrecovery"
 	"github.com/nn1a/autogora/internal/store"
 )
 
@@ -134,9 +136,194 @@ func TestRecoveryCLIHelpRequiresTwoExplicitConfirmations(t *testing.T) {
 		"--fence-generation",
 		"--confirm-worker-stopped",
 		"--confirm-host-writes-stopped",
+		"quarantine status",
+		"quarantine confirm --file",
 	} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("recovery help omitted %s: %s", expected, output)
 		}
+	}
+}
+
+func TestRecoveryCLIShowsAndConfirmsGlobalQuarantine(t *testing.T) {
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "autogora.db")
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Cwd = directory
+	app.Getenv = func(string) string { return "" }
+	runApp(t, app, "init", "--db", dbPath)
+
+	manager, err := app.managerFor(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := manager.OpenCoordinationStore(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, activated, err := authority.ActivateAutomationQuarantine(
+		context.Background(),
+		store.AutomationQuarantineSourceInput{
+			Board:             "*",
+			Kind:              "dispatcher_session_expired",
+			SourceID:          "dispatcher-cli-recovery",
+			ObservedUpdatedAt: "2026-07-24T00:00:00.000000000Z",
+			DiagnosticCode:    "session_expired_without_release",
+		},
+	)
+	if err != nil || !activated {
+		authority.Close()
+		t.Fatalf("activate quarantine: gate=%+v activated=%t err=%v",
+			gate, activated, err)
+	}
+	sources, err := authority.ListAutomationQuarantineSources(
+		context.Background(),
+		store.AutomationQuarantineSourceFilter{
+			ActiveOnly: true,
+			Limit:      1000,
+		},
+	)
+	if err != nil || len(sources) != 1 {
+		authority.Close()
+		t.Fatalf("active sources=%+v err=%v", sources, err)
+	}
+	if err := authority.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	shown := runApp(
+		t,
+		app,
+		"recovery",
+		"quarantine",
+		"status",
+		"--db",
+		dbPath,
+	)
+	var status operatorrecovery.Status
+	if err := json.Unmarshal([]byte(shown), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Gate.Active ||
+		status.Gate.Generation != gate.Generation ||
+		len(status.Sources) != 1 ||
+		status.Sources[0].SourceKey != sources[0].SourceKey ||
+		strings.Contains(shown, "permitToken") ||
+		strings.Contains(shown, "claimToken") ||
+		strings.Contains(shown, dbPath) {
+		t.Fatalf("unsafe or incomplete quarantine status: %s", shown)
+	}
+
+	confirmation := operatorrecovery.Confirmation{
+		Generation:            gate.Generation,
+		Actor:                 "operator@example.test",
+		Reason:                "verified all helper processes and external writers stopped",
+		HelpersStopped:        true,
+		ExternalWritesStopped: true,
+		Sources: []operatorrecovery.ConfirmationSource{{
+			SourceKey:          sources[0].SourceKey,
+			Board:              sources[0].Board,
+			Kind:               sources[0].Kind,
+			SourceID:           sources[0].SourceID,
+			ObservedUpdatedAt:  sources[0].ObservedUpdatedAt,
+			ObservedClaimEpoch: sources[0].ObservedClaimEpoch,
+			DiagnosticCode:     sources[0].DiagnosticCode,
+			Disposition:        store.AutomationSourceAbandoned,
+		}},
+	}
+	raw, err := json.Marshal(confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmationPath := filepath.Join(directory, "recovery.json")
+	if err := os.WriteFile(confirmationPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.Stdout, app.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
+	confirmed := runApp(
+		t,
+		app,
+		"recovery",
+		"quarantine",
+		"confirm",
+		"--file",
+		confirmationPath,
+		"--db",
+		dbPath,
+	)
+	var result operatorrecovery.ConfirmationResult
+	if err := json.Unmarshal([]byte(confirmed), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Cleared || result.Gate.Active {
+		t.Fatalf("quarantine confirmation = %+v", result)
+	}
+
+	app.Stdout, app.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
+	replayed := runApp(
+		t,
+		app,
+		"recovery",
+		"quarantine",
+		"confirm",
+		"--file",
+		confirmationPath,
+		"--db",
+		dbPath,
+	)
+	if err := json.Unmarshal([]byte(replayed), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Cleared || result.Gate.Active {
+		t.Fatalf("idempotent quarantine confirmation = %+v", result)
+	}
+}
+
+func TestRecoveryCLIQuarantineRejectsUnsafeInputsAndWorkerScope(t *testing.T) {
+	directory := t.TempDir()
+	dbPath := filepath.Join(directory, "autogora.db")
+	app := New(&bytes.Buffer{}, &bytes.Buffer{})
+	app.Cwd = directory
+	app.Getenv = func(string) string { return "" }
+	runApp(t, app, "init", "--db", dbPath)
+
+	invalidPath := filepath.Join(directory, "invalid-recovery.json")
+	if err := os.WriteFile(
+		invalidPath,
+		[]byte(`{"generation":1,"claimToken":"secret"}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{
+			"recovery", "quarantine", "confirm",
+			"--file", invalidPath, "--db", dbPath,
+		},
+		{
+			"recovery", "quarantine", "status",
+			"--board", "default", "--db", dbPath,
+		},
+		{
+			"recovery", "quarantine", "status",
+			"--claim-token", "secret", "--db", dbPath,
+		},
+	} {
+		app.Stdout, app.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
+		if err := app.Run(context.Background(), args); err == nil {
+			t.Fatalf("unsafe quarantine command succeeded: %v", args)
+		}
+	}
+
+	app.Getenv = func(name string) string {
+		if name == "AUTOGORA_TASK_ID" {
+			return "task_worker"
+		}
+		return ""
+	}
+	if err := app.Run(context.Background(), []string{
+		"recovery", "quarantine", "status", "--db", dbPath,
+	}); err == nil || !strings.Contains(err.Error(), "scoped workers") {
+		t.Fatalf("worker-scoped quarantine error = %v", err)
 	}
 }
