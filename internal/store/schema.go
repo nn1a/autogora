@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 27
+const schemaVersion = 28
 
 type Store struct {
 	db               *sql.DB
@@ -1986,6 +1986,239 @@ CREATE TABLE IF NOT EXISTS publications (
   CHECK (status <> 'no_change' OR published_at IS NOT NULL)
 );
 
+-- Publication attempt intents are immutable evidence that an exact automatic
+-- publication claim crossed the durable execution boundary. They deliberately
+-- have no task, run, change-set, or publication foreign key so task cleanup
+-- cannot erase evidence for an unresolved external side effect.
+CREATE TABLE IF NOT EXISTS publication_attempt_intents (
+  id TEXT PRIMARY KEY
+    CHECK (
+      typeof(id) = 'text'
+      AND length(CAST(id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(id, char(0)) = 0
+    ),
+  board TEXT NOT NULL
+    CHECK (
+      typeof(board) = 'text'
+      AND length(CAST(board AS BLOB)) BETWEEN 1 AND 128
+      AND instr(board, char(0)) = 0
+    ),
+  publication_id TEXT NOT NULL
+    CHECK (
+      typeof(publication_id) = 'text'
+      AND length(CAST(publication_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(publication_id, char(0)) = 0
+    ),
+  source_key TEXT NOT NULL UNIQUE
+    CHECK (
+      typeof(source_key) = 'text'
+      AND length(CAST(source_key AS BLOB)) = 64
+      AND source_key NOT GLOB '*[^0-9a-f]*'
+    ),
+  change_set_id TEXT NOT NULL
+    CHECK (
+      typeof(change_set_id) = 'text'
+      AND length(CAST(change_set_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(change_set_id, char(0)) = 0
+    ),
+  mode TEXT NOT NULL CHECK (mode IN ('local_ff', 'pull_request')),
+  target_branch TEXT NOT NULL
+    CHECK (
+      typeof(target_branch) = 'text'
+      AND length(CAST(target_branch AS BLOB)) BETWEEN 1 AND 512
+      AND instr(target_branch, char(0)) = 0
+    ),
+  remote TEXT NOT NULL
+    CHECK (
+      typeof(remote) = 'text'
+      AND length(CAST(remote AS BLOB)) BETWEEN 1 AND 256
+      AND instr(remote, char(0)) = 0
+    ),
+  base_commit TEXT NOT NULL
+    CHECK (
+      typeof(base_commit) = 'text'
+      AND length(CAST(base_commit AS BLOB)) BETWEEN 1 AND 1024
+      AND instr(base_commit, char(0)) = 0
+    ),
+  head_commit TEXT NOT NULL
+    CHECK (
+      typeof(head_commit) = 'text'
+      AND length(CAST(head_commit AS BLOB)) BETWEEN 1 AND 1024
+      AND instr(head_commit, char(0)) = 0
+    ),
+  durable_ref TEXT NOT NULL
+    CHECK (
+      typeof(durable_ref) = 'text'
+      AND length(CAST(durable_ref AS BLOB)) BETWEEN 1 AND 2048
+      AND instr(durable_ref, char(0)) = 0
+    ),
+  effect_fingerprint TEXT NOT NULL
+    CHECK (
+      typeof(effect_fingerprint) = 'text'
+      AND length(CAST(effect_fingerprint AS BLOB)) = 64
+      AND effect_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+  claim_epoch INTEGER NOT NULL
+    CHECK (typeof(claim_epoch) = 'integer' AND claim_epoch >= 1),
+  publication_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(publication_updated_at) = 'text'
+      AND length(CAST(publication_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(publication_updated_at, char(0)) = 0
+    ),
+  claim_expires_at TEXT NOT NULL
+    CHECK (
+      typeof(claim_expires_at) = 'text'
+      AND length(CAST(claim_expires_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(claim_expires_at, char(0)) = 0
+    ),
+  session_id TEXT NOT NULL
+    CHECK (
+      typeof(session_id) = 'text'
+      AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND 256
+      AND instr(session_id, char(0)) = 0
+    ),
+  gate_generation INTEGER NOT NULL
+    CHECK (typeof(gate_generation) = 'integer' AND gate_generation >= 0),
+  started_at TEXT NOT NULL
+    CHECK (
+      typeof(started_at) = 'text'
+      AND length(CAST(started_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(started_at, char(0)) = 0
+    ),
+  UNIQUE(board, publication_id, claim_epoch)
+);
+
+CREATE TRIGGER IF NOT EXISTS publication_attempt_intents_prevent_update
+BEFORE UPDATE ON publication_attempt_intents
+BEGIN
+  SELECT RAISE(ABORT, 'publication attempt intents are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS publication_attempt_intents_prevent_delete
+BEFORE DELETE ON publication_attempt_intents
+BEGIN
+  SELECT RAISE(ABORT, 'publication attempt intents are immutable');
+END;
+
+-- Results repeat the complete public attempt identity instead of depending on
+-- a cascading foreign key. A known result terminalizes the publication in the
+-- same transaction; unknown records preserve uncertainty for operator
+-- recovery while permanently closing the executor capability.
+CREATE TABLE IF NOT EXISTS publication_attempt_results (
+  attempt_id TEXT PRIMARY KEY
+    CHECK (
+      typeof(attempt_id) = 'text'
+      AND length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(attempt_id, char(0)) = 0
+    ),
+  board TEXT NOT NULL
+    CHECK (
+      typeof(board) = 'text'
+      AND length(CAST(board AS BLOB)) BETWEEN 1 AND 128
+      AND instr(board, char(0)) = 0
+    ),
+  publication_id TEXT NOT NULL
+    CHECK (
+      typeof(publication_id) = 'text'
+      AND length(CAST(publication_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(publication_id, char(0)) = 0
+    ),
+  claim_epoch INTEGER NOT NULL
+    CHECK (typeof(claim_epoch) = 'integer' AND claim_epoch >= 1),
+  outcome TEXT NOT NULL
+    CHECK (outcome IN ('published', 'failed', 'unknown')),
+  executor_status TEXT NOT NULL
+    CHECK (executor_status IN (
+      'published', 'already_published', 'failed', 'manual_required', 'unknown'
+    )),
+  error_kind TEXT
+    CHECK (
+      error_kind IS NULL
+      OR error_kind IN (
+        'invalid_input', 'manual_mode', 'repository', 'source_changed',
+        'non_fast_forward', 'dirty_worktree', 'remote_conflict',
+        'command_timeout', 'teardown_unconfirmed', 'command_failed',
+        'canceled', 'command_start_blocked', 'command_start_uncertain',
+        'internal', 'unknown'
+      )
+    ),
+  result_url TEXT
+    CHECK (
+      result_url IS NULL
+      OR (
+        typeof(result_url) = 'text'
+        AND length(CAST(result_url AS BLOB)) BETWEEN 1 AND 8192
+        AND instr(result_url, char(0)) = 0
+      )
+    ),
+  error TEXT
+    CHECK (
+      error IS NULL
+      OR (
+        typeof(error) = 'text'
+        AND length(CAST(error AS BLOB)) BETWEEN 1 AND 4096
+        AND instr(error, char(0)) = 0
+      )
+    ),
+  publication_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(publication_updated_at) = 'text'
+      AND length(CAST(publication_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(publication_updated_at, char(0)) = 0
+    ),
+  recorded_at TEXT NOT NULL
+    CHECK (
+      typeof(recorded_at) = 'text'
+      AND length(CAST(recorded_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(recorded_at, char(0)) = 0
+    ),
+  CHECK (
+    (outcome = 'published'
+      AND executor_status IN ('published', 'already_published')
+      AND error_kind IS NULL
+      AND error IS NULL)
+    OR (outcome IN ('failed', 'unknown')
+      AND (
+        (outcome = 'failed'
+          AND executor_status IN ('failed', 'manual_required')
+          AND error_kind IS NOT NULL)
+        OR
+        (outcome = 'unknown'
+          AND executor_status = 'unknown'
+          AND error_kind IS NOT NULL)
+      )
+      AND result_url IS NULL
+      AND error IS NOT NULL
+      AND error <> '')
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS publication_attempt_results_identity_guard
+BEFORE INSERT ON publication_attempt_results
+WHEN NOT EXISTS (
+  SELECT 1 FROM publication_attempt_intents i
+  WHERE i.id = NEW.attempt_id
+    AND i.board = NEW.board
+    AND i.publication_id = NEW.publication_id
+    AND i.claim_epoch = NEW.claim_epoch
+)
+BEGIN
+  SELECT RAISE(ABORT, 'publication attempt result does not match its intent');
+END;
+
+CREATE TRIGGER IF NOT EXISTS publication_attempt_results_prevent_update
+BEFORE UPDATE ON publication_attempt_results
+BEGIN
+  SELECT RAISE(ABORT, 'publication attempt results are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS publication_attempt_results_prevent_delete
+BEFORE DELETE ON publication_attempt_results
+BEGIN
+  SELECT RAISE(ABORT, 'publication attempt results are immutable');
+END;
+
 -- Publication recovery receipts are immutable, board-local proof that an
 -- operator resolved one quarantined external side effect. They intentionally
 -- contain no claim credential and have no foreign key: the audit evidence must
@@ -2163,6 +2396,10 @@ CREATE INDEX IF NOT EXISTS idx_publications_board_status ON publications(board, 
 CREATE INDEX IF NOT EXISTS idx_publications_task ON publications(board, task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_publications_run ON publications(board, run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_publications_claim_due ON publications(board, status, claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_publication_attempt_intents_board_started
+  ON publication_attempt_intents(board, started_at, id);
+CREATE INDEX IF NOT EXISTS idx_publication_attempt_intents_publication
+  ON publication_attempt_intents(board, publication_id, claim_epoch);
 CREATE INDEX IF NOT EXISTS idx_task_hierarchy_parent ON task_hierarchy(parent_id, position, child_id);
 ` + coordinationIncidentIndexes + `
 CREATE INDEX IF NOT EXISTS idx_coordination_proposals_incident ON coordination_proposals(incident_id, created_at DESC);

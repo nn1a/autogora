@@ -208,10 +208,10 @@ func (s *Store) withWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 	})
 }
 
-// withWriteUnchecked exists only for board-removal barrier maintenance and
-// callback-scoped exact operator recovery. All ordinary store mutations must
-// use withWrite so an already-open Store cannot modify a board after removal
-// begins.
+// withWriteUnchecked exists only for board-removal barrier maintenance,
+// callback-scoped exact operator recovery, and exact in-flight publication
+// result cleanup. All ordinary store mutations must use withWrite so an
+// already-open Store cannot modify a board after removal begins.
 func (s *Store) withWriteUnchecked(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
