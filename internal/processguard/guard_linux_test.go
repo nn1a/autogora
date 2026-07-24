@@ -101,6 +101,37 @@ func TestLinuxGuardCleansEscapedDescendantAfterCancellation(t *testing.T) {
 	requireProcessGone(t, descendantPID)
 }
 
+func TestLinuxFencedGuardCleansEscapedDescendantAfterCancellation(
+	t *testing.T,
+) {
+	requireSetsid(t)
+	pidPath := filepath.Join(t.TempDir(), "fenced-descendant.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	command, err := NewFencedCommandContext(
+		ctx,
+		10*time.Second,
+		"/bin/sh",
+		escapedDescendantArguments(pidPath, "wait")...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer command.Close()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	released, err := command.Release()
+	if err != nil || !released {
+		t.Fatalf("release = %t, %v", released, err)
+	}
+	descendantPID := readPIDEventually(t, pidPath)
+	cancel()
+	if err := command.Wait(); err == nil {
+		t.Fatal("canceled fenced command unexpectedly succeeded")
+	}
+	requireProcessGone(t, descendantPID)
+}
+
 func TestLinuxGuardSIGKILLCannotForgeTeardownProof(t *testing.T) {
 	reported := make(chan error, 1)
 	ctx := WithTeardownFailureReporter(context.Background(), func(err error) {
@@ -155,6 +186,119 @@ func TestLinuxGuardBoundsUnprovableCleanupWithoutAttesting(t *testing.T) {
 	case <-reported:
 	case <-time.After(time.Second):
 		t.Fatal("bounded negative attestation was not reported")
+	}
+}
+
+func TestLinuxFencedGuardReportsUnprovableCleanup(t *testing.T) {
+	t.Setenv(testIncompleteLineageEnvironment, "1")
+	t.Setenv(testCleanupLimitEnvironment, "50")
+	reported := make(chan error, 1)
+	ctx := WithTeardownFailureReporter(context.Background(), func(err error) {
+		reported <- err
+	})
+	command, err := NewFencedCommandContext(
+		ctx,
+		5*time.Second,
+		"/bin/true",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer command.Close()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	released, err := command.Release()
+	if err != nil || !released {
+		t.Fatalf("release = %t, %v", released, err)
+	}
+	started := time.Now()
+	err = command.Wait()
+	if !errors.Is(err, ErrTeardownUnconfirmed) {
+		t.Fatalf(
+			"unprovable fenced cleanup error = %v, want ErrTeardownUnconfirmed",
+			err,
+		)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("unprovable fenced cleanup remained blocked for %s", elapsed)
+	}
+	select {
+	case report := <-reported:
+		if !errors.Is(report, ErrTeardownUnconfirmed) {
+			t.Fatalf("reported error = %v", report)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fenced teardown failure reporter was not called")
+	}
+}
+
+func TestLinuxFencedWaitersDoNotReturnBeforeTeardownReporter(
+	t *testing.T,
+) {
+	t.Setenv(testIncompleteLineageEnvironment, "1")
+	t.Setenv(testCleanupLimitEnvironment, "50")
+	reportEntered := make(chan struct{})
+	continueReport := make(chan struct{})
+	ctx := WithTeardownFailureReporter(context.Background(), func(err error) {
+		if !errors.Is(err, ErrTeardownUnconfirmed) {
+			t.Errorf("reported error = %v", err)
+		}
+		close(reportEntered)
+		<-continueReport
+	})
+	command, err := NewFencedCommandContext(
+		ctx,
+		5*time.Second,
+		"/bin/true",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer command.Close()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	released, err := command.Release()
+	if err != nil || !released {
+		t.Fatalf("release = %t, %v", released, err)
+	}
+
+	first := make(chan error, 1)
+	go func() {
+		first <- command.Wait()
+	}()
+	select {
+	case <-reportEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("teardown reporter was not entered")
+	}
+
+	second := make(chan error, 1)
+	go func() {
+		second <- command.Wait()
+	}()
+	select {
+	case err := <-first:
+		t.Fatalf("primary Wait returned before reporter completion: %v", err)
+	case err := <-second:
+		t.Fatalf("concurrent Wait returned before reporter completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(continueReport)
+	for label, result := range map[string]<-chan error{
+		"primary": first,
+		"waiter":  second,
+	} {
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrTeardownUnconfirmed) {
+				t.Fatalf("%s Wait error = %v", label, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s Wait remained blocked after reporter completion", label)
+		}
 	}
 }
 

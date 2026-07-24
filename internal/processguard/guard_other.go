@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"time"
 )
 
 type directTeardownProof struct{}
@@ -21,8 +22,22 @@ func NewFencedCommand(
 	name string,
 	args ...string,
 ) (*FencedCommand, error) {
+	return NewFencedCommandContext(ctx, 0, name, args...)
+}
+
+// NewFencedCommandContext keeps the start barrier context-bound on fallback
+// platforms. These platforms still cannot attest descendant teardown, so
+// automatic mutations remain disabled by the capability boundary.
+func NewFencedCommandContext(
+	ctx context.Context,
+	maximum time.Duration,
+	name string,
+	args ...string,
+) (*FencedCommand, error) {
+	bounded, cancel := boundedContext(ctx, maximum)
 	reader, writer, err := os.Pipe()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	shellArgs := []string{
@@ -32,10 +47,12 @@ func NewFencedCommand(
 		name,
 	}
 	shellArgs = append(shellArgs, args...)
-	command := exec.Command("/bin/sh", shellArgs...)
+	command := exec.CommandContext(bounded, "/bin/sh", shellArgs...)
 	command.ExtraFiles = []*os.File{reader}
 	return newFencedCommand(
 		ctx,
+		bounded,
+		cancel,
 		command,
 		reader,
 		writer,

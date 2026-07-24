@@ -44,27 +44,46 @@ func NewFencedCommand(
 	name string,
 	args ...string,
 ) (*FencedCommand, error) {
+	return NewFencedCommandContext(ctx, 0, name, args...)
+}
+
+// NewFencedCommandContext starts only the durable Linux guard. The guarded
+// target remains behind a one-shot fence until Release, while ctx and maximum
+// bound both the eventual target and teardown wait.
+func NewFencedCommandContext(
+	ctx context.Context,
+	maximum time.Duration,
+	name string,
+	args ...string,
+) (*FencedCommand, error) {
 	if err := requireLinuxGuardCapability(); err != nil {
 		return nil, err
 	}
+	bounded, cancel := boundedContext(ctx, maximum)
 	reader, writer, err := os.Pipe()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	proof, err := newLinuxTeardownProof()
 	if err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
+		cancel()
 		return nil, err
 	}
 	arguments := guardArguments(guardModeFenced, os.Getpid(), fencedProofFD, name, args)
-	command := exec.Command("/proc/self/exe", arguments...)
+	command := newLinuxGuardCommandContext(bounded, arguments...)
 	command.ExtraFiles = []*os.File{reader, proof.writer}
-	command.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGTERM,
-	}
-	return newFencedCommand(ctx, command, reader, writer, proof), nil
+	return newFencedCommand(
+		ctx,
+		bounded,
+		cancel,
+		command,
+		reader,
+		writer,
+		proof,
+	), nil
 }
 
 func newGuardedCommandContext(
@@ -78,8 +97,16 @@ func newGuardedCommandContext(
 		return command, failedTeardownProof{err: err}
 	}
 	arguments := guardArguments(guardModeImmediate, os.Getpid(), immediateProofFD, name, args)
-	command := exec.CommandContext(ctx, "/proc/self/exe", arguments...)
+	command := newLinuxGuardCommandContext(ctx, arguments...)
 	command.ExtraFiles = []*os.File{proof.writer}
+	return command, proof
+}
+
+func newLinuxGuardCommandContext(
+	ctx context.Context,
+	arguments ...string,
+) *exec.Cmd {
+	command := exec.CommandContext(ctx, "/proc/self/exe", arguments...)
 	command.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:   true,
 		Pdeathsig: syscall.SIGTERM,
@@ -97,7 +124,7 @@ func newGuardedCommandContext(
 		}
 		return err
 	}
-	return command, proof
+	return command
 }
 
 func IsGuardCommand(command *exec.Cmd) bool {
