@@ -264,6 +264,804 @@ func seedPublishingPublications(
 	return claimed
 }
 
+type startupPublicationAttemptFixture struct {
+	Intent    store.PublicationAttemptIntent
+	Claimed   model.Publication
+	Operation *store.PublicationAttemptPermit
+}
+
+func seedStartupPublicationAttempt(
+	t *testing.T,
+	manager *boards.Manager,
+	suffix string,
+	result *store.PublicationAttemptResultInput,
+) startupPublicationAttemptFixture {
+	t.Helper()
+	ctx := context.Background()
+	configurePublicationBoard(
+		t,
+		manager,
+		"default",
+		boards.PublicationModeLocalFF,
+		false,
+		true,
+	)
+	createCompletedFinalizerChangeSet(
+		t,
+		manager,
+		"default",
+		"startup-attempt-"+suffix,
+		"ready",
+	)
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publications, err := ensureBoardPublications(
+		ctx,
+		opened,
+		"default",
+		metadata.Orchestration.Autopilot.Publication,
+	)
+	if err != nil || len(publications) != 1 {
+		opened.Close()
+		t.Fatalf("startup attempt publications=%+v err=%v", publications, err)
+	}
+	sessionContext, cancelSession := context.WithCancel(ctx)
+	session, err := startAutomationDispatcherSession(
+		sessionContext,
+		manager,
+		cancelSession,
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	basePermit, err := opened.AcquireAutomationPermitForSession(
+		ctx,
+		session.currentLease(),
+	)
+	if err != nil {
+		session.Shutdown(true)
+		opened.Close()
+		t.Fatal(err)
+	}
+	claimed, operation, acquired, beginErr :=
+		opened.BeginAutomatedPublicationAttempt(
+			ctx,
+			basePermit,
+			publications[0].ID,
+			store.ClaimPublicationInput{
+				ExpectedUpdatedAt: publications[0].UpdatedAt,
+				TTL:               time.Minute,
+			},
+		)
+	closeErr := basePermit.Close()
+	if beginErr != nil || closeErr != nil || !acquired || operation == nil {
+		session.Shutdown(true)
+		opened.Close()
+		t.Fatalf(
+			"begin startup attempt: acquired=%t operation=%s beginErr=%v closeErr=%v",
+			acquired,
+			operation,
+			beginErr,
+			closeErr,
+		)
+	}
+	if result != nil {
+		if _, err := opened.FinishAutomatedPublicationAttempt(
+			ctx,
+			operation,
+			*result,
+		); err != nil {
+			session.Shutdown(true)
+			opened.Close()
+			t.Fatal(err)
+		}
+	}
+	intent := operation.Intent()
+	if shutdownErr := session.Shutdown(true); shutdownErr != nil {
+		opened.Close()
+		t.Fatalf("shutdown startup fixture session: %v", shutdownErr)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return startupPublicationAttemptFixture{
+		Intent:    intent,
+		Claimed:   claimed,
+		Operation: operation,
+	}
+}
+
+func insertStartupPublicationRecoveryReceipt(
+	t *testing.T,
+	dbPath string,
+	intent store.PublicationAttemptIntent,
+	publicationID string,
+	updatedAt string,
+	claimEpoch int64,
+	resultUpdatedAt string,
+) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `
+		INSERT INTO publication_recovery_receipts(
+			source_key, first_generation, publication_id,
+			observed_updated_at, observed_claim_epoch, outcome,
+			disposition, result_url, actor, reason, recovered_at,
+			result_updated_at
+		) VALUES (?, 1, ?, ?, ?, 'failed', 'abandoned', NULL,
+			'startup-test', 'startup recovery fixture', ?, ?)
+	`,
+		intent.SourceKey,
+		publicationID,
+		updatedAt,
+		claimEpoch,
+		resultUpdatedAt,
+		resultUpdatedAt,
+	); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startPublicationRecoveryTestSession(
+	t *testing.T,
+	manager *boards.Manager,
+) *automationDispatcherSession {
+	t.Helper()
+	sessionContext, cancelSession := context.WithCancel(context.Background())
+	session, err := startAutomationDispatcherSession(
+		sessionContext,
+		manager,
+		cancelSession,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func shutdownPublicationRecoveryTestSession(
+	t *testing.T,
+	session *automationDispatcherSession,
+	quarantined bool,
+) {
+	t.Helper()
+	err := session.Shutdown(true)
+	if quarantined {
+		if !errors.Is(err, store.ErrAutomationQuarantined) {
+			t.Fatalf("quarantined startup session shutdown error=%v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("startup session shutdown error=%v", err)
+	}
+}
+
+func TestPublicationAttemptRecoveryRejectsCurrentIdentityMismatch(
+	t *testing.T,
+) {
+	intent := store.PublicationAttemptIntent{
+		ID:                   "attempt_current_identity",
+		Board:                "default",
+		PublicationID:        "pub_current_identity",
+		SourceKey:            "publication:default:pub_current_identity:1",
+		EffectFingerprint:    strings.Repeat("a", 64),
+		ClaimEpoch:           1,
+		PublicationUpdatedAt: "2026-07-24T00:00:00.000000000Z",
+	}
+	for _, test := range []struct {
+		name        string
+		observation store.PublicationAttemptRecoveryObservation
+	}{
+		{
+			name: "known result with different publication id",
+			observation: store.PublicationAttemptRecoveryObservation{
+				Attempt: store.PublicationAttemptRecord{
+					Intent: intent,
+					Result: &store.PublicationAttemptResult{
+						AttemptID:     intent.ID,
+						Board:         intent.Board,
+						PublicationID: intent.PublicationID,
+						ClaimEpoch:    intent.ClaimEpoch,
+						Outcome:       store.PublicationAttemptFailed,
+					},
+				},
+				Publication: store.PublicationAttemptRecoveryPublication{
+					Present: true,
+					ID:      "pub_other",
+					Board:   intent.Board,
+					Status:  model.PublicationFailed,
+				},
+			},
+		},
+		{
+			name: "receipt with different publication board",
+			observation: store.PublicationAttemptRecoveryObservation{
+				Attempt: store.PublicationAttemptRecord{
+					Intent: intent,
+					RecoveryReceipt: &store.PublicationRecoveryReceipt{
+						SourceKey:          intent.SourceKey,
+						PublicationID:      intent.PublicationID,
+						ObservedUpdatedAt:  intent.PublicationUpdatedAt,
+						ObservedClaimEpoch: intent.ClaimEpoch,
+					},
+				},
+				Publication: store.PublicationAttemptRecoveryPublication{
+					Present: true,
+					ID:      intent.PublicationID,
+					Board:   "other",
+					Status:  model.PublicationFailed,
+				},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validatePublicationAttemptObservationIdentity(
+				intent.Board,
+				&intent,
+				test.observation,
+			)
+			if err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"current publication identity does not match",
+				) {
+				t.Fatalf("current identity validation error=%v", err)
+			}
+		})
+	}
+}
+
+func TestDispatcherStartupAttemptRecoveryDistinguishesMissingAndUnknown(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name       string
+		result     *store.PublicationAttemptResultInput
+		diagnostic string
+	}{
+		{
+			name:       "missing result",
+			diagnostic: publicationAttemptMissingDiagnostic,
+		},
+		{
+			name: "unknown result",
+			result: &store.PublicationAttemptResultInput{
+				Outcome:        store.PublicationAttemptUnknown,
+				ExecutorStatus: store.PublicationExecutorUnknown,
+				ErrorKind:      store.PublicationErrorCommandStartUncertain,
+				Error:          "startup fixture effect is uncertain",
+			},
+			diagnostic: publicationAttemptUnknownDiagnostic,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _ := testManager(t)
+			fixture := seedStartupPublicationAttempt(
+				t,
+				manager,
+				strings.ReplaceAll(test.name, " ", "-"),
+				test.result,
+			)
+			session := startPublicationRecoveryTestSession(t, manager)
+			err := quarantineUnconfirmedPublishingOwnership(
+				manager,
+				session,
+			)
+			if !errors.Is(err, store.ErrAutomationQuarantined) {
+				t.Fatalf("attempt startup recovery error=%v", err)
+			}
+			sources := publicationSources(
+				t,
+				manager,
+				store.AutomationQuarantineSourceFilter{
+					Board:      fixture.Intent.Board,
+					Kind:       publicationQuarantineKind,
+					SourceID:   fixture.Intent.PublicationID,
+					ActiveOnly: true,
+				},
+			)
+			if len(sources) != 1 ||
+				sources[0].ObservedUpdatedAt !=
+					fixture.Intent.PublicationUpdatedAt ||
+				sources[0].ObservedClaimEpoch != strconv.FormatInt(
+					fixture.Intent.ClaimEpoch,
+					10,
+				) ||
+				sources[0].DiagnosticCode != test.diagnostic {
+				t.Fatalf("attempt startup source=%+v", sources)
+			}
+			shutdownPublicationRecoveryTestSession(t, session, true)
+		})
+	}
+}
+
+func TestDispatcherStartupSkipsExactlyRecoveredAttempt(t *testing.T) {
+	manager, dbPath := testManager(t)
+	unknown := store.PublicationAttemptResultInput{
+		Outcome:        store.PublicationAttemptUnknown,
+		ExecutorStatus: store.PublicationExecutorUnknown,
+		ErrorKind:      store.PublicationErrorCommandStartUncertain,
+		Error:          "startup fixture effect is uncertain",
+	}
+	fixture := seedStartupPublicationAttempt(
+		t,
+		manager,
+		"recovered",
+		&unknown,
+	)
+	resultUpdatedAt := time.Now().UTC().Add(time.Second).
+		Format(time.RFC3339Nano)
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `
+		UPDATE publications
+		SET status = 'failed', url = NULL, error = ?,
+			claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+		WHERE id = ?
+	`,
+		"operator confirmed publication failure",
+		resultUpdatedAt,
+		fixture.Intent.PublicationID,
+	); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	insertStartupPublicationRecoveryReceipt(
+		t,
+		dbPath,
+		fixture.Intent,
+		fixture.Intent.PublicationID,
+		fixture.Intent.PublicationUpdatedAt,
+		fixture.Intent.ClaimEpoch,
+		resultUpdatedAt,
+	)
+	session := startPublicationRecoveryTestSession(t, manager)
+	if err := quarantineUnconfirmedPublishingOwnership(
+		manager,
+		session,
+	); err != nil {
+		t.Fatalf("recovered attempt startup error=%v", err)
+	}
+	sources := publicationSources(
+		t,
+		manager,
+		store.AutomationQuarantineSourceFilter{
+			Board:      "default",
+			Kind:       publicationQuarantineKind,
+			SourceID:   fixture.Intent.PublicationID,
+			ActiveOnly: true,
+		},
+	)
+	if len(sources) != 0 {
+		t.Fatalf("recovered attempt sources=%+v", sources)
+	}
+	shutdownPublicationRecoveryTestSession(t, session, false)
+}
+
+func TestDispatcherStartupAttemptReceiptIntegrityFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		mismatch bool
+	}{
+		{name: "receipt beside original publishing tuple"},
+		{name: "receipt identity mismatch", mismatch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, dbPath := testManager(t)
+			unknown := store.PublicationAttemptResultInput{
+				Outcome:        store.PublicationAttemptUnknown,
+				ExecutorStatus: store.PublicationExecutorUnknown,
+				ErrorKind:      store.PublicationErrorCommandStartUncertain,
+				Error:          "startup fixture effect is uncertain",
+			}
+			fixture := seedStartupPublicationAttempt(
+				t,
+				manager,
+				strings.ReplaceAll(test.name, " ", "-"),
+				&unknown,
+			)
+			publicationID := fixture.Intent.PublicationID
+			if test.mismatch {
+				publicationID = "pub_receipt_identity_mismatch"
+			}
+			insertStartupPublicationRecoveryReceipt(
+				t,
+				dbPath,
+				fixture.Intent,
+				publicationID,
+				fixture.Intent.PublicationUpdatedAt,
+				fixture.Intent.ClaimEpoch,
+				time.Now().UTC().Format(time.RFC3339Nano),
+			)
+			session := startPublicationRecoveryTestSession(t, manager)
+			err := quarantineUnconfirmedPublishingOwnership(
+				manager,
+				session,
+			)
+			if !errors.Is(err, store.ErrAutomationQuarantined) ||
+				!strings.Contains(err.Error(), "integrity failure") {
+				t.Fatalf("receipt integrity startup error=%v", err)
+			}
+			exact := publicationSources(
+				t,
+				manager,
+				store.AutomationQuarantineSourceFilter{
+					Board:      fixture.Intent.Board,
+					Kind:       publicationQuarantineKind,
+					SourceID:   fixture.Intent.PublicationID,
+					ActiveOnly: true,
+				},
+			)
+			if len(exact) != 0 {
+				t.Fatalf("integrity failure persisted exact source=%+v", exact)
+			}
+			shutdownPublicationRecoveryTestSession(t, session, true)
+		})
+	}
+}
+
+func TestDispatcherStartupUnresolvedAttemptDivergenceFailsClosed(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, store.PublicationAttemptIntent)
+	}{
+		{
+			name: "missing publication",
+			mutate: func(
+				t *testing.T,
+				dbPath string,
+				intent store.PublicationAttemptIntent,
+			) {
+				raw, err := sql.Open("sqlite", dbPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.ExecContext(
+					context.Background(),
+					"DELETE FROM publications WHERE id = ?",
+					intent.PublicationID,
+				); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "newer publishing tuple",
+			mutate: func(
+				t *testing.T,
+				dbPath string,
+				intent store.PublicationAttemptIntent,
+			) {
+				raw, err := sql.Open("sqlite", dbPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.ExecContext(context.Background(), `
+					UPDATE publications
+					SET claim_epoch = claim_epoch + 1,
+						claim_token = 'newer-startup-fixture',
+						claim_expires_at = ?, updated_at = ?
+					WHERE id = ?
+				`,
+					time.Now().UTC().Add(time.Minute).
+						Format(time.RFC3339Nano),
+					time.Now().UTC().Add(time.Second).
+						Format(time.RFC3339Nano),
+					intent.PublicationID,
+				); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, dbPath := testManager(t)
+			fixture := seedStartupPublicationAttempt(
+				t,
+				manager,
+				strings.ReplaceAll(test.name, " ", "-"),
+				nil,
+			)
+			test.mutate(t, dbPath, fixture.Intent)
+			session := startPublicationRecoveryTestSession(t, manager)
+			err := quarantineUnconfirmedPublishingOwnership(
+				manager,
+				session,
+			)
+			if !errors.Is(err, store.ErrAutomationQuarantined) ||
+				!strings.Contains(err.Error(), "integrity failure") {
+				t.Fatalf("divergent attempt startup error=%v", err)
+			}
+			exact := publicationSources(
+				t,
+				manager,
+				store.AutomationQuarantineSourceFilter{
+					Board:      fixture.Intent.Board,
+					Kind:       publicationQuarantineKind,
+					SourceID:   fixture.Intent.PublicationID,
+					ActiveOnly: true,
+				},
+			)
+			if len(exact) != 0 {
+				t.Fatalf("divergent attempt refreshed source=%+v", exact)
+			}
+			shutdownPublicationRecoveryTestSession(t, session, true)
+		})
+	}
+}
+
+func TestDispatcherStartupAttemptProvenanceDivergenceFailsClosed(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name   string
+		column string
+		value  string
+	}{
+		{
+			name:   "task id",
+			column: "task_id",
+			value:  "task_startup_provenance_tampered",
+		},
+		{
+			name:   "repository path",
+			column: "repository_path",
+			value:  "/tampered/startup/repository",
+		},
+		{
+			name:   "worktree path",
+			column: "worktree_path",
+			value:  "/tampered/startup/worktree",
+		},
+		{
+			name:   "source snapshot",
+			column: "source_snapshot_json",
+			value:  `{"tampered":"startup source snapshot"}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, dbPath := testManager(t)
+			fixture := seedStartupPublicationAttempt(
+				t,
+				manager,
+				"provenance-"+strings.ReplaceAll(test.name, " ", "-"),
+				nil,
+			)
+			if fixture.Intent.ExecutionProvenanceFingerprint == "" {
+				t.Fatal("startup attempt lacks execution provenance")
+			}
+			raw, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := raw.ExecContext(
+				context.Background(),
+				"UPDATE publications SET "+test.column+" = ? WHERE id = ?",
+				test.value,
+				fixture.Intent.PublicationID,
+			)
+			if err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if changed != 1 {
+				raw.Close()
+				t.Fatalf("changed provenance rows=%d", changed)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			session := startPublicationRecoveryTestSession(t, manager)
+			err = quarantineUnconfirmedPublishingOwnership(manager, session)
+			if !errors.Is(err, store.ErrAutomationQuarantined) ||
+				!strings.Contains(
+					err.Error(),
+					"original Publishing tuple has incompatible effect identity",
+				) {
+				t.Fatalf("provenance divergence startup error=%v", err)
+			}
+			exact := publicationSources(
+				t,
+				manager,
+				store.AutomationQuarantineSourceFilter{
+					Board:      fixture.Intent.Board,
+					Kind:       publicationQuarantineKind,
+					SourceID:   fixture.Intent.PublicationID,
+					ActiveOnly: true,
+				},
+			)
+			if len(exact) != 0 {
+				t.Fatalf("provenance integrity failure persisted source=%+v", exact)
+			}
+			shutdownPublicationRecoveryTestSession(t, session, true)
+		})
+	}
+}
+
+func TestDispatcherStartupStaleAttemptActivationAcceptsKnownFinish(
+	t *testing.T,
+) {
+	manager, _ := testManager(t)
+	fixture := seedStartupPublicationAttempt(
+		t,
+		manager,
+		"stale-known-finish",
+		nil,
+	)
+	coordination, err := manager.OpenCoordinationStore(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &mutateBeforePublicationActivationAuthority{
+		Store: coordination,
+	}
+	authority.mutate = func(mutationContext context.Context) error {
+		opened, err := manager.OpenStore(mutationContext, "default")
+		if err != nil {
+			return err
+		}
+		defer opened.Close()
+		_, err = opened.FinishAutomatedPublicationAttempt(
+			mutationContext,
+			fixture.Operation,
+			store.PublicationAttemptResultInput{
+				Outcome:        store.PublicationAttemptFailed,
+				ExecutorStatus: store.PublicationExecutorFailed,
+				ErrorKind:      store.PublicationErrorRemoteConflict,
+				Error:          "concurrent known startup failure",
+			},
+		)
+		return err
+	}
+	sessionContext, cancelSession := context.WithCancel(context.Background())
+	session, err := startAutomationDispatcherSessionWithAuthority(
+		sessionContext,
+		authority,
+		coordination.Close,
+		cancelSession,
+		"dispatcher-attempt-stale-known",
+		time.Minute,
+		time.Hour,
+		time.Hour,
+	)
+	if err != nil {
+		coordination.Close()
+		t.Fatal(err)
+	}
+	if err := quarantineUnconfirmedPublishingOwnership(
+		manager,
+		session,
+	); err != nil {
+		t.Fatalf("stale known Finish startup error=%v", err)
+	}
+	if authority.mutationErr != nil {
+		t.Fatalf("stale known Finish mutation error=%v", authority.mutationErr)
+	}
+	sources := publicationSources(
+		t,
+		manager,
+		store.AutomationQuarantineSourceFilter{
+			Board:      fixture.Intent.Board,
+			Kind:       publicationQuarantineKind,
+			SourceID:   fixture.Intent.PublicationID,
+			ActiveOnly: true,
+		},
+	)
+	if len(sources) != 0 {
+		t.Fatalf("known Finish left startup source=%+v", sources)
+	}
+	shutdownPublicationRecoveryTestSession(t, session, false)
+}
+
+func TestDispatcherStartupKnownResultWithOriginalPublishingFailsClosed(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name           string
+		effectMismatch bool
+		want           string
+	}{
+		{
+			name: "known result with original publishing",
+			want: "known result",
+		},
+		{
+			name:           "known result with altered effect",
+			effectMismatch: true,
+			want:           "effect identity",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, dbPath := testManager(t)
+			known := store.PublicationAttemptResultInput{
+				Outcome:        store.PublicationAttemptFailed,
+				ExecutorStatus: store.PublicationExecutorFailed,
+				ErrorKind:      store.PublicationErrorRemoteConflict,
+				Error:          "known startup failure",
+			}
+			fixture := seedStartupPublicationAttempt(
+				t,
+				manager,
+				strings.ReplaceAll(test.name, " ", "-"),
+				&known,
+			)
+			targetBranch := fixture.Intent.TargetBranch
+			if test.effectMismatch {
+				targetBranch = "altered-startup-target"
+			}
+			raw, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.ExecContext(context.Background(), `
+				UPDATE publications
+				SET status = 'publishing', url = NULL, error = NULL,
+					target_branch = ?,
+					claim_token = 'known-original-startup-fixture',
+					claim_expires_at = ?, published_at = NULL, updated_at = ?
+				WHERE id = ?
+			`,
+				targetBranch,
+				fixture.Intent.ClaimExpiresAt,
+				fixture.Intent.PublicationUpdatedAt,
+				fixture.Intent.PublicationID,
+			); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			session := startPublicationRecoveryTestSession(t, manager)
+			err = quarantineUnconfirmedPublishingOwnership(manager, session)
+			if !errors.Is(err, store.ErrAutomationQuarantined) ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"known result/original Publishing startup error=%v",
+					err,
+				)
+			}
+			shutdownPublicationRecoveryTestSession(t, session, true)
+		})
+	}
+}
+
 func publicationSources(
 	t *testing.T,
 	manager *boards.Manager,

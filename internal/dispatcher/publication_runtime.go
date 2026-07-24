@@ -496,9 +496,10 @@ func (s *automationDispatcherSession) quarantinePublicationAttempt(
 		context.Background(),
 		automationSessionOperationLimit,
 	)
-	gate, exactErr := s.persistPublicationQuarantine(
+	gate, exactErr := s.persistPublicationQuarantineWithDiagnostic(
 		operationContext,
 		value,
+		diagnostic,
 		exactPublicationAttemptValidator(opened, intent),
 	)
 	cancel()
