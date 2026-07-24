@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // PublicationMode describes the deterministic host-side operation selected
 // when a finalizer's immutable change set becomes ready for publication.
@@ -81,10 +84,32 @@ type Publication struct {
 	SourceSnapshot  json.RawMessage   `json:"sourceSnapshot"`
 	URL             *string           `json:"url"`
 	Error           *string           `json:"error"`
+	ClaimEpoch      int64             `json:"claimEpoch"`
 	ClaimToken      string            `json:"-"`
 	ClaimExpiresAt  *string           `json:"claimExpiresAt"`
 	ApprovedAt      *string           `json:"approvedAt"`
 	PublishedAt     *string           `json:"publishedAt"`
 	CreatedAt       string            `json:"createdAt"`
 	UpdatedAt       string            `json:"updatedAt"`
+}
+
+type publicationFormat Publication
+
+// String keeps the host-side claim credential out of ordinary structured
+// logging while retaining the rest of the publication state for diagnostics.
+func (p Publication) String() string {
+	safe := publicationFormat(p)
+	if safe.ClaimToken != "" {
+		safe.ClaimToken = "[REDACTED]"
+	}
+	return fmt.Sprintf("%+v", safe)
+}
+
+// GoString provides the same protection for %#v diagnostics.
+func (p Publication) GoString() string {
+	safe := publicationFormat(p)
+	if safe.ClaimToken != "" {
+		safe.ClaimToken = "[REDACTED]"
+	}
+	return fmt.Sprintf("%#v", safe)
 }

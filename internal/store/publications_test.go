@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -261,6 +262,8 @@ func TestPublicationExplicitRetryAndManualCompletion(t *testing.T) {
 	}
 	defer opened.Close()
 	baseTime := time.Date(2026, 7, 24, 6, 0, 0, 0, time.UTC)
+	publicationNow := baseTime
+	opened.publicationClock = func() time.Time { return publicationNow }
 
 	_, retrySource := createPublicationSource(
 		t, opened, "explicit_retry", model.WorkflowRoleFinalizer,
@@ -276,15 +279,16 @@ func TestPublicationExplicitRetryAndManualCompletion(t *testing.T) {
 		ctx, retryPublication.ID, ClaimPublicationInput{
 			ExpectedUpdatedAt: retryPublication.UpdatedAt,
 			TTL:               time.Minute,
-			Current:           baseTime,
 		},
 	)
 	if err != nil || !claimed {
 		t.Fatalf("claim retry publication: claimed=%v err=%v", claimed, err)
 	}
+	publicationNow = baseTime.Add(time.Second)
 	failed, err := opened.FailPublication(ctx, retryPublication.ID, FailPublicationInput{
 		ExpectedUpdatedAt: claim.UpdatedAt, ClaimToken: claim.ClaimToken,
-		Current: baseTime.Add(time.Second), Error: "review the remote before retrying",
+		ClaimEpoch: claim.ClaimEpoch,
+		Error:      "review the remote before retrying",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -351,7 +355,7 @@ func TestPublicationExplicitRetryAndManualCompletion(t *testing.T) {
 	}
 }
 
-func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
+func TestPublicationClaimEpochCompleteFailAndNoExpiredTakeover(t *testing.T) {
 	ctx := context.Background()
 	opened, err := Open(":memory:", "default", "")
 	if err != nil {
@@ -359,6 +363,8 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 	}
 	defer opened.Close()
 	baseTime := time.Date(2026, 7, 24, 4, 0, 0, 0, time.UTC)
+	publicationNow := baseTime
+	opened.publicationClock = func() time.Time { return publicationNow }
 
 	_, completedSource := createPublicationSource(
 		t, opened, "complete", model.WorkflowRoleFinalizer, model.TaskStatusDone,
@@ -371,14 +377,15 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed, acquired, err := opened.ClaimPublication(ctx, pending.ID, ClaimPublicationInput{
-		ExpectedUpdatedAt: pending.UpdatedAt, TTL: time.Minute, Current: baseTime,
+		ExpectedUpdatedAt: pending.UpdatedAt, TTL: time.Minute,
 	})
 	if err != nil || !acquired || claimed.Status != model.PublicationPublishing ||
-		claimed.ClaimToken == "" || claimed.ClaimExpiresAt == nil {
+		claimed.ClaimToken == "" || claimed.ClaimExpiresAt == nil ||
+		claimed.ClaimEpoch != 1 {
 		t.Fatalf("claim publication: value=%+v acquired=%v err=%v", claimed, acquired, err)
 	}
 	visible, err := opened.GetPublication(ctx, claimed.ID)
-	if err != nil || visible.ClaimToken != "" {
+	if err != nil || visible.ClaimToken != "" || visible.ClaimEpoch != claimed.ClaimEpoch {
 		t.Fatalf("public claim leaked token: value=%+v err=%v", visible, err)
 	}
 	encoded, err := json.Marshal(claimed)
@@ -388,24 +395,62 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 	if strings.Contains(string(encoded), claimed.ClaimToken) {
 		t.Fatalf("JSON leaked claim token: %s", encoded)
 	}
+	if !strings.Contains(string(encoded), `"claimEpoch":1`) {
+		t.Fatalf("JSON omitted public claim epoch: %s", encoded)
+	}
+	formatted := fmt.Sprintf("%+v\n%#v", claimed, claimed)
+	if strings.Contains(formatted, claimed.ClaimToken) ||
+		!strings.Contains(formatted, "[REDACTED]") {
+		t.Fatalf("formatted publication exposed its claim token: %s", formatted)
+	}
+	events, err := opened.ListEvents(ctx, EventFilter{
+		TaskID: completedSource.TaskID,
+		Kinds:  []string{"publication_claimed"},
+	})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("claim events = %#v, err=%v", events, err)
+	}
+	var claimPayload struct {
+		ClaimEpoch int64 `json:"claimEpoch"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &claimPayload); err != nil {
+		t.Fatal(err)
+	}
+	if claimPayload.ClaimEpoch != claimed.ClaimEpoch {
+		t.Fatalf("claim event epoch = %d, want %d", claimPayload.ClaimEpoch, claimed.ClaimEpoch)
+	}
 	contended, acquired, err := opened.ClaimPublication(ctx, claimed.ID, ClaimPublicationInput{
-		ExpectedUpdatedAt: claimed.UpdatedAt, TTL: time.Minute,
-		Current: baseTime.Add(time.Second),
+		ExpectedUpdatedAt: pending.UpdatedAt, TTL: time.Minute,
 	})
 	if err != nil || acquired || contended.ClaimToken != "" ||
-		contended.Status != model.PublicationPublishing {
+		contended.Status != model.PublicationPublishing ||
+		contended.ClaimEpoch != claimed.ClaimEpoch ||
+		contended.UpdatedAt != claimed.UpdatedAt {
 		t.Fatalf("contended claim: value=%+v acquired=%v err=%v", contended, acquired, err)
+	}
+	publicationNow = baseTime.Add(2 * time.Second)
+	if _, err := opened.CompletePublication(ctx, claimed.ID, CompletePublicationInput{
+		ExpectedUpdatedAt: claimed.UpdatedAt, ClaimToken: claimed.ClaimToken,
+	}); err == nil || !strings.Contains(err.Error(), "claim epoch must be positive") {
+		t.Fatalf("missing claim epoch completion error = %v", err)
 	}
 	if _, err := opened.CompletePublication(ctx, claimed.ID, CompletePublicationInput{
 		ExpectedUpdatedAt: claimed.UpdatedAt, ClaimToken: "wrong-token",
-		Current: baseTime.Add(2 * time.Second),
+		ClaimEpoch: claimed.ClaimEpoch,
 	}); !errors.Is(err, ErrPublicationClaimNotOwner) {
 		t.Fatalf("wrong owner completion error = %v", err)
+	}
+	if _, err := opened.CompletePublication(ctx, claimed.ID, CompletePublicationInput{
+		ExpectedUpdatedAt: pending.UpdatedAt, ClaimToken: claimed.ClaimToken,
+		ClaimEpoch: claimed.ClaimEpoch,
+	}); !errors.Is(err, ErrPublicationUpdateConflict) {
+		t.Fatalf("stale completion timestamp error = %v", err)
 	}
 	rawURL := "https://example.test/pull/17"
 	completed, err := opened.CompletePublication(ctx, claimed.ID, CompletePublicationInput{
 		ExpectedUpdatedAt: claimed.UpdatedAt, ClaimToken: claimed.ClaimToken,
-		Current: baseTime.Add(2 * time.Second), URL: &rawURL,
+		ClaimEpoch: claimed.ClaimEpoch,
+		URL:        &rawURL,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -426,15 +471,18 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	publicationNow = baseTime
 	retryClaim, acquired, err := opened.ClaimPublication(ctx, retry.ID, ClaimPublicationInput{
-		ExpectedUpdatedAt: retry.UpdatedAt, TTL: time.Minute, Current: baseTime,
+		ExpectedUpdatedAt: retry.UpdatedAt, TTL: time.Minute,
 	})
 	if err != nil || !acquired {
 		t.Fatalf("claim retry source: acquired=%v err=%v", acquired, err)
 	}
+	publicationNow = baseTime.Add(time.Second)
 	failed, err := opened.FailPublication(ctx, retry.ID, FailPublicationInput{
 		ExpectedUpdatedAt: retryClaim.UpdatedAt, ClaimToken: retryClaim.ClaimToken,
-		Current: baseTime.Add(time.Second), Error: "remote temporarily unavailable",
+		ClaimEpoch: retryClaim.ClaimEpoch,
+		Error:      "remote temporarily unavailable",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -443,12 +491,38 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 		*failed.Error != "remote temporarily unavailable" {
 		t.Fatalf("failed publication = %+v", failed)
 	}
-	retryClaim, acquired, err = opened.ClaimPublication(ctx, retry.ID, ClaimPublicationInput{
+	if _, acquired, err := opened.ClaimPublication(ctx, retry.ID, ClaimPublicationInput{
 		ExpectedUpdatedAt: failed.UpdatedAt, TTL: time.Minute,
-		Current: baseTime.Add(2 * time.Second),
+	}); !errors.Is(err, ErrPublicationStateConflict) || acquired {
+		t.Fatalf("automatic failed retry: acquired=%v err=%v", acquired, err)
+	}
+	retried, err := opened.RetryPublication(ctx, retry.ID, RetryPublicationInput{
+		ExpectedUpdatedAt: failed.UpdatedAt,
 	})
-	if err != nil || !acquired || retryClaim.Error != nil {
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationNow = baseTime.Add(2 * time.Second)
+	retryClaim, acquired, err = opened.ClaimPublication(ctx, retry.ID, ClaimPublicationInput{
+		ExpectedUpdatedAt: retried.UpdatedAt, TTL: time.Minute,
+	})
+	if err != nil || !acquired || retryClaim.Error != nil || retryClaim.ClaimEpoch != 2 {
 		t.Fatalf("retry claim: value=%+v acquired=%v err=%v", retryClaim, acquired, err)
+	}
+	publicationNow = baseTime.Add(3 * time.Second)
+	if _, err := opened.FailPublication(ctx, retry.ID, FailPublicationInput{
+		ExpectedUpdatedAt: retryClaim.UpdatedAt, ClaimToken: retryClaim.ClaimToken,
+		ClaimEpoch: retryClaim.ClaimEpoch - 1,
+		Error:      "stale claim epoch",
+	}); !errors.Is(err, ErrPublicationClaimNotOwner) {
+		t.Fatalf("stale claim epoch error = %v", err)
+	}
+	if _, err := opened.FailPublication(ctx, retry.ID, FailPublicationInput{
+		ExpectedUpdatedAt: retried.UpdatedAt, ClaimToken: retryClaim.ClaimToken,
+		ClaimEpoch: retryClaim.ClaimEpoch,
+		Error:      "stale publication version",
+	}); !errors.Is(err, ErrPublicationUpdateConflict) {
+		t.Fatalf("stale failure timestamp error = %v", err)
 	}
 
 	_, takeoverSource := createPublicationSource(
@@ -461,26 +535,97 @@ func TestPublicationClaimCompleteFailAndExpiredTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	publicationNow = baseTime
 	oldClaim, acquired, err := opened.ClaimPublication(ctx, takeover.ID, ClaimPublicationInput{
 		ExpectedUpdatedAt: takeover.UpdatedAt, TTL: MinPublicationClaimTTL,
-		Current: baseTime,
 	})
 	if err != nil || !acquired {
 		t.Fatalf("old claim: acquired=%v err=%v", acquired, err)
 	}
-	newClaim, acquired, err := opened.ClaimPublication(ctx, takeover.ID, ClaimPublicationInput{
-		ExpectedUpdatedAt: oldClaim.UpdatedAt, TTL: time.Minute,
-		Current: baseTime.Add(MinPublicationClaimTTL),
+	publicationNow = baseTime.Add(MinPublicationClaimTTL)
+	observed, acquired, err := opened.ClaimPublication(ctx, takeover.ID, ClaimPublicationInput{
+		ExpectedUpdatedAt: takeover.UpdatedAt, TTL: time.Minute,
 	})
-	if err != nil || !acquired || newClaim.ClaimToken == oldClaim.ClaimToken {
-		t.Fatalf("takeover claim: value=%+v acquired=%v err=%v", newClaim, acquired, err)
+	if err != nil || acquired || observed.ClaimToken != "" ||
+		observed.ClaimEpoch != oldClaim.ClaimEpoch ||
+		observed.UpdatedAt != oldClaim.UpdatedAt ||
+		observed.ClaimExpiresAt == nil ||
+		*observed.ClaimExpiresAt != *oldClaim.ClaimExpiresAt {
+		t.Fatalf("expired publishing observation: value=%+v acquired=%v err=%v", observed, acquired, err)
 	}
+	publicationNow = baseTime.Add(MinPublicationClaimTTL + time.Second)
 	if _, err := opened.FailPublication(ctx, takeover.ID, FailPublicationInput{
-		ExpectedUpdatedAt: newClaim.UpdatedAt, ClaimToken: oldClaim.ClaimToken,
-		Current: baseTime.Add(MinPublicationClaimTTL + time.Second),
-		Error:   "stale worker",
-	}); !errors.Is(err, ErrPublicationClaimNotOwner) {
-		t.Fatalf("stale claimant error = %v", err)
+		ExpectedUpdatedAt: oldClaim.UpdatedAt, ClaimToken: oldClaim.ClaimToken,
+		ClaimEpoch: oldClaim.ClaimEpoch,
+		Error:      "expired worker",
+	}); !errors.Is(err, ErrPublicationClaimExpired) {
+		t.Fatalf("expired claimant error = %v", err)
+	}
+}
+
+func TestPublicationClaimRejectsExhaustedEpoch(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	opened.publicationClock = func() time.Time {
+		return time.Date(2026, 7, 24, 8, 0, 0, 0, time.UTC)
+	}
+
+	_, source := createPublicationSource(
+		t, opened, "exhausted_epoch", model.WorkflowRoleFinalizer,
+		model.TaskStatusDone, model.RunStatusCompleted, "ready",
+	)
+	pending, _, err := opened.EnsurePublication(
+		ctx, publicationPolicyInput(source.ID, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.db.ExecContext(
+		ctx,
+		"UPDATE publications SET claim_epoch = ? WHERE id = ?",
+		int64(math.MaxInt64),
+		pending.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = opened.GetPublication(ctx, pending.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, acquired, err := opened.ClaimPublication(
+		ctx,
+		pending.ID,
+		ClaimPublicationInput{
+			ExpectedUpdatedAt: pending.UpdatedAt,
+			TTL:               time.Minute,
+		},
+	); err == nil || !strings.Contains(err.Error(), "epoch is exhausted") || acquired {
+		t.Fatalf("exhausted claim: acquired=%v err=%v", acquired, err)
+	}
+	var status model.PublicationStatus
+	var epoch int64
+	var token, expiry sql.NullString
+	if err := opened.db.QueryRowContext(
+		ctx,
+		`SELECT status, claim_epoch, claim_token, claim_expires_at
+		 FROM publications WHERE id = ?`,
+		pending.ID,
+	).Scan(&status, &epoch, &token, &expiry); err != nil {
+		t.Fatal(err)
+	}
+	if status != model.PublicationPending || epoch != math.MaxInt64 ||
+		token.Valid || expiry.Valid {
+		t.Fatalf(
+			"exhausted claim mutated row: status=%s epoch=%d token=%v expiry=%v",
+			status,
+			epoch,
+			token.Valid,
+			expiry.Valid,
+		)
 	}
 }
 
@@ -635,5 +780,160 @@ func TestExistingDatabaseEnsuresPublicationSchema(t *testing.T) {
 		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'publications'",
 	).Scan(&tableName); err != nil {
 		t.Fatalf("publication table was not ensured: %v", err)
+	}
+}
+
+func TestExistingPublicationSchemaAddsClaimEpoch(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "claim-epoch.db")
+	opened, err := Open(dbPath, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, changeSet := createPublicationSource(
+		t,
+		opened,
+		"claim_epoch_migration",
+		model.WorkflowRoleFinalizer,
+		model.TaskStatusDone,
+		model.RunStatusCompleted,
+		"ready",
+	)
+	publication, _, err := opened.EnsurePublication(
+		ctx,
+		publicationPolicyInput(changeSet.ID, false),
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", dataSourceName(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER IF EXISTS publications_claim_epoch_insert_guard;
+		DROP TRIGGER IF EXISTS publications_claim_epoch_update_guard;
+		ALTER TABLE publications DROP COLUMN claim_epoch;
+		PRAGMA user_version = 25;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dbPath, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	preserved, err := reopened.GetPublication(ctx, publication.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.ClaimEpoch != 0 || preserved.Status != publication.Status {
+		t.Fatalf("migrated publication = %+v", preserved)
+	}
+	var version, notNull int
+	var columnType, defaultValue string
+	if err := reopened.db.QueryRowContext(
+		ctx,
+		`SELECT type, "notnull", CAST(dflt_value AS TEXT)
+		 FROM pragma_table_info('publications')
+		 WHERE name = 'claim_epoch'`,
+	).Scan(&columnType, &notNull, &defaultValue); err != nil {
+		t.Fatal(err)
+	}
+	if versionErr := reopened.db.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); versionErr != nil {
+		t.Fatal(versionErr)
+	}
+	if version != schemaVersion || schemaVersion != 26 ||
+		columnType != "INTEGER" || notNull != 1 || defaultValue != "0" {
+		t.Fatalf(
+			"claim epoch migration: version=%d constant=%d type=%q notNull=%d default=%q",
+			version,
+			schemaVersion,
+			columnType,
+			notNull,
+			defaultValue,
+		)
+	}
+	if _, err := reopened.db.ExecContext(
+		ctx,
+		"UPDATE publications SET claim_epoch = -1 WHERE id = ?",
+		publication.ID,
+	); err == nil {
+		t.Fatal("negative claim epoch bypassed database constraint")
+	}
+	if _, err := reopened.db.ExecContext(
+		ctx,
+		"UPDATE publications SET claim_epoch = 1.5 WHERE id = ?",
+		publication.ID,
+	); err == nil {
+		t.Fatal("non-integer claim epoch bypassed database constraint")
+	}
+}
+
+func TestExistingPublicationSchemaRejectsStoredNonIntegerClaimEpoch(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "invalid-claim-epoch.db")
+	opened, err := Open(dbPath, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, changeSet := createPublicationSource(
+		t,
+		opened,
+		"invalid_claim_epoch",
+		model.WorkflowRoleFinalizer,
+		model.TaskStatusDone,
+		model.RunStatusCompleted,
+		"ready",
+	)
+	publication, _, err := opened.EnsurePublication(
+		ctx,
+		publicationPolicyInput(changeSet.ID, false),
+	)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", dataSourceName(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER IF EXISTS publications_claim_epoch_insert_guard;
+		DROP TRIGGER IF EXISTS publications_claim_epoch_update_guard;
+		PRAGMA ignore_check_constraints = ON;
+		UPDATE publications SET claim_epoch = 1.5 WHERE id = ?;
+	`, publication.ID); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dbPath, "default", "")
+	if err == nil {
+		reopened.Close()
+		t.Fatal("stored non-integer claim epoch passed schema validation")
+	}
+	if !strings.Contains(err.Error(), "invalid claim epochs") {
+		t.Fatalf("stored non-integer claim epoch error = %v", err)
 	}
 }

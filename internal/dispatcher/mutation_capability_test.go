@@ -269,7 +269,6 @@ func TestUnsupportedAutomaticPublicationFailsDurablyWithoutExecutor(t *testing.T
 		opened,
 		publications[0],
 		options,
-		current,
 		unavailableMutationCapability(),
 	)
 	if !acquired || err == nil {

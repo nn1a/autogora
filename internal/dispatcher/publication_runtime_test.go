@@ -478,7 +478,7 @@ func TestPublicationPassWriteAndAutopilotGates(t *testing.T) {
 	}
 }
 
-func TestPublicationPassReclaimsExpiredLeaseButDoesNotRetryFailure(t *testing.T) {
+func TestPublicationPassDoesNotTakeOverExpiredLease(t *testing.T) {
 	ctx := context.Background()
 	current := time.Now().UTC()
 	manager, _ := testManager(t)
@@ -497,7 +497,7 @@ func TestPublicationPassReclaimsExpiredLeaseButDoesNotRetryFailure(t *testing.T)
 			publisher.Options,
 		) (publisher.Result, error) {
 			calls++
-			return publisher.Result{}, errors.New("persistent failure")
+			return publisher.Result{}, errors.New("unexpected execution")
 		},
 	)
 	state := &publicationRuntimeState{}
@@ -515,7 +515,7 @@ func TestPublicationPassReclaimsExpiredLeaseButDoesNotRetryFailure(t *testing.T)
 		ctx, pending.ID,
 		store.ClaimPublicationInput{
 			ExpectedUpdatedAt: pending.UpdatedAt,
-			TTL:               store.MinPublicationClaimTTL, Current: current,
+			TTL:               store.MinPublicationClaimTTL,
 		},
 	); err != nil || !acquired {
 		opened.Close()
@@ -541,33 +541,15 @@ func TestPublicationPassReclaimsExpiredLeaseButDoesNotRetryFailure(t *testing.T)
 	err = runPublicationPass(
 		ctx, manager, []string{"default"}, options, state, later,
 	)
-	if err == nil {
-		t.Fatal("failed reclaimed publication did not report its execution error")
-	}
-	failed := publicationForChangeSet(t, manager, "default", changeSet.ID)
-	if failed.Status != model.PublicationFailed {
-		t.Fatalf("publication=%+v", failed)
-	}
-	if calls != 1 {
-		t.Fatalf("reclaimed executor calls=%d", calls)
-	}
-	calls = 0
-	options.PublicationExecutor = func(
-		_ context.Context,
-		value model.Publication,
-		_ publisher.Options,
-	) (publisher.Result, error) {
-		calls++
-		return publishedResult(value), nil
-	}
-	if err := runPublicationPass(
-		ctx, manager, []string{"default"}, options, state, later,
-	); err != nil {
+	if err != nil {
 		t.Fatal(err)
 	}
-	stillFailed := publicationForChangeSet(t, manager, "default", changeSet.ID)
-	if stillFailed.Status != model.PublicationFailed || calls != 0 {
-		t.Fatalf("publication=%+v calls=%d", stillFailed, calls)
+	stillPublishing := publicationForChangeSet(t, manager, "default", changeSet.ID)
+	if stillPublishing.Status != model.PublicationPublishing {
+		t.Fatalf("publication=%+v", stillPublishing)
+	}
+	if calls != 0 {
+		t.Fatalf("expired lease executor calls=%d", calls)
 	}
 }
 

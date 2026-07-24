@@ -16,14 +16,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 25
+const schemaVersion = 26
 
 type Store struct {
-	db              *sql.DB
-	dbPath          string
-	board           string
-	attachmentsRoot string
-	automation      *automationGateRuntime
+	db               *sql.DB
+	dbPath           string
+	board            string
+	attachmentsRoot  string
+	publicationClock func() time.Time
+	automation       *automationGateRuntime
 	// Test seam for simulating a crash after source resolution is durable but
 	// before the global gate is cleared.
 	automationAfterConfirmationPhaseOne func() error
@@ -62,7 +63,10 @@ func Open(dbPath, board, attachmentsRoot string) (*Store, error) {
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 
-	store := &Store{db: db, dbPath: resolved, board: board, attachmentsRoot: attachmentsRoot}
+	store := &Store{
+		db: db, dbPath: resolved, board: board, attachmentsRoot: attachmentsRoot,
+		publicationClock: func() time.Time { return time.Now().UTC() },
+	}
 	if err := store.initialize(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -165,6 +169,9 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensureTaskWorkflowRole(ctx); err != nil {
 		return err
 	}
+	if err := s.ensurePublicationClaimEpochSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDependencySatisfaction(ctx); err != nil {
 		return err
 	}
@@ -186,6 +193,118 @@ func (s *Store) initialize(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
 	}
+	return nil
+}
+
+func (s *Store) ensurePublicationClaimEpochSchema(ctx context.Context) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open publication claim epoch migration connection: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin publication claim epoch migration: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info(publications)")
+	if err != nil {
+		return fmt.Errorf("inspect publication schema: %w", err)
+	}
+	tableExists := false
+	hasClaimEpoch := false
+	for rows.Next() {
+		tableExists = true
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan publication schema: %w", err)
+		}
+		if name == "claim_epoch" {
+			hasClaimEpoch = true
+			if !strings.EqualFold(strings.TrimSpace(columnType), "INTEGER") ||
+				notNull != 1 ||
+				fmt.Sprint(defaultValue) != "0" {
+				rows.Close()
+				return errors.New(
+					"incompatible publication schema: claim_epoch must be an INTEGER NOT NULL DEFAULT 0",
+				)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("inspect publication schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !tableExists {
+		return errors.New("publication table is missing after schema initialization")
+	}
+	if !hasClaimEpoch {
+		if _, err := conn.ExecContext(
+			ctx,
+			`ALTER TABLE publications
+			 ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0
+			 CHECK (typeof(claim_epoch) = 'integer' AND claim_epoch >= 0)`,
+		); err != nil {
+			return fmt.Errorf("add publication claim epoch: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `
+		DROP TRIGGER IF EXISTS publications_claim_epoch_insert_guard;
+		CREATE TRIGGER publications_claim_epoch_insert_guard
+		BEFORE INSERT ON publications
+		WHEN typeof(NEW.claim_epoch) <> 'integer' OR NEW.claim_epoch < 0
+		BEGIN
+			SELECT RAISE(ABORT, 'publication claim_epoch must be a non-negative integer');
+		END;
+
+		DROP TRIGGER IF EXISTS publications_claim_epoch_update_guard;
+		CREATE TRIGGER publications_claim_epoch_update_guard
+		BEFORE UPDATE OF claim_epoch ON publications
+		WHEN typeof(NEW.claim_epoch) <> 'integer' OR NEW.claim_epoch < 0
+		BEGIN
+			SELECT RAISE(ABORT, 'publication claim_epoch must be a non-negative integer');
+		END;
+	`); err != nil {
+		return fmt.Errorf("ensure publication claim epoch guards: %w", err)
+	}
+	var invalidRows int
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM publications
+		 WHERE typeof(claim_epoch) <> 'integer' OR claim_epoch < 0`,
+	).Scan(&invalidRows); err != nil {
+		return fmt.Errorf("validate publication claim epochs: %w", err)
+	}
+	if invalidRows != 0 {
+		return fmt.Errorf(
+			"incompatible publication schema: %d invalid claim epochs",
+			invalidRows,
+		)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit publication claim epoch migration: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -1816,6 +1935,8 @@ CREATE TABLE IF NOT EXISTS publications (
   source_snapshot_json TEXT NOT NULL,
   url TEXT,
   error TEXT,
+  claim_epoch INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(claim_epoch) = 'integer' AND claim_epoch >= 0),
   claim_token TEXT,
   claim_expires_at TEXT,
   approved_at TEXT,

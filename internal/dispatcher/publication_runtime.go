@@ -168,14 +168,12 @@ func executePublication(
 	opened *store.Store,
 	value model.Publication,
 	options Options,
-	current time.Time,
 ) (bool, error) {
 	return executePublicationWithCapability(
 		ctx,
 		opened,
 		value,
 		options,
-		current,
 		currentAutomaticMutationCapability(),
 	)
 }
@@ -185,7 +183,6 @@ func executePublicationWithCapability(
 	opened *store.Store,
 	value model.Publication,
 	options Options,
-	current time.Time,
 	capability automaticMutationCapability,
 ) (bool, error) {
 	claimed, acquired, err := opened.ClaimPublication(
@@ -194,7 +191,6 @@ func executePublicationWithCapability(
 		store.ClaimPublicationInput{
 			ExpectedUpdatedAt: value.UpdatedAt,
 			TTL:               options.PublicationClaimTTL,
-			Current:           current,
 		},
 	)
 	if err != nil {
@@ -211,7 +207,6 @@ func executePublicationWithCapability(
 		claimed,
 		capability,
 	); capabilityErr != nil {
-		finishedAt := options.currentTime()
 		persistenceContext, cancelPersistence := context.WithTimeout(
 			context.WithoutCancel(ctx),
 			publicationPersistenceTimeout,
@@ -223,7 +218,7 @@ func executePublicationWithCapability(
 			store.FailPublicationInput{
 				ExpectedUpdatedAt: claimed.UpdatedAt,
 				ClaimToken:        claimed.ClaimToken,
-				Current:           finishedAt,
+				ClaimEpoch:        claimed.ClaimEpoch,
 				Error:             boundedPublicationFailure(capabilityErr),
 			},
 		)
@@ -254,7 +249,6 @@ func executePublicationWithCapability(
 		publisher.Options{CommandTimeout: options.PublicationTimeout},
 	)
 	cancel()
-	finishedAt := options.currentTime()
 	persistenceContext, cancelPersistence := context.WithTimeout(
 		context.WithoutCancel(ctx), publicationPersistenceTimeout,
 	)
@@ -266,7 +260,7 @@ func executePublicationWithCapability(
 			store.FailPublicationInput{
 				ExpectedUpdatedAt: claimed.UpdatedAt,
 				ClaimToken:        claimed.ClaimToken,
-				Current:           finishedAt,
+				ClaimEpoch:        claimed.ClaimEpoch,
 				Error:             boundedPublicationFailure(executionErr),
 			},
 		)
@@ -284,7 +278,7 @@ func executePublicationWithCapability(
 		store.CompletePublicationInput{
 			ExpectedUpdatedAt: claimed.UpdatedAt,
 			ClaimToken:        claimed.ClaimToken,
-			Current:           finishedAt,
+			ClaimEpoch:        claimed.ClaimEpoch,
 			URL:               result.URL,
 		},
 	); err != nil {
@@ -302,7 +296,7 @@ func runPublicationPass(
 	boardSlugs []string,
 	options Options,
 	state *publicationRuntimeState,
-	current time.Time,
+	_ time.Time,
 ) error {
 	if !options.Autopilot {
 		return nil
@@ -351,7 +345,7 @@ func runPublicationPass(
 				// when execution fails. A live publishing lease is not acquired
 				// and therefore does not consume the budget.
 				acquired, executeErr := executePublication(
-					ctx, opened, publication, options, current,
+					ctx, opened, publication, options,
 				)
 				if acquired {
 					executed = true

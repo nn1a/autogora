@@ -621,7 +621,7 @@ func TestSchema25AddsAutomationQuarantineAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	gate, err := reopened.GetAutomationQuarantine(ctx)
-	if err != nil || schemaVersion != 25 || version != schemaVersion ||
+	if err != nil || schemaVersion != 26 || version != schemaVersion ||
 		tables != 4 || releasedAtColumns != 1 ||
 		gate.Active || gate.Generation != 0 {
 		t.Fatalf(

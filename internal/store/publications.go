@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -109,27 +110,27 @@ type SupersedePublicationInput struct {
 type ClaimPublicationInput struct {
 	ExpectedUpdatedAt string
 	TTL               time.Duration
-	Current           time.Time
 }
 
 type CompletePublicationInput struct {
 	ExpectedUpdatedAt string
 	ClaimToken        string
-	Current           time.Time
+	ClaimEpoch        int64
 	URL               *string
 }
 
 type FailPublicationInput struct {
 	ExpectedUpdatedAt string
 	ClaimToken        string
-	Current           time.Time
+	ClaimEpoch        int64
 	Error             string
 }
 
 const publicationColumns = `id, board, task_id, run_id, change_set_id, status, mode,
 	target_branch, remote, require_approval, repository_path, worktree_path,
 	base_commit, head_commit, durable_ref, policy_snapshot_json, source_snapshot_json,
-	url, error, claim_token, claim_expires_at, approved_at, published_at, created_at, updated_at`
+	url, error, claim_epoch, claim_token, claim_expires_at, approved_at, published_at,
+	created_at, updated_at`
 
 func scanPublication(row scanner) (model.Publication, error) {
 	var value model.Publication
@@ -142,8 +143,8 @@ func scanPublication(row scanner) (model.Publication, error) {
 		&value.Status, &value.Mode, &value.TargetBranch, &value.Remote, &requireApproval,
 		&value.RepositoryPath, &value.WorktreePath, &value.BaseCommit, &value.HeadCommit,
 		&value.DurableRef, &policySnapshot, &sourceSnapshot, &rawURL, &publicationError,
-		&claimToken, &claimExpiresAt, &approvedAt, &publishedAt, &value.CreatedAt,
-		&value.UpdatedAt,
+		&value.ClaimEpoch, &claimToken, &claimExpiresAt, &approvedAt, &publishedAt,
+		&value.CreatedAt, &value.UpdatedAt,
 	)
 	value.RequireApproval = requireApproval == 1
 	value.PolicySnapshot = append(json.RawMessage(nil), policySnapshot...)
@@ -257,11 +258,12 @@ func normalizePublicationPolicy(input EnsurePublicationInput) (EnsurePublication
 	return input, nil
 }
 
-func normalizePublicationCurrent(current time.Time) (time.Time, string, error) {
-	if current.IsZero() {
-		current = time.Now()
+func (s *Store) publicationCurrent() (time.Time, string, error) {
+	clock := s.publicationClock
+	if clock == nil {
+		clock = func() time.Time { return time.Now().UTC() }
 	}
-	current = current.UTC()
+	current := clock().UTC()
 	if current.Year() < 0 || current.Year() > 9999 {
 		return time.Time{}, "", errors.New("publication claim time must fit RFC3339")
 	}
@@ -827,8 +829,8 @@ func (s *Store) SupersedePublication(
 }
 
 // ClaimPublication grants a bounded lease for one host-side publication
-// attempt. Failed attempts are retryable; a live lease is never exposed to a
-// competing caller.
+// attempt. Every successful claim advances ClaimEpoch. Publishing records are
+// never taken over automatically, even after their lease expires.
 func (s *Store) ClaimPublication(
 	ctx context.Context,
 	id string,
@@ -844,20 +846,6 @@ func (s *Store) ClaimPublication(
 			MinPublicationClaimTTL, MaxPublicationClaimTTL,
 		)
 	}
-	currentTime, currentTimestamp, err := normalizePublicationCurrent(input.Current)
-	if err != nil {
-		return model.Publication{}, false, err
-	}
-	expires := currentTime.Add(input.TTL)
-	if expires.Year() < 0 || expires.Year() > 9999 {
-		return model.Publication{}, false, errors.New("publication claim expiry must fit RFC3339")
-	}
-	expiresAt := expires.Format(publicationTimestampLayout)
-	token, err := claimToken()
-	if err != nil {
-		return model.Publication{}, false, fmt.Errorf("generate publication claim token: %w", err)
-	}
-
 	var value model.Publication
 	claimed := false
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
@@ -865,47 +853,42 @@ func (s *Store) ClaimPublication(
 		if err != nil {
 			return err
 		}
+		if current.Status == model.PublicationPublishing {
+			value = publicPublication(current)
+			return nil
+		}
 		if err := requirePublicationVersion(current, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
-		var update sql.Result
-		timestamp := now()
-		switch current.Status {
-		case model.PublicationPending, model.PublicationFailed:
-			update, err = tx.ExecContext(ctx, `
-				UPDATE publications
-				SET status = 'publishing', error = NULL, claim_token = ?,
-					claim_expires_at = ?, updated_at = ?
-				WHERE id = ? AND board = ? AND status = ? AND updated_at = ?
-					AND claim_token IS NULL AND claim_expires_at IS NULL
-			`, token, expiresAt, timestamp, current.ID, board, current.Status,
-				current.UpdatedAt)
-		case model.PublicationPublishing:
-			if current.ClaimToken == "" || current.ClaimExpiresAt == nil {
-				return fmt.Errorf("publishing publication %s has no claim lease", current.ID)
-			}
-			expired, expiryErr := publicationClaimExpired(current, currentTime)
-			if expiryErr != nil {
-				return expiryErr
-			}
-			if !expired {
-				value = publicPublication(current)
-				return nil
-			}
-			update, err = tx.ExecContext(ctx, `
-				UPDATE publications
-				SET claim_token = ?, claim_expires_at = ?, updated_at = ?
-				WHERE id = ? AND board = ? AND status = 'publishing'
-					AND updated_at = ? AND claim_token = ? AND claim_expires_at = ?
-					AND claim_expires_at <= ?
-			`, token, expiresAt, timestamp, current.ID, board, current.UpdatedAt,
-				current.ClaimToken, *current.ClaimExpiresAt, currentTimestamp)
-		default:
-			return requirePublicationState(
-				current, model.PublicationPending, model.PublicationFailed,
-				model.PublicationPublishing,
-			)
+		if err := requirePublicationState(current, model.PublicationPending); err != nil {
+			return err
 		}
+		if current.ClaimEpoch == math.MaxInt64 {
+			return errors.New("publication claim epoch is exhausted")
+		}
+		currentTime, _, err := s.publicationCurrent()
+		if err != nil {
+			return err
+		}
+		expires := currentTime.Add(input.TTL)
+		if expires.Year() < 0 || expires.Year() > 9999 {
+			return errors.New("publication claim expiry must fit RFC3339")
+		}
+		expiresAt := expires.Format(publicationTimestampLayout)
+		token, err := claimToken()
+		if err != nil {
+			return fmt.Errorf("generate publication claim token: %w", err)
+		}
+		timestamp := now()
+		update, err := tx.ExecContext(ctx, `
+			UPDATE publications
+			SET status = 'publishing', error = NULL, claim_epoch = claim_epoch + 1,
+				claim_token = ?, claim_expires_at = ?, updated_at = ?
+			WHERE id = ? AND board = ? AND status = 'pending' AND updated_at = ?
+				AND claim_epoch = ? AND claim_epoch < ?
+				AND claim_token IS NULL AND claim_expires_at IS NULL
+		`, token, expiresAt, timestamp, current.ID, board, current.UpdatedAt,
+			current.ClaimEpoch, int64(math.MaxInt64))
 		if err != nil {
 			return err
 		}
@@ -918,8 +901,10 @@ func (s *Store) ClaimPublication(
 				ID: current.ID, Expected: current.UpdatedAt, Actual: "unknown",
 			}
 		}
+		current.ClaimEpoch++
 		if err := appendEvent(ctx, tx, current.TaskID, "publication_claimed", map[string]any{
-			"publicationId": current.ID, "claimExpiresAt": expiresAt,
+			"publicationId": current.ID, "claimEpoch": current.ClaimEpoch,
+			"claimExpiresAt": expiresAt,
 		}, &current.RunID); err != nil {
 			return err
 		}
@@ -941,6 +926,7 @@ func (s *Store) ClaimPublication(
 func requireLivePublicationClaim(
 	value model.Publication,
 	token string,
+	epoch int64,
 	current time.Time,
 ) error {
 	token = strings.TrimSpace(token)
@@ -950,7 +936,7 @@ func requireLivePublicationClaim(
 	if value.ClaimToken == "" || value.ClaimExpiresAt == nil {
 		return fmt.Errorf("publishing publication %s has no claim lease", value.ID)
 	}
-	if token == "" || token != value.ClaimToken {
+	if token == "" || token != value.ClaimToken || epoch != value.ClaimEpoch {
 		return fmt.Errorf("%w: %s", ErrPublicationClaimNotOwner, value.ID)
 	}
 	expired, err := publicationClaimExpired(value, current)
@@ -982,15 +968,14 @@ func (s *Store) CompletePublication(
 	id string,
 	input CompletePublicationInput,
 ) (model.Publication, error) {
+	if input.ClaimEpoch <= 0 {
+		return model.Publication{}, errors.New("publication claim epoch must be positive")
+	}
 	board, err := normalizePublicationBoard("", s.board)
 	if err != nil {
 		return model.Publication{}, err
 	}
 	rawURL, err := normalizePublicationURL(input.URL)
-	if err != nil {
-		return model.Publication{}, err
-	}
-	currentTime, currentTimestamp, err := normalizePublicationCurrent(input.Current)
 	if err != nil {
 		return model.Publication{}, err
 	}
@@ -1003,7 +988,16 @@ func (s *Store) CompletePublication(
 		if err := requirePublicationVersion(current, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
-		if err := requireLivePublicationClaim(current, input.ClaimToken, currentTime); err != nil {
+		currentTime, currentTimestamp, err := s.publicationCurrent()
+		if err != nil {
+			return err
+		}
+		if err := requireLivePublicationClaim(
+			current,
+			input.ClaimToken,
+			input.ClaimEpoch,
+			currentTime,
+		); err != nil {
 			return err
 		}
 		timestamp := now()
@@ -1012,10 +1006,11 @@ func (s *Store) CompletePublication(
 			SET status = 'published', url = ?, error = NULL, claim_token = NULL,
 				claim_expires_at = NULL, published_at = ?, updated_at = ?
 			WHERE id = ? AND board = ? AND status = 'publishing' AND updated_at = ?
-				AND claim_token = ? AND claim_expires_at = ? AND claim_expires_at > ?
+				AND claim_epoch = ? AND claim_token = ? AND claim_expires_at = ?
+				AND claim_expires_at > ?
 		`, nullableString(rawURL), timestamp, timestamp, current.ID, board,
-			current.UpdatedAt, current.ClaimToken, *current.ClaimExpiresAt,
-			currentTimestamp)
+			current.UpdatedAt, current.ClaimEpoch, current.ClaimToken,
+			*current.ClaimExpiresAt, currentTimestamp)
 		if err != nil {
 			return err
 		}
@@ -1029,7 +1024,8 @@ func (s *Store) CompletePublication(
 			}
 		}
 		if err := appendEvent(ctx, tx, current.TaskID, "publication_completed", map[string]any{
-			"publicationId": current.ID, "mode": current.Mode, "url": rawURL,
+			"publicationId": current.ID, "claimEpoch": current.ClaimEpoch,
+			"mode": current.Mode, "url": rawURL,
 		}, &current.RunID); err != nil {
 			return err
 		}
@@ -1051,15 +1047,14 @@ func (s *Store) FailPublication(
 	id string,
 	input FailPublicationInput,
 ) (model.Publication, error) {
+	if input.ClaimEpoch <= 0 {
+		return model.Publication{}, errors.New("publication claim epoch must be positive")
+	}
 	board, err := normalizePublicationBoard("", s.board)
 	if err != nil {
 		return model.Publication{}, err
 	}
 	failure, err := boundedPublicationError(input.Error)
-	if err != nil {
-		return model.Publication{}, err
-	}
-	currentTime, currentTimestamp, err := normalizePublicationCurrent(input.Current)
 	if err != nil {
 		return model.Publication{}, err
 	}
@@ -1072,7 +1067,16 @@ func (s *Store) FailPublication(
 		if err := requirePublicationVersion(current, input.ExpectedUpdatedAt); err != nil {
 			return err
 		}
-		if err := requireLivePublicationClaim(current, input.ClaimToken, currentTime); err != nil {
+		currentTime, currentTimestamp, err := s.publicationCurrent()
+		if err != nil {
+			return err
+		}
+		if err := requireLivePublicationClaim(
+			current,
+			input.ClaimToken,
+			input.ClaimEpoch,
+			currentTime,
+		); err != nil {
 			return err
 		}
 		timestamp := now()
@@ -1081,9 +1085,11 @@ func (s *Store) FailPublication(
 			SET status = 'failed', error = ?, claim_token = NULL,
 				claim_expires_at = NULL, updated_at = ?
 			WHERE id = ? AND board = ? AND status = 'publishing' AND updated_at = ?
-				AND claim_token = ? AND claim_expires_at = ? AND claim_expires_at > ?
+				AND claim_epoch = ? AND claim_token = ? AND claim_expires_at = ?
+				AND claim_expires_at > ?
 		`, failure, timestamp, current.ID, board, current.UpdatedAt,
-			current.ClaimToken, *current.ClaimExpiresAt, currentTimestamp)
+			current.ClaimEpoch, current.ClaimToken, *current.ClaimExpiresAt,
+			currentTimestamp)
 		if err != nil {
 			return err
 		}
@@ -1097,7 +1103,8 @@ func (s *Store) FailPublication(
 			}
 		}
 		if err := appendEvent(ctx, tx, current.TaskID, "publication_failed", map[string]any{
-			"publicationId": current.ID, "error": failure,
+			"publicationId": current.ID, "claimEpoch": current.ClaimEpoch,
+			"error": failure,
 		}, &current.RunID); err != nil {
 			return err
 		}

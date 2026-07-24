@@ -85,12 +85,11 @@ func failDashboardPublication(
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	current := time.Now().UTC()
 	claimed, acquired, err := opened.ClaimPublication(
 		ctx,
 		value.ID,
 		store.ClaimPublicationInput{
-			ExpectedUpdatedAt: value.UpdatedAt, TTL: time.Minute, Current: current,
+			ExpectedUpdatedAt: value.UpdatedAt, TTL: time.Minute,
 		},
 	)
 	if err != nil || !acquired {
@@ -98,7 +97,7 @@ func failDashboardPublication(
 	}
 	failed, err := opened.FailPublication(ctx, value.ID, store.FailPublicationInput{
 		ExpectedUpdatedAt: claimed.UpdatedAt, ClaimToken: claimed.ClaimToken,
-		Current: current.Add(time.Second), Error: "temporary publication failure",
+		ClaimEpoch: claimed.ClaimEpoch, Error: "temporary publication failure",
 	})
 	if err != nil {
 		t.Fatal(err)
