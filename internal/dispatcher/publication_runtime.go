@@ -11,6 +11,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 	"github.com/nn1a/autogora/internal/publisher"
 	"github.com/nn1a/autogora/internal/store"
 )
@@ -249,6 +250,19 @@ func executePublicationWithCapability(
 		publisher.Options{CommandTimeout: options.PublicationTimeout},
 	)
 	cancel()
+	if errors.Is(executionErr, processguard.ErrTeardownUnconfirmed) {
+		quarantineErr := options.automationSession.quarantinePublicationTeardown(
+			claimed,
+		)
+		return true, errors.Join(
+			fmt.Errorf(
+				"execute publication %s with unconfirmed teardown: %w",
+				claimed.ID,
+				executionErr,
+			),
+			quarantineErr,
+		)
+	}
 	persistenceContext, cancelPersistence := context.WithTimeout(
 		context.WithoutCancel(ctx), publicationPersistenceTimeout,
 	)

@@ -3177,6 +3177,15 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		shutdownErr := automation.Shutdown(automationStopped)
 		runErr = errors.Join(runErr, automation.Err(), shutdownErr)
 	}()
+	if err := quarantineUnconfirmedPublishingOwnership(
+		manager,
+		automation,
+	); err != nil {
+		return err
+	}
+	if err := automation.Err(); err != nil {
+		return err
+	}
 	if err := automation.CheckGate(ctx); err != nil {
 		return err
 	}

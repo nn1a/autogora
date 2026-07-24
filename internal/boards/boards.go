@@ -109,6 +109,18 @@ type Metadata struct {
 	LogsRoot        string                   `json:"logsRoot"`
 	Orchestration   OrchestrationSettings    `json:"orchestration"`
 	Counts          map[model.TaskStatus]int `json:"counts,omitempty"`
+	listedIdentity  *listedBoardIdentity
+}
+
+type listedBoardIdentity struct {
+	slug          string
+	archived      bool
+	dbPath        string
+	dbInfo        os.FileInfo
+	directoryPath string
+	directoryInfo os.FileInfo
+	createdAt     string
+	hasCreatedAt  bool
 }
 
 type Update struct {
@@ -819,7 +831,178 @@ func (m *Manager) update(slug string, update Update) (Metadata, error) {
 	return m.write(slug, update, nil)
 }
 
-func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, error) {
+func attachListedBoardIdentity(
+	metadata *Metadata,
+	archivedDirectory string,
+) error {
+	if metadata == nil {
+		return errors.New("listed board metadata is required")
+	}
+	slug, err := NormalizeSlug(metadata.Slug)
+	if err != nil {
+		return err
+	}
+	dbPath, err := filepath.Abs(strings.TrimSpace(metadata.DBPath))
+	if err != nil || strings.TrimSpace(metadata.DBPath) == "" {
+		return errors.New("listed board database path is required")
+	}
+	var dbInfo os.FileInfo
+	if metadata.Archived {
+		dbInfo, err = os.Lstat(dbPath)
+	} else {
+		dbInfo, err = os.Stat(dbPath)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect listed board %s database: %w", slug, err)
+	}
+	if !dbInfo.Mode().IsRegular() ||
+		(metadata.Archived && dbInfo.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf(
+			"listed board %s database must be a regular file",
+			slug,
+		)
+	}
+	identity := &listedBoardIdentity{
+		slug: slug, archived: metadata.Archived,
+		dbPath: dbPath, dbInfo: dbInfo,
+	}
+	if metadata.CreatedAt != nil {
+		identity.createdAt = *metadata.CreatedAt
+		identity.hasCreatedAt = true
+	}
+	if metadata.Archived {
+		directoryPath, err := filepath.Abs(archivedDirectory)
+		if err != nil || strings.TrimSpace(archivedDirectory) == "" {
+			return errors.New("listed archived board directory is required")
+		}
+		directoryInfo, err := os.Lstat(directoryPath)
+		if err != nil {
+			return fmt.Errorf(
+				"inspect listed archived board %s directory: %w",
+				slug,
+				err,
+			)
+		}
+		if !directoryInfo.IsDir() ||
+			directoryInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"listed archived board %s directory must be a real directory",
+				slug,
+			)
+		}
+		identity.directoryPath = directoryPath
+		identity.directoryInfo = directoryInfo
+	}
+	metadata.DBPath = dbPath
+	metadata.listedIdentity = identity
+	return nil
+}
+
+func listedCreatedAtMatches(
+	identity *listedBoardIdentity,
+	createdAt *string,
+) bool {
+	if identity == nil {
+		return false
+	}
+	if createdAt == nil {
+		return !identity.hasCreatedAt
+	}
+	return identity.hasCreatedAt && identity.createdAt == *createdAt
+}
+
+func (m *Manager) listActiveMetadata(
+	ctx context.Context,
+	slug string,
+) (metadata Metadata, err error) {
+	metadataLock, acquired, lockErr := acquireBoardMutationLock(
+		m.boardMetadataLockPath(slug),
+		false,
+	)
+	if lockErr != nil {
+		return Metadata{}, fmt.Errorf(
+			"lock board %s metadata for recovery inventory: %w",
+			slug,
+			lockErr,
+		)
+	}
+	if !acquired {
+		return Metadata{}, fmt.Errorf(
+			"%w: %s",
+			ErrBoardMutationInProgress,
+			slug,
+		)
+	}
+	lifecycleLock, acquired, lifecycleErr := acquireBoardMutationLock(
+		m.boardLifecycleLockPath(slug),
+		false,
+	)
+	if lifecycleErr != nil || !acquired {
+		closeErr := metadataLock.Close()
+		if lifecycleErr != nil {
+			return Metadata{}, errors.Join(
+				fmt.Errorf(
+					"lock board %s lifecycle for recovery inventory: %w",
+					slug,
+					lifecycleErr,
+				),
+				closeErr,
+			)
+		}
+		return Metadata{}, errors.Join(
+			fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug),
+			closeErr,
+		)
+	}
+	defer func() {
+		err = errors.Join(
+			err,
+			lifecycleLock.Close(),
+			metadataLock.Close(),
+		)
+	}()
+	if err := ctx.Err(); err != nil {
+		return Metadata{}, err
+	}
+	metadata, err = m.Read(slug)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if metadata.Archived {
+		return Metadata{}, fmt.Errorf(
+			"active recovery inventory found archived metadata for board %s",
+			slug,
+		)
+	}
+	if err := attachListedBoardIdentity(&metadata, ""); err != nil {
+		return Metadata{}, err
+	}
+	current, err := m.Read(slug)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if current.Archived ||
+		current.DBPath != metadata.DBPath ||
+		!listedCreatedAtMatches(metadata.listedIdentity, current.CreatedAt) {
+		return Metadata{}, fmt.Errorf(
+			"board %s changed during recovery inventory",
+			slug,
+		)
+	}
+	return metadata, nil
+}
+
+// ListMetadata returns active and, when requested, archived board locations
+// without opening their databases. Callers that inspect archived databases
+// must pass these values to OpenListedPublicationRecoveryReader so the path
+// remains constrained to the manager-owned archive root.
+func (m *Manager) ListMetadata(
+	ctx context.Context,
+	includeArchived bool,
+) ([]Metadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	slugs := map[string]bool{"default": true}
 	entries, err := os.ReadDir(m.boardsRoot)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -843,45 +1026,92 @@ func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, e
 	}
 	result := make([]Metadata, 0, len(ordered))
 	for _, slug := range ordered {
-		metadata, err := m.Read(slug)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		metadata, err := m.listActiveMetadata(ctx, slug)
 		if err != nil {
 			return nil, err
 		}
-		opened, err := m.OpenStore(ctx, slug)
-		if err != nil {
-			return nil, err
-		}
-		counts, countErr := opened.CountTasksByStatus(ctx, slug)
-		closeErr := opened.Close()
-		if countErr != nil {
-			return nil, countErr
-		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		metadata.Counts = counts
 		result = append(result, metadata)
 	}
 	if !includeArchived {
 		return result, nil
 	}
 	archivedRoot := filepath.Join(m.boardsRoot, "_archived")
+	archivedRootInfo, err := os.Lstat(archivedRoot)
+	if err == nil {
+		if !archivedRootInfo.IsDir() ||
+			archivedRootInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New(
+				"archived recovery inventory root must be a real directory",
+			)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	archivedEntries, err := os.ReadDir(archivedRoot)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	for _, entry := range archivedEntries {
-		if !entry.IsDir() {
-			continue
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		directory := filepath.Join(archivedRoot, entry.Name())
+		entryInfo, err := os.Lstat(directory)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"inspect archived recovery inventory entry %s: %w",
+				entry.Name(),
+				err,
+			)
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf(
+				"archived recovery inventory contains a symbolic link: %s",
+				entry.Name(),
+			)
+		}
+		if !entryInfo.IsDir() {
+			continue
+		}
 		raw := readPersisted(filepath.Join(directory, "board.json"))
 		slug := raw.Slug
 		if slug == "" {
 			slug = regexp.MustCompile(`-\d+$`).ReplaceAllString(entry.Name(), "")
 		}
 		metadata := Metadata{Slug: slug, Name: raw.Name, Description: raw.Description, Icon: raw.Icon, Color: raw.Color, DefaultWorkdir: raw.DefaultWorkdir, CreatedAt: raw.CreatedAt, Archived: true, DBPath: filepath.Join(directory, "autogora.db"), WorkspaceRoot: filepath.Join(directory, "workspaces"), AttachmentsRoot: filepath.Join(directory, "attachments"), LogsRoot: filepath.Join(directory, "logs"), Orchestration: normalizeOrchestration(raw.Orchestration)}
+		if err := attachListedBoardIdentity(&metadata, directory); err != nil {
+			return nil, err
+		}
 		result = append(result, metadata)
+	}
+	return result, nil
+}
+
+func (m *Manager) List(ctx context.Context, includeArchived bool) ([]Metadata, error) {
+	result, err := m.ListMetadata(ctx, includeArchived)
+	if err != nil {
+		return nil, err
+	}
+	for index := range result {
+		if result[index].Archived {
+			continue
+		}
+		opened, err := m.OpenStore(ctx, result[index].Slug)
+		if err != nil {
+			return nil, err
+		}
+		counts, countErr := opened.CountTasksByStatus(ctx, result[index].Slug)
+		closeErr := opened.Close()
+		if countErr != nil {
+			return nil, errors.Join(countErr, closeErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		result[index].Counts = counts
 	}
 	return result, nil
 }
@@ -1403,6 +1633,342 @@ func (m *Manager) OpenStore(ctx context.Context, board string) (*store.Store, er
 		}
 	}
 	if err := metadataLock.Close(); err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	return opened, nil
+}
+
+func validateListedBoardIdentity(
+	metadata Metadata,
+	slug string,
+	archived bool,
+) (*listedBoardIdentity, error) {
+	identity := metadata.listedIdentity
+	if identity == nil {
+		return nil, errors.New(
+			"board metadata was not produced by the recovery inventory",
+		)
+	}
+	if metadata.Slug != slug ||
+		metadata.Archived != archived ||
+		identity.slug != slug ||
+		identity.archived != archived ||
+		identity.dbInfo == nil ||
+		!listedCreatedAtMatches(identity, metadata.CreatedAt) {
+		return nil, errors.New(
+			"board metadata does not match its listed recovery identity",
+		)
+	}
+	dbPath, err := filepath.Abs(strings.TrimSpace(metadata.DBPath))
+	if err != nil || strings.TrimSpace(metadata.DBPath) == "" {
+		return nil, errors.New("listed board database path is required")
+	}
+	if dbPath != identity.dbPath {
+		return nil, errors.New(
+			"board database path does not match its listed recovery identity",
+		)
+	}
+	return identity, nil
+}
+
+func (m *Manager) openActiveListedPublicationRecoveryReader(
+	ctx context.Context,
+	metadata Metadata,
+	slug string,
+) (*store.PublicationRecoveryReader, error) {
+	identity, err := validateListedBoardIdentity(
+		metadata,
+		slug,
+		false,
+	)
+	if err != nil {
+		return nil, err
+	}
+	expectedDBPath, err := m.DBPath(slug)
+	if err != nil {
+		return nil, err
+	}
+	expectedDBPath, err = filepath.Abs(expectedDBPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"resolve active board %s database: %w",
+			slug,
+			err,
+		)
+	}
+	if expectedDBPath != identity.dbPath {
+		return nil, errors.New(
+			"active board database is outside its manager-owned location",
+		)
+	}
+
+	metadataLock, acquired, lockErr := acquireBoardMutationLock(
+		m.boardMetadataLockPath(slug),
+		false,
+	)
+	if lockErr != nil {
+		return nil, fmt.Errorf(
+			"lock board %s metadata for publication recovery: %w",
+			slug,
+			lockErr,
+		)
+	}
+	if !acquired {
+		return nil, fmt.Errorf(
+			"%w: %s",
+			ErrBoardMutationInProgress,
+			slug,
+		)
+	}
+	lifecycleLock, acquired, lifecycleErr := acquireBoardMutationLock(
+		m.boardLifecycleLockPath(slug),
+		false,
+	)
+	if lifecycleErr != nil || !acquired {
+		closeErr := metadataLock.Close()
+		if lifecycleErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf(
+					"lock board %s lifecycle for publication recovery: %w",
+					slug,
+					lifecycleErr,
+				),
+				closeErr,
+			)
+		}
+		return nil, errors.Join(
+			fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug),
+			closeErr,
+		)
+	}
+	closeLocks := func(cause error) error {
+		return errors.Join(
+			cause,
+			lifecycleLock.Close(),
+			metadataLock.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, closeLocks(err)
+	}
+	current, err := m.Read(slug)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	currentDBPath, err := filepath.Abs(current.DBPath)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	if current.Slug != slug ||
+		current.Archived ||
+		currentDBPath != identity.dbPath ||
+		!listedCreatedAtMatches(identity, current.CreatedAt) {
+		return nil, closeLocks(fmt.Errorf(
+			"active board %s changed since recovery inventory",
+			slug,
+		))
+	}
+	dbInfo, err := os.Stat(identity.dbPath)
+	if err != nil {
+		return nil, closeLocks(fmt.Errorf(
+			"inspect active board %s database: %w",
+			slug,
+			err,
+		))
+	}
+	if !dbInfo.Mode().IsRegular() ||
+		!os.SameFile(identity.dbInfo, dbInfo) {
+		return nil, closeLocks(fmt.Errorf(
+			"active board %s database changed since recovery inventory",
+			slug,
+		))
+	}
+	opened, err := store.OpenPublicationRecoveryReader(
+		ctx,
+		identity.dbPath,
+		slug,
+	)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	opened.SetCloseHook(lifecycleLock.Close)
+	dbInfoAfterOpen, statErr := os.Stat(identity.dbPath)
+	if statErr != nil ||
+		!dbInfoAfterOpen.Mode().IsRegular() ||
+		!os.SameFile(identity.dbInfo, dbInfoAfterOpen) {
+		if statErr == nil {
+			statErr = fmt.Errorf(
+				"active board %s database changed while opening recovery reader",
+				slug,
+			)
+		} else {
+			statErr = fmt.Errorf(
+				"reinspect active board %s database: %w",
+				slug,
+				statErr,
+			)
+		}
+		return nil, errors.Join(
+			statErr,
+			opened.Close(),
+			metadataLock.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(
+			err,
+			opened.Close(),
+			metadataLock.Close(),
+		)
+	}
+	if err := metadataLock.Close(); err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	return opened, nil
+}
+
+// OpenListedPublicationRecoveryReader opens an active board by slug or an
+// archived board through the exact manager-owned location returned by
+// ListMetadata. It is query-only: startup ownership checks never migrate or
+// otherwise mutate an archived database. Exact quarantine evidence is written
+// separately through the dispatcher's shared default-board authority.
+func (m *Manager) OpenListedPublicationRecoveryReader(
+	ctx context.Context,
+	metadata Metadata,
+) (*store.PublicationRecoveryReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	slug, err := NormalizeSlug(metadata.Slug)
+	if err != nil {
+		return nil, err
+	}
+	if !metadata.Archived {
+		return m.openActiveListedPublicationRecoveryReader(
+			ctx,
+			metadata,
+			slug,
+		)
+	}
+	archiveRoot, err := filepath.Abs(filepath.Join(m.boardsRoot, "_archived"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve archived board root: %w", err)
+	}
+	dbPath, err := filepath.Abs(strings.TrimSpace(metadata.DBPath))
+	if err != nil || strings.TrimSpace(metadata.DBPath) == "" {
+		return nil, errors.New("archived board database path is required")
+	}
+	relative, err := filepath.Rel(archiveRoot, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve archived board database: %w", err)
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] == "" || parts[0] == "." ||
+		parts[0] == ".." || parts[1] != "autogora.db" {
+		return nil, errors.New(
+			"archived board database is outside its manager-owned location",
+		)
+	}
+	directory := filepath.Join(archiveRoot, parts[0])
+	identity, err := validateListedBoardIdentity(metadata, slug, true)
+	if err != nil {
+		return nil, err
+	}
+	if identity.directoryInfo == nil ||
+		identity.directoryPath != directory {
+		return nil, errors.New(
+			"archived board directory does not match its listed recovery identity",
+		)
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil {
+		return nil, fmt.Errorf("inspect archived board directory: %w", err)
+	}
+	if !directoryInfo.IsDir() ||
+		directoryInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("archived board directory must be a real directory")
+	}
+	if !os.SameFile(identity.directoryInfo, directoryInfo) {
+		return nil, errors.New(
+			"archived board directory changed since recovery inventory",
+		)
+	}
+	dbInfo, err := os.Lstat(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect archived board database: %w", err)
+	}
+	if !dbInfo.Mode().IsRegular() || dbInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("archived board database must be a regular file")
+	}
+	if !os.SameFile(identity.dbInfo, dbInfo) {
+		return nil, errors.New(
+			"archived board database changed since recovery inventory",
+		)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(archiveRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve archived board root links: %w", err)
+	}
+	canonicalDB, err := filepath.EvalSymlinks(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve archived board database links: %w", err)
+	}
+	canonicalRelative, err := filepath.Rel(canonicalRoot, canonicalDB)
+	if err != nil {
+		return nil, fmt.Errorf("validate archived board database links: %w", err)
+	}
+	canonicalParts := strings.Split(
+		canonicalRelative,
+		string(filepath.Separator),
+	)
+	if len(canonicalParts) != 2 ||
+		canonicalParts[0] != parts[0] ||
+		canonicalParts[1] != "autogora.db" {
+		return nil, errors.New(
+			"archived board database resolves outside its manager-owned location",
+		)
+	}
+	contents, err := os.ReadFile(filepath.Join(directory, "board.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read archived board metadata: %w", err)
+	}
+	var raw persistedMetadata
+	if err := json.Unmarshal(contents, &raw); err != nil {
+		return nil, fmt.Errorf("decode archived board metadata: %w", err)
+	}
+	persistedSlug, err := NormalizeSlug(raw.Slug)
+	if err != nil ||
+		persistedSlug != slug ||
+		!raw.Archived ||
+		!listedCreatedAtMatches(identity, raw.CreatedAt) {
+		return nil, errors.New(
+			"archived board metadata does not match its listed identity",
+		)
+	}
+	opened, err := store.OpenPublicationRecoveryReader(ctx, dbPath, slug)
+	if err != nil {
+		return nil, err
+	}
+	directoryInfoAfterOpen, directoryStatErr := os.Lstat(directory)
+	dbInfoAfterOpen, dbStatErr := os.Lstat(dbPath)
+	if directoryStatErr != nil ||
+		dbStatErr != nil ||
+		!directoryInfoAfterOpen.IsDir() ||
+		directoryInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!dbInfoAfterOpen.Mode().IsRegular() ||
+		dbInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.directoryInfo, directoryInfoAfterOpen) ||
+		!os.SameFile(identity.dbInfo, dbInfoAfterOpen) {
+		return nil, errors.Join(
+			errors.New(
+				"archived board changed while opening recovery reader",
+			),
+			directoryStatErr,
+			dbStatErr,
+			opened.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, errors.Join(err, opened.Close())
 	}
 	return opened, nil

@@ -1,0 +1,243 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/nn1a/autogora/internal/model"
+	_ "modernc.org/sqlite"
+)
+
+// PublicationRecoveryReader is a query-only startup view. It deliberately
+// bypasses Store initialization so archived databases are never migrated or
+// otherwise changed merely because a dispatcher checks ownership.
+type PublicationRecoveryReader struct {
+	db        *sql.DB
+	board     string
+	closeOnce sync.Once
+	closeHook func() error
+	closeErr  error
+}
+
+const publicationRecoveryPageSize = 100
+
+func OpenPublicationRecoveryReader(
+	ctx context.Context,
+	dbPath string,
+	board string,
+) (*PublicationRecoveryReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	board, err := normalizePublicationBoard(board, board)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(dbPath) == "" || dbPath == ":memory:" {
+		return nil, errors.New(
+			"publication recovery requires a persistent database path",
+		)
+	}
+	resolved, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve publication recovery database: %w", err)
+	}
+	source := &url.URL{Scheme: "file", Path: filepath.ToSlash(resolved)}
+	query := source.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "query_only(1)")
+	query.Add("_pragma", "busy_timeout(5000)")
+	source.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", source.String())
+	if err != nil {
+		return nil, fmt.Errorf("open publication recovery database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	closeWith := func(cause error) (*PublicationRecoveryReader, error) {
+		return nil, errors.Join(cause, db.Close())
+	}
+	if err := db.PingContext(ctx); err != nil {
+		return closeWith(fmt.Errorf("read publication recovery database: %w", err))
+	}
+	var tableName string
+	err = db.QueryRowContext(
+		ctx,
+		`SELECT name FROM sqlite_master
+		 WHERE type = 'table' AND name = 'publications'`,
+	).Scan(&tableName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return closeWith(errors.New(
+			"publication recovery schema is missing publications table",
+		))
+	}
+	if err != nil {
+		return closeWith(fmt.Errorf("inspect publication recovery schema: %w", err))
+	}
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(publications)")
+	if err != nil {
+		return closeWith(fmt.Errorf("inspect publication columns: %w", err))
+	}
+	columns := make(map[string]string)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			rows.Close()
+			return closeWith(fmt.Errorf("scan publication columns: %w", err))
+		}
+		columns[strings.ToLower(strings.TrimSpace(name))] =
+			strings.ToUpper(strings.TrimSpace(columnType))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return closeWith(fmt.Errorf("inspect publication columns: %w", err))
+	}
+	if err := rows.Close(); err != nil {
+		return closeWith(err)
+	}
+	for _, required := range []string{
+		"id",
+		"board",
+		"status",
+		"updated_at",
+		"claim_epoch",
+	} {
+		if _, ok := columns[required]; !ok {
+			return closeWith(fmt.Errorf(
+				"publication recovery schema is missing %s",
+				required,
+			))
+		}
+	}
+	if columns["claim_epoch"] != "INTEGER" {
+		return closeWith(errors.New(
+			"publication recovery claim_epoch must be INTEGER",
+		))
+	}
+	return &PublicationRecoveryReader{
+		db:    db,
+		board: board,
+	}, nil
+}
+
+func (r *PublicationRecoveryReader) Close() error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	r.closeOnce.Do(func() {
+		r.closeErr = r.db.Close()
+		if r.closeHook != nil {
+			r.closeErr = errors.Join(r.closeErr, r.closeHook())
+		}
+	})
+	return r.closeErr
+}
+
+// SetCloseHook lets Boards.Manager retain an active board's lifecycle lock
+// until the query-only reader releases its SQLite handle.
+func (r *PublicationRecoveryReader) SetCloseHook(hook func() error) {
+	r.closeHook = hook
+}
+
+// ListPublishingAfter returns one token-free keyset page and its next cursor.
+// An empty next cursor proves that the full publishing set was consumed.
+func (r *PublicationRecoveryReader) ListPublishingAfter(
+	ctx context.Context,
+	afterID string,
+) ([]model.Publication, string, error) {
+	if r == nil || r.db == nil {
+		return nil, "", errors.New("publication recovery reader is closed")
+	}
+	afterID, err := validRecordID(afterID, "publication recovery cursor")
+	if err != nil {
+		return nil, "", err
+	}
+	rows, err := r.db.QueryContext(
+		ctx,
+		`SELECT id, board, status, updated_at, claim_epoch
+		 FROM publications
+		 WHERE status = 'publishing' AND id > ?
+		 ORDER BY id
+		 LIMIT ?`,
+		afterID,
+		publicationRecoveryPageSize+1,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	result := make([]model.Publication, 0, publicationRecoveryPageSize+1)
+	for rows.Next() {
+		var value model.Publication
+		if err := rows.Scan(
+			&value.ID,
+			&value.Board,
+			&value.Status,
+			&value.UpdatedAt,
+			&value.ClaimEpoch,
+		); err != nil {
+			return nil, "", err
+		}
+		rawID := value.ID
+		normalizedID, err := validRecordID(rawID, "publication recovery ID")
+		if err != nil || normalizedID == "" {
+			if err == nil {
+				err = errors.New("publication recovery ID cannot be empty")
+			}
+			return nil, "", err
+		}
+		if normalizedID != rawID {
+			return nil, "", errors.New(
+				"publication recovery ID is not stored canonically",
+			)
+		}
+		rawUpdatedAt := value.UpdatedAt
+		normalizedUpdatedAt, err := normalizedPublicationText(
+			rawUpdatedAt,
+			"publication recovery updatedAt",
+			128,
+			true,
+		)
+		if err != nil {
+			return nil, "", err
+		}
+		if normalizedUpdatedAt != rawUpdatedAt {
+			return nil, "", errors.New(
+				"publication recovery updatedAt is not stored canonically",
+			)
+		}
+		if value.Board != r.board ||
+			value.Status != model.PublicationPublishing ||
+			value.ClaimEpoch <= 0 {
+			return nil, "", fmt.Errorf(
+				"publication %s has incompatible publishing ownership evidence",
+				value.ID,
+			)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(result) > publicationRecoveryPageSize {
+		result = result[:publicationRecoveryPageSize]
+		next = result[len(result)-1].ID
+	}
+	return result, next, nil
+}

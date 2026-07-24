@@ -937,3 +937,100 @@ func TestExistingPublicationSchemaRejectsStoredNonIntegerClaimEpoch(t *testing.T
 		t.Fatalf("stored non-integer claim epoch error = %v", err)
 	}
 }
+
+func TestPublicationRecoveryReaderRejectsNonExactPublishingEvidence(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name   string
+		mutate func(model.Publication) (string, []any)
+	}{
+		{
+			name: "non-canonical updatedAt",
+			mutate: func(value model.Publication) (string, []any) {
+				return "UPDATE publications SET updated_at = ? WHERE id = ?",
+					[]any{" " + value.UpdatedAt, value.ID}
+			},
+		},
+		{
+			name: "non-positive claim epoch",
+			mutate: func(value model.Publication) (string, []any) {
+				return "UPDATE publications SET claim_epoch = 0 WHERE id = ?",
+					[]any{value.ID}
+			},
+		},
+		{
+			name: "board mismatch",
+			mutate: func(value model.Publication) (string, []any) {
+				return "UPDATE publications SET board = 'other' WHERE id = ?",
+					[]any{value.ID}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "recovery-evidence.db")
+			opened, err := Open(dbPath, "default", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, changeSet := createPublicationSource(
+				t,
+				opened,
+				"recovery_evidence",
+				model.WorkflowRoleFinalizer,
+				model.TaskStatusDone,
+				model.RunStatusCompleted,
+				"ready",
+			)
+			pending, _, err := opened.EnsurePublication(
+				ctx,
+				publicationPolicyInput(changeSet.ID, false),
+			)
+			if err != nil {
+				opened.Close()
+				t.Fatal(err)
+			}
+			claimed, acquired, err := opened.ClaimPublication(
+				ctx,
+				pending.ID,
+				ClaimPublicationInput{
+					ExpectedUpdatedAt: pending.UpdatedAt,
+					TTL:               time.Minute,
+				},
+			)
+			if err != nil || !acquired {
+				opened.Close()
+				t.Fatalf("claim publication: acquired=%t err=%v", acquired, err)
+			}
+			query, arguments := test.mutate(claimed)
+			if _, err := opened.db.ExecContext(
+				ctx,
+				query,
+				arguments...,
+			); err != nil {
+				opened.Close()
+				t.Fatal(err)
+			}
+			if err := opened.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := OpenPublicationRecoveryReader(
+				ctx,
+				dbPath,
+				"default",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, readErr := reader.ListPublishingAfter(ctx, "")
+			closeErr := reader.Close()
+			if readErr == nil {
+				t.Fatal("corrupt publishing evidence passed recovery scan")
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+		})
+	}
+}
