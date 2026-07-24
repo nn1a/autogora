@@ -59,6 +59,9 @@ func (s *Server) handleAPI(response http.ResponseWriter, request *http.Request, 
 	if segments[1] == "operations" {
 		return s.handleOperations(response, request, segments)
 	}
+	if segments[1] == "recovery" {
+		return s.handleOperatorRecovery(response, request, segments)
+	}
 	board, err := s.boardFrom(request)
 	if err != nil {
 		return err

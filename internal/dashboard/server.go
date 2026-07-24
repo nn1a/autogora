@@ -22,6 +22,8 @@ import (
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/dispatcher"
 	"github.com/nn1a/autogora/internal/githubissues"
+	"github.com/nn1a/autogora/internal/operatorrecovery"
+	"github.com/nn1a/autogora/internal/store"
 	"github.com/nn1a/autogora/internal/supervisor"
 	webui "github.com/nn1a/autogora/web"
 )
@@ -211,6 +213,15 @@ func sendJSON(response http.ResponseWriter, status int, value any) {
 func errorStatus(err error) int {
 	message := strings.ToLower(err.Error())
 	switch {
+	case errors.Is(err, operatorrecovery.ErrInvalidConfirmation):
+		return http.StatusBadRequest
+	case errors.Is(err, store.ErrAutomationGateConflict),
+		errors.Is(err, store.ErrAutomationHostNotIdle),
+		errors.Is(err, store.ErrAutomationSourceConflict),
+		errors.Is(err, store.ErrAutomationQuarantined),
+		errors.Is(err, store.ErrPublicationRecoveryConflict),
+		errors.Is(err, operatorrecovery.ErrPublicationStorageConflict):
+		return http.StatusConflict
 	case strings.Contains(message, "exceeds") && strings.Contains(message, "bytes"):
 		return http.StatusRequestEntityTooLarge
 	case strings.Contains(message, "not found"):

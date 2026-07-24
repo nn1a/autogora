@@ -1173,6 +1173,68 @@ dialog::backdrop { background: rgb(4 8 16 / 62%); backdrop-filter: blur(3px); }
 .automation-record h3 { margin: 0 0 6px; overflow-wrap: anywhere; font-size: 15px; }
 .automation-record-meta { margin-top: 10px; }
 .automation-facts { margin-top: 10px; }
+.global-quarantine, .quarantine-confirmation {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 11px;
+}
+.quarantine-operator-fields, .quarantine-source-fields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 9px;
+}
+.quarantine-source-list { min-width: 0; }
+.quarantine-source { overflow: hidden; }
+.quarantine-source .automation-record-header > .mono {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+}
+.quarantine-source-summary {
+  margin: 7px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.quarantine-source-fields { margin-top: 11px; }
+.quarantine-source-fields label > span { color: var(--muted); font-size: 10px; }
+.quarantine-attestations {
+  min-width: 0;
+  margin: 0;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warning) 6%, var(--panel-2));
+}
+.quarantine-attestations legend {
+  padding: 0 5px;
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 750;
+}
+.quarantine-attestations label.inline {
+  display: flex;
+  min-width: 0;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.quarantine-attestations input[type="checkbox"] {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin-top: 1px;
+}
 .automation-proposal {
   min-width: 0;
   margin-top: 12px;

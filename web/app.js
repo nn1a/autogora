@@ -1793,6 +1793,9 @@ const AUTOMATION_HELP = {
     },
     recovery: "Planner handles normal Triage work. Coordinator only proposes recovery when the graph needs exceptional intervention.",
     recoveryAssist: "Assist mode waits for a person to approve, reject, or request a new analysis before changing the graph.",
+    quarantine: "Global safety quarantine stops automatic mutations when process or publication ownership cannot be proven. Clear it only after helper processes and external writers are stopped and every source has an observed outcome.",
+    quarantinePrepared: "One or more publication receipts are already durable, but authority source resolution has not started. Keep the recorded actor and reason, review the remaining sources, and confirm that all helpers and external writers are still stopped.",
+    quarantinePending: "Publication receipts are already durable, but gate clearing was interrupted. Resume with the exact recorded actor, reason, source outcomes, and generation.",
     publishing: "Each handoff preserves the Finalizer task, run, immutable change set, and head commit. Publication actions use the version currently shown.",
     manualEscalation: {
       empty: "No automatic graph changes are proposed. Resolve the affected task manually, dismiss this escalation, or request a new analysis.",
@@ -1823,6 +1826,9 @@ const AUTOMATION_HELP = {
     },
     recovery: "Planner는 일반 Triage 작업을 처리합니다. Coordinator는 그래프에 예외적인 개입이 필요할 때만 복구안을 제시합니다.",
     recoveryAssist: "Assist 모드에서는 사람이 승인, 거절, 재분석을 선택한 뒤에만 그래프를 변경합니다.",
+    quarantine: "프로세스나 publication 소유권을 확인할 수 없으면 전역 safety quarantine이 자동 변경을 중지합니다. helper process와 외부 writer가 모두 멈추고 각 source의 결과를 확인한 뒤에만 해제하세요.",
+    quarantinePrepared: "하나 이상의 publication receipt는 저장됐지만 authority source 해결은 아직 시작되지 않았습니다. 기록된 actor와 reason을 유지하고 남은 source를 검토한 뒤 helper와 외부 writer가 여전히 멈춰 있는지 다시 확인하세요.",
+    quarantinePending: "Publication receipt는 이미 저장했지만 gate 해제가 중단됐습니다. 기록된 actor, reason, source 결과, generation을 그대로 사용해 재개하세요.",
     publishing: "각 handoff는 Finalizer task, run, immutable change set, head commit을 보존합니다. 화면에 표시된 최신 상태를 확인한 뒤 publication 작업을 실행하세요.",
     manualEscalation: {
       empty: "자동으로 적용할 그래프 변경안이 없습니다. 영향을 받은 작업을 직접 해결하거나, 이 에스컬레이션을 Dismiss하거나, Reanalyze로 다시 분석하세요.",
@@ -2145,6 +2151,7 @@ function readinessStep(name, ready, detail, checks) {
 function automationReadiness(data, planner, workerRoutes) {
   const orchestration = data.metadata?.orchestration || {};
   const autopilot = orchestration.autopilot || {};
+  const safetyGateReady = !data.quarantine?.gate?.active;
   const supervisorReady = Boolean(data.supervisor.running);
   const autopilotReady = Boolean(autopilot.enabled);
   const plannerPolicyReady = Boolean(autopilot.autoPlan && orchestration.autoDecompose);
@@ -2153,20 +2160,20 @@ function automationReadiness(data, planner, workerRoutes) {
   const workerReady = workerRoutes.some((profile) => !workerRouteUnavailable(profile));
   const projectReady = Boolean(String(data.metadata?.defaultWorkdir || "").trim());
   const writesReady = Boolean(data.supervisor.allowWrites && autopilot.workspaceWrites);
-  const planningReady = supervisorReady && autopilotReady && plannerPolicyReady && plannerReady;
-  const dispatchReady = supervisorReady && autopilotReady && dispatcherPolicyReady;
+  const planningReady = safetyGateReady && supervisorReady && autopilotReady && plannerPolicyReady && plannerReady;
+  const dispatchReady = safetyGateReady && supervisorReady && autopilotReady && dispatcherPolicyReady;
   const executionReady = dispatchReady && workerReady && projectReady && writesReady;
   const automaticReady = planningReady && executionReady;
   return {
     ready: automaticReady,
     html: `<ol class="automation-readiness" aria-label="Automatic task path readiness">
       ${readinessStep("Triage", true, "Dashboard tasks enter the automatic planning queue.", [["Eligible dashboard task", true]])}
-      ${readinessStep("Planner", planningReady, planningReady ? `${planner.profile} can prepare Triage work.` : "Enable planning and configure an available Planner.", [
-        ["Supervisor", supervisorReady], ["Autopilot", autopilotReady],
+      ${readinessStep("Planner", planningReady, planningReady ? `${planner.profile} can prepare Triage work.` : !safetyGateReady ? "Resolve the global safety quarantine before planning resumes." : "Enable planning and configure an available Planner.", [
+        ["Safety gate", safetyGateReady], ["Supervisor", supervisorReady], ["Autopilot", autopilotReady],
         ["Triage planning", plannerPolicyReady], ["Planner route", plannerReady],
       ])}
-      ${readinessStep("Dispatcher", dispatchReady, dispatchReady ? "Ready tasks can be claimed automatically." : "Start Supervisor and enable AutoExecute.", [
-        ["Supervisor", supervisorReady], ["Autopilot", autopilotReady], ["AutoExecute", dispatcherPolicyReady],
+      ${readinessStep("Dispatcher", dispatchReady, dispatchReady ? "Ready tasks can be claimed automatically." : !safetyGateReady ? "Resolve the global safety quarantine before dispatch resumes." : "Start Supervisor and enable AutoExecute.", [
+        ["Safety gate", safetyGateReady], ["Supervisor", supervisorReady], ["Autopilot", autopilotReady], ["AutoExecute", dispatcherPolicyReady],
       ])}
       ${readinessStep("Worker", executionReady, executionReady ? `${workerRoutes.length} route${workerRoutes.length === 1 ? "" : "s"} can run code tasks.` : "Configure a Worker, project directory, and write policy for code tasks.", [
         ["Worker route", workerReady], ["Project directory", projectReady], ["Global writes", Boolean(data.supervisor.allowWrites)],
@@ -2224,7 +2231,9 @@ function renderAutomationOverview(data) {
   const publicationState = publicationRoleState(data.publications);
   const coordinationAttention = Number(coordination.activeCount || 0);
   const supervisorAttention = data.supervisor.lastError ? 1 : 0;
-  const attention = issues.length + publicationState.attention + coordinationAttention + supervisorAttention;
+  const quarantineAttention = data.quarantine?.gate?.active ? 1 : 0;
+  const attention = issues.length + publicationState.attention + coordinationAttention +
+    supervisorAttention + quarantineAttention;
   const approvals = Number(coordination.awaitingApprovalCount || 0) +
     publicationState.approvals;
   const supervisor = supervisorPresentation(data.supervisor);
@@ -2279,6 +2288,7 @@ function renderAutomationOverview(data) {
     }),
   ].join("");
   return `${automationLoadWarnings(data)}
+    ${quarantineAttention ? `<div class="automation-warning"><strong>Global safety quarantine active</strong><p>Generation ${data.quarantine.gate.generation} blocks automatic mutations. Open Recovery to review ${Number(data.quarantine.gate.activeSourceCount || data.quarantine.sources?.length || 0)} source(s).</p></div>` : ""}
     <section class="activity-section">
       <div class="activity-summary automation-summary">
         <div><small>Board policy</small><strong>${autopilot.enabled ? "Autopilot enabled" : "Manual control"}</strong><span>${autopilot.workspaceWrites && data.supervisor.allowWrites ? "Writes permitted" : "Read-only boundary"}</span></div>
@@ -2447,6 +2457,120 @@ function coordinationIncidentCard(entry, actionsAvailable) {
   </article>`;
 }
 
+function globalQuarantineActive(data = state.automationData) {
+  return Boolean(data?.quarantine?.gate?.active);
+}
+
+function quarantineSourceSummary(source) {
+  if (source.kind === "publication") {
+    const storage = source.publication || {};
+    const location = storage.archived == null ? "location unknown" : storage.archived ? "archived board" : "active board";
+    return `Publication ownership is unresolved · ${storage.matchCount ?? 0} storage match(es) · ${location}`;
+  }
+  return `${humanizeIdentifier(source.kind || "unknown source")} requires an operator disposition`;
+}
+
+function quarantineSourceCard(source, phase) {
+  const storage = source.publication || {};
+  const publication = source.kind === "publication";
+  const locked = phase === "pending" || Boolean(source.receiptDisposition);
+  const outcome = source.outcome || "";
+  const recordedDisposition = source.receiptDisposition || source.disposition;
+  const disposition = recordedDisposition === "active" ? "" : recordedDisposition || "";
+  const exactStorage = !publication || storage.matchCount === 1;
+  const resultURL = source.resultUrl || "";
+  return `<article class="automation-record quarantine-source" data-quarantine-source="${escapeHtml(source.sourceKey)}">
+    <header class="automation-record-header"><div><h3>${escapeHtml(source.sourceId || "Unknown source")}</h3><div class="automation-statuses">${automationStatus(source.kind || "unknown")}${automationStatus(exactStorage ? "ready" : "conflict")}</div></div><span class="mono">Generation ${Number(source.firstGeneration || 0)}</span></header>
+    <p class="quarantine-source-summary">${escapeHtml(quarantineSourceSummary(source))}</p>
+    <dl class="automation-record-meta">
+      <div><dt>Board</dt><dd>${escapeHtml(source.board || "—")}</dd></div>
+      <div><dt>Diagnostic</dt><dd>${escapeHtml(humanizeIdentifier(source.diagnosticCode || "unknown"))}</dd></div>
+      <div><dt>Observed update</dt><dd class="mono">${escapeHtml(source.observedUpdatedAt || "—")}</dd></div>
+      <div><dt>Claim epoch</dt><dd>${escapeHtml(source.observedClaimEpoch || "—")}</dd></div>
+      ${publication ? `<div><dt>Stored status</dt><dd>${escapeHtml(humanizeIdentifier(storage.currentStatus || "missing"))}</dd></div>
+      <div><dt>Storage</dt><dd>${storage.matchCount === 1 ? (storage.archived ? "Archived" : "Active") : `${Number(storage.matchCount || 0)} matches`}</dd></div>` : ""}
+    </dl>
+    ${publication ? `<div class="quarantine-source-fields">
+      <label>Observed publication outcome
+        <select data-quarantine-outcome required${locked ? " disabled" : ""}>
+          <option value=""${outcome ? "" : " selected"}>Select observed outcome</option>
+          <option value="published"${outcome === "published" ? " selected" : ""}>Published</option>
+          <option value="failed"${outcome === "failed" ? " selected" : ""}>Failed</option>
+          <option value="superseded"${outcome === "superseded" ? " selected" : ""}>Superseded</option>
+        </select>
+      </label>
+      <label>Published URL <span>optional; used only for Published</span>
+        <input data-quarantine-result-url type="url" value="${escapeHtml(resultURL)}" placeholder="https://…" ${outcome !== "published" ? "disabled" : locked ? "readonly" : ""}>
+      </label>
+    </div>` : `<div class="quarantine-source-fields">
+      <label>Disposition
+        <select data-quarantine-disposition required${locked ? " disabled" : ""}>
+          <option value=""${disposition ? "" : " selected"}>Select disposition</option>
+          <option value="abandoned"${disposition === "abandoned" ? " selected" : ""}>Abandoned</option>
+          <option value="superseded"${disposition === "superseded" ? " selected" : ""}>Superseded</option>
+        </select>
+      </label>
+    </div>`}
+    ${exactStorage ? "" : '<div class="automation-warning"><strong>Exact storage match required</strong><p>Recovery is blocked until this source matches exactly one active or archived board database.</p></div>'}
+  </article>`;
+}
+
+function renderGlobalQuarantine(data) {
+  const value = data.quarantine || {};
+  const gate = value.gate || {};
+  if (!gate.active) {
+    return `<section class="activity-section">
+      <h2 class="automation-section-title">Global safety quarantine</h2>
+      <div class="automation-help-callout"><strong>No global quarantine</strong><p>Automatic mutations are not blocked by unresolved process or publication ownership.</p></div>
+    </section>`;
+  }
+  const sources = value.sources || [];
+  const pending = value.pending || null;
+  const prepared = value.prepared || null;
+  const recoveryEvidence = pending || prepared;
+  const phase = pending ? "pending" : prepared ? "prepared" : "review";
+  const unacknowledged = Number(value.unacknowledgedSessionCount || 0);
+  const ambiguous = sources.some((source) =>
+    source.kind === "publication" && source.publication?.matchCount !== 1);
+  const actionsAvailable = Boolean(data.actionsAvailable.quarantine);
+  const blocked = !actionsAvailable || unacknowledged > 0 || ambiguous || !sources.length;
+  const actor = recoveryEvidence?.actor || "";
+  const reason = recoveryEvidence?.reason || "";
+  const sourceCards = sources.map((source) =>
+    quarantineSourceCard(source, phase)).join("");
+  return `<section class="activity-section global-quarantine">
+    <h2 class="automation-section-title">Global safety quarantine</h2>
+    <div class="automation-help-callout is-attention"><strong>${pending ? "Gate clearing interrupted" : prepared ? "Publication recovery partially recorded" : "Automatic mutations stopped"}</strong><p>${escapeHtml(automationHelp(pending ? "quarantinePending" : prepared ? "quarantinePrepared" : "quarantine"))}</p></div>
+    <div class="activity-summary automation-summary">
+      <div><small>Generation</small><strong>${Number(gate.generation || 0)}</strong><span>Exact confirmation required</span></div>
+      <div><small>Sources</small><strong>${sources.length}</strong><span>${Number(gate.activeSourceCount || 0)} unresolved in authority</span></div>
+      <div><small>Dispatcher sessions</small><strong>${unacknowledged}</strong><span>${unacknowledged ? "Awaiting quarantine acknowledgement" : "All live sessions acknowledged"}</span></div>
+      <div><small>Phase</small><strong>${pending ? "Resume clearing" : prepared ? "Resume prepared recovery" : "Operator review"}</strong><span>${pending ? "Authority resolution is durable" : prepared ? `${Number(prepared.recoveredPublicationSources || 0)} publication receipt(s) durable` : "No source has been resolved yet"}</span></div>
+    </div>
+    ${unacknowledged ? '<div class="automation-warning"><strong>Host is not idle</strong><p>Stop or wait for every live Dispatcher session, then refresh this view.</p></div>' : ""}
+    <form class="quarantine-confirmation" data-quarantine-form data-quarantine-generation="${Number(gate.generation || 0)}">
+      <div class="quarantine-operator-fields">
+        <label>Operator
+          <input name="actor" maxlength="128" value="${escapeHtml(actor)}" autocomplete="name" required ${recoveryEvidence ? "readonly" : ""}>
+        </label>
+        <label>Evidence and reason
+          <textarea name="reason" maxlength="2048" rows="3" required ${recoveryEvidence ? "readonly" : ""}>${escapeHtml(reason)}</textarea>
+        </label>
+      </div>
+      <div class="automation-record-list quarantine-source-list">${sourceCards || '<p class="automation-empty">No exact recovery sources were returned.</p>'}</div>
+      <fieldset class="quarantine-attestations">
+        <legend>Required confirmations</legend>
+        <label class="inline"><input name="helpersStopped" type="checkbox" ${pending?.helpersStopped ? "checked disabled" : ""} required> Supervisor, Dispatcher, coding-agent helpers, and publication processes are stopped.</label>
+        <label class="inline"><input name="externalWritesStopped" type="checkbox" ${pending?.externalWritesStopped ? "checked disabled" : ""} required> External workspace, Git, and publication writers are stopped.</label>
+      </fieldset>
+      <div class="automation-actions">
+        <button type="submit" class="danger" data-quarantine-action="confirm" ${blocked ? "disabled" : ""}>${pending ? "Resume exact recovery" : prepared ? "Resume prepared recovery" : `Confirm and clear generation ${Number(gate.generation || 0)}`}</button>
+        ${!actionsAvailable ? "<span>Recovery status is stale or unavailable. Refresh before confirming.</span>" : ""}
+      </div>
+    </form>
+  </section>`;
+}
+
 function renderAutomationRecovery(data) {
   const policy = data.coordination.policy || {};
   let records = '<p class="automation-empty">No coordination incidents.</p>';
@@ -2455,6 +2579,7 @@ function renderAutomationRecovery(data) {
     .map((entry) => coordinationIncidentCard(entry, data.actionsAvailable.recovery)).join("");
   else if (!data.recoveryLoaded && (data.coordination.incidents || []).length) records = '<div class="detail-row">Loading recovery proposals…</div>';
   return `${automationLoadWarnings(data)}
+    ${renderGlobalQuarantine(data)}
     <div class="automation-help-callout"><strong>Planner ≠ Coordinator</strong><p>${escapeHtml(automationHelp("recovery"))}</p></div>
     ${policy.mode === "assist" ? `<div class="automation-help-callout is-attention"><strong>Assist mode</strong><p>${escapeHtml(automationHelp("recoveryAssist"))}</p></div>` : ""}
     <section class="activity-section">
@@ -2475,9 +2600,10 @@ function safeExternalURL(value) {
   } catch (_) { return null; }
 }
 
-function publicationCard(item, actionsAvailable) {
+function publicationCard(item, actionsAvailable, quarantineActive = false) {
   const link = safeExternalURL(item.url);
-  const canReject = actionsAvailable && ["awaiting_approval", "pending", "failed"].includes(item.status);
+  const rejectEligible = actionsAvailable && ["awaiting_approval", "pending", "failed"].includes(item.status);
+  const retryEligible = actionsAvailable && item.status === "failed";
   const canComplete = actionsAvailable && item.mode === "manual" && item.status === "pending" &&
     (!item.requireApproval || item.approvedAt);
   return `<article class="automation-record publication-record">
@@ -2494,10 +2620,11 @@ function publicationCard(item, actionsAvailable) {
       <div><dt>URL</dt><dd>${link ? `<a data-automation-focus="publication:url:${escapeHtml(item.id)}" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.url)}</a>` : escapeHtml(item.url || "—")}</dd></div>
     </dl>
     ${item.error ? `<div class="automation-error"><strong>Error</strong><p>${escapeHtml(item.error)}</p></div>` : ""}
-    ${actionsAvailable && (item.status === "awaiting_approval" || canReject || item.status === "failed" || canComplete) ? `<div class="automation-actions">
+    ${quarantineActive && (rejectEligible || retryEligible) ? '<div class="automation-warning"><strong>Global safety quarantine</strong><p>Retry and Reject remain disabled until the exact quarantine source set is resolved.</p></div>' : ""}
+    ${actionsAvailable && (item.status === "awaiting_approval" || rejectEligible || retryEligible || canComplete) ? `<div class="automation-actions">
       ${actionsAvailable && item.status === "awaiting_approval" ? `<button type="button" class="primary" data-automation-focus="publication:approve:${escapeHtml(item.id)}" data-publication-action="approve" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Approve</button>` : ""}
-      ${canReject ? `<button type="button" class="danger" data-automation-focus="publication:reject:${escapeHtml(item.id)}" data-publication-action="reject" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Reject</button>` : ""}
-      ${actionsAvailable && item.status === "failed" ? `<button type="button" data-automation-focus="publication:retry:${escapeHtml(item.id)}" data-publication-action="retry" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Retry</button>` : ""}
+      ${rejectEligible ? `<button type="button" class="danger" data-automation-focus="publication:reject:${escapeHtml(item.id)}" data-publication-action="reject" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}" ${quarantineActive ? 'disabled title="Resolve global safety quarantine first"' : ""}>Reject</button>` : ""}
+      ${retryEligible ? `<button type="button" data-automation-focus="publication:retry:${escapeHtml(item.id)}" data-publication-action="retry" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}" ${quarantineActive ? 'disabled title="Resolve global safety quarantine first"' : ""}>Retry</button>` : ""}
       ${canComplete ? `<button type="button" class="primary" data-automation-focus="publication:complete:${escapeHtml(item.id)}" data-publication-action="complete" data-publication-id="${escapeHtml(item.id)}" data-publication-version="${escapeHtml(item.updatedAt)}">Complete manually</button>` : ""}
     </div>` : ""}
   </article>`;
@@ -2515,7 +2642,7 @@ function renderAutomationPublishing(data) {
         <div><small>Needs attention</small><strong>${publicationState.attention}</strong><span>${publicationState.failed} failed · ${publicationState.approvals} approval · ${publicationState.manual} manual</span></div>
       </div>
     </section>
-    <section class="activity-section"><h2 class="automation-section-title">Publication handoffs</h2><div class="automation-record-list">${data.publications.map((item) => publicationCard(item, data.actionsAvailable.publishing)).join("") || '<p class="automation-empty">No publication handoffs yet.</p>'}</div></section>`;
+    <section class="activity-section"><h2 class="automation-section-title">Publication handoffs</h2><div class="automation-record-list">${data.publications.map((item) => publicationCard(item, data.actionsAvailable.publishing, globalQuarantineActive(data))).join("") || '<p class="automation-empty">No publication handoffs yet.</p>'}</div></section>`;
 }
 
 function eventSummary(payload) {
@@ -2600,7 +2727,7 @@ function setAutomationBusy(busy) {
   content.setAttribute("aria-busy", String(busy));
   $("#activity-refresh").disabled = busy;
   if (busy) {
-    $$("[data-coordination-action], [data-publication-action]", content)
+    $$("[data-coordination-action], [data-publication-action], [data-quarantine-action]", content)
       .forEach((button) => { button.disabled = true; });
   }
 }
@@ -2719,6 +2846,7 @@ async function loadActivity() {
       api(boardPathFor(board, "/api/agents/effective"), { signal }),
       api(boardPathFor(board, "/api/operations"), { signal }),
       api(boardPathFor(board, "/api/coordination"), { signal }),
+      api("/api/recovery/quarantine", { signal }),
       api(boardPathFor(board, "/api/publications?limit=100"), { signal }),
     ]);
     if (!currentAutomationRequest(board, generation, signal)) return false;
@@ -2729,22 +2857,24 @@ async function loadActivity() {
       previous?.effective || { profiles: state.effectiveAgents || [], config: state.agentConfig || {}, metadata: state.metadata },
       previous?.operations || state.operations || [],
       previous?.coordination || { policy: state.metadata?.orchestration?.autopilot?.coordination || {}, incidents: [], activeCount: 0, awaitingApprovalCount: 0 },
+      previous?.quarantine || { gate: { active: false }, sources: [], unacknowledgedSessionCount: 0 },
       previous?.publications || [],
     ];
-    const labels = ["Board inspection", "Supervisor", "Agents", "Operations", "Recovery", "Publishing"];
+    const labels = ["Board inspection", "Supervisor", "Agents", "Operations", "Recovery", "Global safety", "Publishing"];
     const values = requests.map((request, index) => request.status === "fulfilled" ? request.value : fallback[index]);
     const loadErrors = requests.flatMap((request, index) => request.status === "rejected" && request.reason?.name !== "AbortError"
       ? [{ label: labels[index], message: request.reason?.message || "Request failed" }] : []);
-    const [inspection, supervisor, effective, operations, coordination, publications] = values;
+    const [inspection, supervisor, effective, operations, coordination, quarantine, publications] = values;
     const data = {
       board, loadGeneration: generation, requestSignal: signal,
       metadata: effective.metadata || previous?.metadata || state.metadata,
       inspection, supervisor, effective, operations: operations || [], coordination,
-      publications: publications || [], loadErrors, recoveryDetails: [], recoveryLoaded: false,
+      quarantine, publications: publications || [], loadErrors, recoveryDetails: [], recoveryLoaded: false,
       recoveryLoading: false,
       actionsAvailable: {
         recovery: requests[4].status === "fulfilled",
-        publishing: requests[5].status === "fulfilled",
+        quarantine: requests[5].status === "fulfilled",
+        publishing: requests[6].status === "fulfilled",
       },
     };
     state.supervisor = supervisor;
@@ -2781,6 +2911,90 @@ async function runAutomationMutation(button, action, successMessage) {
   } finally {
     if (button.isConnected) button.disabled = false;
   }
+}
+
+function quarantineConfirmationFromForm(form, data) {
+  const quarantine = data.quarantine || {};
+  const generation = Number(form.dataset.quarantineGeneration || 0);
+  if (!quarantine.gate?.active || generation !== Number(quarantine.gate.generation)) {
+    throw new Error("The global quarantine generation changed. Refresh before confirming.");
+  }
+  const actor = String(form.elements.actor?.value || "").trim();
+  const reason = String(form.elements.reason?.value || "").trim();
+  if (!actor || !reason) throw new Error("Operator and evidence are required.");
+  if (!form.elements.helpersStopped?.checked || !form.elements.externalWritesStopped?.checked) {
+    throw new Error("Both stopped-process and stopped-writer confirmations are required.");
+  }
+  const sources = (quarantine.sources || []).map((source) => {
+    const container = $$("[data-quarantine-source]", form)
+      .find((element) => element.dataset.quarantineSource === source.sourceKey);
+    if (!container) throw new Error(`Recovery source ${source.sourceKey} is no longer rendered.`);
+    const value = {
+      sourceKey: source.sourceKey,
+      board: source.board,
+      kind: source.kind,
+      sourceId: source.sourceId,
+      observedUpdatedAt: source.observedUpdatedAt || "",
+      observedClaimEpoch: source.observedClaimEpoch || "",
+      diagnosticCode: source.diagnosticCode,
+    };
+    if (source.kind === "publication") {
+      const outcome = $("[data-quarantine-outcome]", container)?.value || "";
+      if (!["published", "failed", "superseded"].includes(outcome)) {
+        throw new Error(`Select the observed outcome for publication ${source.sourceId}.`);
+      }
+      value.outcome = outcome;
+      value.disposition = outcome === "failed" ? "abandoned" : "superseded";
+      const resultURL = String($("[data-quarantine-result-url]", container)?.value || "").trim();
+      if (outcome === "published" && resultURL) value.resultUrl = resultURL;
+    } else {
+      const disposition = $("[data-quarantine-disposition]", container)?.value || "";
+      if (!["abandoned", "superseded"].includes(disposition)) {
+        throw new Error(`Select a disposition for ${source.sourceId}.`);
+      }
+      value.disposition = disposition;
+    }
+    return value;
+  });
+  return {
+    generation, actor, reason,
+    helpersStopped: true,
+    externalWritesStopped: true,
+    sources,
+  };
+}
+
+async function confirmGlobalQuarantine(form) {
+  const data = state.automationData;
+  if (!data || data.board !== state.board || !data.actionsAvailable.quarantine) {
+    toast("Global recovery data is stale. Refresh before confirming.", true);
+    return;
+  }
+  if (!form.reportValidity()) return;
+  let input;
+  try {
+    input = quarantineConfirmationFromForm(form, data);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+  const pending = Boolean(data.quarantine?.pending);
+  const prepared = Boolean(data.quarantine?.prepared);
+  const promptText = pending
+    ? `Resume exact recovery for generation ${input.generation}?`
+    : prepared
+      ? `Resume prepared recovery for generation ${input.generation} after reviewing ${input.sources.length} exact source(s)?`
+    : `Clear global quarantine generation ${input.generation} after resolving ${input.sources.length} exact source(s)?`;
+  if (!confirm(promptText)) return;
+  const button = $("[data-quarantine-action=confirm]", form);
+  await runAutomationMutation(
+    button,
+    () => api("/api/recovery/quarantine/confirm", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+    pending || prepared ? "Global quarantine recovery resumed" : "Global quarantine cleared",
+  );
 }
 
 async function mutateCoordination(button) {
@@ -2842,6 +3056,10 @@ async function mutatePublication(button) {
   const data = state.automationData;
   if (!data || data.board !== state.board || !data.actionsAvailable.publishing) {
     toast("Publishing data is stale. Refresh before acting.", true);
+    return;
+  }
+  if (globalQuarantineActive(data) && ["reject", "retry"].includes(action)) {
+    toast("Resolve the global safety quarantine before changing this publication.", true);
     return;
   }
   const item = data.publications.find((value) => value.id === button.dataset.publicationId);
@@ -3380,6 +3598,21 @@ function bindGlobalActions() {
     }
     const publicationButton = event.target.closest("[data-publication-action]");
     if (publicationButton) mutatePublication(publicationButton).catch((error) => toast(error.message, true));
+  });
+  $("#activity-content").addEventListener("change", (event) => {
+    const outcome = event.target.closest("[data-quarantine-outcome]");
+    if (!outcome) return;
+    const source = outcome.closest("[data-quarantine-source]");
+    const resultURL = source && $("[data-quarantine-result-url]", source);
+    if (!resultURL || resultURL.readOnly) return;
+    resultURL.disabled = outcome.value !== "published";
+    if (resultURL.disabled) resultURL.value = "";
+  });
+  $("#activity-content").addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-quarantine-form]");
+    if (!form) return;
+    event.preventDefault();
+    confirmGlobalQuarantine(form).catch((error) => toast(error.message, true));
   });
   $("#manage-agents").addEventListener("click", () => {
     $("#settings-dialog").close();

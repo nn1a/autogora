@@ -263,6 +263,49 @@ func TestAutomationCenterTreatsEmptyCoordinationActionsAsManualEscalation(t *tes
 	}
 }
 
+func TestAutomationCenterSeparatesGlobalQuarantineRecovery(t *testing.T) {
+	javascript := dashboardAsset(t, "app.js")
+	styles := dashboardAsset(t, "styles.css")
+	for _, marker := range []string{
+		`api("/api/recovery/quarantine", { signal })`,
+		`function renderGlobalQuarantine(data)`,
+		`Global safety quarantine`,
+		`data-quarantine-form`,
+		`data-quarantine-generation=`,
+		`name="helpersStopped"`,
+		`name="externalWritesStopped"`,
+		`data-quarantine-outcome`,
+		`data-quarantine-disposition`,
+		`const prepared = value.prepared || null`,
+		`Boolean(source.receiptDisposition)`,
+		`prepared.recoveredPublicationSources`,
+		`function quarantineConfirmationFromForm(form, data)`,
+		`sourceKey: source.sourceKey`,
+		`observedUpdatedAt: source.observedUpdatedAt || ""`,
+		`observedClaimEpoch: source.observedClaimEpoch || ""`,
+		`api("/api/recovery/quarantine/confirm"`,
+		`Resolve the global safety quarantine before changing this publication.`,
+		`data.actionsAvailable.quarantine`,
+	} {
+		if !strings.Contains(javascript, marker) {
+			t.Fatalf("global quarantine recovery marker %q is missing", marker)
+		}
+	}
+	if strings.Contains(javascript, `boardPathFor(board, "/api/recovery/quarantine"`) {
+		t.Fatal("global quarantine status must not be scoped to the selected board")
+	}
+	for _, marker := range []string{
+		`.global-quarantine, .quarantine-confirmation`,
+		`.quarantine-operator-fields, .quarantine-source-fields`,
+		`.quarantine-attestations`,
+		`grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));`,
+	} {
+		if !strings.Contains(styles, marker) {
+			t.Fatalf("global quarantine responsive style %q is missing", marker)
+		}
+	}
+}
+
 func TestAutomationCenterIsResponsiveWithoutDialogOverflow(t *testing.T) {
 	styles := dashboardAsset(t, "styles.css")
 	for _, marker := range []string{
