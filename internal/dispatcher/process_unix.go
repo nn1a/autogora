@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -103,17 +104,57 @@ func supportedUnixBinaryMagic(value []byte) bool {
 // subreaper, and does not start the coding agent until the dispatcher records
 // the guard PID and identity.
 func newWorkerCommand(ctx context.Context, command RunnerCommand) (*workerCommand, error) {
-	guarded, err := processguard.NewFencedCommand(ctx, command.Command, command.Args...)
+	guarded, err := processguard.NewFencedCommand(
+		ctx,
+		command.Command,
+		command.Args...,
+	)
 	if err != nil {
 		return nil, err
 	}
-	return &workerCommand{
-		child:   guarded.Command,
-		start:   guarded.Start,
-		wait:    guarded.Wait,
+	child := &exec.Cmd{}
+	var cleanupOnce sync.Once
+	worker := &workerCommand{
+		child: child,
+		// Every Unix worker is owned by FencedCommand, including the direct
+		// fallback used outside Linux. Its stop/cleanup lifecycle must never
+		// fall back to a reusable numeric proxy PID or process group.
+		guarded: true,
+		start: func() error {
+			guarded.Dir = child.Dir
+			guarded.Env = append([]string(nil), child.Env...)
+			guarded.Stdin = child.Stdin
+			guarded.Stdout = child.Stdout
+			guarded.Stderr = child.Stderr
+			if err := guarded.Start(); err != nil {
+				return err
+			}
+			pid, err := guarded.PID()
+			if err != nil {
+				return err
+			}
+			child.Process, err = os.FindProcess(pid)
+			return err
+		},
+		wait: func() error {
+			err := guarded.Wait()
+			child.ProcessState = guarded.ProcessState()
+			return err
+		},
 		release: guarded.Release,
-		cleanup: guarded.Close,
-	}, nil
+		stop: func(bool) error {
+			return guarded.RequestStop()
+		},
+	}
+	worker.cleanup = func() {
+		cleanupOnce.Do(func() {
+			guarded.Close()
+			if child.Process != nil {
+				_ = child.Process.Release()
+			}
+		})
+	}
+	return worker, nil
 }
 
 func configureProcess(cmd *exec.Cmd) {
@@ -123,9 +164,16 @@ func configureProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
-func attachProcessTree(cmd *exec.Cmd) (func(), error) {
+func attachProcessTree(cmd *exec.Cmd, guarded bool) (func(), error) {
 	pid := cmd.Process.Pid
 	return func() {
+		if guarded {
+			// FencedCommand owns this lifecycle. Linux proves descendant
+			// quiescence itself; fallback platforms retain their conservative
+			// recovery policy. Neither may use this proxy PID after Wait because
+			// cleanup can release it and numeric identifiers can be reused.
+			return
+		}
 		// This closure runs only for the exact command started by this
 		// dispatcher. Unlike restart recovery, the group cannot have been
 		// confused with an unrelated persisted PID, so it is safe to clean up
@@ -135,12 +183,6 @@ func attachProcessTree(cmd *exec.Cmd) (func(), error) {
 		}
 		_ = syscall.Kill(-pid, syscall.SIGTERM)
 		if waitForProcessGroup(pid, time.Second) {
-			return
-		}
-		if processguard.IsGuardCommand(cmd) {
-			// The Linux guard escalates its descendants itself. Killing the
-			// subreaper would destroy teardown proof and let setsid children
-			// escape. Leave a non-quiescent guard for recovery/operator action.
 			return
 		}
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
@@ -166,7 +208,7 @@ func terminateProcess(cmd *exec.Cmd, force bool) error {
 		return nil
 	}
 	signal := syscall.SIGTERM
-	if force && !processguard.IsGuardCommand(cmd) {
+	if force {
 		signal = syscall.SIGKILL
 	}
 	return syscall.Kill(-cmd.Process.Pid, signal)

@@ -13,6 +13,13 @@ var ErrAutomaticMutationContainmentUnavailable = errors.New(
 	"automatic mutation containment is unavailable",
 )
 
+// ErrUnsafeProcessGuardPrivileges means the host process would pass a
+// privilege to guarded targets that can bypass the process-identity or
+// descriptor boundary.
+var ErrUnsafeProcessGuardPrivileges = errors.New(
+	"process guard cannot run with unsafe privileges",
+)
+
 const automaticMutationContainmentUnsupportedReason = "this platform cannot attest that every descendant process stopped; automatic host and durable workspace mutations require the Linux process guard"
 
 // AutomaticMutationContainmentAvailable reports whether automatic writable
@@ -29,6 +36,9 @@ func AutomaticMutationContainmentAvailable() bool {
 func AutomaticMutationContainmentUnsupportedReason() string {
 	if AutomaticMutationContainmentAvailable() {
 		return ""
+	}
+	if reason := teardownProofUnavailableReason(); reason != "" {
+		return reason
 	}
 	return automaticMutationContainmentUnsupportedReason
 }

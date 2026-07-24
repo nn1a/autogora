@@ -28,16 +28,17 @@ func attachPlannerProcessTree(cmd *exec.Cmd) (func(), error) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			if processguard.IsGuardCommand(cmd) {
+				// The guard owns descendant termination and teardown proof.
+				// Never address its reusable numeric process group after a
+				// concurrent Wait may have reaped the guard.
+				return
+			}
 			if !plannerProcessGroupAlive(pid) {
 				return
 			}
 			_ = syscall.Kill(-pid, syscall.SIGTERM)
 			if waitForPlannerProcessGroup(pid, plannerProcessTerminationGrace) {
-				return
-			}
-			if processguard.IsGuardCommand(cmd) {
-				// The guard owns escalation and teardown proof. Killing it
-				// would let setsid descendants survive without an attestation.
 				return
 			}
 			_ = syscall.Kill(-pid, syscall.SIGKILL)

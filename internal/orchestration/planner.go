@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
@@ -53,11 +54,14 @@ const (
 )
 
 type limitedBuffer struct {
+	mu     sync.Mutex
 	buffer bytes.Buffer
 	limit  int
 }
 
 func (w *limitedBuffer) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	written := len(value)
 	remaining := w.limit - w.buffer.Len()
 	if remaining > 0 {
@@ -69,7 +73,11 @@ func (w *limitedBuffer) Write(value []byte) (int, error) {
 	return written, nil
 }
 
-func (w *limitedBuffer) String() string { return w.buffer.String() }
+func (w *limitedBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.String()
+}
 
 func plannerBinary(getenv func(string) string, runtime model.Runtime, configured string) string {
 	name := "AUTOGORA_" + strings.ToUpper(string(runtime)) + "_BIN"

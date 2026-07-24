@@ -3540,6 +3540,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				case <-workerFinished:
 					timer.Stop()
 					if err := handleWorkerResults(); err != nil {
+						cancelDispatcher()
 						processes.StopAll()
 						workers.Wait()
 						return err
@@ -3614,6 +3615,7 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		case <-workerFinished:
 			timer.Stop()
 			if err := handleWorkerResults(); err != nil {
+				cancelDispatcher()
 				processes.StopAll()
 				workers.Wait()
 				return err

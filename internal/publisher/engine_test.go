@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,33 @@ import (
 )
 
 type panicRunner struct{}
+
+func TestLimitedBufferConcurrentSnapshot(t *testing.T) {
+	buffer := limitedBuffer{limit: 64}
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		for range 1_000 {
+			_, _ = buffer.Write([]byte("abcdefgh"))
+		}
+	}()
+	go func() {
+		defer wait.Done()
+		for range 1_000 {
+			_, _ = buffer.snapshot()
+		}
+	}()
+	wait.Wait()
+	value, truncated := buffer.snapshot()
+	if len(value) != buffer.limit || !truncated {
+		t.Fatalf(
+			"limited buffer snapshot length=%d truncated=%t",
+			len(value),
+			truncated,
+		)
+	}
+}
 
 func (panicRunner) Run(
 	context.Context,

@@ -60,12 +60,34 @@ func NewFencedCommandContext(
 	), nil
 }
 
+// NewFencedCommandContextWithDurableReceipt fails before spawning on fallback
+// platforms because they cannot attest descendant teardown across restart.
+func NewFencedCommandContextWithDurableReceipt(
+	_ context.Context,
+	_ time.Duration,
+	receipt DurableReceiptConfig,
+	_ string,
+	_ ...string,
+) (*FencedCommand, error) {
+	if err := receipt.consume(); err != nil {
+		return nil, err
+	}
+	return nil, ErrDurableTeardownReceiptUnavailable
+}
+
+// ObserveDurableIdentity is unavailable on fallback platforms.
+func ObserveDurableIdentity(
+	_ DurableIdentity,
+) (DurableProcessObservation, error) {
+	return "", ErrDurableProcessIdentityUnavailable
+}
+
 func newGuardedCommandContext(
 	ctx context.Context,
 	name string,
 	args ...string,
-) (*exec.Cmd, teardownProof) {
-	return exec.CommandContext(ctx, name, args...), directTeardownProof{}
+) (*exec.Cmd, teardownProof, error) {
+	return exec.CommandContext(ctx, name, args...), directTeardownProof{}, nil
 }
 
 func IsGuardCommand(_ *exec.Cmd) bool { return false }
@@ -73,3 +95,7 @@ func IsGuardCommand(_ *exec.Cmd) bool { return false }
 // Direct fallback commands cannot attest descendants. Managed recovery must
 // remain operator-only on these platforms.
 func TeardownProofAvailable() bool { return false }
+
+func teardownProofUnavailableReason() string {
+	return automaticMutationContainmentUnsupportedReason
+}

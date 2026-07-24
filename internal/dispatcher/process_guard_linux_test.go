@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -59,7 +60,13 @@ func TestExecuteTurnCleansSetsidEscapedDescendant(t *testing.T) {
 func TestExecuteTurnReturnsUnconfirmedTeardownWithoutRuntimeLimit(t *testing.T) {
 	t.Setenv("AUTOGORA_INTERNAL_PROCESS_GUARD_TEST_INCOMPLETE_LINEAGE", "1")
 	t.Setenv("AUTOGORA_INTERNAL_PROCESS_GUARD_TEST_CLEANUP_LIMIT_MS", "50")
-	ctx := context.Background()
+	var teardownReports atomic.Int32
+	ctx := processguard.WithTeardownFailureReporter(
+		context.Background(),
+		func(error) {
+			teardownReports.Add(1)
+		},
+	)
 	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
 	if err != nil {
 		t.Fatal(err)
@@ -87,5 +94,8 @@ func TestExecuteTurnReturnsUnconfirmedTeardownWithoutRuntimeLimit(t *testing.T) 
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("unconfirmed worker cleanup blocked for %s", elapsed)
+	}
+	if reports := teardownReports.Load(); reports != 1 {
+		t.Fatalf("teardown reporter calls = %d, want 1", reports)
 	}
 }

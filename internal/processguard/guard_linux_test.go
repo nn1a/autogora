@@ -189,6 +189,54 @@ func TestLinuxGuardBoundsUnprovableCleanupWithoutAttesting(t *testing.T) {
 	}
 }
 
+func TestLinuxCommandCloseDoesNotReturnBeforeTeardownReporter(t *testing.T) {
+	t.Setenv(testIncompleteLineageEnvironment, "1")
+	t.Setenv(testCleanupLimitEnvironment, "50")
+	reportEntered := make(chan struct{})
+	continueReport := make(chan struct{})
+	ctx := WithTeardownFailureReporter(context.Background(), func(error) {
+		close(reportEntered)
+		<-continueReport
+	})
+	command := NewCommandContext(ctx, 5*time.Second, "/bin/true")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		waited <- command.Wait()
+	}()
+	select {
+	case <-reportEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("teardown reporter was not entered")
+	}
+	closed := make(chan struct{})
+	go func() {
+		command.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned before teardown reporter completion")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(continueReport)
+	select {
+	case err := <-waited:
+		if !errors.Is(err, ErrTeardownUnconfirmed) {
+			t.Fatalf("Wait error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait remained blocked after reporter completion")
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close remained blocked after reporter completion")
+	}
+}
+
 func TestLinuxFencedGuardReportsUnprovableCleanup(t *testing.T) {
 	t.Setenv(testIncompleteLineageEnvironment, "1")
 	t.Setenv(testCleanupLimitEnvironment, "50")
@@ -278,11 +326,18 @@ func TestLinuxFencedWaitersDoNotReturnBeforeTeardownReporter(
 	go func() {
 		second <- command.Wait()
 	}()
+	closed := make(chan struct{})
+	go func() {
+		command.Close()
+		close(closed)
+	}()
 	select {
 	case err := <-first:
 		t.Fatalf("primary Wait returned before reporter completion: %v", err)
 	case err := <-second:
 		t.Fatalf("concurrent Wait returned before reporter completion: %v", err)
+	case <-closed:
+		t.Fatal("Close returned before reporter completion")
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -300,10 +355,16 @@ func TestLinuxFencedWaitersDoNotReturnBeforeTeardownReporter(
 			t.Fatalf("%s Wait remained blocked after reporter completion", label)
 		}
 	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close remained blocked after reporter completion")
+	}
 }
 
 // TestLinuxGuardParentDeathHelper is re-executed as the parent whose abrupt
-// death must trigger the guard's PDEATHSIG cleanup.
+// death closes the proof socket. SIGCONT also wakes a stopped guard so it can
+// confirm either that EOF or a changed kernel parent identity before cleanup.
 func TestLinuxGuardParentDeathHelper(t *testing.T) {
 	if os.Getenv(parentHelperEnvironment) != "1" {
 		return
@@ -361,4 +422,33 @@ func TestLinuxGuardCleansEscapedDescendantAfterParentDeath(t *testing.T) {
 		t.Fatal("killed parent unexpectedly succeeded")
 	}
 	requireProcessGone(t, descendantPID)
+}
+
+func TestLinuxCommandCloseResumesStoppedGuard(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "guard-stopped")
+	reported := false
+	ctx := WithTeardownFailureReporter(
+		context.Background(),
+		func(error) { reported = true },
+	)
+	command := NewCommandContext(
+		ctx,
+		time.Minute,
+		"/bin/sh",
+		"-c",
+		`kill -STOP "$PPID"; printf stopped >"$1"; sleep 30`,
+		"autogora-target",
+		marker,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	requireFileEventually(t, marker)
+	command.Close()
+	if reported {
+		t.Fatal("Close reported an unconfirmed stopped immediate guard")
+	}
+	if command.ProcessState == nil {
+		t.Fatal("Close did not reap the stopped immediate guard")
+	}
 }

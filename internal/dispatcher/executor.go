@@ -28,6 +28,8 @@ type TurnExecution struct {
 	SessionID  string
 }
 
+var ErrProcessSetStopping = errors.New("dispatcher process set is stopping")
+
 // TurnStartCompensation reverses durable state reserved by a TurnStartGate
 // while the platform fence still guarantees that no coding-agent code has
 // been released. ExecuteTurn calls it with a fresh, bounded context that is
@@ -43,9 +45,11 @@ type TurnStartGate func(context.Context) (TurnStartCompensation, error)
 // agent. release is the only operation allowed to let user code run.
 type workerCommand struct {
 	child   *exec.Cmd
+	guarded bool
 	start   func() error
 	wait    func() error
 	release func() (bool, error)
+	stop    func(bool) error
 	cleanup func()
 }
 
@@ -73,15 +77,37 @@ func (b *tailBuffer) String() string {
 
 type ProcessSet struct {
 	mu        sync.Mutex
-	processes map[int]*exec.Cmd
+	processes map[int]trackedProcess
+	stopping  bool
 }
 
-func NewProcessSet() *ProcessSet { return &ProcessSet{processes: map[int]*exec.Cmd{}} }
+type trackedProcess struct {
+	command *exec.Cmd
+	stop    func(bool) error
+}
 
-func (p *ProcessSet) add(command *exec.Cmd) {
+func NewProcessSet() *ProcessSet {
+	return &ProcessSet{processes: map[int]trackedProcess{}}
+}
+
+// add registers one live process unless shutdown has sealed the set. A
+// rejected registration receives its graceful stop request before add returns,
+// so its caller cannot cross the worker release boundary.
+func (p *ProcessSet) add(command *exec.Cmd, stop func(bool) error) bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.processes[command.Process.Pid] = command
+	if p.stopping {
+		p.mu.Unlock()
+		if stop != nil {
+			_ = stop(false)
+		}
+		return false
+	}
+	p.processes[command.Process.Pid] = trackedProcess{
+		command: command,
+		stop:    stop,
+	}
+	p.mu.Unlock()
+	return true
 }
 
 func (p *ProcessSet) remove(command *exec.Cmd) {
@@ -90,18 +116,30 @@ func (p *ProcessSet) remove(command *exec.Cmd) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.processes, command.Process.Pid)
+	pid := command.Process.Pid
+	if tracked, ok := p.processes[pid]; ok &&
+		tracked.command == command {
+		delete(p.processes, pid)
+	}
 }
 
 func (p *ProcessSet) StopAll() {
 	p.mu.Lock()
-	commands := make([]*exec.Cmd, 0, len(p.processes))
-	for _, command := range p.processes {
-		commands = append(commands, command)
+	if p.stopping {
+		p.mu.Unlock()
+		return
 	}
+	p.stopping = true
+	processes := make([]trackedProcess, 0, len(p.processes))
+	for _, process := range p.processes {
+		processes = append(processes, process)
+	}
+	clear(p.processes)
 	p.mu.Unlock()
-	for _, command := range commands {
-		_ = terminateProcess(command, false)
+	for _, process := range processes {
+		if process.stop != nil {
+			_ = process.stop(false)
+		}
 	}
 }
 
@@ -134,13 +172,32 @@ func exitDetails(err error) (int, string) {
 	return -1, err.Error()
 }
 
-func stopAndWait(ctx context.Context, command *exec.Cmd, done <-chan error) error {
-	_ = terminateProcess(command, false)
+func stopAndWait(
+	ctx context.Context,
+	stop func(bool) error,
+	done <-chan error,
+) error {
+	if stop != nil {
+		_ = stop(false)
+	}
+	return waitAfterStop(ctx, stop, done)
+}
+
+// waitAfterStop bounds teardown after the caller has already issued the
+// graceful stop. It avoids sending a duplicate initial stop when ProcessSet.add
+// rejects a registration during shutdown.
+func waitAfterStop(
+	ctx context.Context,
+	stop func(bool) error,
+	done <-chan error,
+) error {
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(5 * time.Second):
-		_ = terminateProcess(command, true)
+		if stop != nil {
+			_ = stop(true)
+		}
 		select {
 		case err := <-done:
 			return err
@@ -227,9 +284,9 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if err := worker.start(); err != nil {
 		return TurnExecution{Code: -1, SpawnError: err}
 	}
-	releaseProcessTree, err := attachProcessTree(child)
+	releaseProcessTree, err := attachProcessTree(child, worker.guarded)
 	if err != nil {
-		_ = child.Process.Kill()
+		_ = worker.stop(true)
 		_ = worker.wait()
 		return TurnExecution{
 			Code:       -1,
@@ -238,13 +295,22 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		}
 	}
 	defer releaseProcessTree()
-	processes.add(child)
+	if !processes.add(child, worker.stop) {
+		done := make(chan error, 1)
+		go func() { done <- worker.wait() }()
+		waitErr := waitAfterStop(ctx, worker.stop, done)
+		return TurnExecution{
+			Code:       -1,
+			SpawnError: errors.Join(ErrProcessSetStopping, waitErr),
+			Output:     tail.String(),
+		}
+	}
 	defer processes.remove(child)
 	processIdentity, err := processidentity.Capture(child.Process.Pid)
 	if err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()
-		_ = stopAndWait(ctx, child, done)
+		_ = stopAndWait(ctx, worker.stop, done)
 		return TurnExecution{
 			Code:       -1,
 			SpawnError: fmt.Errorf("capture worker process identity: %w", err),
@@ -254,7 +320,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if _, err := opened.RecordSpawnWithIdentity(ctx, scope, child.Process.Pid, logPath, processIdentity); err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()
-		_ = stopAndWait(ctx, child, done)
+		_ = stopAndWait(ctx, worker.stop, done)
 		return TurnExecution{
 			Code:       -1,
 			SpawnError: fmt.Errorf("record worker spawn: %w", err),
@@ -267,7 +333,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		if err != nil {
 			done := make(chan error, 1)
 			go func() { done <- worker.wait() }()
-			_ = stopAndWait(ctx, child, done)
+			_ = stopAndWait(ctx, worker.stop, done)
 			return TurnExecution{Code: -1, SpawnError: err, Output: tail.String()}
 		}
 		defer stopBroker()
@@ -276,7 +342,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if err := ctx.Err(); err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()
-		_ = stopAndWait(ctx, child, done)
+		_ = stopAndWait(ctx, worker.stop, done)
 		return canceledTurnExecution(err)
 	}
 	if len(startGate) == 1 && startGate[0] != nil {
@@ -284,7 +350,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		if err != nil {
 			done := make(chan error, 1)
 			go func() { done <- worker.wait() }()
-			_ = stopAndWait(ctx, child, done)
+			_ = stopAndWait(ctx, worker.stop, done)
 			return TurnExecution{
 				Code: -1,
 				SpawnError: compensateUnstartedTurn(
@@ -298,7 +364,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if err := ctx.Err(); err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()
-		_ = stopAndWait(ctx, child, done)
+		_ = stopAndWait(ctx, worker.stop, done)
 		return canceledTurnExecution(
 			compensateUnstartedTurn(compensate, err),
 		)
@@ -313,7 +379,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()
-		_ = stopAndWait(ctx, child, done)
+		_ = stopAndWait(ctx, worker.stop, done)
 		if !released {
 			err = compensateUnstartedTurn(compensate, fmt.Errorf("release worker start barrier: %w", err))
 		} else {
@@ -336,7 +402,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		case waitErr = <-done:
 		case <-ctx.Done():
 			result.Canceled = true
-			waitErr = stopAndWait(ctx, child, done)
+			waitErr = stopAndWait(ctx, worker.stop, done)
 		}
 	} else {
 		limit := *runtimeLimit
@@ -349,16 +415,15 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		case waitErr = <-done:
 		case <-ctx.Done():
 			result.Canceled = true
-			waitErr = stopAndWait(ctx, child, done)
+			waitErr = stopAndWait(ctx, worker.stop, done)
 		case <-timer.C:
 			result.TimedOut = true
-			waitErr = stopAndWait(ctx, child, done)
+			waitErr = stopAndWait(ctx, worker.stop, done)
 		}
 	}
 	result.Code, result.Signal = exitDetails(waitErr)
 	if errors.Is(waitErr, processguard.ErrTeardownUnconfirmed) {
 		result.SpawnError = waitErr
-		processguard.ReportTeardownFailure(ctx, waitErr)
 	}
 	result.Output = tail.String()
 	result.SessionID = SessionIDFromOutput(result.Output)

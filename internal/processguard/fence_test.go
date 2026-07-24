@@ -46,6 +46,56 @@ func (fenceTestProof) afterStart() error { return nil }
 func (fenceTestProof) confirm() error    { return nil }
 func (fenceTestProof) close()            {}
 
+type fenceTestLease struct {
+	closed chan struct{}
+}
+
+func (l *fenceTestLease) close() error {
+	close(l.closed)
+	return nil
+}
+
+func TestFencedCommandLateProcessWaitStillClosesLifetimeLease(t *testing.T) {
+	finished := exec.Command("/bin/true")
+	if err := finished.Run(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	command := &FencedCommand{
+		command:                   &exec.Cmd{ProcessState: finished.ProcessState},
+		context:                   ctx,
+		cancel:                    func() {},
+		proof:                     fenceTestProof{},
+		teardownConfirmationDelay: 10 * time.Millisecond,
+		waitDone:                  make(chan struct{}),
+		state:                     fencedCommandReleased,
+	}
+	waited := make(chan error, 1)
+	lease := &fenceTestLease{closed: make(chan struct{})}
+	command.processWait = command.observeProcessWait(waited, lease)
+
+	if err := command.waitForProcess(); !errors.Is(
+		err,
+		ErrTeardownUnconfirmed,
+	) {
+		t.Fatalf("bounded wait error = %v", err)
+	}
+	waited <- nil
+	select {
+	case <-lease.closed:
+	case <-time.After(time.Second):
+		t.Fatal("late process Wait did not close the lifetime lease")
+	}
+	deadline := time.Now().Add(time.Second)
+	for command.ProcessState() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if command.ProcessState() != finished.ProcessState {
+		t.Fatal("late process Wait did not publish ProcessState")
+	}
+}
+
 func eofIgnoringFencedCommand(
 	t *testing.T,
 ) (*FencedCommand, string) {
@@ -245,7 +295,7 @@ func TestFencedCommandCloseReapsUnreleasedGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	command.Close()
-	if command.Command.ProcessState == nil {
+	if command.ProcessState() == nil {
 		t.Fatalf(
 			"Close returned without reaping the unreleased guard: state=%d waitStarted=%t waitComplete=%t waitErr=%v",
 			command.state,
@@ -289,7 +339,7 @@ func TestFencedCommandCloseBoundsExistingWaitOnEOFIgnoringGuard(
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("EOF-ignoring guard cancellation took %s", elapsed)
 	}
-	if command.Command.ProcessState == nil {
+	if command.ProcessState() == nil {
 		t.Fatal("EOF-ignoring guard was not reaped")
 	}
 }

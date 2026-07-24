@@ -16,9 +16,9 @@ func TestAutomaticMutationContainmentMatchesTeardownProof(t *testing.T) {
 			TeardownProofAvailable(),
 		)
 	}
-	if available != (runtime.GOOS == "linux") {
+	if runtime.GOOS != "linux" && available {
 		t.Fatalf(
-			"automatic mutation containment = %t on %s, want Linux only",
+			"automatic mutation containment = %t on unsupported %s",
 			available,
 			runtime.GOOS,
 		)

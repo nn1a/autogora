@@ -16,9 +16,13 @@ import (
 func newWorkerCommand(_ context.Context, command RunnerCommand) (*workerCommand, error) {
 	child := exec.Command(command.Command, command.Args...)
 	return &workerCommand{
-		child: child,
-		start: child.Start,
-		wait:  child.Wait,
+		child:   child,
+		guarded: false,
+		start:   child.Start,
+		wait:    child.Wait,
+		stop: func(force bool) error {
+			return terminateProcess(child, force)
+		},
 		release: func() (bool, error) {
 			if child.Process == nil {
 				return false, errors.New("worker process has not started")
@@ -46,7 +50,7 @@ func configureProcess(cmd *exec.Cmd) {
 // Object. The handle remains open until Wait returns, and the operating system
 // closes it if the supervisor exits, so worker descendants cannot outlive the
 // dispatcher silently.
-func attachProcessTree(cmd *exec.Cmd) (func(), error) {
+func attachProcessTree(cmd *exec.Cmd, _ bool) (func(), error) {
 	if cmd.Process == nil {
 		return nil, fmt.Errorf("worker process has not started")
 	}

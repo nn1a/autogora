@@ -199,12 +199,15 @@ func newCommandStartError(released bool, cause error) *CommandStartError {
 }
 
 type limitedBuffer struct {
+	mu        sync.Mutex
 	buffer    bytes.Buffer
 	limit     int
 	truncated bool
 }
 
 func (b *limitedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	original := len(value)
 	remaining := b.limit - b.buffer.Len()
 	if remaining <= 0 {
@@ -219,7 +222,11 @@ func (b *limitedBuffer) Write(value []byte) (int, error) {
 	return original, nil
 }
 
-func (b *limitedBuffer) String() string { return b.buffer.String() }
+func (b *limitedBuffer) snapshot() (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String(), b.truncated
+}
 
 // ExecRunner is the production runner. It bounds output while the child is
 // running, disables interactive Git/GitHub prompts, and waits for guarded
@@ -245,9 +252,11 @@ func (ExecRunner) Run(
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	err := command.Run()
+	stdoutText, stdoutTruncated := stdout.snapshot()
+	stderrText, stderrTruncated := stderr.snapshot()
 	return CommandOutput{
-		Stdout: stdout.String(), Stderr: stderr.String(),
-		StdoutTruncated: stdout.truncated, StderrTruncated: stderr.truncated,
+		Stdout: stdoutText, Stderr: stderrText,
+		StdoutTruncated: stdoutTruncated, StderrTruncated: stderrTruncated,
 	}, err
 }
 
@@ -271,16 +280,19 @@ func (ExecRunner) RunGated(
 		return CommandOutput{}, newCommandStartError(false, err)
 	}
 	defer command.Close()
-	command.Command.Dir = directory
-	command.Command.Env = commandEnvironment()
+	command.Dir = directory
+	command.Env = commandEnvironment()
 	stdout := limitedBuffer{limit: MaxCommandOutputBytes}
 	stderr := limitedBuffer{limit: MaxCommandOutputBytes}
-	command.Command.Stdout = &stdout
-	command.Command.Stderr = &stderr
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	output := func() CommandOutput {
+		stdoutText, stdoutTruncated := stdout.snapshot()
+		stderrText, stderrTruncated := stderr.snapshot()
 		return CommandOutput{
-			Stdout: stdout.String(), Stderr: stderr.String(),
-			StdoutTruncated: stdout.truncated, StderrTruncated: stderr.truncated,
+			Stdout: stdoutText, Stderr: stderrText,
+			StdoutTruncated: stdoutTruncated,
+			StderrTruncated: stderrTruncated,
 		}
 	}
 	if err := command.Start(); err != nil {

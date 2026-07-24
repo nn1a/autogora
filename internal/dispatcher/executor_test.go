@@ -5,14 +5,194 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
 )
+
+func TestProcessSetStopAllSealsAndIsIdempotent(t *testing.T) {
+	first := &exec.Cmd{Process: &os.Process{Pid: 424240}}
+	late := &exec.Cmd{Process: &os.Process{Pid: 424241}}
+	var firstStops, lateStops atomic.Int32
+	processes := NewProcessSet()
+	if !processes.add(first, func(bool) error {
+		firstStops.Add(1)
+		return nil
+	}) {
+		t.Fatal("live process set rejected its first registration")
+	}
+
+	processes.StopAll()
+	processes.StopAll()
+	if accepted := processes.add(late, func(bool) error {
+		lateStops.Add(1)
+		return nil
+	}); accepted {
+		t.Fatal("stopped process set accepted a late registration")
+	}
+	processes.StopAll()
+
+	if firstStops.Load() != 1 || lateStops.Load() != 1 {
+		t.Fatalf(
+			"stop counts after sealed registration = first:%d late:%d",
+			firstStops.Load(),
+			lateStops.Load(),
+		)
+	}
+	processes.mu.Lock()
+	stopping, tracked := processes.stopping, len(processes.processes)
+	processes.mu.Unlock()
+	if !stopping || tracked != 0 {
+		t.Fatalf(
+			"sealed process set state = stopping:%t tracked:%d",
+			stopping,
+			tracked,
+		)
+	}
+}
+
+func TestProcessSetConcurrentAddAndStopAllStopsExactlyOnce(t *testing.T) {
+	const attempts = 256
+	for attempt := 0; attempt < attempts; attempt++ {
+		processes := NewProcessSet()
+		command := &exec.Cmd{
+			Process: &os.Process{Pid: 500000 + attempt},
+		}
+		var stops atomic.Int32
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			processes.add(command, func(bool) error {
+				stops.Add(1)
+				return nil
+			})
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			processes.StopAll()
+		}()
+		close(start)
+		wait.Wait()
+		processes.StopAll()
+
+		if count := stops.Load(); count != 1 {
+			t.Fatalf(
+				"attempt %d concurrent registration stop count = %d",
+				attempt,
+				count,
+			)
+		}
+	}
+}
+
+func TestProcessSetOldRegistrationCannotRemoveReusedPID(t *testing.T) {
+	const pid = 424242
+	first := &exec.Cmd{Process: &os.Process{Pid: pid}}
+	second := &exec.Cmd{Process: &os.Process{Pid: pid}}
+	var firstStops, secondStops int
+	processes := NewProcessSet()
+	processes.add(first, func(bool) error {
+		firstStops++
+		return nil
+	})
+	processes.add(second, func(bool) error {
+		secondStops++
+		return nil
+	})
+
+	processes.remove(first)
+	processes.StopAll()
+
+	if firstStops != 0 || secondStops != 1 {
+		t.Fatalf(
+			"stop counts after reused PID removal = first:%d second:%d",
+			firstStops,
+			secondStops,
+		)
+	}
+}
+
+func TestExecuteTurnRejectsRegistrationAfterProcessSetStops(t *testing.T) {
+	ctx := context.Background()
+	opened, err := store.Open(":memory:", "default", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title:    "do not run during dispatcher shutdown",
+		Assignee: &assignee,
+		Runtime:  model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(
+		ctx,
+		store.ClaimOptions{TaskID: task.Task.ID},
+	)
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	processes := NewProcessSet()
+	processes.StopAll()
+	marker := filepath.Join(t.TempDir(), "worker-started")
+	releaseGateCalls := 0
+	result := ExecuteTurn(
+		ctx,
+		RunnerCommand{
+			Command: "/bin/sh",
+			Args:    []string{"-c", `printf started >"$1"`, "sh", marker},
+			CWD:     t.TempDir(),
+			ReleaseGate: func(
+				context.Context,
+				WorkerRelease,
+			) (bool, error) {
+				releaseGateCalls++
+				return true, errors.New("release gate must not run")
+			},
+		},
+		opened,
+		store.RunScope{
+			RunID:      claim.Run.ID,
+			ClaimToken: claim.ClaimToken,
+		},
+		processes,
+		filepath.Join(t.TempDir(), "worker.log"),
+		nil,
+	)
+	if !errors.Is(result.SpawnError, ErrProcessSetStopping) {
+		t.Fatalf("stopped process set result = %#v", result)
+	}
+	if releaseGateCalls != 0 {
+		t.Fatalf("release gate calls = %d, want 0", releaseGateCalls)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker crossed the stopped process-set boundary: %v", err)
+	}
+	inspection, err := opened.GetRun(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.PID != nil {
+		t.Fatalf(
+			"stopped process set persisted a spawn PID: %d",
+			*inspection.Run.PID,
+		)
+	}
+}
 
 func TestExecuteTurnRecordsSpawnLogAndSession(t *testing.T) {
 	ctx := context.Background()
