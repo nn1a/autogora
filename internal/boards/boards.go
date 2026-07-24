@@ -1422,7 +1422,16 @@ func (m *Manager) openStoreUnlocked(ctx context.Context, board string) (*store.S
 	}
 	dbPath, _ := m.DBPath(normalized)
 	attachments, _ := m.AttachmentsRoot(normalized)
-	return store.Open(dbPath, normalized, attachments)
+	opened, err := store.Open(dbPath, normalized, attachments)
+	if err != nil {
+		return nil, err
+	}
+	if err := opened.ConfigureAutomationGate(store.AutomationGateConfig{
+		AuthorityDBPath: m.defaultDBPath,
+	}); err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	return opened, nil
 }
 
 // OpenCoordinationStore opens the default database shared by every board.

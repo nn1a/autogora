@@ -31,7 +31,18 @@ func WithTeardownFailureReporter(
 	if reporter == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, teardownFailureReporterKey{}, reporter)
+	parent := teardownFailureReporter(ctx)
+	if parent == nil {
+		return context.WithValue(ctx, teardownFailureReporterKey{}, reporter)
+	}
+	// The outer reporter owns the broader safety boundary. In the dispatcher
+	// that means persisting the global automation quarantine before a nested
+	// managed-run reporter records its local recovery fence.
+	combined := func(err error) {
+		parent(err)
+		reporter(err)
+	}
+	return context.WithValue(ctx, teardownFailureReporterKey{}, combined)
 }
 
 func teardownFailureReporter(ctx context.Context) func(error) {

@@ -16,16 +16,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 24
+const schemaVersion = 25
 
 type Store struct {
 	db              *sql.DB
 	dbPath          string
 	board           string
 	attachmentsRoot string
-	closeOnce       sync.Once
-	closeHook       func() error
-	closeErr        error
+	automation      *automationGateRuntime
+	// Test seam for simulating a crash after source resolution is durable but
+	// before the global gate is cleared.
+	automationAfterConfirmationPhaseOne func() error
+	closeOnce                           sync.Once
+	closeHook                           func() error
+	closeErr                            error
 }
 
 func Open(dbPath, board, attachmentsRoot string) (*Store, error) {
@@ -63,6 +67,14 @@ func Open(dbPath, board, attachmentsRoot string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if board == "default" {
+		if err := store.ConfigureAutomationGate(AutomationGateConfig{
+			AuthorityDBPath: resolved,
+		}); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("configure automation gate: %w", err)
+		}
+	}
 	return store, nil
 }
 
@@ -89,12 +101,24 @@ func dataSourceName(path string) string {
 
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		var automationErr error
+		if s.automation != nil && s.automation.authorityOwned {
+			automationErr = s.automation.authorityDB.Close()
+		}
+		if s.automation != nil && s.automation.ephemeralLock {
+			if err := os.Remove(s.automation.lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				automationErr = errors.Join(
+					automationErr,
+					secretSafeAutomationLockError(err),
+				)
+			}
+		}
 		dbErr := s.db.Close()
 		var hookErr error
 		if s.closeHook != nil {
 			hookErr = s.closeHook()
 		}
-		s.closeErr = errors.Join(dbErr, hookErr)
+		s.closeErr = errors.Join(automationErr, dbErr, hookErr)
 	})
 	return s.closeErr
 }
@@ -1545,6 +1569,93 @@ CREATE TABLE IF NOT EXISTS global_workspace_leases (
   acquired_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS automation_quarantine_gate (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  permit_token TEXT NOT NULL CHECK (permit_token <> ''),
+  activated_at TEXT,
+  cleared_at TEXT,
+  confirmation_started_at TEXT,
+  confirmation_actor TEXT,
+  confirmation_reason TEXT,
+  confirmation_helpers_stopped INTEGER NOT NULL DEFAULT 0
+    CHECK (confirmation_helpers_stopped IN (0, 1)),
+  confirmation_external_writes_stopped INTEGER NOT NULL DEFAULT 0
+    CHECK (confirmation_external_writes_stopped IN (0, 1)),
+  CHECK (
+    (confirmation_started_at IS NULL
+      AND confirmation_actor IS NULL
+      AND confirmation_reason IS NULL
+      AND confirmation_helpers_stopped = 0
+      AND confirmation_external_writes_stopped = 0)
+    OR
+    (confirmation_started_at IS NOT NULL
+      AND confirmation_actor IS NOT NULL
+      AND confirmation_reason IS NOT NULL
+      AND confirmation_helpers_stopped = 1
+      AND confirmation_external_writes_stopped = 1)
+  )
+);
+
+INSERT OR IGNORE INTO automation_quarantine_gate(
+  singleton, active, generation, permit_token
+) VALUES (1, 0, 0, lower(hex(randomblob(32))));
+
+CREATE TABLE IF NOT EXISTS automation_quarantine_sources (
+  source_key TEXT PRIMARY KEY CHECK (length(source_key) = 64),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  board TEXT NOT NULL CHECK (length(CAST(board AS BLOB)) BETWEEN 1 AND 128),
+  kind TEXT NOT NULL CHECK (length(CAST(kind AS BLOB)) BETWEEN 1 AND 64),
+  source_id TEXT NOT NULL CHECK (length(CAST(source_id AS BLOB)) BETWEEN 1 AND 256),
+  observed_updated_at TEXT NOT NULL DEFAULT ''
+    CHECK (length(CAST(observed_updated_at AS BLOB)) <= 128),
+  observed_claim_epoch TEXT NOT NULL DEFAULT ''
+    CHECK (length(CAST(observed_claim_epoch AS BLOB)) <= 128),
+  diagnostic_code TEXT NOT NULL
+    CHECK (length(CAST(diagnostic_code AS BLOB)) BETWEEN 1 AND 128),
+  disposition TEXT NOT NULL DEFAULT 'active'
+    CHECK (disposition IN ('active', 'superseded', 'abandoned')),
+  observed_at TEXT NOT NULL,
+  resolved_at TEXT,
+  resolved_by TEXT,
+  resolution_reason TEXT,
+  resolved_generation INTEGER,
+  CHECK (observed_updated_at <> '' OR observed_claim_epoch <> ''),
+  CHECK (
+    (disposition = 'active'
+      AND resolved_at IS NULL
+      AND resolved_by IS NULL
+      AND resolution_reason IS NULL
+      AND resolved_generation IS NULL)
+    OR
+    (disposition <> 'active'
+      AND resolved_at IS NOT NULL
+      AND resolved_by IS NOT NULL
+      AND resolution_reason IS NOT NULL
+      AND resolved_generation IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS automation_dispatcher_sessions (
+  session_id TEXT PRIMARY KEY
+    CHECK (length(CAST(session_id AS BLOB)) BETWEEN 1 AND 256),
+  board TEXT NOT NULL CHECK (length(CAST(board AS BLOB)) BETWEEN 1 AND 128),
+  lease_token TEXT NOT NULL CHECK (lease_token <> ''),
+  registered_at TEXT NOT NULL,
+  renewed_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS automation_dispatcher_acks (
+  session_id TEXT NOT NULL REFERENCES automation_dispatcher_sessions(session_id)
+    ON DELETE CASCADE,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  acknowledged_at TEXT NOT NULL,
+  PRIMARY KEY(session_id, generation)
+);
+
 -- Agent slots coordinate concurrency across every board. Run IDs belong to
 -- board-local databases, so this table intentionally has no foreign keys.
 CREATE TABLE IF NOT EXISTS global_agent_slots (
@@ -1803,6 +1914,12 @@ CREATE INDEX IF NOT EXISTS idx_auto_decompose_due ON auto_decompose_state(next_a
 CREATE INDEX IF NOT EXISTS idx_service_leases_expiry ON service_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_resource_leases_run ON resource_leases(run_id);
 CREATE INDEX IF NOT EXISTS idx_global_workspace_leases_owner ON global_workspace_leases(board, run_id);
+CREATE INDEX IF NOT EXISTS idx_automation_quarantine_sources_identity
+  ON automation_quarantine_sources(board, kind, source_id, generation DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_quarantine_sources_active
+  ON automation_quarantine_sources(disposition, generation DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_dispatcher_sessions_expiry
+  ON automation_dispatcher_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_global_agent_slots_expiry ON global_agent_slots(owner_kind, expires_at);
 CREATE INDEX IF NOT EXISTS idx_terminal_requests_pending ON run_terminal_requests(finalized_at, requested_at);
 CREATE INDEX IF NOT EXISTS idx_change_sets_task ON task_change_sets(task_id, created_at DESC);

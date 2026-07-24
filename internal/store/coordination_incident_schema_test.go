@@ -152,7 +152,7 @@ func TestSchema24UpgradesVersion21CoordinationIncidentTriggerWithoutLosingBindin
 	).Scan(&definition); err != nil {
 		t.Fatal(err)
 	}
-	if version != 24 || schemaVersion != 24 ||
+	if version != 25 || schemaVersion != 25 ||
 		!strings.Contains(definition, "'run_invariant'") {
 		t.Fatalf(
 			"schema upgrade = version:%d constant:%d definition:%q",
