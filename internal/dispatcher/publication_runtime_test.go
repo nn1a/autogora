@@ -135,6 +135,49 @@ func publicationTestOptions(
 	return options
 }
 
+func attachPublicationTestAutomation(
+	t *testing.T,
+	manager *boards.Manager,
+	options *Options,
+) *automationDispatcherSession {
+	t.Helper()
+	_, cancelDispatcher := context.WithCancel(context.Background())
+	session, err := startAutomationDispatcherSession(
+		context.Background(),
+		manager,
+		cancelDispatcher,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.automationSession = session
+	t.Cleanup(func() {
+		_ = session.Shutdown(true)
+		cancelDispatcher()
+	})
+	return session
+}
+
+func releasePublicationTestCommand(
+	ctx context.Context,
+	options publisher.Options,
+) error {
+	if options.ReleaseGate == nil {
+		return errors.New("publication command release gate is required")
+	}
+	released, err := options.ReleaseGate(
+		ctx,
+		func() (bool, error) { return true, nil },
+	)
+	if err != nil {
+		return err
+	}
+	if !released {
+		return errors.New("publication test command was not released")
+	}
+	return nil
+}
+
 func publishedResult(value model.Publication) publisher.Result {
 	return publisher.Result{
 		Status: publisher.ResultPublished, Mode: value.Mode,
@@ -243,14 +286,21 @@ func TestPublicationPassApprovalExecutesOnlyAfterExplicitApproval(t *testing.T) 
 	options := publicationTestOptions(
 		current,
 		func(
-			_ context.Context,
+			executionContext context.Context,
 			value model.Publication,
-			_ publisher.Options,
+			publicationOptions publisher.Options,
 		) (publisher.Result, error) {
 			calls++
+			if err := releasePublicationTestCommand(
+				executionContext,
+				publicationOptions,
+			); err != nil {
+				return publisher.Result{}, err
+			}
 			return publishedResult(value), nil
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	state := &publicationRuntimeState{}
 	if err := runPublicationPass(
 		ctx, manager, []string{"default"}, options, state, current,
@@ -294,7 +344,11 @@ func TestPublicationPassPersistsExecutionSuccessAndFailure(t *testing.T) {
 	}{
 		{name: "success", wantStatus: model.PublicationPublished},
 		{
-			name: "failure", executeErr: errors.New("remote rejected"),
+			name: "failure",
+			executeErr: &publisher.Error{
+				Kind: publisher.ErrorInvalidInput,
+				Err:  errors.New("publication input rejected"),
+			},
 			wantStatus: model.PublicationFailed, wantPassErr: true,
 		},
 	} {
@@ -311,18 +365,25 @@ func TestPublicationPassPersistsExecutionSuccessAndFailure(t *testing.T) {
 			options := publicationTestOptions(
 				current,
 				func(
-					_ context.Context,
+					executionContext context.Context,
 					value model.Publication,
-					_ publisher.Options,
+					publicationOptions publisher.Options,
 				) (publisher.Result, error) {
 					if test.executeErr != nil {
 						return publisher.Result{}, test.executeErr
+					}
+					if err := releasePublicationTestCommand(
+						executionContext,
+						publicationOptions,
+					); err != nil {
+						return publisher.Result{}, err
 					}
 					result := publishedResult(value)
 					result.URL = &url
 					return result, nil
 				},
 			)
+			attachPublicationTestAutomation(t, manager, &options)
 			err := runPublicationPass(
 				ctx, manager, []string{"default"}, options,
 				&publicationRuntimeState{}, current,
@@ -370,6 +431,7 @@ func TestPublicationPassPersistsFailureAfterDispatcherCancellation(t *testing.T)
 			return publisher.Result{}, executionContext.Err()
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	err := runPublicationPass(
 		ctx, manager, []string{"default"}, options,
 		&publicationRuntimeState{}, current,
@@ -378,10 +440,30 @@ func TestPublicationPassPersistsFailureAfterDispatcherCancellation(t *testing.T)
 		t.Fatal("canceled publication did not report an execution error")
 	}
 	value := publicationForChangeSet(t, manager, "default", changeSet.ID)
-	if value.Status != model.PublicationFailed ||
-		value.Error == nil ||
-		!strings.Contains(*value.Error, "canceled") {
+	if value.Status != model.PublicationPublishing || value.Error != nil {
 		t.Fatalf("publication=%+v", value)
+	}
+	opened, openErr := manager.OpenStore(context.Background(), "default")
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	unresolved, listErr := opened.ListUnresolvedPublicationAttempts(
+		context.Background(),
+		store.PublicationAttemptFilter{Limit: 10},
+	)
+	closeErr := opened.Close()
+	if listErr != nil || closeErr != nil ||
+		len(unresolved) != 1 ||
+		unresolved[0].Result == nil ||
+		unresolved[0].Result.Outcome != store.PublicationAttemptUnknown ||
+		unresolved[0].Result.ErrorKind == nil ||
+		*unresolved[0].Result.ErrorKind != store.PublicationErrorCanceled {
+		t.Fatalf(
+			"unresolved=%+v listErr=%v closeErr=%v",
+			unresolved,
+			listErr,
+			closeErr,
+		)
 	}
 }
 
@@ -500,6 +582,7 @@ func TestPublicationPassDoesNotTakeOverExpiredLease(t *testing.T) {
 			return publisher.Result{}, errors.New("unexpected execution")
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	state := &publicationRuntimeState{}
 	if err := runPublicationPass(
 		ctx, manager, []string{"default"}, options, state, current,
@@ -572,14 +655,21 @@ func TestPublicationPassExecutesOneBoardPerPassWithRoundRobinFairness(t *testing
 	options := publicationTestOptions(
 		current,
 		func(
-			_ context.Context,
+			executionContext context.Context,
 			value model.Publication,
-			_ publisher.Options,
+			publicationOptions publisher.Options,
 		) (publisher.Result, error) {
 			executed = append(executed, value.Board)
+			if err := releasePublicationTestCommand(
+				executionContext,
+				publicationOptions,
+			); err != nil {
+				return publisher.Result{}, err
+			}
 			return publishedResult(value), nil
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	state := &publicationRuntimeState{}
 	for range 2 {
 		if err := runPublicationPass(
@@ -760,14 +850,21 @@ func TestPublicationPassContinuesAfterBoardError(t *testing.T) {
 	options := publicationTestOptions(
 		current,
 		func(
-			_ context.Context,
+			executionContext context.Context,
 			value model.Publication,
-			_ publisher.Options,
+			publicationOptions publisher.Options,
 		) (publisher.Result, error) {
 			calls++
+			if err := releasePublicationTestCommand(
+				executionContext,
+				publicationOptions,
+			); err != nil {
+				return publisher.Result{}, err
+			}
 			return publishedResult(value), nil
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	err := runPublicationPass(
 		ctx, manager, []string{"missing", "default"}, options,
 		&publicationRuntimeState{}, current,
@@ -798,15 +895,22 @@ func TestPublicationQueueCoalescesPendingPasses(t *testing.T) {
 	options := publicationTestOptions(
 		current,
 		func(
-			_ context.Context,
+			executionContext context.Context,
 			value model.Publication,
-			_ publisher.Options,
+			publicationOptions publisher.Options,
 		) (publisher.Result, error) {
+			if err := releasePublicationTestCommand(
+				executionContext,
+				publicationOptions,
+			); err != nil {
+				return publisher.Result{}, err
+			}
 			once.Do(func() { close(started) })
 			<-release
 			return publishedResult(value), nil
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	queue := startPublicationQueue(ctx, manager, options)
 	first := queue.Enqueue([]string{"default"})
 	if first == nil {
@@ -893,11 +997,17 @@ func TestOncePublishesFinalizerCompletedByItsWorker(t *testing.T) {
 				return ""
 			},
 			PublicationExecutor: func(
-				_ context.Context,
+				executionContext context.Context,
 				value model.Publication,
-				_ publisher.Options,
+				publicationOptions publisher.Options,
 			) (publisher.Result, error) {
 				calls++
+				if err := releasePublicationTestCommand(
+					executionContext,
+					publicationOptions,
+				); err != nil {
+					return publisher.Result{}, err
+				}
 				return publishedResult(value), nil
 			},
 		},

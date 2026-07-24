@@ -227,7 +227,7 @@ func TestUnsupportedAutomaticPublicationFailsDurablyWithoutExecutor(t *testing.T
 		false,
 		true,
 	)
-	_, changeSet := createCompletedFinalizerChangeSet(
+	task, changeSet := createCompletedFinalizerChangeSet(
 		t,
 		manager,
 		"default",
@@ -264,6 +264,7 @@ func TestUnsupportedAutomaticPublicationFailsDurablyWithoutExecutor(t *testing.T
 			return publisher.Result{}, nil
 		},
 	)
+	attachPublicationTestAutomation(t, manager, &options)
 	acquired, err := executePublicationWithCapability(
 		ctx,
 		opened,
@@ -291,6 +292,13 @@ func TestUnsupportedAutomaticPublicationFailsDurablyWithoutExecutor(t *testing.T
 		failed.Error == nil ||
 		!strings.Contains(*failed.Error, automaticMutationCapabilityCode) {
 		t.Fatalf("publication=%+v", failed)
+	}
+	attempt := publicationAttemptRecordForTask(t, opened, task.ID)
+	if attempt.Result == nil ||
+		attempt.Result.Outcome != store.PublicationAttemptFailed ||
+		attempt.Result.ErrorKind == nil ||
+		*attempt.Result.ErrorKind != store.PublicationErrorInternal {
+		t.Fatalf("capability attempt=%+v", attempt)
 	}
 
 	// A failed capability diagnostic is not an automatic candidate. A later

@@ -61,6 +61,14 @@ type automationSessionAuthority interface {
 		context.Context,
 		store.AutomationQuarantineSourceInput,
 	) (store.AutomationQuarantine, bool, error)
+	EnsureAutomationQuarantineSource(
+		context.Context,
+		store.AutomationQuarantineSourceInput,
+	) (
+		store.AutomationQuarantine,
+		store.AutomationQuarantineSourceEnsureOutcome,
+		error,
+	)
 }
 
 type automationDispatcherSession struct {

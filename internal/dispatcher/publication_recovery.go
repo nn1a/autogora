@@ -19,6 +19,10 @@ const (
 	publicationStartupOwnershipScanTimeout    = 30 * time.Second
 )
 
+var errPublicationQuarantineSourceResolved = errors.New(
+	"exact publication quarantine source was already resolved",
+)
+
 func publicationQuarantineSource(
 	value model.Publication,
 	validate store.AutomationQuarantineSourceValidator,
@@ -55,7 +59,7 @@ func (s *automationDispatcherSession) persistPublicationQuarantine(
 			value.Status,
 		)
 	}
-	gate, _, err := s.authority.ActivateAutomationQuarantine(
+	gate, outcome, err := s.authority.EnsureAutomationQuarantineSource(
 		ctx,
 		publicationQuarantineSource(value, validate),
 	)
@@ -66,6 +70,22 @@ func (s *automationDispatcherSession) persistPublicationQuarantine(
 			err,
 		)
 	}
+	switch outcome {
+	case store.AutomationQuarantineSourceCreated,
+		store.AutomationQuarantineSourceExistingActive:
+	case store.AutomationQuarantineSourceExistingResolved:
+		return gate, fmt.Errorf(
+			"%w: publication %s",
+			errPublicationQuarantineSourceResolved,
+			value.ID,
+		)
+	default:
+		return gate, fmt.Errorf(
+			"publication %s quarantine source returned invalid lifecycle outcome %q",
+			value.ID,
+			outcome,
+		)
+	}
 	if !gate.Active {
 		return gate, fmt.Errorf(
 			"publication %s quarantine source did not activate the gate",
@@ -73,48 +93,6 @@ func (s *automationDispatcherSession) persistPublicationQuarantine(
 		)
 	}
 	return gate, nil
-}
-
-// quarantinePublicationTeardown records the exact publication attempt before
-// the caller can transition it to Failed. The session latch withholds its ACK,
-// and observeGate cancels every remaining dispatcher queue.
-func (s *automationDispatcherSession) quarantinePublicationTeardown(
-	opened *store.Store,
-	value model.Publication,
-) error {
-	if s == nil {
-		return errors.New(
-			"automation dispatcher session is required after unconfirmed publication teardown",
-		)
-	}
-	if opened == nil {
-		return errors.New(
-			"publication Store is required after unconfirmed publication teardown",
-		)
-	}
-	s.unconfirmed.Store(true)
-	operationContext, cancel := context.WithTimeout(
-		context.Background(),
-		automationSessionOperationLimit,
-	)
-	gate, err := s.persistPublicationQuarantine(
-		operationContext,
-		value,
-		opened.ValidatePublishingAutomationSource,
-	)
-	cancel()
-	if errors.Is(err, store.ErrAutomationSourceStale) {
-		return errors.Join(
-			err,
-			s.activateUnconfirmedQuarantine(automationTeardownDiagnostic),
-		)
-	}
-	if err != nil {
-		s.recordFailure(err)
-		return err
-	}
-	s.sourceSaved.Store(true)
-	return s.observeGate(gate)
 }
 
 func failPublishingOwnershipScan(

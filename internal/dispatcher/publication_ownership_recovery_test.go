@@ -52,6 +52,27 @@ func (a *mutateBeforePublicationActivationAuthority) ActivateAutomationQuarantin
 	return a.Store.ActivateAutomationQuarantine(ctx, input)
 }
 
+func (a *mutateBeforePublicationActivationAuthority) EnsureAutomationQuarantineSource(
+	ctx context.Context,
+	input store.AutomationQuarantineSourceInput,
+) (
+	store.AutomationQuarantine,
+	store.AutomationQuarantineSourceEnsureOutcome,
+	error,
+) {
+	if input.Kind == publicationQuarantineKind {
+		a.once.Do(func() {
+			if a.mutate != nil {
+				a.mutationErr = a.mutate(ctx)
+			}
+		})
+		if a.mutationErr != nil {
+			return store.AutomationQuarantine{}, "", a.mutationErr
+		}
+	}
+	return a.Store.EnsureAutomationQuarantineSource(ctx, input)
+}
+
 func (a *cappedPublicationAutomationAuthority) ActivateAutomationQuarantine(
 	ctx context.Context,
 	input store.AutomationQuarantineSourceInput,
@@ -78,10 +99,96 @@ func (a *cappedPublicationAutomationAuthority) ActivateAutomationQuarantine(
 	return gate, activated, err
 }
 
+func (a *cappedPublicationAutomationAuthority) EnsureAutomationQuarantineSource(
+	ctx context.Context,
+	input store.AutomationQuarantineSourceInput,
+) (
+	store.AutomationQuarantine,
+	store.AutomationQuarantineSourceEnsureOutcome,
+	error,
+) {
+	a.mu.Lock()
+	if len(a.persisted) >= a.limit {
+		a.mu.Unlock()
+		a.addCall("ensure")
+		a.fakeAutomationSessionAuthority.mu.Lock()
+		gate := a.fakeAutomationSessionAuthority.gate
+		a.fakeAutomationSessionAuthority.mu.Unlock()
+		return gate, "", errors.New(
+			"automation quarantine has too many active sources",
+		)
+	}
+	a.mu.Unlock()
+	gate, outcome, err := a.fakeAutomationSessionAuthority.
+		EnsureAutomationQuarantineSource(ctx, input)
+	if err == nil {
+		a.mu.Lock()
+		a.persisted = append(a.persisted, input)
+		a.mu.Unlock()
+	}
+	return gate, outcome, err
+}
+
 func (a *cappedPublicationAutomationAuthority) persistedSources() []store.AutomationQuarantineSourceInput {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]store.AutomationQuarantineSourceInput(nil), a.persisted...)
+}
+
+func TestResolvedExactPublicationSourceFallsBackToGlobalQuarantine(
+	t *testing.T,
+) {
+	authority := &fakeAutomationSessionAuthority{
+		registerOK: true,
+		gate: store.AutomationQuarantine{
+			Active:     true,
+			Generation: 7,
+		},
+		ensureOutcome: store.AutomationQuarantineSourceExistingResolved,
+	}
+	session := &automationDispatcherSession{
+		authority:        authority,
+		cancelDispatcher: func() {},
+		lease: store.AutomationDispatcherSessionLease{
+			SessionID: "resolved-source-session",
+			Board:     globalAutomationSessionBoard,
+		},
+	}
+	value := model.Publication{
+		ID:         "pub_resolved_source",
+		Board:      "default",
+		Status:     model.PublicationPublishing,
+		ClaimEpoch: 3,
+		UpdatedAt:  "2026-07-24T00:00:00.000000000Z",
+	}
+	err := session.quarantinePublicationAttempt(
+		nil,
+		value,
+		publicationAttemptIntentFromClaimed(value),
+		publicationResultPersistenceDiagnostic,
+	)
+	if !errors.Is(err, errPublicationQuarantineSourceResolved) ||
+		!errors.Is(err, store.ErrAutomationQuarantined) ||
+		!session.TeardownUnconfirmed() ||
+		!session.UncertaintySourcePersisted() {
+		t.Fatalf(
+			"resolved source fallback err=%v unconfirmed=%t sourceSaved=%t",
+			err,
+			session.TeardownUnconfirmed(),
+			session.UncertaintySourcePersisted(),
+		)
+	}
+	authority.mu.Lock()
+	activated := append(
+		[]store.AutomationQuarantineSourceInput(nil),
+		authority.activated...,
+	)
+	authority.mu.Unlock()
+	if len(activated) != 2 ||
+		activated[0].Kind != publicationQuarantineKind ||
+		activated[1].Kind != automationSessionSourceKind {
+		t.Fatalf("activation sequence=%+v", activated)
+	}
 }
 
 func seedPublishingPublications(
@@ -714,7 +821,7 @@ func TestPublicationTeardownUnconfirmedKeepsPublishingAndExactSource(
 	}
 }
 
-func TestPublicationTeardownStaleTupleFallsBackToSessionQuarantine(
+func TestPublicationResultPersistenceFailureFallsBackToSessionQuarantine(
 	t *testing.T,
 ) {
 	manager, _ := testManager(t)
@@ -760,24 +867,15 @@ func TestPublicationTeardownStaleTupleFallsBackToSessionQuarantine(
 		opened.Close()
 		t.Fatal(err)
 	}
-	var terminalizationErr error
+	var injectedCloseErr error
 	options := publicationTestOptions(
 		time.Now().UTC(),
 		func(
 			_ context.Context,
-			claimed model.Publication,
+			_ model.Publication,
 			_ publisher.Options,
 		) (publisher.Result, error) {
-			_, terminalizationErr = opened.FailPublication(
-				context.Background(),
-				claimed.ID,
-				store.FailPublicationInput{
-					ExpectedUpdatedAt: claimed.UpdatedAt,
-					ClaimToken:        claimed.ClaimToken,
-					ClaimEpoch:        claimed.ClaimEpoch,
-					Error:             "terminalized before quarantine activation",
-				},
-			)
+			injectedCloseErr = opened.Close()
 			return publisher.Result{}, processguard.ErrTeardownUnconfirmed
 		},
 	)
@@ -789,28 +887,29 @@ func TestPublicationTeardownStaleTupleFallsBackToSessionQuarantine(
 		options,
 		automaticMutationCapability{Available: true},
 	)
-	if terminalizationErr != nil {
-		opened.Close()
-		t.Fatalf("terminalize before activation: %v", terminalizationErr)
+	if injectedCloseErr != nil {
+		t.Fatalf("close publication store before result persistence: %v", injectedCloseErr)
 	}
 	if !acquired ||
 		!errors.Is(executeErr, processguard.ErrTeardownUnconfirmed) ||
-		!errors.Is(executeErr, store.ErrAutomationSourceStale) ||
 		!errors.Is(executeErr, store.ErrAutomationQuarantined) {
-		opened.Close()
-		t.Fatalf("stale teardown execution: acquired=%t err=%v",
+		t.Fatalf("persistence failure execution: acquired=%t err=%v",
 			acquired, executeErr)
 	}
-	current, err := opened.GetPublication(context.Background(), pending.ID)
+	check, err := manager.OpenStore(context.Background(), "default")
 	if err != nil {
-		opened.Close()
 		t.Fatal(err)
 	}
-	if current.Status != model.PublicationFailed {
-		opened.Close()
-		t.Fatalf("stale teardown publication=%+v", current)
+	current, err := check.GetPublication(context.Background(), pending.ID)
+	if err != nil {
+		check.Close()
+		t.Fatal(err)
 	}
-	if err := opened.Close(); err != nil {
+	if current.Status != model.PublicationPublishing {
+		check.Close()
+		t.Fatalf("persistence failure publication=%+v", current)
+	}
+	if err := check.Close(); err != nil {
 		t.Fatal(err)
 	}
 	exactSources := publicationSources(
@@ -824,7 +923,7 @@ func TestPublicationTeardownStaleTupleFallsBackToSessionQuarantine(
 		},
 	)
 	if len(exactSources) != 0 {
-		t.Fatalf("stale publication source persisted=%+v", exactSources)
+		t.Fatalf("unvalidated publication source persisted=%+v", exactSources)
 	}
 	sessionSources := publicationSources(
 		t,
@@ -836,7 +935,7 @@ func TestPublicationTeardownStaleTupleFallsBackToSessionQuarantine(
 		},
 	)
 	if len(sessionSources) != 1 ||
-		sessionSources[0].DiagnosticCode != automationTeardownDiagnostic {
+		sessionSources[0].DiagnosticCode != publicationResultPersistenceDiagnostic {
 		t.Fatalf("fallback session source=%+v", sessionSources)
 	}
 	if !session.TeardownUnconfirmed() ||

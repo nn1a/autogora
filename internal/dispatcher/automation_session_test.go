@@ -17,13 +17,14 @@ import (
 type fakeAutomationSessionAuthority struct {
 	mu sync.Mutex
 
-	gate        store.AutomationQuarantine
-	renewErr    error
-	activateErr error
-	registerOK  bool
-	calls       []string
-	acked       []int64
-	activated   []store.AutomationQuarantineSourceInput
+	gate          store.AutomationQuarantine
+	renewErr      error
+	activateErr   error
+	registerOK    bool
+	calls         []string
+	acked         []int64
+	activated     []store.AutomationQuarantineSourceInput
+	ensureOutcome store.AutomationQuarantineSourceEnsureOutcome
 }
 
 func (f *fakeAutomationSessionAuthority) addCall(value string) {
@@ -113,6 +114,35 @@ func (f *fakeAutomationSessionAuthority) ActivateAutomationQuarantine(
 		}
 	}
 	return f.gate, true, nil
+}
+
+func (f *fakeAutomationSessionAuthority) EnsureAutomationQuarantineSource(
+	_ context.Context,
+	input store.AutomationQuarantineSourceInput,
+) (
+	store.AutomationQuarantine,
+	store.AutomationQuarantineSourceEnsureOutcome,
+	error,
+) {
+	f.addCall("ensure")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activated = append(f.activated, input)
+	if f.activateErr != nil {
+		return f.gate, "", f.activateErr
+	}
+	outcome := f.ensureOutcome
+	if outcome == "" {
+		outcome = store.AutomationQuarantineSourceCreated
+	}
+	if outcome == store.AutomationQuarantineSourceCreated && !f.gate.Active {
+		f.gate.Active = true
+		f.gate.Generation++
+		if f.gate.Generation < 1 {
+			f.gate.Generation = 1
+		}
+	}
+	return f.gate, outcome, nil
 }
 
 func (f *fakeAutomationSessionAuthority) setActivationError(err error) {
