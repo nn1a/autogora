@@ -97,7 +97,7 @@ func createCompletedFinalizerChangeSet(
 	if err != nil {
 		t.Fatal(err)
 	}
-	finalized, err := opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
+	finalized, err := opened.FinalizeRunTerminal(ctx, scope, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +721,7 @@ func TestPublicationPassUsesOnlyLatestFinalizerChangeSet(t *testing.T) {
 		opened.Close()
 		t.Fatal(err)
 	}
-	if _, err := opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0); err != nil {
+	if _, err := opened.FinalizeRunTerminal(ctx, scope, 0); err != nil {
 		opened.Close()
 		t.Fatal(err)
 	}

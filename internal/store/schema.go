@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 23
+const schemaVersion = 24
 
 type Store struct {
 	db              *sql.DB
@@ -150,8 +150,316 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensureCoordinationIncidentTriggerSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureIntegrationResolutionResolvedSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureRunRecoveryFenceSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.validateRecoveryCompletionInvariants(ctx); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureRunRecoveryFenceSchema(ctx context.Context) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open run recovery fence migration connection: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin run recovery fence migration: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	var definition string
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT sql FROM sqlite_master
+		 WHERE type = 'table' AND name = 'run_reclaim_requests'`,
+	).Scan(&definition); err != nil {
+		return fmt.Errorf("inspect run recovery fence schema: %w", err)
+	}
+	current := strings.ToLower(definition)
+	hasDurableFenceState := strings.Contains(current, "requires_operator") &&
+		strings.Contains(current, "diagnostic_code") &&
+		strings.Contains(current, "fence_token") &&
+		strings.Contains(current, "fence_generation") &&
+		strings.Contains(current, "host_acknowledged_at") &&
+		strings.Contains(current, "recovery_owner_token") &&
+		strings.Contains(current, "recovery_owner_expires_at") &&
+		strings.Contains(current, "'crashed'")
+	if !strings.Contains(current, "requires_operator") ||
+		!strings.Contains(current, "diagnostic_code") ||
+		!strings.Contains(current, "fence_token") ||
+		!strings.Contains(current, "fence_generation") ||
+		!strings.Contains(current, "host_acknowledged_at") ||
+		!strings.Contains(current, "host_acknowledged_fence_token") ||
+		!strings.Contains(current, "recovery_owner_token") ||
+		!strings.Contains(current, "recovery_owner_expires_at") ||
+		!strings.Contains(current, "operator_quiesced_at") ||
+		!strings.Contains(current, "operator_quiesced_by") ||
+		!strings.Contains(current, "operator_quiescence_reason") ||
+		!strings.Contains(current, "operator_quiesced_generation") ||
+		!strings.Contains(current, "operator_confirmed_worker_stopped") ||
+		!strings.Contains(current, "operator_confirmed_host_writes_stopped") ||
+		!strings.Contains(current, "operator_observed_heartbeat_at") ||
+		!strings.Contains(current, "operator_observed_claim_expires_at") ||
+		!strings.Contains(current, "operator_observed_pid") ||
+		!strings.Contains(current, "operator_observed_process_identity") ||
+		!strings.Contains(current, "'crashed'") {
+		if _, err := conn.ExecContext(
+			ctx,
+			`ALTER TABLE run_reclaim_requests
+			 RENAME TO run_reclaim_requests_before_v25`,
+		); err != nil {
+			return fmt.Errorf("rename old run recovery fence table: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `CREATE TABLE run_reclaim_requests (
+			run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+			expires_at TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			outcome TEXT NOT NULL CHECK (outcome IN ('reclaimed', 'timed_out', 'crashed')),
+			count_failure INTEGER NOT NULL CHECK (count_failure IN (0, 1)),
+			requested_at TEXT NOT NULL,
+			requires_operator INTEGER NOT NULL DEFAULT 0 CHECK (requires_operator IN (0, 1)),
+			diagnostic_code TEXT,
+			fence_token TEXT NOT NULL,
+			fence_generation INTEGER NOT NULL DEFAULT 1 CHECK (fence_generation >= 1),
+			host_acknowledged_at TEXT,
+			host_acknowledged_fence_token TEXT,
+			recovery_owner_token TEXT,
+			recovery_owner_expires_at TEXT,
+			operator_quiesced_at TEXT,
+			operator_quiesced_by TEXT,
+			operator_quiescence_reason TEXT,
+			operator_quiesced_generation INTEGER,
+			operator_confirmed_worker_stopped INTEGER NOT NULL DEFAULT 0
+				CHECK (operator_confirmed_worker_stopped IN (0, 1)),
+			operator_confirmed_host_writes_stopped INTEGER NOT NULL DEFAULT 0
+				CHECK (operator_confirmed_host_writes_stopped IN (0, 1)),
+			operator_observed_heartbeat_at TEXT,
+			operator_observed_claim_expires_at TEXT,
+			operator_observed_pid INTEGER,
+			operator_observed_process_identity TEXT,
+			CHECK (
+				(recovery_owner_token IS NULL AND recovery_owner_expires_at IS NULL) OR
+				(recovery_owner_token IS NOT NULL AND recovery_owner_expires_at IS NOT NULL)
+			),
+			CHECK (
+				(host_acknowledged_at IS NULL AND host_acknowledged_fence_token IS NULL) OR
+				(host_acknowledged_at IS NOT NULL AND host_acknowledged_fence_token IS NOT NULL)
+			),
+			CHECK (
+				(operator_quiesced_at IS NULL
+				 AND operator_quiesced_by IS NULL
+				 AND operator_quiescence_reason IS NULL
+				 AND operator_quiesced_generation IS NULL
+				 AND operator_confirmed_worker_stopped = 0
+				 AND operator_confirmed_host_writes_stopped = 0
+				 AND operator_observed_heartbeat_at IS NULL
+				 AND operator_observed_claim_expires_at IS NULL
+				 AND operator_observed_pid IS NULL
+				 AND operator_observed_process_identity IS NULL)
+				OR
+				(operator_quiesced_at IS NOT NULL
+				 AND operator_quiesced_by IS NOT NULL
+				 AND operator_quiescence_reason IS NOT NULL
+				 AND operator_quiesced_generation = fence_generation
+				 AND operator_confirmed_worker_stopped = 1
+				 AND operator_confirmed_host_writes_stopped = 1
+				 AND operator_observed_heartbeat_at IS NOT NULL
+				 AND operator_observed_claim_expires_at IS NOT NULL)
+			)
+		)`); err != nil {
+			return fmt.Errorf("create run recovery fence table: %w", err)
+		}
+		if hasDurableFenceState {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO run_reclaim_requests(
+					run_id, expires_at, reason, outcome, count_failure, requested_at,
+					requires_operator, diagnostic_code, fence_token,
+					fence_generation, host_acknowledged_at,
+					host_acknowledged_fence_token,
+					recovery_owner_token, recovery_owner_expires_at
+				)
+				SELECT run_id, expires_at, reason, outcome, count_failure, requested_at,
+					requires_operator, diagnostic_code, fence_token,
+					fence_generation, host_acknowledged_at,
+					CASE WHEN host_acknowledged_at IS NULL THEN NULL ELSE fence_token END,
+					recovery_owner_token, recovery_owner_expires_at
+				FROM run_reclaim_requests_before_v25`); err != nil {
+				return fmt.Errorf("copy durable run recovery fences: %w", err)
+			}
+		} else {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO run_reclaim_requests(
+					run_id, expires_at, reason, outcome, count_failure, requested_at,
+					requires_operator, diagnostic_code, fence_token,
+					fence_generation, host_acknowledged_at,
+					host_acknowledged_fence_token,
+					recovery_owner_token, recovery_owner_expires_at
+				)
+				SELECT run_id, expires_at, reason, outcome, count_failure, requested_at,
+					0, NULL, lower(hex(randomblob(24))), 1, NULL, NULL, NULL, NULL
+				FROM run_reclaim_requests_before_v25`); err != nil {
+				return fmt.Errorf("copy legacy run recovery fences: %w", err)
+			}
+		}
+		if _, err := conn.ExecContext(
+			ctx,
+			"DROP TABLE run_reclaim_requests_before_v25",
+		); err != nil {
+			return fmt.Errorf("drop old run recovery fence table: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit run recovery fence migration: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) ensureIntegrationResolutionResolvedSchema(ctx context.Context) (resultErr error) {
+	// Serialize the inspection and additive migration. Two processes may open
+	// the same v23 database at once; checking outside the write transaction
+	// lets both observe the missing column before one ALTER wins.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open integration resolution migration connection: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin integration resolution migration: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	rows, err := conn.QueryContext(ctx, "PRAGMA table_info(integration_resolution_attempts)")
+	if err != nil {
+		return fmt.Errorf("inspect integration resolution schema: %w", err)
+	}
+	tableExists := false
+	hasResolvedAt := false
+	for rows.Next() {
+		tableExists = true
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan integration resolution schema: %w", err)
+		}
+		if name == "resolved_at" {
+			hasResolvedAt = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("inspect integration resolution schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !tableExists {
+		return errors.New("integration resolution ledger is missing after schema initialization")
+	}
+	if !hasResolvedAt {
+		if _, err := conn.ExecContext(
+			ctx,
+			"ALTER TABLE integration_resolution_attempts ADD COLUMN resolved_at TEXT",
+		); err != nil {
+			return fmt.Errorf("add integration resolution resolved timestamp: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, integrationResolutionInvariantTriggers); err != nil {
+		return fmt.Errorf("ensure integration resolution invariants: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit integration resolution migration: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) validateRecoveryCompletionInvariants(ctx context.Context) error {
+	var taskID, checkpointID, state string
+	err := s.db.QueryRowContext(ctx, `SELECT task.id, checkpoint.id, checkpoint.state
+		FROM tasks task
+		JOIN recovery_checkpoints checkpoint ON checkpoint.task_id = task.id
+		WHERE task.status = 'done'
+			AND checkpoint.state IN ('pending', 'reserved', 'adopted')
+		ORDER BY task.id, checkpoint.id
+		LIMIT 1`).Scan(&taskID, &checkpointID, &state)
+	if err == nil {
+		return fmt.Errorf(
+			"incompatible recovery state: done task %s has active checkpoint %s in state %s",
+			taskID,
+			checkpointID,
+			state,
+		)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("validate done task recovery state: %w", err)
+	}
+
+	var runID string
+	err = s.db.QueryRowContext(ctx, `SELECT resolution.run_id
+		FROM integration_resolution_attempts resolution
+		LEFT JOIN recovery_checkpoints checkpoint
+			ON checkpoint.reserved_run_id = resolution.run_id
+		LEFT JOIN run_workspaces workspace ON workspace.run_id = resolution.run_id
+		WHERE
+			(
+				resolution.resolved_at IS NOT NULL
+				AND (
+					resolution.attempt IS NULL
+					OR resolution.started_at IS NULL
+					OR checkpoint.id IS NULL
+					OR checkpoint.state NOT IN ('adopted', 'consumed', 'superseded')
+					OR checkpoint.adopted_output_base_commit IS NULL
+					OR checkpoint.adopted_head_commit IS NULL
+					OR workspace.base_commit IS NULL
+					OR workspace.base_commit <> checkpoint.adopted_output_base_commit
+				)
+			)
+			OR
+			(
+				resolution.resolved_at IS NULL
+				AND checkpoint.state IN ('adopted', 'consumed')
+			)
+		ORDER BY resolution.run_id
+		LIMIT 1`).Scan(&runID)
+	if err == nil {
+		return fmt.Errorf(
+			"incompatible integration recovery state for run %s",
+			runID,
+		)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("validate integration recovery state: %w", err)
 	}
 	return nil
 }
@@ -611,6 +919,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_incidents_active_dedupe
   ON coordination_incidents(board, trigger, IFNULL(root_task_id, ''), IFNULL(task_id, ''))
   WHERE status IN ('open', 'coordinating', 'awaiting_approval', 'applying');`
 
+const integrationResolutionInvariantTriggers = `
+CREATE TRIGGER IF NOT EXISTS integration_resolution_insert_requires_started_recovery
+BEFORE INSERT ON integration_resolution_attempts
+WHEN NEW.resolved_at IS NOT NULL AND (
+  NEW.attempt IS NULL
+  OR NEW.started_at IS NULL
+  OR NOT EXISTS (
+    SELECT 1 FROM recovery_checkpoints checkpoint
+    WHERE checkpoint.reserved_run_id = NEW.run_id
+      AND checkpoint.state = 'adopted'
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'resolved integration requires started adopted recovery');
+END;
+
+CREATE TRIGGER IF NOT EXISTS integration_resolution_update_requires_started_recovery
+BEFORE UPDATE OF attempt, started_at, resolved_at ON integration_resolution_attempts
+WHEN
+  (OLD.resolved_at IS NOT NULL AND OLD.resolved_at IS NOT NEW.resolved_at)
+  OR
+  (
+    NEW.resolved_at IS NOT NULL
+    AND (
+      NEW.attempt IS NULL
+      OR NEW.started_at IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM recovery_checkpoints checkpoint
+        WHERE checkpoint.reserved_run_id = NEW.run_id
+          AND checkpoint.state = 'adopted'
+      )
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'resolved integration requires immutable started adopted recovery');
+END;
+
+-- ConfirmRecoveryAfterIntegrationResolution intentionally updates the
+-- workspace base before it records resolved_at in the same transaction. Once
+-- that marker exists, changing the base would break the durable bridge between
+-- the resolved graph, adopted checkpoint, and Finalizer verification turn.
+CREATE TRIGGER IF NOT EXISTS run_workspace_prevent_confirmed_integration_base_change
+BEFORE UPDATE OF base_commit ON run_workspaces
+WHEN OLD.base_commit IS NOT NEW.base_commit AND EXISTS (
+  SELECT 1 FROM integration_resolution_attempts resolution
+  WHERE resolution.run_id = OLD.run_id
+    AND resolution.resolved_at IS NOT NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'run workspace base is immutable after integration recovery confirmation');
+END;`
+
 const latestSchema = `
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -1068,6 +1428,19 @@ BEGIN
   WHERE reserved_run_id = OLD.id AND state = 'reserved';
 END;
 
+-- A task cannot become Done while partial work still needs a recovery
+-- decision. FinalizeRunTerminal consumes an adopted checkpoint before updating
+-- the task, so valid successful completion satisfies this invariant.
+CREATE TRIGGER IF NOT EXISTS recovery_checkpoint_prevent_done_with_active
+BEFORE UPDATE OF status ON tasks
+WHEN NEW.status = 'done' AND EXISTS (
+  SELECT 1 FROM recovery_checkpoints
+  WHERE task_id = NEW.id AND state IN ('pending', 'reserved', 'adopted')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'task cannot be done with an active recovery checkpoint');
+END;
+
 -- Conflict-resolution preparations and started attempts are control-plane
 -- safety state. They survive event retention so GC cannot reset retry bounds.
 CREATE TABLE IF NOT EXISTS integration_resolution_attempts (
@@ -1083,10 +1456,12 @@ CREATE TABLE IF NOT EXISTS integration_resolution_attempts (
   conflicting_files_json TEXT NOT NULL DEFAULT '[]',
   prepared_at TEXT NOT NULL,
   started_at TEXT,
+  resolved_at TEXT,
   CHECK (
     (attempt IS NULL AND started_at IS NULL) OR
     (attempt IS NOT NULL AND started_at IS NOT NULL)
   ),
+  CHECK (resolved_at IS NULL OR (attempt IS NOT NULL AND started_at IS NOT NULL)),
   CHECK (attempt IS NULL OR attempt <= max_attempts),
   PRIMARY KEY (task_id, conflict_fingerprint, run_id),
   UNIQUE (task_id, conflict_fingerprint, attempt)
@@ -1239,9 +1614,58 @@ CREATE TABLE IF NOT EXISTS run_reclaim_requests (
   run_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
   expires_at TEXT NOT NULL,
   reason TEXT NOT NULL,
-  outcome TEXT NOT NULL CHECK (outcome IN ('reclaimed', 'timed_out')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('reclaimed', 'timed_out', 'crashed')),
   count_failure INTEGER NOT NULL CHECK (count_failure IN (0, 1)),
-  requested_at TEXT NOT NULL
+  requested_at TEXT NOT NULL,
+  requires_operator INTEGER NOT NULL DEFAULT 0 CHECK (requires_operator IN (0, 1)),
+  diagnostic_code TEXT,
+  fence_token TEXT NOT NULL,
+  fence_generation INTEGER NOT NULL DEFAULT 1 CHECK (fence_generation >= 1),
+  host_acknowledged_at TEXT,
+  host_acknowledged_fence_token TEXT,
+  recovery_owner_token TEXT,
+  recovery_owner_expires_at TEXT,
+  operator_quiesced_at TEXT,
+  operator_quiesced_by TEXT,
+  operator_quiescence_reason TEXT,
+  operator_quiesced_generation INTEGER,
+  operator_confirmed_worker_stopped INTEGER NOT NULL DEFAULT 0
+    CHECK (operator_confirmed_worker_stopped IN (0, 1)),
+  operator_confirmed_host_writes_stopped INTEGER NOT NULL DEFAULT 0
+    CHECK (operator_confirmed_host_writes_stopped IN (0, 1)),
+  operator_observed_heartbeat_at TEXT,
+  operator_observed_claim_expires_at TEXT,
+  operator_observed_pid INTEGER,
+  operator_observed_process_identity TEXT,
+  CHECK (
+    (recovery_owner_token IS NULL AND recovery_owner_expires_at IS NULL) OR
+    (recovery_owner_token IS NOT NULL AND recovery_owner_expires_at IS NOT NULL)
+  ),
+  CHECK (
+    (host_acknowledged_at IS NULL AND host_acknowledged_fence_token IS NULL) OR
+    (host_acknowledged_at IS NOT NULL AND host_acknowledged_fence_token IS NOT NULL)
+  ),
+  CHECK (
+    (operator_quiesced_at IS NULL
+      AND operator_quiesced_by IS NULL
+      AND operator_quiescence_reason IS NULL
+      AND operator_quiesced_generation IS NULL
+      AND operator_confirmed_worker_stopped = 0
+      AND operator_confirmed_host_writes_stopped = 0
+      AND operator_observed_heartbeat_at IS NULL
+      AND operator_observed_claim_expires_at IS NULL
+      AND operator_observed_pid IS NULL
+      AND operator_observed_process_identity IS NULL)
+    OR
+    (operator_quiesced_at IS NOT NULL
+      AND operator_quiesced_by IS NOT NULL
+      AND operator_quiescence_reason IS NOT NULL
+      AND operator_quiesced_generation = fence_generation
+      AND operator_confirmed_worker_stopped = 1
+      AND operator_confirmed_host_writes_stopped = 1
+      AND operator_observed_heartbeat_at IS NOT NULL
+      AND operator_observed_claim_expires_at IS NOT NULL)
+  )
 );
 
 CREATE TABLE IF NOT EXISTS task_change_sets (

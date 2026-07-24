@@ -3,6 +3,7 @@
 package dispatcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -12,10 +13,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func newWorkerCommand(command RunnerCommand) (*workerCommand, error) {
+func newWorkerCommand(_ context.Context, command RunnerCommand) (*workerCommand, error) {
 	child := exec.Command(command.Command, command.Args...)
 	return &workerCommand{
 		child: child,
+		start: child.Start,
+		wait:  child.Wait,
 		release: func() (bool, error) {
 			if child.Process == nil {
 				return false, errors.New("worker process has not started")

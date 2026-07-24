@@ -219,7 +219,7 @@ func (s *Store) requestRunCompletion(ctx context.Context, scope RunScope, comple
 		return model.TaskDetail{}, err
 	}
 	if finalizeNow {
-		finalized, finalizeErr := s.FinalizeRunTerminal(ctx, scope.RunID, 0)
+		finalized, finalizeErr := s.FinalizeRunTerminal(ctx, scope, 0)
 		if finalizeErr != nil {
 			_ = s.DiscardRunTerminalRequest(ctx, scope, "immediate finalization failed")
 		}
@@ -266,7 +266,7 @@ func (s *Store) requestRunBlock(ctx context.Context, scope RunScope, input Block
 		return model.TaskDetail{}, err
 	}
 	if finalizeNow {
-		finalized, finalizeErr := s.FinalizeRunTerminal(ctx, scope.RunID, 0)
+		finalized, finalizeErr := s.FinalizeRunTerminal(ctx, scope, 0)
 		if finalizeErr != nil {
 			_ = s.DiscardRunTerminalRequest(ctx, scope, "immediate finalization failed")
 		}
@@ -300,7 +300,13 @@ func (s *Store) DiscardRunTerminalRequest(ctx context.Context, scope RunScope, r
 	})
 }
 
-func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode int) (model.TaskDetail, error) {
+func (s *Store) finalizeRunTerminal(
+	ctx context.Context,
+	runID string,
+	scope *RunScope,
+	observation *RunRecoveryObservation,
+	exitCode int,
+) (model.TaskDetail, error) {
 	request, err := s.GetRunTerminalRequest(ctx, runID)
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -308,7 +314,12 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 	if request == nil {
 		return model.TaskDetail{}, fmt.Errorf("run has no terminal request: %s", runID)
 	}
-	run, err := getRun(ctx, s.db, runID)
+	var run model.Run
+	if scope != nil {
+		run, err = requireRunScope(ctx, s.db, *scope)
+	} else {
+		run, err = getRun(ctx, s.db, runID)
+	}
 	if err != nil {
 		return model.TaskDetail{}, err
 	}
@@ -318,40 +329,15 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 		}
 		return model.TaskDetail{}, fmt.Errorf("cannot finalize terminal run: %s", run.Status)
 	}
+	if observation != nil {
+		if err := requireSupervisorRunRecoveryFence(ctx, s.db, run, observation); err != nil {
+			return model.TaskDetail{}, err
+		}
+	} else if err := ensureNoRunRecoveryFence(ctx, s.db, run.ID); err != nil {
+		return model.TaskDetail{}, err
+	}
 	if exitCode != 0 && request.Kind != "block" {
 		return model.TaskDetail{}, fmt.Errorf("cannot finalize terminal request after exit code %d", exitCode)
-	}
-	task, err := requireTask(ctx, s.db, run.TaskID)
-	if err != nil {
-		return model.TaskDetail{}, err
-	}
-	metadata := request.Metadata
-	if request.Kind == "complete" && len(request.Artifacts) > 0 {
-		workspacePath := ""
-		if workspace, err := s.GetRunWorkspace(ctx, runID); err != nil {
-			return model.TaskDetail{}, err
-		} else if workspace != nil {
-			workspacePath = workspace.Path
-		}
-		if workspacePath == "" && task.Workspace != nil {
-			workspacePath = strings.TrimPrefix(strings.TrimPrefix(*task.Workspace, "dir:"), "worktree:")
-		}
-		captured, err := s.captureArtifactsAt(ctx, task, workspacePath, request.Artifacts)
-		if err != nil {
-			return model.TaskDetail{}, err
-		}
-		if metadata == nil {
-			metadata = map[string]any{}
-		}
-		artifacts := make([]map[string]any, 0, len(captured))
-		for _, attachment := range captured {
-			artifacts = append(artifacts, map[string]any{"id": attachment.ID, "name": attachment.Name, "path": attachment.Path})
-		}
-		metadata["artifacts"] = artifacts
-	}
-	metadataJSON, err := terminalJSON(metadata)
-	if err != nil {
-		return model.TaskDetail{}, err
 	}
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		currentRequest, err := getTerminalRequest(ctx, tx, runID)
@@ -361,7 +347,12 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 		if currentRequest == nil {
 			return fmt.Errorf("run has no terminal request: %s", runID)
 		}
-		currentRun, err := getRun(ctx, tx, runID)
+		var currentRun model.Run
+		if scope != nil {
+			currentRun, err = requireRunScope(ctx, tx, *scope)
+		} else {
+			currentRun, err = getRun(ctx, tx, runID)
+		}
 		if err != nil {
 			return err
 		}
@@ -371,6 +362,13 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 			}
 			return fmt.Errorf("cannot finalize terminal run: %s", currentRun.Status)
 		}
+		if observation != nil {
+			if err := requireSupervisorRunRecoveryFence(ctx, tx, currentRun, observation); err != nil {
+				return err
+			}
+		} else if err := ensureNoRunRecoveryFence(ctx, tx, currentRun.ID); err != nil {
+			return err
+		}
 		currentTask, err := requireTask(ctx, tx, currentRun.TaskID)
 		if err != nil {
 			return err
@@ -378,7 +376,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 		if currentTask.CurrentRunID == nil || *currentTask.CurrentRunID != runID || currentTask.Status != model.TaskStatusRunning {
 			return errors.New("run no longer owns this task")
 		}
-		timestamp := now()
+		timestamp := ""
 		switch currentRequest.Kind {
 		case "complete":
 			open, err := hasOpenParents(ctx, tx, currentTask.ID)
@@ -388,8 +386,12 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 			if open {
 				return errors.New("task prerequisites changed while completion was pending")
 			}
-			var workspaceKind string
-			workspaceErr := tx.QueryRowContext(ctx, "SELECT kind FROM run_workspaces WHERE run_id = ?", runID).Scan(&workspaceKind)
+			var workspaceKind, workspacePath string
+			workspaceErr := tx.QueryRowContext(
+				ctx,
+				"SELECT kind, path FROM run_workspaces WHERE run_id = ?",
+				runID,
+			).Scan(&workspaceKind, &workspacePath)
 			if workspaceErr != nil && !errors.Is(workspaceErr, sql.ErrNoRows) {
 				return workspaceErr
 			}
@@ -410,10 +412,41 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 				tx,
 				currentTask.ID,
 				runID,
-				timestamp,
+				now(),
 			); err != nil {
 				return err
 			}
+			metadata := currentRequest.Metadata
+			if len(currentRequest.Artifacts) > 0 {
+				captured, err := s.captureTerminalArtifacts(
+					ctx,
+					tx,
+					currentTask,
+					currentRun,
+					*currentRequest,
+					workspacePath,
+				)
+				if err != nil {
+					return err
+				}
+				if metadata == nil {
+					metadata = map[string]any{}
+				}
+				artifacts := make([]map[string]any, 0, len(captured))
+				for _, attachment := range captured {
+					artifacts = append(artifacts, map[string]any{
+						"id":   attachment.ID,
+						"name": attachment.Name,
+						"path": attachment.Path,
+					})
+				}
+				metadata["artifacts"] = artifacts
+			}
+			metadataJSON, err := terminalJSON(metadata)
+			if err != nil {
+				return err
+			}
+			timestamp = now()
 			if _, err := tx.ExecContext(ctx, `UPDATE task_runs SET status = 'completed', ended_at = ?, heartbeat_at = ?,
 				exit_code = ?, summary = ?, metadata_json = ? WHERE id = ?`, timestamp, timestamp, exitCode,
 				currentRequest.Summary, metadataJSON, runID); err != nil {
@@ -438,6 +471,7 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 				return err
 			}
 		case "block":
+			timestamp = now()
 			reason := ""
 			if currentRequest.Reason != nil {
 				reason = *currentRequest.Reason
@@ -462,4 +496,31 @@ func (s *Store) FinalizeRunTerminal(ctx context.Context, runID string, exitCode 
 		return model.TaskDetail{}, err
 	}
 	return s.GetTask(ctx, run.TaskID)
+}
+
+// FinalizeRunTerminal finalizes the exact active host claim that created the
+// terminal request. A concurrent recovery fence rejects it in the same
+// transaction. Supervisor recovery uses FinalizeObservedRunTerminal instead.
+func (s *Store) FinalizeRunTerminal(
+	ctx context.Context,
+	scope RunScope,
+	exitCode int,
+) (model.TaskDetail, error) {
+	return s.finalizeRunTerminal(ctx, scope.RunID, &scope, nil, exitCode)
+}
+
+// FinalizeObservedRunTerminal finalizes a stopped managed worker's request
+// only when its lease and process state still match the Supervisor snapshot.
+func (s *Store) FinalizeObservedRunTerminal(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	exitCode int,
+) (model.TaskDetail, error) {
+	return s.finalizeRunTerminal(
+		ctx,
+		observation.RunID,
+		nil,
+		&observation,
+		exitCode,
+	)
 }

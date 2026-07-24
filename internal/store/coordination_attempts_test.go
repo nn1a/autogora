@@ -1247,8 +1247,8 @@ func TestLatestSchemaRecreatesCoordinationAttemptTableAndAdvancesVersion(t *test
 	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 23 || version != schemaVersion {
-		t.Fatalf("schema version = constant:%d database:%d, want 23", schemaVersion, version)
+	if schemaVersion != 24 || version != schemaVersion {
+		t.Fatalf("schema version = constant:%d database:%d, want 24", schemaVersion, version)
 	}
 	incident := createAttemptTestIncident(
 		t,

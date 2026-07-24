@@ -73,7 +73,7 @@ func createCLIPublication(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := opened.FinalizeRunTerminal(ctx, claimed.Run.ID, 0); err != nil {
+	if _, err := opened.FinalizeRunTerminal(ctx, scope, 0); err != nil {
 		t.Fatal(err)
 	}
 	value, created, err := opened.EnsurePublication(ctx, store.EnsurePublicationInput{

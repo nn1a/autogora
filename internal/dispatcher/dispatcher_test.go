@@ -41,6 +41,66 @@ func testManager(t *testing.T) (*boards.Manager, string) {
 	return manager, dbPath
 }
 
+func confirmCurrentRunRecoveryQuiescence(
+	t *testing.T,
+	ctx context.Context,
+	opened *store.Store,
+	runID string,
+) store.DeferredReclaim {
+	t.Helper()
+	fence, err := opened.GetDeferredReclaim(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence == nil || !fence.RequiresOperator {
+		t.Fatalf("operator recovery fence = %#v", fence)
+	}
+	confirmed, err := opened.ConfirmRunRecoveryQuiescence(
+		ctx,
+		store.ConfirmRunRecoveryQuiescenceInput{
+			RunID:                    runID,
+			FenceGeneration:          fence.FenceGeneration,
+			Actor:                    "dispatcher recovery test",
+			Reason:                   "the fixture worker and all host writes have stopped",
+			ConfirmWorkerStopped:     true,
+			ConfirmHostWritesStopped: true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return confirmed
+}
+
+func acknowledgeCurrentRunRecoveryFence(
+	t *testing.T,
+	ctx context.Context,
+	opened *store.Store,
+	scope store.RunScope,
+) store.DeferredReclaim {
+	t.Helper()
+	fence, err := opened.GetDeferredReclaim(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence == nil || fence.RequiresOperator {
+		t.Fatalf("managed host recovery fence = %#v", fence)
+	}
+	acknowledged, err := opened.AcknowledgeRunRecoveryFence(
+		ctx,
+		scope,
+		fence.FenceToken,
+		fence.FenceGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledged.HostAcknowledgedAt == nil {
+		t.Fatalf("managed host fence was not acknowledged: %#v", acknowledged)
+	}
+	return acknowledged
+}
+
 func executableFixture(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fixture.sh")
@@ -204,6 +264,18 @@ func TestRecoveryRequeuesRecordedDeadWorker(t *testing.T) {
 	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 		t.Fatal(err)
 	}
+	fence := confirmCurrentRunRecoveryQuiescence(
+		t,
+		ctx,
+		opened,
+		claim.Run.ID,
+	)
+	if fence.RequiresOperator {
+		t.Fatalf("operator confirmation did not release fence: %#v", fence)
+	}
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
 	detail, _ := opened.GetTask(ctx, task.Task.ID)
 	if detail.Task.Status != model.TaskStatusReady || detail.Task.FailureCount != 1 || detail.Runs[0].Status != model.RunStatusCrashed {
 		t.Fatalf("dead worker was not recovered: %#v", detail)
@@ -260,21 +332,55 @@ func TestRecoveryEscalatesDeferredTerminationWithoutDuplicateGraceEvents(t *test
 	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 		t.Fatal(err)
 	}
+	firstFence, err := opened.GetDeferredReclaim(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstFence == nil || !firstFence.RequiresOperator {
+		t.Fatalf("live worker did not enter operator recovery fence: %#v", firstFence)
+	}
 	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 		t.Fatal(err)
 	}
-	events, err := opened.ListEvents(ctx, store.EventFilter{TaskID: task.Task.ID, Kinds: []string{"reclaim_deferred"}})
+	secondFence, err := opened.GetDeferredReclaim(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondFence == nil ||
+		secondFence.FenceToken != firstFence.FenceToken ||
+		secondFence.FenceGeneration != firstFence.FenceGeneration {
+		t.Fatalf(
+			"repeated sweep replaced operator fence: first=%#v second=%#v",
+			firstFence,
+			secondFence,
+		)
+	}
+	events, err := opened.ListEvents(ctx, store.EventFilter{
+		TaskID: task.Task.ID,
+		Kinds:  []string{"reclaim_requires_operator"},
+	})
 	if err != nil || len(events) != 1 {
 		t.Fatalf("grace period emitted duplicate events: %d, %v", len(events), err)
 	}
-	time.Sleep(1100 * time.Millisecond)
-	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
-		t.Fatal(err)
-	}
+	_ = process.Process.Kill()
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
-		t.Fatal("force termination did not stop the stale worker")
+		t.Fatal("fixture worker did not stop")
+	}
+	confirmed := confirmCurrentRunRecoveryQuiescence(
+		t,
+		ctx,
+		opened,
+		claim.Run.ID,
+	)
+	if confirmed.FenceToken != firstFence.FenceToken ||
+		confirmed.FenceGeneration != firstFence.FenceGeneration+1 {
+		t.Fatalf(
+			"operator confirmation did not rotate exact generation: before=%#v after=%#v",
+			firstFence,
+			confirmed,
+		)
 	}
 	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 		t.Fatal(err)
@@ -287,23 +393,28 @@ func TestRecoveryEscalatesDeferredTerminationWithoutDuplicateGraceEvents(t *test
 		len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusReclaimed {
 		t.Fatalf("stale worker was not reclaimed after escalation: %#v", detail)
 	}
-	events, err = opened.ListEvents(ctx, store.EventFilter{TaskID: task.Task.ID, Kinds: []string{"reclaim_deferred"}})
-	if err != nil || len(events) != 2 {
-		t.Fatalf("escalation events = %d, %v", len(events), err)
+	events, err = opened.ListEvents(ctx, store.EventFilter{
+		TaskID: task.Task.ID,
+		Kinds:  []string{"reclaim_requires_operator"},
+	})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("operator fence events = %d, %v", len(events), err)
 	}
 }
 
-func TestRecoveryBlocksStaleRunsWithUnreviewedWorktreeChanges(t *testing.T) {
+func TestRecoveryCheckpointsStaleRunsAfterWorkerStops(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		mutate func(*testing.T, string)
+		name         string
+		changedFile  string
+		expectedBody string
+		mutate       func(*testing.T, string)
 	}{
-		{name: "dirty", mutate: func(t *testing.T, path string) {
+		{name: "dirty", changedFile: "partial.txt", expectedBody: "unfinished\n", mutate: func(t *testing.T, path string) {
 			if err := os.WriteFile(filepath.Join(path, "partial.txt"), []byte("unfinished\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{name: "committed", mutate: func(t *testing.T, path string) {
+		{name: "committed", changedFile: "committed.txt", expectedBody: "committed before recovery\n", mutate: func(t *testing.T, path string) {
 			if err := os.WriteFile(filepath.Join(path, "committed.txt"), []byte("committed before recovery\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -343,12 +454,15 @@ func TestRecoveryBlocksStaleRunsWithUnreviewedWorktreeChanges(t *testing.T) {
 			if prepared.Workspace == nil || prepared.Workspace.Kind != model.WorkspaceWorktree {
 				t.Fatalf("expected prepared worktree: %#v", prepared.Workspace)
 			}
-			test.mutate(t, prepared.Workspace.Path)
-			headOutput, err := exec.Command("git", "-C", prepared.Workspace.Path, "rev-parse", "HEAD").Output()
-			if err != nil {
+			if _, err := opened.RecordSpawn(
+				ctx,
+				store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+				99999999,
+				filepath.Join(t.TempDir(), "stopped-worker.log"),
+			); err != nil {
 				t.Fatal(err)
 			}
-			head := strings.TrimSpace(string(headOutput))
+			test.mutate(t, prepared.Workspace.Path)
 
 			database, err := sql.Open("sqlite", dbPath)
 			if err != nil {
@@ -369,28 +483,52 @@ func TestRecoveryBlocksStaleRunsWithUnreviewedWorktreeChanges(t *testing.T) {
 			if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 				t.Fatal(err)
 			}
+			confirmCurrentRunRecoveryQuiescence(
+				t,
+				ctx,
+				opened,
+				claim.Run.ID,
+			)
+			if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+				t.Fatal(err)
+			}
 			detail, err := opened.GetTask(ctx, task.Task.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || detail.Task.BlockKind == nil ||
-				*detail.Task.BlockKind != model.BlockKindNeedsInput || detail.Task.BlockReason == nil {
-				t.Fatalf("stale partial run was not blocked for review: %#v", detail)
+			if detail.Task.Status != model.TaskStatusReady || detail.Task.CurrentRunID != nil ||
+				detail.Task.FailureCount != 1 || detail.Task.BlockKind != nil ||
+				len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusCrashed {
+				t.Fatalf("stale partial run was not checkpointed and requeued: %#v", detail)
 			}
-			reason := *detail.Task.BlockReason
-			if !strings.Contains(reason, prepared.Workspace.Path) || !strings.Contains(reason, head) ||
-				!strings.Contains(reason, "partial changes remain") || !strings.Contains(reason, "before unblocking") {
-				t.Fatalf("block reason is not actionable: %q", reason)
+			checkpoint, err := opened.GetActiveRecoveryCheckpoint(ctx, task.Task.ID)
+			if err != nil {
+				t.Fatal(err)
 			}
-			var recovered *model.Run
-			for index := range detail.Runs {
-				if detail.Runs[index].ID == claim.Run.ID {
-					recovered = &detail.Runs[index]
-					break
-				}
+			if checkpoint == nil || checkpoint.State != model.RecoveryCheckpointPending ||
+				checkpoint.SourceRunID != claim.Run.ID ||
+				checkpoint.WorktreePath != prepared.Workspace.Path ||
+				checkpoint.ReservationToken != "" ||
+				len(checkpoint.ChangedFiles) != 1 ||
+				checkpoint.ChangedFiles[0] != test.changedFile {
+				t.Fatalf("unexpected abandoned-run checkpoint: %#v", checkpoint)
 			}
-			if recovered == nil || recovered.Status != model.RunStatusReclaimed || recovered.Error == nil || !strings.Contains(*recovered.Error, prepared.Workspace.Path) {
-				t.Fatalf("original stale run lacks preservation evidence: %#v", detail.Runs)
+			refHead, err := exec.Command(
+				"git", "-C", repository, "rev-parse", checkpoint.DurableRef,
+			).Output()
+			if err != nil || strings.TrimSpace(string(refHead)) != checkpoint.HeadCommit {
+				t.Fatalf("checkpoint ref = %q, head=%s, err=%v", refHead, checkpoint.HeadCommit, err)
+			}
+			snapshotBody, err := exec.Command(
+				"git", "-C", repository, "show",
+				checkpoint.HeadCommit+":"+test.changedFile,
+			).Output()
+			if err != nil || string(snapshotBody) != test.expectedBody {
+				t.Fatalf("checkpoint content = %q, want %q, err=%v", snapshotBody, test.expectedBody, err)
+			}
+			sourceBody, err := os.ReadFile(filepath.Join(prepared.Workspace.Path, test.changedFile))
+			if err != nil || string(sourceBody) != test.expectedBody {
+				t.Fatalf("source worktree was not preserved: content=%q err=%v", sourceBody, err)
 			}
 		})
 	}
@@ -435,6 +573,10 @@ func TestAdministrativeTerminationPreservesManagedRunChanges(t *testing.T) {
 		t.Fatalf("termination released managed run too early: %+v", termination)
 	}
 
+	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgeCurrentRunRecoveryFence(t, ctx, opened, scope)
 	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -484,6 +626,10 @@ func TestReadOnlyManagedDirRunReclaimsWithoutFalsePartialWorkBlock(t *testing.T)
 		t.Fatalf("expected shared dir workspace: %+v", prepared.Workspace)
 	}
 
+	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgeCurrentRunRecoveryFence(t, ctx, opened, scope)
 	if err := recoverAbandonedRuns(ctx, opened, "default", Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -930,6 +1076,7 @@ while :; do sleep 1; done`)
 	}
 
 	deadline := time.Now().Add(4 * time.Second)
+	recoveryConfirmed := false
 	for {
 		workerStarted := false
 		if _, err := os.Stat(marker); err == nil {
@@ -942,10 +1089,29 @@ while :; do sleep 1; done`)
 		}
 		staleDetail, staleErr := check.GetTask(context.Background(), stale.Task.ID)
 		readyDetail, readyErr := check.GetTask(context.Background(), ready.Task.ID)
+		fence, fenceErr := check.GetDeferredReclaim(
+			context.Background(),
+			staleClaim.Run.ID,
+		)
+		if !recoveryConfirmed && fenceErr == nil &&
+			fence != nil && fence.RequiresOperator {
+			confirmCurrentRunRecoveryQuiescence(
+				t,
+				context.Background(),
+				check,
+				staleClaim.Run.ID,
+			)
+			recoveryConfirmed = true
+		}
 		check.Close()
-		if staleErr != nil || readyErr != nil {
+		if staleErr != nil || readyErr != nil || fenceErr != nil {
 			cancel()
-			t.Fatalf("inspect concurrent progress: stale=%v ready=%v", staleErr, readyErr)
+			t.Fatalf(
+				"inspect concurrent progress: stale=%v ready=%v fence=%v",
+				staleErr,
+				readyErr,
+				fenceErr,
+			)
 		}
 		if workerStarted && staleDetail.Task.Status != model.TaskStatusRunning && len(staleDetail.Runs) == 1 &&
 			staleDetail.Runs[0].Status == model.RunStatusReclaimed && readyDetail.Task.Status == model.TaskStatusRunning {
@@ -1044,6 +1210,53 @@ printf '%s\n' '{"type":"run_result","text":"done"}'`)
 	if order[0] != "default" || order[1] != "alpha" || order[2] != "default" {
 		cancel()
 		t.Fatalf("worker claim order = %v, want [default alpha default]", order[:3])
+	}
+	// The fixture records its board immediately after requesting completion.
+	// Under a loaded test runner the dispatcher can still be persisting the
+	// terminal request when the third record appears, so wait for the durable
+	// task states before cancelling the supervisor.
+	waitDefault, err := manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	waitAlpha, err := manager.OpenStore(context.Background(), "alpha")
+	if err != nil {
+		cancel()
+		waitDefault.Close()
+		t.Fatal(err)
+	}
+	completionDeadline := time.Now().Add(4 * time.Second)
+	for {
+		allDone := true
+		for _, taskID := range defaultIDs {
+			detail, getErr := waitDefault.GetTask(context.Background(), taskID)
+			if getErr != nil || detail.Task.Status != model.TaskStatusDone {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			detail, getErr := waitAlpha.GetTask(
+				context.Background(),
+				alphaTask.Task.ID,
+			)
+			allDone = getErr == nil && detail.Task.Status == model.TaskStatusDone
+		}
+		if allDone {
+			break
+		}
+		if time.Now().After(completionDeadline) {
+			cancel()
+			waitDefault.Close()
+			waitAlpha.Close()
+			t.Fatal("worker terminal requests were not durably completed")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err := errors.Join(waitDefault.Close(), waitAlpha.Close()); err != nil {
+		cancel()
+		t.Fatal(err)
 	}
 	cancel()
 	select {
@@ -1936,7 +2149,7 @@ func TestDispatcherQuarantinesMissingConfiguredCommandWithoutConsumingRetry(t *t
 	}
 }
 
-func TestDispatcherPreservesPartialWorktreeAndDoesNotRunFallback(t *testing.T) {
+func TestDispatcherResumesPartialWorktreeWithFallback(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
 	repository := gitRepositoryFixture(t)
@@ -1949,8 +2162,10 @@ func TestDispatcherPreservesPartialWorktreeAndDoesNotRunFallback(t *testing.T) {
 printf '%s\n' 'unfinished change' > "$AUTOGORA_WORKSPACE/partial.txt"
 exit 75`)
 	fallbackCommand := executableFixture(t, `
+test "$(cat "$AUTOGORA_WORKSPACE/partial.txt")" = "unfinished change"
+printf '%s\n' 'fallback completed' >> "$AUTOGORA_WORKSPACE/partial.txt"
 touch "$AUTOGORA_TEST_FALLBACK_MARKER"
-"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "fallback should not run" >/dev/null`)
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "fallback resumed checkpoint" >/dev/null`)
 	config := agentconfig.Config{
 		SchemaVersion: agentconfig.SchemaVersion,
 		Supervisor:    agentconfig.Supervisor{MaxWorkers: 1, AllowWrites: true},
@@ -1978,6 +2193,40 @@ touch "$AUTOGORA_TEST_FALLBACK_MARKER"
 	if err := Run(ctx, options); err != nil {
 		t.Fatal(err)
 	}
+	firstCheck, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDetail, err := firstCheck.GetTask(ctx, task.Task.ID)
+	if err != nil {
+		firstCheck.Close()
+		t.Fatal(err)
+	}
+	pending, err := firstCheck.GetActiveRecoveryCheckpoint(ctx, task.Task.ID)
+	if closeErr := firstCheck.Close(); err != nil || closeErr != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	if firstDetail.Task.Status != model.TaskStatusReady ||
+		firstDetail.Task.FailureCount != 0 ||
+		len(firstDetail.Runs) != 1 ||
+		firstDetail.Runs[0].Status != model.RunStatusRateLimited ||
+		len(firstDetail.RunWorkspaces) != 1 ||
+		len(firstDetail.ChangeSets) != 0 {
+		t.Fatalf("primary failure did not leave a retryable checkpoint handoff: %#v", firstDetail)
+	}
+	if pending == nil ||
+		pending.State != model.RecoveryCheckpointPending ||
+		pending.SourceRunID != firstDetail.Runs[0].ID ||
+		pending.WorktreePath != firstDetail.RunWorkspaces[0].Path ||
+		pending.ReservationToken != "" ||
+		len(pending.ChangedFiles) != 1 ||
+		pending.ChangedFiles[0] != "partial.txt" {
+		t.Fatalf("unexpected pending recovery checkpoint: %#v", pending)
+	}
+	refHead, err := exec.Command("git", "-C", repository, "rev-parse", pending.DurableRef).Output()
+	if err != nil || strings.TrimSpace(string(refHead)) != pending.HeadCommit {
+		t.Fatalf("pending checkpoint ref = %q, head=%s, err=%v", refHead, pending.HeadCommit, err)
+	}
 	if err := Run(ctx, options); err != nil {
 		t.Fatal(err)
 	}
@@ -1990,30 +2239,80 @@ touch "$AUTOGORA_TEST_FALLBACK_MARKER"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || detail.Task.BlockReason == nil ||
-		!strings.Contains(*detail.Task.BlockReason, "partial changes remain") {
-		t.Fatalf("partial availability failure did not block for review: %#v", detail)
+	if detail.Task.Status != model.TaskStatusDone ||
+		detail.Task.FailureCount != 0 ||
+		detail.Task.BlockReason != nil ||
+		len(detail.Runs) != 2 ||
+		detail.Runs[0].Status != model.RunStatusRateLimited ||
+		detail.Runs[1].Status != model.RunStatusCompleted ||
+		len(detail.RunWorkspaces) != 2 ||
+		len(detail.ChangeSets) != 1 {
+		t.Fatalf("fallback did not complete the recovered task: %#v", detail)
 	}
-	if len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked || len(detail.RunWorkspaces) != 1 {
-		t.Fatalf("partial run history is incomplete: %#v", detail)
+	if detail.RunWorkspaces[0].Path == detail.RunWorkspaces[1].Path ||
+		detail.RunWorkspaces[0].RunID != detail.Runs[0].ID ||
+		detail.RunWorkspaces[1].RunID != detail.Runs[1].ID {
+		t.Fatalf("recovery did not use distinct run worktrees: %#v", detail.RunWorkspaces)
 	}
-	workspace := detail.RunWorkspaces[0]
-	if workspace.Kind != model.WorkspaceWorktree || !workspace.Generated {
-		t.Fatalf("expected an isolated generated worktree: %#v", workspace)
+	for _, runWorkspace := range detail.RunWorkspaces {
+		if runWorkspace.Kind != model.WorkspaceWorktree || !runWorkspace.Generated {
+			t.Fatalf("expected isolated generated worktrees: %#v", detail.RunWorkspaces)
+		}
 	}
-	contents, err := os.ReadFile(filepath.Join(workspace.Path, "partial.txt"))
-	if err != nil || string(contents) != "unfinished change\n" {
-		t.Fatalf("partial worktree was not preserved: contents=%q err=%v workspace=%#v", contents, err, workspace)
+	contents, err := os.ReadFile(filepath.Join(detail.RunWorkspaces[1].Path, "partial.txt"))
+	if err != nil || string(contents) != "unfinished change\nfallback completed\n" {
+		t.Fatalf("fallback worktree did not inherit and finish partial work: contents=%q err=%v", contents, err)
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("fallback ran after partial edits were detected: %v", err)
+	sourceContents, err := os.ReadFile(filepath.Join(detail.RunWorkspaces[0].Path, "partial.txt"))
+	if err != nil || string(sourceContents) != "unfinished change\n" {
+		t.Fatalf("source checkpoint worktree changed: contents=%q err=%v", sourceContents, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("fallback did not run: %v", err)
+	}
+	change := detail.ChangeSets[0]
+	if change.RunID != detail.Runs[1].ID ||
+		change.State != "ready" ||
+		len(change.ChangedFiles) != 1 ||
+		change.ChangedFiles[0] != "partial.txt" {
+		t.Fatalf("completed recovery lacks one normal change set: %#v", change)
+	}
+	changeContents, err := exec.Command(
+		"git", "-C", repository, "show", change.HeadCommit+":partial.txt",
+	).Output()
+	if err != nil || string(changeContents) != "unfinished change\nfallback completed\n" {
+		t.Fatalf("captured recovery output = %q, err=%v", changeContents, err)
+	}
+	checkpoints, err := check.ListRecoveryCheckpoints(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 1 ||
+		checkpoints[0].ID != pending.ID ||
+		checkpoints[0].State != model.RecoveryCheckpointConsumed ||
+		checkpoints[0].ReservedRunID == nil ||
+		*checkpoints[0].ReservedRunID != detail.Runs[1].ID ||
+		checkpoints[0].AdoptedHeadCommit == nil ||
+		*checkpoints[0].AdoptedHeadCommit != pending.HeadCommit ||
+		checkpoints[0].ConsumedAt == nil {
+		t.Fatalf("checkpoint lifecycle was not consumed by fallback: %#v", checkpoints)
+	}
+	active, err := check.GetActiveRecoveryCheckpoint(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != nil {
+		t.Fatalf("consumed checkpoint remained active: %#v", active)
 	}
 	if _, err := os.Stat(filepath.Join(repository, "partial.txt")); !os.IsNotExist(err) {
 		t.Fatalf("partial edit leaked into the user checkout: %v", err)
 	}
+	if output, err := exec.Command("git", "-C", repository, "status", "--porcelain").Output(); err != nil || len(output) != 0 {
+		t.Fatalf("recovery dirtied the user checkout: %q err=%v", output, err)
+	}
 }
 
-func TestDispatcherPreservesCleanCommittedWorkAfterNonzeroExit(t *testing.T) {
+func TestDispatcherRegistersPendingCheckpointForCleanCommittedFailure(t *testing.T) {
 	ctx := context.Background()
 	manager, dbPath := testManager(t)
 	repository := gitRepositoryFixture(t)
@@ -2030,7 +2329,7 @@ exit 2`)
 		t.Fatal(err)
 	}
 	assignee := "committing-worker"
-	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "preserve committed failure", Assignee: &assignee, Runtime: model.RuntimeCodex})
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{Title: "checkpoint committed failure", Assignee: &assignee, Runtime: model.RuntimeCodex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2053,19 +2352,52 @@ exit 2`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Task.Status != model.TaskStatusBlocked || detail.Task.FailureCount != 0 || len(detail.Runs) != 1 || detail.Runs[0].Status != model.RunStatusBlocked {
-		t.Fatalf("committed failure was not preserved without retry: %#v", detail)
+	if detail.Task.Status != model.TaskStatusReady ||
+		detail.Task.FailureCount != 1 ||
+		detail.Task.BlockReason != nil ||
+		len(detail.Runs) != 1 ||
+		detail.Runs[0].Status != model.RunStatusFailed ||
+		len(detail.RunWorkspaces) != 1 ||
+		len(detail.ChangeSets) != 0 {
+		t.Fatalf("committed failure was not checkpointed before retry: %#v", detail)
 	}
-	if detail.Task.BlockReason == nil || !strings.Contains(*detail.Task.BlockReason, "partial changes remain") || len(detail.RunWorkspaces) != 1 {
-		t.Fatalf("preserved work was not explained: %#v", detail)
+	runWorkspace := detail.RunWorkspaces[0]
+	if runWorkspace.BaseCommit == nil {
+		t.Fatalf("generated worktree has no base commit: %#v", runWorkspace)
 	}
-	workspace := detail.RunWorkspaces[0]
-	if output, err := exec.Command("git", "-C", workspace.Path, "status", "--porcelain").CombinedOutput(); err != nil || len(output) != 0 {
+	if output, err := exec.Command("git", "-C", runWorkspace.Path, "status", "--porcelain").CombinedOutput(); err != nil || len(output) != 0 {
 		t.Fatalf("fixture worktree is not clean: %q %v", output, err)
 	}
-	contents, err := os.ReadFile(filepath.Join(workspace.Path, "committed.txt"))
+	contents, err := os.ReadFile(filepath.Join(runWorkspace.Path, "committed.txt"))
 	if err != nil || string(contents) != "committed before failure\n" {
 		t.Fatalf("committed work was not preserved: contents=%q err=%v", contents, err)
+	}
+	checkpoint, err := check.GetActiveRecoveryCheckpoint(ctx, task.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint == nil ||
+		checkpoint.State != model.RecoveryCheckpointPending ||
+		checkpoint.SourceRunID != detail.Runs[0].ID ||
+		checkpoint.WorktreePath != runWorkspace.Path ||
+		checkpoint.OutputBaseCommit != *runWorkspace.BaseCommit ||
+		checkpoint.ReservationToken != "" ||
+		len(checkpoint.ChangedFiles) != 1 ||
+		checkpoint.ChangedFiles[0] != "committed.txt" {
+		t.Fatalf("unexpected committed-work checkpoint: %#v", checkpoint)
+	}
+	refHead, err := exec.Command("git", "-C", repository, "rev-parse", checkpoint.DurableRef).Output()
+	if err != nil || strings.TrimSpace(string(refHead)) != checkpoint.HeadCommit {
+		t.Fatalf("checkpoint ref = %q, head=%s, err=%v", refHead, checkpoint.HeadCommit, err)
+	}
+	snapshotBody, err := exec.Command(
+		"git", "-C", repository, "show", checkpoint.HeadCommit+":committed.txt",
+	).Output()
+	if err != nil || string(snapshotBody) != "committed before failure\n" {
+		t.Fatalf("checkpoint content = %q, err=%v", snapshotBody, err)
+	}
+	if _, err := os.Stat(filepath.Join(repository, "committed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("committed partial work leaked into the user checkout: %v", err)
 	}
 }
 

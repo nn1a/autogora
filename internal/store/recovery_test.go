@@ -44,7 +44,7 @@ func TestRecoverRunBlockedIsAtomicIdempotentAndReleasesLease(t *testing.T) {
 	}
 	reason := "partial changes remain; inspect them before unblocking"
 	input := RecoverBlockedRunInput{Outcome: model.RunStatusCrashed, Reason: reason, Kind: model.BlockKindNeedsInput}
-	if _, err := opened.RecoverRunBlocked(ctx, claim.Run.ID, input); err == nil || !strings.Contains(err.Error(), "forced blocked-task failure") {
+	if _, err := opened.RecoverRunBlocked(ctx, scope, input); err == nil || !strings.Contains(err.Error(), "forced blocked-task failure") {
 		t.Fatalf("recovery error = %v, want injected task-update failure", err)
 	}
 
@@ -96,7 +96,7 @@ func TestRecoverRunBlockedIsAtomicIdempotentAndReleasesLease(t *testing.T) {
 			}
 		}
 	}()
-	recovered, err := opened.RecoverRunBlocked(ctx, claim.Run.ID, input)
+	recovered, err := opened.RecoverRunBlocked(ctx, scope, input)
 	close(stopClaims)
 	wait.Wait()
 	select {
@@ -121,7 +121,7 @@ func TestRecoverRunBlockedIsAtomicIdempotentAndReleasesLease(t *testing.T) {
 		t.Fatalf("terminal recovery retained workspace leases: %#v", leases)
 	}
 	eventCount := len(recovered.Events)
-	again, err := opened.RecoverRunBlocked(ctx, claim.Run.ID, input)
+	again, err := opened.RecoverRunBlocked(ctx, scope, input)
 	if err != nil {
 		t.Fatal(err)
 	}

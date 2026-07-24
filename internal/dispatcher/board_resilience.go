@@ -229,6 +229,8 @@ type dispatcherTestHooks struct {
 	claimTask        func(context.Context, *store.Store, store.ClaimOptions) (*model.ClaimedTask, error)
 	runClaim         func(context.Context, *boards.Manager, *store.Store, *model.ClaimedTask, Options, *ProcessSet, string) error
 	discoveredBoards func(context.Context, string) ([]string, error)
+	managedRunPhase  func(context.Context, string) error
+	recoveryObserved func(context.Context, store.ActiveRun) error
 }
 
 func (o Options) readBoardMetadata(manager *boards.Manager, board string) (boards.Metadata, error) {

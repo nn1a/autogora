@@ -134,6 +134,42 @@ func createCoordinatorIntegrationIncidentWithCode(
 	return incident
 }
 
+func registerCoordinatorTestCheckpoint(
+	t *testing.T,
+	ctx context.Context,
+	opened *store.Store,
+	taskID string,
+	changedFiles []string,
+	options store.FailRunOptions,
+) model.RecoveryCheckpoint {
+	t.Helper()
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: taskID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim checkpoint source: claim=%+v err=%v", claim, err)
+	}
+	checkpoint, _, err := opened.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+		store.RegisterRecoveryCheckpointInput{
+			RepositoryPath:          "/private/coordinator/repository",
+			WorktreePath:            "/private/coordinator/worktree",
+			OutputBaseCommit:        strings.Repeat("a", 40),
+			StartCommit:             strings.Repeat("a", 40),
+			HeadCommit:              strings.Repeat("d", 40),
+			DurableRef:              "refs/autogora/checkpoints/" + claim.Run.ID,
+			ChangedFiles:            changedFiles,
+			TaskSpecFingerprint:     strings.Repeat("b", 64),
+			PrerequisiteFingerprint: strings.Repeat("c", 64),
+		},
+		"checkpoint source stopped",
+		options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return checkpoint
+}
+
 func TestCoordinatorObserverRepeatedBlockThresholdAndReconciliation(t *testing.T) {
 	ctx := context.Background()
 	manager, _ := testManager(t)
@@ -657,14 +693,364 @@ func TestCoordinatorObserverRetryExhaustionPreservesFailureDetails(t *testing.T)
 	}
 	if len(snapshot.Nodes) != 1 || snapshot.Nodes[0].FailureCount != 2 ||
 		snapshot.Nodes[0].CurrentRunID != nil || snapshot.Nodes[0].BlockReason == nil ||
-		*snapshot.Nodes[0].BlockReason != "compiler failed on attempt 2" {
+		*snapshot.Nodes[0].BlockReason != "task_blocked" {
 		t.Fatalf("retry snapshot node = %+v", snapshot.Nodes)
+	}
+	if _, found := snapshot.Details["blockReason"]; found {
+		t.Fatalf("raw block reason crossed Coordinator boundary: %#v", snapshot.Details)
+	}
+	lastRun, ok = snapshot.Details["lastRun"].(map[string]any)
+	if !ok || lastRun["status"] != string(model.RunStatusFailed) ||
+		lastRun["error"] != nil || lastRun["summary"] != nil {
+		t.Fatalf("sanitized retry details = %#v", snapshot.Details)
 	}
 	if len(snapshot.AvailableAgents) != 1 || snapshot.AvailableAgents[0].ID != "worker" ||
 		!snapshot.AvailableAgents[0].Enabled ||
 		!containsCoordinatorString(snapshot.AvailableAgents[0].Roles, "worker") ||
 		!containsCoordinatorString(snapshot.AvailableAgents[0].Roles, "coordinator") {
 		t.Fatalf("snapshot agents = %+v", snapshot.AvailableAgents)
+	}
+}
+
+func TestCoordinatorObserverEscalatesOnlyPermanentCheckpointAdoptionBlock(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "checkpoint requiring deterministic escalation", Assignee: &assignee,
+		Runtime: model.RuntimeCodex, MaxRetries: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	countFailure := false
+	checkpoint := registerCoordinatorTestCheckpoint(
+		t,
+		ctx,
+		opened,
+		task.Task.ID,
+		[]string{"src/recovered.go"},
+		store.FailRunOptions{CountFailure: &countFailure},
+	)
+	if incidents := observeCoordinatorTestBoard(
+		t,
+		ctx,
+		manager,
+		opened,
+		config,
+		time.Now(),
+	); findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant) != nil {
+		t.Fatalf("normal pending checkpoint opened an incident: %+v", incidents)
+	}
+
+	if _, err := opened.BlockTask(ctx, task.Task.ID, store.BlockInput{
+		Kind: model.BlockKindNeedsInput, Reason: "user must choose a target platform",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if incidents := observeCoordinatorTestBoard(
+		t,
+		ctx,
+		manager,
+		opened,
+		config,
+		time.Now(),
+	); findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant) != nil {
+		t.Fatalf("ordinary needs-input block opened a checkpoint incident: %+v", incidents)
+	}
+	if _, err := opened.UnblockTask(ctx, task.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	const adoptionFailure = coordinatorCheckpointAdoptionFailurePrefix + " immutable ref validation failed"
+	if _, err := opened.BlockTask(ctx, task.Task.ID, store.BlockInput{
+		Kind: model.BlockKindNeedsInput, Reason: adoptionFailure,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	incidents := observeCoordinatorTestBoard(
+		t,
+		ctx,
+		manager,
+		opened,
+		config,
+		time.Now(),
+	)
+	invariant := findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant)
+	if invariant == nil || invariant.TaskID == nil || *invariant.TaskID != task.Task.ID ||
+		invariant.Summary != "Recovery checkpoint adoption requires intervention" {
+		t.Fatalf("permanent checkpoint adoption incident = %+v", invariant)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(invariant.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["reason"] != "recovery_checkpoint_adoption_exhausted" ||
+		details["checkpointId"] != checkpoint.ID ||
+		details["checkpointState"] != string(model.RecoveryCheckpointPending) ||
+		details["sourceRunId"] != checkpoint.SourceRunID {
+		t.Fatalf("permanent checkpoint adoption details = %#v", details)
+	}
+}
+
+func TestCoordinatorIncidentSnapshotsBoundRecoveryContextForExistingTriggers(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	if _, err := opened.SetAgentHealth(ctx, store.SetAgentHealthInput{
+		AgentID: "worker", Status: model.AgentHealthReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assignee := "worker"
+	countFailure := false
+
+	repeatedTask, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "repeated checkpoint block", Assignee: &assignee,
+		Runtime: model.RuntimeCodex, MaxRetries: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedFiles := []string{
+		"/private/coordinator/repository/absolute.go",
+		"../private/coordinator/worktree/escape.go",
+	}
+	for index := 0; index < 18; index++ {
+		changedFiles = append(changedFiles, fmt.Sprintf("src/recovery/file-%02d.go", index))
+	}
+	originalCheckpoint := registerCoordinatorTestCheckpoint(
+		t,
+		ctx,
+		opened,
+		repeatedTask.Task.ID,
+		changedFiles,
+		store.FailRunOptions{CountFailure: &countFailure},
+	)
+	recoveryClaim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: repeatedTask.Task.ID})
+	if err != nil || recoveryClaim == nil {
+		t.Fatalf("claim recovery reservation: claim=%+v err=%v", recoveryClaim, err)
+	}
+	reserved, won, err := opened.ReserveRecoveryCheckpoint(
+		ctx,
+		store.RunScope{
+			RunID: recoveryClaim.Run.ID, ClaimToken: recoveryClaim.ClaimToken,
+		},
+		store.ReserveRecoveryCheckpointInput{
+			CheckpointID:            originalCheckpoint.ID,
+			TaskSpecFingerprint:     originalCheckpoint.TaskSpecFingerprint,
+			PrerequisiteFingerprint: originalCheckpoint.PrerequisiteFingerprint,
+		},
+	)
+	if err != nil || !won || reserved == nil {
+		t.Fatalf("reserve recovery context: checkpoint=%+v won=%t err=%v", reserved, won, err)
+	}
+	reservationToken := reserved.ReservationToken
+	adopted, err := opened.ConfirmRecoveryCheckpointAdoption(
+		ctx,
+		store.RunScope{
+			RunID: recoveryClaim.Run.ID, ClaimToken: recoveryClaim.ClaimToken,
+		},
+		originalCheckpoint.ID,
+		reservationToken,
+		originalCheckpoint.OutputBaseCommit,
+		strings.Repeat("e", 40),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementInput := store.RegisterRecoveryCheckpointInput{
+		RepositoryPath:          originalCheckpoint.RepositoryPath,
+		WorktreePath:            "/private/coordinator/recovery-worktree",
+		OutputBaseCommit:        originalCheckpoint.OutputBaseCommit,
+		StartCommit:             strings.Repeat("e", 40),
+		HeadCommit:              strings.Repeat("f", 40),
+		DurableRef:              "refs/autogora/checkpoints/" + recoveryClaim.Run.ID,
+		ChangedFiles:            changedFiles,
+		TaskSpecFingerprint:     originalCheckpoint.TaskSpecFingerprint,
+		PrerequisiteFingerprint: originalCheckpoint.PrerequisiteFingerprint,
+	}
+	repeatedCheckpoint, _, err := opened.SupersedeRecoveryCheckpointAndFailRun(
+		ctx,
+		store.RunScope{
+			RunID: recoveryClaim.Run.ID, ClaimToken: recoveryClaim.ClaimToken,
+		},
+		originalCheckpoint.ID,
+		adopted.ReservationToken,
+		replacementInput,
+		"recovery launch stopped",
+		store.FailRunOptions{CountFailure: &countFailure},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeatedBlock := store.BlockInput{
+		Kind: model.BlockKindTransient, Reason: "same transient worker failure",
+	}
+	if _, err := opened.BlockTask(ctx, repeatedTask.Task.ID, repeatedBlock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.UnblockTask(ctx, repeatedTask.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.BlockTask(ctx, repeatedTask.Task.ID, repeatedBlock); err != nil {
+		t.Fatal(err)
+	}
+
+	retryTask, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "checkpoint retry exhaustion", Assignee: &assignee,
+		Runtime: model.RuntimeCodex, MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerCoordinatorTestCheckpoint(
+		t,
+		ctx,
+		opened,
+		retryTask.Task.ID,
+		[]string{"src/retry.go"},
+		store.FailRunOptions{Outcome: model.RunStatusCrashed},
+	)
+
+	finalizerTask, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "checkpoint finalizer conflict", Assignee: &assignee,
+		Runtime: model.RuntimeCodex, WorkflowRole: model.WorkflowRoleFinalizer,
+		MaxRetries: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerCoordinatorTestCheckpoint(
+		t,
+		ctx,
+		opened,
+		finalizerTask.Task.ID,
+		[]string{"release/final.go"},
+		store.FailRunOptions{CountFailure: &countFailure},
+	)
+	const integrationReason = "finalizer conflict requires recovery"
+	if _, err := opened.BlockTask(ctx, finalizerTask.Task.ID, store.BlockInput{
+		Kind: model.BlockKindNeedsInput, Reason: integrationReason,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	integration := createCoordinatorIntegrationIncident(
+		t,
+		ctx,
+		opened,
+		finalizerTask.Task.ID,
+		integrationReason,
+	)
+
+	incidents := observeCoordinatorTestBoard(
+		t,
+		ctx,
+		manager,
+		opened,
+		config,
+		time.Now(),
+	)
+	repeated := findCoordinatorIncident(incidents, model.CoordinationTriggerRepeatedBlock)
+	retry := findCoordinatorIncident(incidents, model.CoordinationTriggerRetryExhausted)
+	if repeated == nil || retry == nil {
+		t.Fatalf("existing checkpoint incidents = %+v", incidents)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		AgentConfig: &config,
+		Getenv:      func(string) string { return "" },
+	}
+	for name, test := range map[string]struct {
+		incident model.CoordinationIncident
+		count    int
+	}{
+		"repeated_block":  {incident: *repeated, count: 2},
+		"retry_exhausted": {incident: *retry, count: 1},
+		"finalizer":       {incident: integration, count: 1},
+	} {
+		snapshot, err := buildCoordinatorIncidentSnapshot(
+			ctx,
+			manager,
+			opened,
+			metadata,
+			options,
+			test.incident,
+		)
+		if err != nil {
+			t.Fatalf("%s snapshot: %v", name, err)
+		}
+		if len(snapshot.RecoveryCheckpoints) != test.count {
+			t.Fatalf("%s recovery checkpoint context = %+v", name, snapshot.RecoveryCheckpoints)
+		}
+	}
+
+	snapshot, err := buildCoordinatorIncidentSnapshot(
+		ctx,
+		manager,
+		opened,
+		metadata,
+		options,
+		*repeated,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := snapshot.RecoveryCheckpoints[0]
+	if recovery.ID != repeatedCheckpoint.ID ||
+		recovery.State != model.RecoveryCheckpointPending ||
+		recovery.SourceRunID != repeatedCheckpoint.SourceRunID ||
+		recovery.ChangedFileCount != len(changedFiles) ||
+		len(recovery.BoundedChangedFiles) != coordinatorCheckpointFileLimit {
+		t.Fatalf("bounded recovery checkpoint = %+v", recovery)
+	}
+	recent := snapshot.RecoveryCheckpoints[1]
+	if recent.ID != originalCheckpoint.ID ||
+		recent.State != model.RecoveryCheckpointSuperseded ||
+		recent.AdoptedAt == nil ||
+		recent.SupersedeReason == nil ||
+		strings.TrimSpace(*recent.SupersedeReason) == "" {
+		t.Fatalf("recent recovery checkpoint = %+v", recent)
+	}
+	for _, file := range recovery.BoundedChangedFiles {
+		if !safeCoordinatorCheckpointPath(file) {
+			t.Fatalf("unsafe changed path crossed Coordinator boundary: %q", file)
+		}
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialized := string(encoded)
+	for _, forbidden := range []string{
+		"/private/coordinator/repository",
+		"/private/coordinator/worktree",
+		"/private/coordinator/recovery-worktree",
+		originalCheckpoint.DurableRef,
+		repeatedCheckpoint.DurableRef,
+		reservationToken,
+	} {
+		if strings.Contains(serialized, forbidden) {
+			t.Fatalf("Coordinator snapshot leaked %q: %s", forbidden, serialized)
+		}
 	}
 }
 
@@ -1204,8 +1590,15 @@ func TestCoordinatorObserverDefersGraphStallUntilStaleRunRecoveryCompletes(t *te
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := opened.RecoverAbandonedRun(
-		ctx, claim.Run.ID, model.RunStatusReclaimed, "stale heartbeat recovered", false,
+	countFailure := false
+	recovered, err := opened.FailRun(
+		ctx,
+		store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+		"stale heartbeat recovered",
+		store.FailRunOptions{
+			Outcome:      model.RunStatusReclaimed,
+			CountFailure: &countFailure,
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1300,6 +1693,83 @@ func TestCoordinatorObserverExposesStableMissingRunOwnership(t *testing.T) {
 	}
 	if stalled := findCoordinatorIncident(incidents, model.CoordinationTriggerGraphStalled); stalled != nil {
 		t.Fatalf("missing run was misreported as graph_stalled: %+v", stalled)
+	}
+}
+
+func TestCoordinatorObserverExposesOperatorRecoveryFenceWithoutSecrets(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := testManager(t)
+	opened, err := manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "worker requiring recovery inspection", Assignee: &assignee,
+		Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim worker: claim=%+v err=%v", claim, err)
+	}
+	observation := store.ObserveRunForRecovery(claim.Run, nil)
+	if _, err := opened.RequireObservedRunRecoveryIntervention(
+		ctx,
+		observation,
+		30,
+		"private /workspace/path and token must not leave the control plane",
+		model.RunStatusReclaimed,
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	reclaim, err := opened.GetDeferredReclaim(ctx, claim.Run.ID)
+	if err != nil || reclaim == nil {
+		t.Fatalf("operator fence: value=%+v err=%v", reclaim, err)
+	}
+	metadata, err := manager.Read("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := coordinatorTestConfig(coordinatorWorker("worker"))
+	incidents, err := reconcileCoordinatorIncidents(
+		ctx,
+		manager,
+		opened,
+		metadata,
+		Options{AgentConfig: &config, Getenv: func(string) string { return "" }},
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invariant := findCoordinatorIncident(incidents, model.CoordinationTriggerRunInvariant)
+	if invariant == nil || invariant.TaskID == nil || *invariant.TaskID != task.Task.ID {
+		t.Fatalf("operator fence invariant was not exposed: %+v", incidents)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(invariant.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["reason"] != "operator_recovery_required" ||
+		details["currentRunId"] != claim.Run.ID ||
+		details["diagnosticCode"] != "unverifiable_process_ownership" ||
+		int(details["fenceGeneration"].(float64)) != reclaim.FenceGeneration {
+		t.Fatalf("operator fence details = %#v", details)
+	}
+	encoded := string(invariant.Details)
+	for _, secret := range []string{
+		reclaim.FenceToken,
+		"/workspace/path",
+		"private",
+	} {
+		if secret != "" && strings.Contains(encoded, secret) {
+			t.Fatalf("operator fence incident leaked %q: %s", secret, encoded)
+		}
 	}
 }
 
@@ -1541,6 +2011,9 @@ func TestBoundCoordinatorGraphLimitsNodesAndDependencies(t *testing.T) {
 			PrerequisiteID: from, DependentID: to,
 		})
 	}
+	graph.Dependencies = append(graph.Dependencies, model.DependencyEdge{
+		PrerequisiteID: "n247", DependentID: graph.FocusTaskID,
+	})
 	nodes, dependencies, truncated := boundCoordinatorGraph(graph)
 	if len(nodes) != coordinatorSnapshotNodeLimit ||
 		len(dependencies) != coordinatorSnapshotDependencyLimit || !truncated {
@@ -1552,5 +2025,8 @@ func TestBoundCoordinatorGraphLimitsNodesAndDependencies(t *testing.T) {
 	}
 	if !selected[graph.FocusTaskID] || !selected[graph.RootTaskID] {
 		t.Fatalf("bounded graph omitted focus/root: selected=%v", selected)
+	}
+	if !selected["n247"] {
+		t.Fatalf("bounded graph omitted focus prerequisite sorted beyond the fill window")
 	}
 }

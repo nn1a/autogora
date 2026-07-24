@@ -13,7 +13,7 @@ import (
 	"github.com/nn1a/autogora/internal/store"
 )
 
-func TestTerminateRunPersistsIntentAndReclaimsMissingProcess(t *testing.T) {
+func TestTerminateExternalRunWithoutProcessRequiresQuiescenceConfirmation(t *testing.T) {
 	ctx := context.Background()
 	opened, err := store.Open(filepath.Join(t.TempDir(), "autogora.db"), "default", "")
 	if err != nil {
@@ -33,15 +33,30 @@ func TestTerminateRunPersistsIntentAndReclaimsMissingProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if termination.RunID != claim.Run.ID || termination.Signaled || termination.Pending || termination.Task.Task.Status != model.TaskStatusReady {
+	if termination.RunID != claim.Run.ID || termination.Signaled ||
+		!termination.Pending ||
+		termination.Task.Task.Status != model.TaskStatusRunning {
 		t.Fatalf("unexpected termination: %+v", termination)
 	}
 	inspection, err := opened.GetRun(ctx, claim.Run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.Run.Status != model.RunStatusReclaimed || inspection.Run.Error == nil || *inspection.Run.Error != "administrative edit" {
-		t.Fatalf("termination intent was not preserved: %+v", inspection.Run)
+	if inspection.Run.Status != model.RunStatusRunning ||
+		inspection.Task.CurrentRunID == nil ||
+		*inspection.Task.CurrentRunID != claim.Run.ID {
+		t.Fatalf("external run was released without confirmation: %+v", inspection)
+	}
+	intent, err := opened.GetDeferredReclaim(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent == nil || !intent.RequiresOperator ||
+		intent.FenceGeneration != 2 ||
+		intent.DiagnosticCode == nil ||
+		*intent.DiagnosticCode != "unverifiable_process_ownership" ||
+		intent.OperatorQuiescedGeneration != nil {
+		t.Fatalf("operator recovery fence = %+v", intent)
 	}
 }
 

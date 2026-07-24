@@ -167,7 +167,13 @@ func recoverRunBlockedRecords(
 // both changes in one transaction prevents another dispatcher from observing a
 // transient Ready task after the terminal-run resource trigger releases its
 // workspace lease. Repeating the same recovery is safe and emits no new events.
-func (s *Store) RecoverRunBlocked(ctx context.Context, runID string, raw RecoverBlockedRunInput) (model.TaskDetail, error) {
+func (s *Store) recoverRunBlocked(
+	ctx context.Context,
+	runID string,
+	scope *RunScope,
+	observation *RunRecoveryObservation,
+	raw RecoverBlockedRunInput,
+) (model.TaskDetail, error) {
 	input, err := normalizeRecoverBlockedRunInput(raw)
 	if err != nil {
 		return model.TaskDetail{}, err
@@ -175,7 +181,13 @@ func (s *Store) RecoverRunBlocked(ctx context.Context, runID string, raw Recover
 
 	taskID := ""
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		run, err := getRun(ctx, tx, runID)
+		var run model.Run
+		var err error
+		if scope != nil {
+			run, err = requireRunScope(ctx, tx, *scope)
+		} else {
+			run, err = getRun(ctx, tx, runID)
+		}
 		if err != nil {
 			return err
 		}
@@ -190,8 +202,25 @@ func (s *Store) RecoverRunBlocked(ctx context.Context, runID string, raw Recover
 			}
 			return fmt.Errorf("cannot recover terminal run as blocked: %s", run.Status)
 		}
-		if task.Status != model.TaskStatusRunning || task.CurrentRunID == nil || *task.CurrentRunID != run.ID {
-			return errors.New("run no longer owns this task")
+		if scope != nil {
+			task, run, err = requireActiveRun(ctx, tx, *scope)
+			if err != nil {
+				return err
+			}
+		} else {
+			if task.Status != model.TaskStatusRunning ||
+				task.CurrentRunID == nil ||
+				*task.CurrentRunID != run.ID {
+				return errors.New("run no longer owns this task")
+			}
+			if err := requireSupervisorRunRecoveryFence(
+				ctx,
+				tx,
+				run,
+				observation,
+			); err != nil {
+				return err
+			}
 		}
 		return recoverRunBlockedRecords(ctx, tx, run, task, input)
 	})
@@ -199,4 +228,30 @@ func (s *Store) RecoverRunBlocked(ctx context.Context, runID string, raw Recover
 		return model.TaskDetail{}, err
 	}
 	return s.GetTask(ctx, taskID)
+}
+
+// RecoverRunBlocked is the active host path. Its exact claim scope is checked
+// in the same transaction, and any recovery fence rejects the mutation.
+func (s *Store) RecoverRunBlocked(
+	ctx context.Context,
+	scope RunScope,
+	raw RecoverBlockedRunInput,
+) (model.TaskDetail, error) {
+	return s.recoverRunBlocked(ctx, scope.RunID, &scope, nil, raw)
+}
+
+// RecoverObservedRunBlocked blocks and terminalizes only if the run still
+// matches the Supervisor's exact lease and process observation.
+func (s *Store) RecoverObservedRunBlocked(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	raw RecoverBlockedRunInput,
+) (model.TaskDetail, error) {
+	return s.recoverRunBlocked(
+		ctx,
+		observation.RunID,
+		nil,
+		&observation,
+		raw,
+	)
 }

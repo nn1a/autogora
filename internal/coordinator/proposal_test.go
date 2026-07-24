@@ -108,6 +108,35 @@ func TestTaskVersionMapRejectsInvalidStrictEntries(t *testing.T) {
 	}
 }
 
+func TestAnalyzerRejectsUnboundedRecoveryCheckpointContextBeforePlanner(t *testing.T) {
+	called := false
+	analyzer := Analyzer{
+		Planner: func(context.Context, orchestration.PlannerRequest) (any, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	snapshot := IncidentSnapshot{
+		IncidentID: "ci-recovery-bound",
+		RecoveryCheckpoints: []RecoveryCheckpointSnapshot{
+			{ID: "rcp-1"},
+			{ID: "rcp-2"},
+			{ID: "rcp-3"},
+			{ID: "rcp-4"},
+		},
+	}
+	err := func() error {
+		_, err := analyzer.Analyze(context.Background(), snapshot)
+		return err
+	}()
+	if err == nil || !strings.Contains(err.Error(), "bounded analysis limit") {
+		t.Fatalf("unbounded recovery context error = %v", err)
+	}
+	if called {
+		t.Fatal("Planner received an unbounded recovery checkpoint snapshot")
+	}
+}
+
 func assertStrictCoordinatorObjectSchema(t *testing.T, path string, value any) {
 	t.Helper()
 	switch typed := value.(type) {

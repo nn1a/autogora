@@ -74,11 +74,28 @@ type GoalJudgment struct {
 // dispatcher keeps the run active until the worker actually exits, then uses
 // this outcome instead of relying on whichever task event happened last.
 type DeferredReclaim struct {
-	RunID        string          `json:"runId"`
-	ExpiresAt    string          `json:"expiresAt"`
-	Reason       string          `json:"reason"`
-	Outcome      model.RunStatus `json:"outcome"`
-	CountFailure bool            `json:"countFailure"`
+	RunID                              string          `json:"runId"`
+	ExpiresAt                          string          `json:"expiresAt"`
+	Reason                             string          `json:"reason"`
+	Outcome                            model.RunStatus `json:"outcome"`
+	CountFailure                       bool            `json:"countFailure"`
+	RequiresOperator                   bool            `json:"requiresOperator"`
+	DiagnosticCode                     *string         `json:"diagnosticCode,omitempty"`
+	FenceToken                         string          `json:"-"`
+	FenceGeneration                    int             `json:"fenceGeneration"`
+	HostAcknowledgedAt                 *string         `json:"hostAcknowledgedAt,omitempty"`
+	RecoveryOwnerToken                 *string         `json:"-"`
+	RecoveryOwnerExpiresAt             *string         `json:"-"`
+	OperatorQuiescedAt                 *string         `json:"operatorQuiescedAt,omitempty"`
+	OperatorQuiescedBy                 *string         `json:"operatorQuiescedBy,omitempty"`
+	OperatorQuiescenceReason           *string         `json:"operatorQuiescenceReason,omitempty"`
+	OperatorQuiescedGeneration         *int            `json:"operatorQuiescedGeneration,omitempty"`
+	OperatorConfirmedWorkerStopped     bool            `json:"operatorConfirmedWorkerStopped"`
+	OperatorConfirmedHostWritesStopped bool            `json:"operatorConfirmedHostWritesStopped"`
+	OperatorObservedHeartbeatAt        *string         `json:"-"`
+	OperatorObservedClaimExpiresAt     *string         `json:"-"`
+	OperatorObservedPID                *int            `json:"-"`
+	OperatorObservedProcessIdentity    *string         `json:"-"`
 }
 
 type ActiveRun struct {
@@ -116,7 +133,12 @@ func getRun(ctx context.Context, q querier, runID string) (model.Run, error) {
 	return run, err
 }
 
-func requireActiveRun(ctx context.Context, q querier, scope RunScope) (model.Task, model.Run, error) {
+func requireActiveRunState(
+	ctx context.Context,
+	q querier,
+	scope RunScope,
+	allowRecoveryFence bool,
+) (model.Task, model.Run, error) {
 	run, err := getRun(ctx, q, scope.RunID)
 	if err != nil {
 		return model.Task{}, model.Run{}, err
@@ -138,7 +160,28 @@ func requireActiveRun(ctx context.Context, q querier, scope RunScope) (model.Tas
 	if task.CurrentRunID == nil || *task.CurrentRunID != run.ID || task.Status != model.TaskStatusRunning {
 		return model.Task{}, model.Run{}, errors.New("run no longer owns this task")
 	}
+	if !allowRecoveryFence {
+		if err := ensureNoRunRecoveryFence(ctx, q, run.ID); err != nil {
+			return model.Task{}, model.Run{}, err
+		}
+	}
 	return task, run, nil
+}
+
+func requireActiveRun(
+	ctx context.Context,
+	q querier,
+	scope RunScope,
+) (model.Task, model.Run, error) {
+	return requireActiveRunState(ctx, q, scope, false)
+}
+
+func requireActiveRunForRecovery(
+	ctx context.Context,
+	q querier,
+	scope RunScope,
+) (model.Task, model.Run, error) {
+	return requireActiveRunState(ctx, q, scope, true)
 }
 
 var guardedRunError = regexp.MustCompile(`(?i)(?:429|rate.?limit|quota|unauthorized|authentication|invalid api key)`)
@@ -448,6 +491,9 @@ func (s *Store) HeartbeatTask(ctx context.Context, taskID, note string) (model.R
 }
 
 func extendRunLease(ctx context.Context, tx *sql.Tx, task model.Task, run model.Run, clearPID bool) error {
+	if err := ensureNoRunRecoveryFence(ctx, tx, run.ID); err != nil {
+		return err
+	}
 	expiry, expiryErr := time.Parse(time.RFC3339Nano, run.ClaimExpiresAt)
 	heartbeat, heartbeatErr := time.Parse(time.RFC3339Nano, run.HeartbeatAt)
 	ttl := 15 * time.Minute
@@ -465,6 +511,25 @@ func extendRunLease(ctx context.Context, tx *sql.Tx, task model.Task, run model.
 	}
 	_, err := tx.ExecContext(ctx, "UPDATE tasks SET updated_at = ? WHERE id = ?", timestamp, task.ID)
 	return err
+}
+
+func ensureNoRunRecoveryFence(
+	ctx context.Context,
+	q querier,
+	runID string,
+) error {
+	var reclaimCount int
+	if err := q.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM run_reclaim_requests WHERE run_id = ?",
+		runID,
+	).Scan(&reclaimCount); err != nil {
+		return err
+	}
+	if reclaimCount > 0 {
+		return fmt.Errorf("%w: %s", ErrRunTerminationPending, runID)
+	}
+	return nil
 }
 
 func boundedGoalText(value string) string {
@@ -536,14 +601,8 @@ func (s *Store) RecordSpawnWithIdentity(ctx context.Context, scope RunScope, pid
 		if err := ensureNoTerminalRequest(ctx, tx, run.ID); err != nil {
 			return err
 		}
-		var reclaimCount int
-		if err := tx.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM run_reclaim_requests WHERE run_id = ?", run.ID,
-		).Scan(&reclaimCount); err != nil {
+		if err := ensureNoRunRecoveryFence(ctx, tx, run.ID); err != nil {
 			return err
-		}
-		if reclaimCount > 0 {
-			return fmt.Errorf("%w: %s", ErrRunTerminationPending, run.ID)
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET pid = ?, log_path = ? WHERE id = ?", pid, resolved, run.ID); err != nil {
 			return err
@@ -633,6 +692,13 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 	if preflight.CurrentRunID != nil {
 		return model.TaskDetail{}, errors.New("cannot complete a running task administratively; let the worker complete or terminate the active run first")
 	}
+	if err := requireNoActiveRecoveryCheckpointForCompletion(
+		ctx,
+		s.db,
+		preflight.ID,
+	); err != nil {
+		return model.TaskDetail{}, err
+	}
 	if preflight.Status != model.TaskStatusDone {
 		captured, err := s.captureArtifacts(ctx, preflight, completion.Artifacts)
 		if err != nil {
@@ -670,6 +736,13 @@ func (s *Store) CompleteTask(ctx context.Context, taskID string, completion Comp
 		}
 		if task.Status == model.TaskStatusDone {
 			return nil
+		}
+		if err := requireNoActiveRecoveryCheckpointForCompletion(
+			ctx,
+			tx,
+			task.ID,
+		); err != nil {
+			return err
 		}
 		var runID *string
 		if summary != "" || completion.Metadata != nil {
@@ -854,7 +927,14 @@ func (s *Store) FailRun(ctx context.Context, scope RunScope, runError string, op
 	return s.GetTask(ctx, taskID)
 }
 
-func (s *Store) RecoverAbandonedRun(ctx context.Context, runID string, outcome model.RunStatus, runError string, countFailure bool) (model.TaskDetail, error) {
+func (s *Store) recoverAbandonedRun(
+	ctx context.Context,
+	runID string,
+	observation RunRecoveryObservation,
+	outcome model.RunStatus,
+	runError string,
+	countFailure bool,
+) (model.TaskDetail, error) {
 	taskID := ""
 	err := s.withWrite(ctx, func(tx *sql.Tx) error {
 		run, err := getRun(ctx, tx, runID)
@@ -869,6 +949,14 @@ func (s *Store) RecoverAbandonedRun(ctx context.Context, runID string, outcome m
 		if run.Status != model.RunStatusRunning || task.CurrentRunID == nil || *task.CurrentRunID != run.ID || task.Status != model.TaskStatusRunning {
 			return nil
 		}
+		if err := requireSupervisorRunRecoveryFence(
+			ctx,
+			tx,
+			run,
+			&observation,
+		); err != nil {
+			return err
+		}
 		return finishUnsuccessful(ctx, tx, task, run, runError, FailRunOptions{Outcome: outcome, CountFailure: &countFailure})
 	})
 	if err != nil {
@@ -877,7 +965,38 @@ func (s *Store) RecoverAbandonedRun(ctx context.Context, runID string, outcome m
 	return s.GetTask(ctx, taskID)
 }
 
-func (s *Store) deferRunRecovery(ctx context.Context, runID string, seconds int, reason string, outcome model.RunStatus, countFailure bool) (model.Run, error) {
+// RecoverObservedAbandonedRun terminalizes only when the run still matches the
+// exact lease/process state, durable fence, host/operator quiescence, and
+// unexpired recovery-owner epoch observed by the Supervisor. There is no
+// tokenless administrative terminalization path.
+func (s *Store) RecoverObservedAbandonedRun(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	outcome model.RunStatus,
+	runError string,
+	countFailure bool,
+) (model.TaskDetail, error) {
+	return s.recoverAbandonedRun(
+		ctx,
+		observation.RunID,
+		observation,
+		outcome,
+		runError,
+		countFailure,
+	)
+}
+
+func (s *Store) deferRunRecovery(
+	ctx context.Context,
+	runID string,
+	observation *RunRecoveryObservation,
+	seconds int,
+	reason string,
+	outcome model.RunStatus,
+	countFailure bool,
+	requiresOperator bool,
+	diagnosticCode string,
+) (model.Run, error) {
 	if seconds <= 0 {
 		seconds = 120
 	}
@@ -889,11 +1008,19 @@ func (s *Store) deferRunRecovery(ctx context.Context, runID string, seconds int,
 		outcome = model.RunStatusReclaimed
 	}
 	switch outcome {
-	case model.RunStatusReclaimed, model.RunStatusTimedOut:
+	case model.RunStatusReclaimed, model.RunStatusTimedOut, model.RunStatusCrashed:
 	default:
 		return model.Run{}, fmt.Errorf("unsupported deferred run outcome: %s", outcome)
 	}
-	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+	diagnosticCode = strings.TrimSpace(diagnosticCode)
+	if requiresOperator && diagnosticCode == "" {
+		diagnosticCode = "unverifiable_process_ownership"
+	}
+	fenceToken, err := claimToken()
+	if err != nil {
+		return model.Run{}, fmt.Errorf("create run recovery fence token: %w", err)
+	}
+	err = s.withWrite(ctx, func(tx *sql.Tx) error {
 		run, err := getRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -901,25 +1028,139 @@ func (s *Store) deferRunRecovery(ctx context.Context, runID string, seconds int,
 		if run.Status != model.RunStatusRunning {
 			return fmt.Errorf("active run not found: %s", runID)
 		}
+		if err := requireRunRecoveryObservation(ctx, tx, run, observation); err != nil {
+			return err
+		}
+		var currentReason, currentOutcome, currentFenceToken string
+		var currentCountFailure, currentRequiresOperator bool
+		var currentFenceGeneration int
+		currentErr := tx.QueryRowContext(
+			ctx,
+			`SELECT reason, outcome, count_failure, requires_operator,
+				fence_token, fence_generation
+			 FROM run_reclaim_requests WHERE run_id = ?`,
+			run.ID,
+		).Scan(
+			&currentReason,
+			&currentOutcome,
+			&currentCountFailure,
+			&currentRequiresOperator,
+			&currentFenceToken,
+			&currentFenceGeneration,
+		)
+		exists := currentErr == nil
+		if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+			return currentErr
+		}
+		// Only the audited quiescence-confirmation transaction can lower an
+		// operator fence. Ordinary Supervisor refreshes preserve it.
+		if exists && currentRequiresOperator && !requiresOperator {
+			return nil
+		}
+		if exists && currentRequiresOperator && requiresOperator &&
+			currentReason == reason &&
+			currentOutcome == string(outcome) &&
+			currentCountFailure == countFailure {
+			return nil
+		}
+		operatorTransition := requiresOperator &&
+			(!exists || !currentRequiresOperator)
+		generation := 1
+		if exists {
+			fenceToken = currentFenceToken
+			generation = currentFenceGeneration
+			if operatorTransition {
+				generation++
+			}
+		}
 		expires := futureISO(max(1, seconds))
 		requestedAt := now()
+		var diagnosticValue any
+		if requiresOperator {
+			diagnosticValue = diagnosticCode
+		}
 		if _, err := tx.ExecContext(ctx, "UPDATE task_runs SET claim_expires_at = ? WHERE id = ?", expires, runID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO run_reclaim_requests(
-				run_id, expires_at, reason, outcome, count_failure, requested_at
-			) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET
-				expires_at = excluded.expires_at,
-				reason = excluded.reason,
-				outcome = excluded.outcome,
-				count_failure = excluded.count_failure,
-				requested_at = excluded.requested_at`,
-			run.ID, expires, reason, outcome, countFailure, requestedAt); err != nil {
-			return err
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO run_reclaim_requests(
+					run_id, expires_at, reason, outcome, count_failure, requested_at,
+					requires_operator, diagnostic_code, fence_token, fence_generation
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				run.ID, expires, reason, outcome, countFailure, requestedAt,
+				requiresOperator, diagnosticValue, fenceToken, generation); err != nil {
+				return err
+			}
+		} else if operatorTransition {
+			result, err := tx.ExecContext(ctx, `UPDATE run_reclaim_requests SET
+					expires_at = ?, reason = ?, outcome = ?, count_failure = ?,
+					requested_at = ?, requires_operator = 1,
+					diagnostic_code = ?, fence_generation = ?,
+					recovery_owner_token = NULL,
+					recovery_owner_expires_at = NULL,
+					operator_quiesced_at = NULL,
+					operator_quiesced_by = NULL,
+					operator_quiescence_reason = NULL,
+					operator_quiesced_generation = NULL,
+					operator_confirmed_worker_stopped = 0,
+					operator_confirmed_host_writes_stopped = 0,
+					operator_observed_heartbeat_at = NULL,
+					operator_observed_claim_expires_at = NULL,
+					operator_observed_pid = NULL,
+					operator_observed_process_identity = NULL
+				 WHERE run_id = ? AND fence_token = ?
+				   AND fence_generation = ? AND requires_operator = 0`,
+				expires, reason, outcome, countFailure, requestedAt,
+				diagnosticValue, generation, run.ID, fenceToken,
+				currentFenceGeneration)
+			if err != nil {
+				return err
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if rows != 1 {
+				return fmt.Errorf(
+					"%w: run %s fence changed before operator transition",
+					ErrRunRecoveryObservationChanged,
+					run.ID,
+				)
+			}
+		} else {
+			result, err := tx.ExecContext(ctx, `UPDATE run_reclaim_requests SET
+					expires_at = ?, reason = ?, outcome = ?, count_failure = ?,
+					requested_at = ?
+				 WHERE run_id = ? AND fence_token = ?
+				   AND fence_generation = ?`,
+				expires, reason, outcome, countFailure, requestedAt,
+				run.ID, fenceToken, currentFenceGeneration)
+			if err != nil {
+				return err
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if rows != 1 {
+				return fmt.Errorf(
+					"%w: run %s recovery fence changed",
+					ErrRunRecoveryObservationChanged,
+					run.ID,
+				)
+			}
 		}
-		return appendEvent(ctx, tx, run.TaskID, "reclaim_deferred", map[string]any{
+		if requiresOperator && !operatorTransition {
+			return nil
+		}
+		event := "reclaim_deferred"
+		if requiresOperator {
+			event = "reclaim_requires_operator"
+		}
+		return appendEvent(ctx, tx, run.TaskID, event, map[string]any{
 			"pid": run.PID, "expires": expires, "reason": reason,
 			"outcome": outcome, "countFailure": countFailure,
+			"diagnosticCode": diagnosticValue, "fenceGeneration": generation,
 		}, &run.ID)
 	})
 	if err != nil {
@@ -929,11 +1170,126 @@ func (s *Store) deferRunRecovery(ctx context.Context, runID string, seconds int,
 }
 
 func (s *Store) DeferReclaim(ctx context.Context, runID string, seconds int, reason string) (model.Run, error) {
-	return s.deferRunRecovery(ctx, runID, seconds, reason, model.RunStatusReclaimed, false)
+	return s.deferRunRecovery(ctx, runID, nil, seconds, reason, model.RunStatusReclaimed, false, false, "")
 }
 
 func (s *Store) DeferTimedOutRun(ctx context.Context, runID string, seconds int, reason string) (model.Run, error) {
-	return s.deferRunRecovery(ctx, runID, seconds, reason, model.RunStatusTimedOut, true)
+	return s.deferRunRecovery(ctx, runID, nil, seconds, reason, model.RunStatusTimedOut, true, false, "")
+}
+
+// DeferObservedReclaim persists the automatic Supervisor's termination intent
+// only if no owner update won after its liveness observation.
+func (s *Store) DeferObservedReclaim(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	seconds int,
+	reason string,
+) (model.Run, error) {
+	return s.deferRunRecovery(
+		ctx,
+		observation.RunID,
+		&observation,
+		seconds,
+		reason,
+		model.RunStatusReclaimed,
+		false,
+		false,
+		"",
+	)
+}
+
+// DeferObservedTimedOutRun is the maximum-runtime counterpart to
+// DeferObservedReclaim.
+func (s *Store) DeferObservedTimedOutRun(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	seconds int,
+	reason string,
+) (model.Run, error) {
+	return s.deferRunRecovery(
+		ctx,
+		observation.RunID,
+		&observation,
+		seconds,
+		reason,
+		model.RunStatusTimedOut,
+		true,
+		false,
+		"",
+	)
+}
+
+// FenceObservedRunRecovery wins durable recovery ownership before the
+// Supervisor signals a process or reads and checkpoints a mutable worktree.
+// Lease renewal and new process registration reject this fence.
+func (s *Store) FenceObservedRunRecovery(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	seconds int,
+	reason string,
+	outcome model.RunStatus,
+	countFailure bool,
+) (model.Run, error) {
+	return s.deferRunRecovery(
+		ctx,
+		observation.RunID,
+		&observation,
+		seconds,
+		reason,
+		outcome,
+		countFailure,
+		false,
+		"",
+	)
+}
+
+// RequireObservedRunRecoveryIntervention durably exposes an unsafe process
+// ownership state without repeatedly emitting the same event on every sweep.
+func (s *Store) RequireObservedRunRecoveryIntervention(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	seconds int,
+	reason string,
+	outcome model.RunStatus,
+	countFailure bool,
+) (model.Run, error) {
+	return s.deferRunRecovery(
+		ctx,
+		observation.RunID,
+		&observation,
+		seconds,
+		reason,
+		outcome,
+		countFailure,
+		true,
+		"unverifiable_process_ownership",
+	)
+}
+
+// RequireObservedRunRecoveryInterventionWithDiagnostic records an explicit,
+// stable operator incident code. It is used when the Supervisor has a stronger
+// reason than ambiguous process ownership, such as unconfirmed subprocess
+// teardown. Repeated identical incidents remain one-shot.
+func (s *Store) RequireObservedRunRecoveryInterventionWithDiagnostic(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	seconds int,
+	reason string,
+	outcome model.RunStatus,
+	countFailure bool,
+	diagnosticCode string,
+) (model.Run, error) {
+	return s.deferRunRecovery(
+		ctx,
+		observation.RunID,
+		&observation,
+		seconds,
+		reason,
+		outcome,
+		countFailure,
+		true,
+		diagnosticCode,
+	)
 }
 
 // GetDeferredReclaim reads coordination state directly by run ID. It is not
@@ -944,10 +1300,52 @@ func (s *Store) GetDeferredReclaim(ctx context.Context, runID string) (*Deferred
 		return nil, errors.New("run ID is required")
 	}
 	var value DeferredReclaim
-	var countFailure bool
-	err := s.db.QueryRowContext(ctx, `SELECT run_id, expires_at, reason, outcome, count_failure
+	var countFailure, requiresOperator bool
+	var diagnosticCode, hostAcknowledgedAt, hostAcknowledgedFenceToken sql.NullString
+	var recoveryOwnerToken, recoveryOwnerExpiresAt sql.NullString
+	var operatorQuiescedAt, operatorQuiescedBy sql.NullString
+	var operatorQuiescenceReason sql.NullString
+	var operatorQuiescedGeneration sql.NullInt64
+	var operatorObservedHeartbeatAt, operatorObservedClaimExpiresAt sql.NullString
+	var operatorObservedPID sql.NullInt64
+	var operatorObservedProcessIdentity sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT run_id, expires_at, reason, outcome,
+			count_failure, requires_operator, diagnostic_code, fence_token,
+			fence_generation, host_acknowledged_at,
+			host_acknowledged_fence_token, recovery_owner_token,
+			recovery_owner_expires_at, operator_quiesced_at,
+			operator_quiesced_by, operator_quiescence_reason,
+			operator_quiesced_generation,
+			operator_confirmed_worker_stopped,
+			operator_confirmed_host_writes_stopped,
+			operator_observed_heartbeat_at,
+			operator_observed_claim_expires_at,
+			operator_observed_pid,
+			operator_observed_process_identity
 		FROM run_reclaim_requests WHERE run_id = ?`, runID).Scan(
-		&value.RunID, &value.ExpiresAt, &value.Reason, &value.Outcome, &countFailure,
+		&value.RunID,
+		&value.ExpiresAt,
+		&value.Reason,
+		&value.Outcome,
+		&countFailure,
+		&requiresOperator,
+		&diagnosticCode,
+		&value.FenceToken,
+		&value.FenceGeneration,
+		&hostAcknowledgedAt,
+		&hostAcknowledgedFenceToken,
+		&recoveryOwnerToken,
+		&recoveryOwnerExpiresAt,
+		&operatorQuiescedAt,
+		&operatorQuiescedBy,
+		&operatorQuiescenceReason,
+		&operatorQuiescedGeneration,
+		&value.OperatorConfirmedWorkerStopped,
+		&value.OperatorConfirmedHostWritesStopped,
+		&operatorObservedHeartbeatAt,
+		&operatorObservedClaimExpiresAt,
+		&operatorObservedPID,
+		&operatorObservedProcessIdentity,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -965,6 +1363,37 @@ func (s *Store) GetDeferredReclaim(ctx context.Context, runID string) (*Deferred
 		value.Reason = "Run termination requested"
 	}
 	value.CountFailure = countFailure
+	value.RequiresOperator = requiresOperator
+	value.DiagnosticCode = stringPointer(diagnosticCode)
+	if !validObservedHostAcknowledgment(
+		value.FenceToken,
+		hostAcknowledgedAt,
+		hostAcknowledgedFenceToken,
+	) {
+		return nil, fmt.Errorf(
+			"invalid host acknowledgment fence token for run %s",
+			runID,
+		)
+	}
+	value.HostAcknowledgedAt = stringPointer(hostAcknowledgedAt)
+	value.RecoveryOwnerToken = stringPointer(recoveryOwnerToken)
+	value.RecoveryOwnerExpiresAt = stringPointer(recoveryOwnerExpiresAt)
+	value.OperatorQuiescedAt = stringPointer(operatorQuiescedAt)
+	value.OperatorQuiescedBy = stringPointer(operatorQuiescedBy)
+	value.OperatorQuiescenceReason = stringPointer(operatorQuiescenceReason)
+	if operatorQuiescedGeneration.Valid {
+		generation := int(operatorQuiescedGeneration.Int64)
+		value.OperatorQuiescedGeneration = &generation
+	}
+	value.OperatorObservedHeartbeatAt = stringPointer(operatorObservedHeartbeatAt)
+	value.OperatorObservedClaimExpiresAt = stringPointer(operatorObservedClaimExpiresAt)
+	if operatorObservedPID.Valid {
+		pid := int(operatorObservedPID.Int64)
+		value.OperatorObservedPID = &pid
+	}
+	value.OperatorObservedProcessIdentity = stringPointer(
+		operatorObservedProcessIdentity,
+	)
 	return &value, nil
 }
 

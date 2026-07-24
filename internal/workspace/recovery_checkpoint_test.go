@@ -572,6 +572,157 @@ func TestAdoptRecoveryCheckpointAllowsRemovedSourceWorktree(t *testing.T) {
 	}
 }
 
+func TestLoadPublishedRecoveryCheckpointAfterSourceWorktreeDisappears(t *testing.T) {
+	fixture := newRecoveryGitFixture(t, "run-published-gap")
+	checkpoint := captureMixedRecoveryCheckpoint(t, fixture)
+	runWorkspaceGit(
+		t,
+		fixture.repository,
+		"worktree",
+		"remove",
+		"--force",
+		fixture.source,
+	)
+
+	loaded, err := (&Manager{}).LoadPublishedRecoveryCheckpoint(
+		context.Background(),
+		fixture.workspace,
+		fixture.base,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil ||
+		loaded.RunID != checkpoint.RunID ||
+		loaded.RepositoryPath != checkpoint.RepositoryPath ||
+		loaded.WorktreePath != checkpoint.WorktreePath ||
+		loaded.OutputBaseCommit != checkpoint.OutputBaseCommit ||
+		loaded.SourceStartCommit != checkpoint.SourceStartCommit ||
+		loaded.SourceHeadCommit != "" ||
+		loaded.HeadCommit != checkpoint.HeadCommit ||
+		loaded.DurableRef != checkpoint.DurableRef ||
+		!slices.Equal(loaded.ChangedFiles, checkpoint.ChangedFiles) {
+		t.Fatalf("loaded checkpoint = %+v, captured = %+v", loaded, checkpoint)
+	}
+}
+
+func TestLoadPublishedRecoveryCheckpointReturnsNilWithoutRunRef(t *testing.T) {
+	fixture := newRecoveryGitFixture(t, "run-no-published-checkpoint")
+	runWorkspaceGit(
+		t,
+		fixture.repository,
+		"worktree",
+		"remove",
+		"--force",
+		fixture.source,
+	)
+
+	loaded, err := (&Manager{}).LoadPublishedRecoveryCheckpoint(
+		context.Background(),
+		fixture.workspace,
+		fixture.base,
+	)
+	if err != nil || loaded != nil {
+		t.Fatalf("missing published checkpoint = %+v, err=%v", loaded, err)
+	}
+}
+
+func TestReissueAdoptedRecoveryCheckpointAfterTargetDisappears(t *testing.T) {
+	fixture := newRecoveryGitFixture(t, "run-reissue-source")
+	checkpoint := captureMixedRecoveryCheckpoint(t, fixture)
+	target := addRecoveryTarget(
+		t,
+		fixture,
+		"reissue-target",
+		fixture.base,
+		"run-reissue-target",
+	)
+	adoption, err := (&Manager{}).AdoptRecoveryCheckpoint(
+		context.Background(),
+		target,
+		checkpoint,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(
+		t,
+		fixture.repository,
+		"worktree",
+		"remove",
+		"--force",
+		target.Path,
+	)
+	if _, err := os.Stat(target.Path); !os.IsNotExist(err) {
+		t.Fatalf("adopted target still exists or cannot be inspected: %v", err)
+	}
+
+	reissued, err := (&Manager{}).ReissueAdoptedRecoveryCheckpoint(
+		context.Background(),
+		checkpoint,
+		target.RunID,
+		target.Path,
+		adoption.OutputBaseCommit,
+		adoption.AdoptedHeadCommit,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reissued.RunID != target.RunID ||
+		reissued.WorktreePath != target.Path ||
+		reissued.OutputBaseCommit != adoption.OutputBaseCommit ||
+		reissued.SourceStartCommit != adoption.AdoptedHeadCommit ||
+		reissued.SourceHeadCommit != adoption.AdoptedHeadCommit ||
+		reissued.HeadCommit != adoption.AdoptedHeadCommit ||
+		reissued.DurableRef != "refs/autogora/checkpoints/"+target.RunID ||
+		!slices.Equal(reissued.ChangedFiles, adoption.ChangedFiles) {
+		t.Fatalf("reissued checkpoint = %+v, adoption = %+v", reissued, adoption)
+	}
+	if err := ValidateRecoveryCheckpoint(
+		context.Background(),
+		reissued,
+	); err != nil {
+		t.Fatal(err)
+	}
+	again, err := (&Manager{}).ReissueAdoptedRecoveryCheckpoint(
+		context.Background(),
+		checkpoint,
+		target.RunID,
+		target.Path,
+		adoption.OutputBaseCommit,
+		adoption.AdoptedHeadCommit,
+	)
+	if err != nil || again.HeadCommit != reissued.HeadCommit {
+		t.Fatalf("idempotent reissue = %+v, err=%v", again, err)
+	}
+}
+
+func TestReissueAdoptedRecoveryCheckpointRejectsConflictingRunRef(t *testing.T) {
+	fixture := newRecoveryGitFixture(t, "run-reissue-conflict-source")
+	checkpoint := captureMixedRecoveryCheckpoint(t, fixture)
+	const runID = "run-reissue-conflict"
+	ref, err := recoveryCheckpointRef(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runWorkspaceGit(t, fixture.repository, "update-ref", ref, fixture.base)
+
+	_, err = (&Manager{}).ReissueAdoptedRecoveryCheckpoint(
+		context.Background(),
+		checkpoint,
+		runID,
+		filepath.Join(fixture.root, "missing-target"),
+		fixture.base,
+		checkpoint.HeadCommit,
+	)
+	if err == nil || !strings.Contains(err.Error(), "different work") {
+		t.Fatalf("conflicting reissue ref error = %v", err)
+	}
+	if head := runWorkspaceGit(t, fixture.repository, "rev-parse", ref); head != fixture.base {
+		t.Fatalf("conflicting reissue changed ref to %s", head)
+	}
+}
+
 func TestRecoveryCheckpointRequiresExactWorktreeTopLevel(t *testing.T) {
 	t.Run("preserves whitespace in worktree paths", func(t *testing.T) {
 		root := t.TempDir()

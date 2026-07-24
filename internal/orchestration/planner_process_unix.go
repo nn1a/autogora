@@ -9,10 +9,15 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 func configurePlannerProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 }
 
 func attachPlannerProcessTree(cmd *exec.Cmd) (func(), error) {
@@ -28,6 +33,11 @@ func attachPlannerProcessTree(cmd *exec.Cmd) (func(), error) {
 			}
 			_ = syscall.Kill(-pid, syscall.SIGTERM)
 			if waitForPlannerProcessGroup(pid, plannerProcessTerminationGrace) {
+				return
+			}
+			if processguard.IsGuardCommand(cmd) {
+				// The guard owns escalation and teardown proof. Killing it
+				// would let setsid descendants survive without an attestation.
 				return
 			}
 			_ = syscall.Kill(-pid, syscall.SIGKILL)

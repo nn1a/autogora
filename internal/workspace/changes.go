@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/nn1a/autogora/internal/model"
@@ -115,7 +114,7 @@ func (m *Manager) HasChangesSince(
 }
 
 func gitOutputWithEnv(ctx context.Context, directory string, environment map[string]string, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", directory}, args...)...)
+	command := workspaceCommand(ctx, "git", append([]string{"-C", directory}, args...)...)
 	command.Env = make([]string, 0, len(os.Environ())+len(environment))
 	for _, item := range os.Environ() {
 		key := item

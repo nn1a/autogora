@@ -91,7 +91,7 @@ func downgradeCoordinationIncidentSchemaToVersion21(
 	}
 }
 
-func TestSchema23UpgradesVersion21CoordinationIncidentTriggerWithoutLosingBindings(t *testing.T) {
+func TestSchema24UpgradesVersion21CoordinationIncidentTriggerWithoutLosingBindings(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "autogora.db")
 	initial, err := Open(path, "default", "")
@@ -152,7 +152,7 @@ func TestSchema23UpgradesVersion21CoordinationIncidentTriggerWithoutLosingBindin
 	).Scan(&definition); err != nil {
 		t.Fatal(err)
 	}
-	if version != 23 || schemaVersion != 23 ||
+	if version != 24 || schemaVersion != 24 ||
 		!strings.Contains(definition, "'run_invariant'") {
 		t.Fatalf(
 			"schema upgrade = version:%d constant:%d definition:%q",

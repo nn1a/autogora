@@ -36,6 +36,7 @@ Commands:
   terminate <task-id>   Signal and reclaim a task's active worker run
   stats                 Show board counts
   diagnostics           Inspect board health and active workers
+  recovery <action>     Inspect or confirm a fenced run recovery
   coordination <action> Inspect Coordinator incidents and proposals
   publication <action>  Inspect and control publication handoffs
   tail <task-id>        Read or follow one task's events
@@ -262,6 +263,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runReadTask(ctx, command, opts)
 	case "stats", "diagnostics", "diag", "assignees":
 		return a.runStats(ctx, command, opts)
+	case "recovery":
+		return a.runRecovery(ctx, opts)
 	case "coordination":
 		return a.runCoordination(ctx, opts)
 	case "publication":

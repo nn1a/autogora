@@ -323,7 +323,9 @@ func (e *Engine) createPullRequest(
 	}
 	var execution *Error
 	if errors.As(err, &execution) &&
-		(execution.Kind == ErrorCommandTimeout || execution.Kind == ErrorCanceled) {
+		(execution.Kind == ErrorCommandTimeout ||
+			execution.Kind == ErrorCanceled ||
+			execution.Kind == ErrorTeardownUnconfirmed) {
 		return "", err
 	}
 	records, listErr := e.listPullRequests(ctx, publication, branch)

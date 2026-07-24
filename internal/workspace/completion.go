@@ -47,7 +47,7 @@ func (m *Manager) CompleteRun(ctx context.Context, opened *store.Store, scope st
 		})
 	}
 	if captureErr == nil {
-		completed, finalizeErr := opened.FinalizeRunTerminal(ctx, scope.RunID, 0)
+		completed, finalizeErr := opened.FinalizeRunTerminal(ctx, scope, 0)
 		if finalizeErr == nil {
 			return completed, nil
 		}

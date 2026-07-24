@@ -104,6 +104,27 @@ func TestRunnerOutputAndErrorsAreBounded(t *testing.T) {
 	}
 }
 
+func TestEnginePreservesUnconfirmedTeardownForOperatorHandling(t *testing.T) {
+	engine := New(Options{Runner: outputRunner{
+		err: ErrTeardownUnconfirmed,
+	}})
+	_, err := engine.run(context.Background(), ".", "ignored")
+	if !errors.Is(err, ErrTeardownUnconfirmed) {
+		t.Fatalf("teardown error = %v", err)
+	}
+	var execution *Error
+	if !errors.As(err, &execution) ||
+		execution.Kind != ErrorTeardownUnconfirmed {
+		t.Fatalf("teardown error kind = %#v", execution)
+	}
+	if control := commandControlError(err); !errors.Is(
+		control,
+		ErrTeardownUnconfirmed,
+	) {
+		t.Fatalf("teardown control error = %v", control)
+	}
+}
+
 func TestParseWorktreePorcelain(t *testing.T) {
 	records, err := parseWorktreePorcelain(
 		"worktree /repo\x00HEAD " + strings.Repeat("a", 40) +

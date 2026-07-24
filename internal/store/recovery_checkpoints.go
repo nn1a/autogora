@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nn1a/autogora/internal/model"
@@ -353,7 +354,15 @@ func (s *Store) GetActiveRecoveryCheckpoint(
 	if _, err := requireTask(ctx, s.db, taskID); err != nil {
 		return nil, err
 	}
-	value, err := scanRecoveryCheckpoint(s.db.QueryRowContext(
+	return getActiveRecoveryCheckpoint(ctx, s.db, taskID)
+}
+
+func getActiveRecoveryCheckpoint(
+	ctx context.Context,
+	q querier,
+	taskID string,
+) (*model.RecoveryCheckpoint, error) {
+	value, err := scanRecoveryCheckpoint(q.QueryRowContext(
 		ctx,
 		`SELECT `+recoveryCheckpointColumns+` FROM recovery_checkpoints
 		 WHERE task_id = ? AND state IN ('pending', 'reserved', 'adopted')`,
@@ -366,6 +375,25 @@ func (s *Store) GetActiveRecoveryCheckpoint(
 		return nil, err
 	}
 	return &value, nil
+}
+
+func requireNoActiveRecoveryCheckpointForCompletion(
+	ctx context.Context,
+	q querier,
+	taskID string,
+) error {
+	checkpoint, err := getActiveRecoveryCheckpoint(ctx, q, taskID)
+	if err != nil {
+		return err
+	}
+	if checkpoint == nil {
+		return nil
+	}
+	return fmt.Errorf(
+		"task cannot be completed with active recovery checkpoint %s in state %s",
+		checkpoint.ID,
+		checkpoint.State,
+	)
 }
 
 func (s *Store) GetRunRecoveryCheckpoint(
@@ -500,6 +528,155 @@ func validRecoveryFailureOutcome(outcome model.RunStatus) bool {
 	}
 }
 
+func terminalFailureRetryMatches(
+	ctx context.Context,
+	q querier,
+	run model.Run,
+	task model.Task,
+	runError string,
+	options FailRunOptions,
+) (bool, error) {
+	outcome := options.Outcome
+	if outcome == "" {
+		outcome = model.RunStatusFailed
+	}
+	countFailure := true
+	if options.CountFailure != nil {
+		countFailure = *options.CountFailure
+	}
+	limit := options.FailureLimit
+	if limit <= 0 {
+		limit = task.MaxRetries
+	}
+	limit = max(1, limit)
+	if run.Status != outcome ||
+		run.Error == nil ||
+		*run.Error != runError ||
+		run.EndedAt == nil ||
+		task.CurrentRunID != nil {
+		return false, nil
+	}
+
+	rows, err := q.QueryContext(
+		ctx,
+		`SELECT kind, payload_json, created_at
+		 FROM task_events
+		 WHERE run_id = ?
+		 ORDER BY id DESC`,
+		run.ID,
+	)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, createdAt string
+		var payloadBytes []byte
+		if err := rows.Scan(&kind, &payloadBytes, &createdAt); err != nil {
+			return false, err
+		}
+		if kind != string(outcome) &&
+			!(outcome == model.RunStatusFailed &&
+				(kind == "requeued" || kind == "gave_up")) {
+			continue
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+			continue
+		}
+		var eventError string
+		var eventOutcome model.RunStatus
+		var eventCountFailure bool
+		var failures, effectiveLimit int
+		if json.Unmarshal(payload["error"], &eventError) != nil ||
+			json.Unmarshal(payload["outcome"], &eventOutcome) != nil ||
+			json.Unmarshal(payload["countFailure"], &eventCountFailure) != nil ||
+			json.Unmarshal(payload["failures"], &failures) != nil ||
+			json.Unmarshal(payload["effectiveLimit"], &effectiveLimit) != nil ||
+			eventError != runError ||
+			eventOutcome != outcome ||
+			eventCountFailure != countFailure ||
+			effectiveLimit != limit ||
+			task.FailureCount != failures {
+			continue
+		}
+		exhausted := countFailure && failures >= effectiveLimit
+		expectedKind := string(outcome)
+		if outcome == model.RunStatusFailed {
+			if exhausted {
+				expectedKind = "gave_up"
+			} else {
+				expectedKind = "requeued"
+			}
+		}
+		if kind != expectedKind {
+			continue
+		}
+		var scheduledAt *string
+		rawScheduledAt, exists := payload["scheduledAt"]
+		if !exists || json.Unmarshal(rawScheduledAt, &scheduledAt) != nil {
+			continue
+		}
+		if !sameRecoveryOptionalString(task.ScheduledAt, scheduledAt) {
+			continue
+		}
+		switch {
+		case exhausted:
+			if task.Status != model.TaskStatusBlocked ||
+				task.BlockReason == nil ||
+				*task.BlockReason != runError ||
+				scheduledAt != nil {
+				continue
+			}
+		case options.CooldownSeconds > 0:
+			if task.Status != model.TaskStatusScheduled ||
+				scheduledAt == nil ||
+				!scheduledDelayMatches(
+					createdAt,
+					*scheduledAt,
+					options.CooldownSeconds,
+				) {
+				continue
+			}
+		default:
+			if scheduledAt != nil {
+				continue
+			}
+			open, err := hasOpenParents(ctx, q, task.ID)
+			if err != nil {
+				return false, err
+			}
+			expectedStatus := model.TaskStatusReady
+			if open || task.Assignee == nil ||
+				task.Runtime == model.RuntimeManual {
+				expectedStatus = model.TaskStatusTodo
+			}
+			if task.Status != expectedStatus {
+				continue
+			}
+		}
+		return true, nil
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func scheduledDelayMatches(createdAt, scheduledAt string, seconds int) bool {
+	created, createdErr := time.Parse(time.RFC3339Nano, createdAt)
+	scheduled, scheduledErr := time.Parse(time.RFC3339Nano, scheduledAt)
+	if createdErr != nil || scheduledErr != nil {
+		return false
+	}
+	expected := time.Duration(seconds) * time.Second
+	difference := scheduled.Sub(created) - expected
+	if difference < 0 {
+		difference = -difference
+	}
+	return difference <= time.Second
+}
+
 // RegisterRecoveryCheckpointAndFailRun atomically records a partial-work
 // snapshot while the source claim still owns the task, then terminalizes that
 // run. A dispatcher can never observe a retryable task without its checkpoint.
@@ -546,6 +723,26 @@ func (s *Store) RegisterRecoveryCheckpointAndFailRun(
 			}
 			checkpoint = *existing
 			if scopedRun.Status != model.RunStatusRunning {
+				task, err := requireTask(ctx, tx, scopedRun.TaskID)
+				if err != nil {
+					return err
+				}
+				matches, err := terminalFailureRetryMatches(
+					ctx,
+					tx,
+					scopedRun,
+					task,
+					runError,
+					options,
+				)
+				if err != nil {
+					return err
+				}
+				if !matches {
+					return errors.New(
+						"recovery checkpoint failure retry does not match terminal effect",
+					)
+				}
 				return nil
 			}
 		}
@@ -938,59 +1135,101 @@ func (s *Store) ConfirmRecoveryCheckpointAdoption(
 		if err != nil {
 			return err
 		}
-		checkpoint, err = requireOwnedRecoveryCheckpoint(
+		var unresolvedIntegration bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM integration_resolution_attempts
+			WHERE run_id = ? AND resolved_at IS NULL
+		)`, run.ID).Scan(&unresolvedIntegration); err != nil {
+			return err
+		}
+		if unresolvedIntegration {
+			return errors.New(
+				"integration resolution recovery must use atomic resolution confirmation",
+			)
+		}
+		checkpoint, err = confirmRecoveryCheckpointAdoption(
 			ctx,
 			tx,
 			task,
 			run,
 			checkpointID,
 			reservationToken,
+			adoptedOutputBaseCommit,
+			adoptedHeadCommit,
+			now(),
 		)
-		if err != nil {
-			return err
-		}
-		if checkpoint.State == model.RecoveryCheckpointAdopted {
-			if checkpoint.AdoptedOutputBaseCommit != nil &&
-				*checkpoint.AdoptedOutputBaseCommit == adoptedOutputBaseCommit &&
-				checkpoint.AdoptedHeadCommit != nil &&
-				*checkpoint.AdoptedHeadCommit == adoptedHeadCommit {
-				return nil
-			}
-			return errors.New("recovery checkpoint was already adopted at a different base or head")
-		}
-		if checkpoint.State != model.RecoveryCheckpointReserved {
-			return fmt.Errorf("recovery checkpoint cannot be adopted from state %s", checkpoint.State)
-		}
-		timestamp := now()
-		result, err := tx.ExecContext(ctx, `UPDATE recovery_checkpoints
-			SET state = 'adopted', adopted_output_base_commit = ?,
-				adopted_head_commit = ?, adopted_at = ?, updated_at = ?
-			WHERE id = ? AND state = 'reserved' AND reserved_run_id = ? AND reservation_token = ?`,
-			adoptedOutputBaseCommit, adoptedHeadCommit, timestamp, timestamp,
-			checkpoint.ID, run.ID, reservationToken,
-		)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return errors.New("recovery checkpoint changed before adoption")
-		}
-		if err := appendEvent(ctx, tx, task.ID, "recovery_checkpoint_adopted", map[string]any{
-			"checkpointId":            checkpoint.ID,
-			"sourceHeadCommit":        checkpoint.HeadCommit,
-			"adoptedOutputBaseCommit": adoptedOutputBaseCommit,
-			"adoptedHeadCommit":       adoptedHeadCommit,
-		}, &run.ID); err != nil {
-			return err
-		}
-		checkpoint, err = getRecoveryCheckpoint(ctx, tx, checkpoint.ID)
 		return err
 	})
 	return checkpoint, err
+}
+
+func confirmRecoveryCheckpointAdoption(
+	ctx context.Context,
+	q querier,
+	task model.Task,
+	run model.Run,
+	checkpointID string,
+	reservationToken string,
+	adoptedOutputBaseCommit string,
+	adoptedHeadCommit string,
+	timestamp string,
+) (model.RecoveryCheckpoint, error) {
+	checkpoint, err := requireOwnedRecoveryCheckpoint(
+		ctx,
+		q,
+		task,
+		run,
+		checkpointID,
+		reservationToken,
+	)
+	if err != nil {
+		return model.RecoveryCheckpoint{}, err
+	}
+	if checkpoint.State == model.RecoveryCheckpointAdopted {
+		if checkpoint.AdoptedOutputBaseCommit != nil &&
+			*checkpoint.AdoptedOutputBaseCommit == adoptedOutputBaseCommit &&
+			checkpoint.AdoptedHeadCommit != nil &&
+			*checkpoint.AdoptedHeadCommit == adoptedHeadCommit {
+			return checkpoint, nil
+		}
+		return model.RecoveryCheckpoint{}, errors.New(
+			"recovery checkpoint was already adopted at a different base or head",
+		)
+	}
+	if checkpoint.State != model.RecoveryCheckpointReserved {
+		return model.RecoveryCheckpoint{}, fmt.Errorf(
+			"recovery checkpoint cannot be adopted from state %s",
+			checkpoint.State,
+		)
+	}
+	result, err := q.ExecContext(ctx, `UPDATE recovery_checkpoints
+		SET state = 'adopted', adopted_output_base_commit = ?,
+			adopted_head_commit = ?, adopted_at = ?, updated_at = ?
+		WHERE id = ? AND state = 'reserved' AND reserved_run_id = ? AND reservation_token = ?`,
+		adoptedOutputBaseCommit, adoptedHeadCommit, timestamp, timestamp,
+		checkpoint.ID, run.ID, reservationToken,
+	)
+	if err != nil {
+		return model.RecoveryCheckpoint{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return model.RecoveryCheckpoint{}, err
+	}
+	if changed != 1 {
+		return model.RecoveryCheckpoint{}, errors.New(
+			"recovery checkpoint changed before adoption",
+		)
+	}
+	if err := appendEvent(ctx, q, task.ID, "recovery_checkpoint_adopted", map[string]any{
+		"checkpointId":            checkpoint.ID,
+		"sourceHeadCommit":        checkpoint.HeadCommit,
+		"adoptedOutputBaseCommit": adoptedOutputBaseCommit,
+		"adoptedHeadCommit":       adoptedHeadCommit,
+	}, &run.ID); err != nil {
+		return model.RecoveryCheckpoint{}, err
+	}
+	return getRecoveryCheckpoint(ctx, q, checkpoint.ID)
 }
 
 func supersedeAdoptedRecoveryCheckpoint(
@@ -1345,9 +1584,10 @@ func finalizeRequestedBlockRecords(
 // attempt's partial work and finalizes its already-requested block in one
 // transaction. A later unblock can therefore adopt the checkpoint in a fresh
 // worktree instead of silently starting over.
-func (s *Store) RegisterRecoveryCheckpointAndFinalizeBlock(
+func (s *Store) registerRecoveryCheckpointAndFinalizeBlock(
 	ctx context.Context,
 	scope RunScope,
+	observation *RunRecoveryObservation,
 	raw RegisterRecoveryCheckpointInput,
 	exitCode int,
 ) (model.RecoveryCheckpoint, model.TaskDetail, error) {
@@ -1403,8 +1643,15 @@ func (s *Store) RegisterRecoveryCheckpointAndFinalizeBlock(
 			}
 		}
 
-		task, activeRun, err := requireActiveRun(ctx, tx, scope)
+		activeRunLoader := requireActiveRun
+		if observation != nil {
+			activeRunLoader = requireActiveRunForRecovery
+		}
+		task, activeRun, err := activeRunLoader(ctx, tx, scope)
 		if err != nil {
+			return err
+		}
+		if err := requireOptionalSupervisorRunRecoveryFence(ctx, tx, activeRun, observation); err != nil {
 			return err
 		}
 		if request.FinalizedAt != nil {
@@ -1432,13 +1679,77 @@ func (s *Store) RegisterRecoveryCheckpointAndFinalizeBlock(
 	return checkpoint, detail, err
 }
 
+func (s *Store) RegisterRecoveryCheckpointAndFinalizeBlock(
+	ctx context.Context,
+	scope RunScope,
+	raw RegisterRecoveryCheckpointInput,
+	exitCode int,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.registerRecoveryCheckpointAndFinalizeBlock(
+		ctx,
+		scope,
+		nil,
+		raw,
+		exitCode,
+	)
+}
+
+func (s *Store) stoppedManagedRunScope(
+	ctx context.Context,
+	runID string,
+) (RunScope, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return RunScope{}, errors.New("run ID is required")
+	}
+	var claimToken string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT runs.claim_token
+		 FROM task_runs runs
+		 JOIN managed_runs managed ON managed.run_id = runs.id
+		 WHERE runs.id = ?`,
+		runID,
+	).Scan(&claimToken); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RunScope{}, errors.New(
+				"stopped recovery block requires a managed run",
+			)
+		}
+		return RunScope{}, err
+	}
+	return RunScope{RunID: runID, ClaimToken: claimToken}, nil
+}
+
+// RegisterRecoveryCheckpointAndFinalizeObservedStoppedBlock is the
+// compare-and-swap protected Supervisor counterpart.
+func (s *Store) RegisterRecoveryCheckpointAndFinalizeObservedStoppedBlock(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	raw RegisterRecoveryCheckpointInput,
+	exitCode int,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	scope, err := s.stoppedManagedRunScope(ctx, observation.RunID)
+	if err != nil {
+		return model.RecoveryCheckpoint{}, model.TaskDetail{}, err
+	}
+	return s.registerRecoveryCheckpointAndFinalizeBlock(
+		ctx,
+		scope,
+		&observation,
+		raw,
+		exitCode,
+	)
+}
+
 // SupersedeRecoveryCheckpointAndFinalizeBlock preserves cumulative work from
 // an adopted checkpoint and finalizes an already-requested worker block in one
 // transaction. The returned replacement is pending and contains no reservation
 // token. Repeating the same call after a committed-but-lost response is safe.
-func (s *Store) SupersedeRecoveryCheckpointAndFinalizeBlock(
+func (s *Store) supersedeRecoveryCheckpointAndFinalizeBlock(
 	ctx context.Context,
 	scope RunScope,
+	observation *RunRecoveryObservation,
 	checkpointID string,
 	reservationToken string,
 	raw RegisterRecoveryCheckpointInput,
@@ -1511,8 +1822,15 @@ func (s *Store) SupersedeRecoveryCheckpointAndFinalizeBlock(
 			}
 		}
 
-		task, activeRun, err := requireActiveRun(ctx, tx, scope)
+		activeRunLoader := requireActiveRun
+		if observation != nil {
+			activeRunLoader = requireActiveRunForRecovery
+		}
+		task, activeRun, err := activeRunLoader(ctx, tx, scope)
 		if err != nil {
+			return err
+		}
+		if err := requireOptionalSupervisorRunRecoveryFence(ctx, tx, activeRun, observation); err != nil {
 			return err
 		}
 		if request.FinalizedAt != nil {
@@ -1560,12 +1878,68 @@ func (s *Store) SupersedeRecoveryCheckpointAndFinalizeBlock(
 	return replacement, detail, err
 }
 
-// RegisterRecoveryCheckpointAndRecoverRunBlocked is the tokenless Supervisor
-// path for a first attempt whose process is proven dead. It preserves the
-// stopped run's partial work and blocks the task atomically.
-func (s *Store) RegisterRecoveryCheckpointAndRecoverRunBlocked(
+func (s *Store) SupersedeRecoveryCheckpointAndFinalizeBlock(
+	ctx context.Context,
+	scope RunScope,
+	checkpointID string,
+	reservationToken string,
+	raw RegisterRecoveryCheckpointInput,
+	exitCode int,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.supersedeRecoveryCheckpointAndFinalizeBlock(
+		ctx,
+		scope,
+		nil,
+		checkpointID,
+		reservationToken,
+		raw,
+		exitCode,
+	)
+}
+
+// SupersedeRecoveryCheckpointAndFinalizeObservedStoppedBlock is the
+// compare-and-swap protected Supervisor counterpart for a stopped recovery
+// run.
+func (s *Store) SupersedeRecoveryCheckpointAndFinalizeObservedStoppedBlock(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	raw RegisterRecoveryCheckpointInput,
+	exitCode int,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	scope, err := s.stoppedManagedRunScope(ctx, observation.RunID)
+	if err != nil {
+		return model.RecoveryCheckpoint{}, model.TaskDetail{}, err
+	}
+	checkpoint, err := getRecoveryCheckpointByReservedRun(ctx, s.db, scope.RunID)
+	if err != nil {
+		return model.RecoveryCheckpoint{}, model.TaskDetail{}, err
+	}
+	if checkpoint == nil ||
+		(checkpoint.State != model.RecoveryCheckpointAdopted &&
+			checkpoint.State != model.RecoveryCheckpointSuperseded) {
+		return model.RecoveryCheckpoint{}, model.TaskDetail{}, errors.New(
+			"stopped recovery block requires an adopted checkpoint or its committed supersession",
+		)
+	}
+	return s.supersedeRecoveryCheckpointAndFinalizeBlock(
+		ctx,
+		scope,
+		&observation,
+		checkpoint.ID,
+		checkpoint.ReservationToken,
+		raw,
+		exitCode,
+	)
+}
+
+// registerRecoveryCheckpointAndRecoverRunBlocked serves either an exact active
+// host claim or an observed Supervisor recovery owner. It never accepts an
+// unauthenticated run ID.
+func (s *Store) registerRecoveryCheckpointAndRecoverRunBlocked(
 	ctx context.Context,
 	runID string,
+	scope *RunScope,
+	observation *RunRecoveryObservation,
 	rawCheckpoint RegisterRecoveryCheckpointInput,
 	rawBlocked RecoverBlockedRunInput,
 ) (model.RecoveryCheckpoint, model.TaskDetail, error) {
@@ -1587,7 +1961,13 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverRunBlocked(
 	var checkpoint model.RecoveryCheckpoint
 	taskID := ""
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		run, err := getRun(ctx, tx, runID)
+		var run model.Run
+		var err error
+		if scope != nil {
+			run, err = requireRunScope(ctx, tx, *scope)
+		} else {
+			run, err = getRun(ctx, tx, runID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1623,11 +2003,26 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverRunBlocked(
 			}
 		}
 
-		if run.Status != model.RunStatusRunning ||
-			task.Status != model.TaskStatusRunning ||
-			task.CurrentRunID == nil ||
-			*task.CurrentRunID != run.ID {
-			return errors.New("run no longer owns this task")
+		if scope != nil {
+			task, run, err = requireActiveRun(ctx, tx, *scope)
+			if err != nil {
+				return err
+			}
+		} else {
+			if run.Status != model.RunStatusRunning ||
+				task.Status != model.TaskStatusRunning ||
+				task.CurrentRunID == nil ||
+				*task.CurrentRunID != run.ID {
+				return errors.New("run no longer owns this task")
+			}
+			if err := requireSupervisorRunRecoveryFence(
+				ctx,
+				tx,
+				run,
+				observation,
+			); err != nil {
+				return err
+			}
 		}
 		if existing == nil {
 			checkpoint, err = insertRecoveryCheckpoint(ctx, tx, task, run, input)
@@ -1644,13 +2039,46 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverRunBlocked(
 	return checkpoint, detail, err
 }
 
-// SupersedeRecoveryCheckpointAndRecoverRunBlocked is the tokenless Supervisor
-// counterpart for a process already proven dead. It atomically replaces the
-// adopted checkpoint with cumulative work and applies RecoverRunBlocked's
-// terminal state. The replacement never exposes the worker reservation token.
-func (s *Store) SupersedeRecoveryCheckpointAndRecoverRunBlocked(
+func (s *Store) RegisterRecoveryCheckpointAndRecoverRunBlocked(
+	ctx context.Context,
+	scope RunScope,
+	rawCheckpoint RegisterRecoveryCheckpointInput,
+	rawBlocked RecoverBlockedRunInput,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.registerRecoveryCheckpointAndRecoverRunBlocked(
+		ctx,
+		scope.RunID,
+		&scope,
+		nil,
+		rawCheckpoint,
+		rawBlocked,
+	)
+}
+
+func (s *Store) RegisterRecoveryCheckpointAndRecoverObservedRunBlocked(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	rawCheckpoint RegisterRecoveryCheckpointInput,
+	rawBlocked RecoverBlockedRunInput,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.registerRecoveryCheckpointAndRecoverRunBlocked(
+		ctx,
+		observation.RunID,
+		nil,
+		&observation,
+		rawCheckpoint,
+		rawBlocked,
+	)
+}
+
+// supersedeRecoveryCheckpointAndRecoverRunBlocked serves either an exact
+// active host claim or an observed Supervisor recovery owner. The replacement
+// never exposes the worker reservation token.
+func (s *Store) supersedeRecoveryCheckpointAndRecoverRunBlocked(
 	ctx context.Context,
 	runID string,
+	scope *RunScope,
+	observation *RunRecoveryObservation,
 	rawCheckpoint RegisterRecoveryCheckpointInput,
 	rawBlocked RecoverBlockedRunInput,
 ) (model.RecoveryCheckpoint, model.TaskDetail, error) {
@@ -1672,7 +2100,13 @@ func (s *Store) SupersedeRecoveryCheckpointAndRecoverRunBlocked(
 	var replacement model.RecoveryCheckpoint
 	taskID := ""
 	err = s.withWrite(ctx, func(tx *sql.Tx) error {
-		run, err := getRun(ctx, tx, runID)
+		var run model.Run
+		var err error
+		if scope != nil {
+			run, err = requireRunScope(ctx, tx, *scope)
+		} else {
+			run, err = getRun(ctx, tx, runID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1715,11 +2149,26 @@ func (s *Store) SupersedeRecoveryCheckpointAndRecoverRunBlocked(
 			}
 		}
 
-		if run.Status != model.RunStatusRunning ||
-			task.Status != model.TaskStatusRunning ||
-			task.CurrentRunID == nil ||
-			*task.CurrentRunID != run.ID {
-			return errors.New("run no longer owns this task")
+		if scope != nil {
+			task, run, err = requireActiveRun(ctx, tx, *scope)
+			if err != nil {
+				return err
+			}
+		} else {
+			if run.Status != model.RunStatusRunning ||
+				task.Status != model.TaskStatusRunning ||
+				task.CurrentRunID == nil ||
+				*task.CurrentRunID != run.ID {
+				return errors.New("run no longer owns this task")
+			}
+			if err := requireSupervisorRunRecoveryFence(
+				ctx,
+				tx,
+				run,
+				observation,
+			); err != nil {
+				return err
+			}
 		}
 		if existing == nil {
 			checkpoint, err := getRecoveryCheckpointByReservedRun(ctx, tx, run.ID)
@@ -1753,14 +2202,46 @@ func (s *Store) SupersedeRecoveryCheckpointAndRecoverRunBlocked(
 	return replacement, detail, err
 }
 
-// RegisterRecoveryCheckpointAndRecoverAbandonedRun is the supervisor path for
-// a process that is known to have exited. It does not require a worker claim
-// token, but still requires the run to be the task's active owner. A normal
-// run registers its first checkpoint; a recovery run atomically replaces the
-// checkpoint it adopted. Repeating an already-committed call is idempotent.
-func (s *Store) RegisterRecoveryCheckpointAndRecoverAbandonedRun(
+func (s *Store) SupersedeRecoveryCheckpointAndRecoverRunBlocked(
+	ctx context.Context,
+	scope RunScope,
+	rawCheckpoint RegisterRecoveryCheckpointInput,
+	rawBlocked RecoverBlockedRunInput,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.supersedeRecoveryCheckpointAndRecoverRunBlocked(
+		ctx,
+		scope.RunID,
+		&scope,
+		nil,
+		rawCheckpoint,
+		rawBlocked,
+	)
+}
+
+func (s *Store) SupersedeRecoveryCheckpointAndRecoverObservedRunBlocked(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	rawCheckpoint RegisterRecoveryCheckpointInput,
+	rawBlocked RecoverBlockedRunInput,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.supersedeRecoveryCheckpointAndRecoverRunBlocked(
+		ctx,
+		observation.RunID,
+		nil,
+		&observation,
+		rawCheckpoint,
+		rawBlocked,
+	)
+}
+
+// registerRecoveryCheckpointAndRecoverAbandonedRun is the observed Supervisor
+// path for a process whose quiescence has been proven. A normal run registers
+// its first checkpoint; a recovery run atomically replaces the checkpoint it
+// adopted. Repeating the same committed terminal effect is idempotent.
+func (s *Store) registerRecoveryCheckpointAndRecoverAbandonedRun(
 	ctx context.Context,
 	runID string,
+	observation RunRecoveryObservation,
 	raw RegisterRecoveryCheckpointInput,
 	outcome model.RunStatus,
 	runError string,
@@ -1813,6 +2294,29 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverAbandonedRun(
 			}
 			checkpoint = *existing
 			if run.Status != model.RunStatusRunning {
+				task, err := requireTask(ctx, tx, run.TaskID)
+				if err != nil {
+					return err
+				}
+				matches, err := terminalFailureRetryMatches(
+					ctx,
+					tx,
+					run,
+					task,
+					runError,
+					FailRunOptions{
+						Outcome:      outcome,
+						CountFailure: &countFailure,
+					},
+				)
+				if err != nil {
+					return err
+				}
+				if !matches {
+					return errors.New(
+						"abandoned recovery checkpoint retry does not match terminal effect",
+					)
+				}
 				return nil
 			}
 		}
@@ -1825,6 +2329,14 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverAbandonedRun(
 			task.CurrentRunID == nil ||
 			*task.CurrentRunID != run.ID {
 			return errors.New("run no longer owns this task")
+		}
+		if err := requireSupervisorRunRecoveryFence(
+			ctx,
+			tx,
+			run,
+			&observation,
+		); err != nil {
+			return err
 		}
 		if existing == nil {
 			reserved, err := getRecoveryCheckpointByReservedRun(ctx, tx, run.ID)
@@ -1865,6 +2377,25 @@ func (s *Store) RegisterRecoveryCheckpointAndRecoverAbandonedRun(
 	return checkpoint, detail, err
 }
 
+func (s *Store) RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
+	ctx context.Context,
+	observation RunRecoveryObservation,
+	raw RegisterRecoveryCheckpointInput,
+	outcome model.RunStatus,
+	runError string,
+	countFailure bool,
+) (model.RecoveryCheckpoint, model.TaskDetail, error) {
+	return s.registerRecoveryCheckpointAndRecoverAbandonedRun(
+		ctx,
+		observation.RunID,
+		observation,
+		raw,
+		outcome,
+		runError,
+		countFailure,
+	)
+}
+
 // consumeRecoveryCheckpointForSuccessfulCompletion is deliberately
 // transaction-only. FinalizeRunTerminal calls it after validating a successful
 // completion and before committing the task/run terminal transition. There is
@@ -1877,19 +2408,20 @@ func consumeRecoveryCheckpointForSuccessfulCompletion(
 	runID string,
 	timestamp string,
 ) error {
-	checkpoint, err := getRecoveryCheckpointByReservedRun(ctx, q, runID)
+	checkpoint, err := getActiveRecoveryCheckpoint(ctx, q, taskID)
 	if err != nil {
 		return err
 	}
 	if checkpoint == nil {
 		return nil
 	}
-	if checkpoint.TaskID != taskID {
-		return errors.New("recovery checkpoint reservation belongs to a different task")
-	}
-	if checkpoint.State != model.RecoveryCheckpointAdopted {
+	if checkpoint.TaskID != taskID ||
+		checkpoint.ReservedRunID == nil ||
+		*checkpoint.ReservedRunID != runID ||
+		checkpoint.State != model.RecoveryCheckpointAdopted {
 		return fmt.Errorf(
-			"successful recovery completion requires an adopted checkpoint: %s",
+			"task cannot be completed with active recovery checkpoint %s in state %s",
+			checkpoint.ID,
 			checkpoint.State,
 		)
 	}

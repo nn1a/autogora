@@ -605,7 +605,9 @@ func (e *Engine) publishLocalFF(
 			publication.targetRef, publication.head, publication.targetHead); err != nil {
 			var execution *Error
 			if errors.As(err, &execution) &&
-				(execution.Kind == ErrorCommandTimeout || execution.Kind == ErrorCanceled) {
+				(execution.Kind == ErrorCommandTimeout ||
+					execution.Kind == ErrorCanceled ||
+					execution.Kind == ErrorTeardownUnconfirmed) {
 				return result, err
 			}
 			return result, semanticError(
@@ -640,7 +642,9 @@ func (e *Engine) publishLocalFF(
 			"git", "merge", "--ff-only", "--no-edit", publication.head); err != nil {
 			var execution *Error
 			if errors.As(err, &execution) &&
-				(execution.Kind == ErrorCommandTimeout || execution.Kind == ErrorCanceled) {
+				(execution.Kind == ErrorCommandTimeout ||
+					execution.Kind == ErrorCanceled ||
+					execution.Kind == ErrorTeardownUnconfirmed) {
 				return result, err
 			}
 			return result, semanticError(

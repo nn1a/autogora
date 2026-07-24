@@ -32,7 +32,13 @@ const (
 	coordinatorObservationTaskLimit    = 5000
 	coordinatorConditionFingerprintKey = "conditionFingerprint"
 	coordinatorRunOwnershipReadLimit   = 3
+	coordinatorCheckpointRecentLimit   = 2
+	coordinatorCheckpointFileLimit     = 12
+	coordinatorCheckpointPathLimit     = 256
+	coordinatorCheckpointReasonLimit   = 1024
 )
+
+const coordinatorCheckpointAdoptionFailurePrefix = "Recovery checkpoint adoption failed:"
 
 type coordinatorCondition struct {
 	trigger       model.CoordinationTrigger
@@ -447,7 +453,43 @@ func detectCoordinatorConditions(
 			continue
 		}
 		unfinishedCount++
-		if task.Status == model.TaskStatusRunning || task.CurrentRunID != nil {
+		operatorRecoveryObserved := false
+		if task.CurrentRunID != nil &&
+			strings.TrimSpace(*task.CurrentRunID) != "" {
+			runID := strings.TrimSpace(*task.CurrentRunID)
+			reclaim, reclaimErr := opened.GetDeferredReclaim(ctx, runID)
+			if reclaimErr != nil {
+				return nil, reclaimErr
+			}
+			if reclaim != nil && reclaim.RequiresOperator {
+				diagnosticCode := ""
+				if reclaim.DiagnosticCode != nil {
+					diagnosticCode = strings.TrimSpace(*reclaim.DiagnosticCode)
+				}
+				condition, conditionErr := conditionForTask(
+					task,
+					model.CoordinationTriggerRunInvariant,
+					model.CoordinationSeverityCritical,
+					"Run recovery requires operator authorization",
+					map[string]any{
+						"reason":          "operator_recovery_required",
+						"taskStatus":      task.Status,
+						"currentRunId":    runID,
+						"diagnosticCode":  diagnosticCode,
+						"fenceGeneration": reclaim.FenceGeneration,
+						"taskUpdatedAt":   task.UpdatedAt,
+					},
+				)
+				if conditionErr != nil {
+					return nil, conditionErr
+				}
+				conditions = append(conditions, condition)
+				observedRunOwnership = true
+				operatorRecoveryObserved = true
+			}
+		}
+		if !operatorRecoveryObserved &&
+			(task.Status == model.TaskStatusRunning || task.CurrentRunID != nil) {
 			listedActive := task.Status == model.TaskStatusRunning &&
 				task.CurrentRunID != nil &&
 				activeRunIDs[strings.TrimSpace(*task.CurrentRunID)]
@@ -562,6 +604,47 @@ func detectCoordinatorConditions(
 				return nil, err
 			}
 			conditions = append(conditions, condition)
+		}
+
+		// A terminal-safe adoption failure is deliberately persisted as a
+		// needs-input block so deterministic recovery will not retry an
+		// unverified checkpoint forever. Surface the first such permanent
+		// state without waiting for a second identical block. Repeated-block
+		// and retry-exhausted already own their respective conditions.
+		recoveryFailureAlreadyObserved := task.BlockRecurrences >= 2 ||
+			(task.Status == model.TaskStatusBlocked && task.MaxRetries > 0 &&
+				task.FailureCount >= task.MaxRetries)
+		if !recoveryFailureAlreadyObserved &&
+			(task.Status == model.TaskStatusBlocked || task.Status == model.TaskStatusTriage) &&
+			task.BlockKind != nil && *task.BlockKind == model.BlockKindNeedsInput &&
+			task.BlockReason != nil &&
+			strings.HasPrefix(*task.BlockReason, coordinatorCheckpointAdoptionFailurePrefix) {
+			checkpoint, checkpointErr := opened.GetActiveRecoveryCheckpoint(ctx, task.ID)
+			if checkpointErr != nil {
+				return nil, checkpointErr
+			}
+			if checkpoint != nil && checkpoint.State == model.RecoveryCheckpointPending {
+				condition, conditionErr := conditionForTask(
+					task,
+					model.CoordinationTriggerRunInvariant,
+					model.CoordinationSeverityError,
+					"Recovery checkpoint adoption requires intervention",
+					map[string]any{
+						"reason":          "recovery_checkpoint_adoption_exhausted",
+						"taskStatus":      task.Status,
+						"blockKind":       task.BlockKind,
+						"blockReason":     boundedCoordinatorText(*task.BlockReason, 2048),
+						"checkpointId":    checkpoint.ID,
+						"checkpointState": checkpoint.State,
+						"sourceRunId":     checkpoint.SourceRunID,
+						"taskUpdatedAt":   task.UpdatedAt,
+					},
+				)
+				if conditionErr != nil {
+					return nil, conditionErr
+				}
+				conditions = append(conditions, condition)
+			}
 		}
 
 		if coordinatorTaskNeedsAgent(task) {
@@ -963,6 +1046,16 @@ func buildCoordinatorIncidentSnapshotWithProfiles(
 	if err != nil {
 		return coordinator.IncidentSnapshot{}, err
 	}
+	if coordinatorIncidentNeedsRecoveryContext(incident.Trigger) {
+		snapshot.RecoveryCheckpoints, err = buildCoordinatorRecoveryCheckpointSnapshots(
+			ctx,
+			opened,
+			focusTaskID,
+		)
+		if err != nil {
+			return coordinator.IncidentSnapshot{}, err
+		}
+	}
 	workspaces := workspace.New(manager)
 	for _, graphNode := range nodes {
 		detail, err := opened.GetTask(ctx, graphNode.Task.ID)
@@ -1013,7 +1106,72 @@ func buildCoordinatorIncidentSnapshotWithProfiles(
 	if err != nil {
 		return coordinator.IncidentSnapshot{}, err
 	}
-	return snapshot, nil
+	return coordinator.SanitizeIncidentSnapshot(snapshot), nil
+}
+
+func coordinatorIncidentNeedsRecoveryContext(trigger model.CoordinationTrigger) bool {
+	switch trigger {
+	case model.CoordinationTriggerRepeatedBlock,
+		model.CoordinationTriggerRetryExhausted,
+		model.CoordinationTriggerIntegrationConflict,
+		model.CoordinationTriggerRunInvariant:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildCoordinatorRecoveryCheckpointSnapshots(
+	ctx context.Context,
+	opened *store.Store,
+	taskID string,
+) ([]coordinator.RecoveryCheckpointSnapshot, error) {
+	values, err := opened.ListRecoveryCheckpointContext(
+		ctx,
+		taskID,
+		coordinatorCheckpointRecentLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]coordinator.RecoveryCheckpointSnapshot, 0, len(values))
+	for _, value := range values {
+		files := make([]string, 0, min(
+			len(value.ChangedFiles),
+			coordinatorCheckpointFileLimit,
+		))
+		for _, file := range value.ChangedFiles {
+			if len(files) >= coordinatorCheckpointFileLimit {
+				break
+			}
+			if !safeCoordinatorCheckpointPath(file) {
+				continue
+			}
+			files = append(
+				files,
+				boundedCoordinatorText(file, coordinatorCheckpointPathLimit),
+			)
+		}
+		result = append(result, coordinator.RecoveryCheckpointSnapshot{
+			ID:                  value.ID,
+			State:               value.State,
+			SourceRunID:         value.SourceRunID,
+			ChangedFileCount:    len(value.ChangedFiles),
+			BoundedChangedFiles: files,
+			CreatedAt:           value.CreatedAt,
+			AdoptedAt:           boundedCoordinatorStringPointer(value.AdoptedAt, 128),
+			SupersedeReason: boundedCoordinatorStringPointer(
+				value.SupersedeReason,
+				coordinatorCheckpointReasonLimit,
+			),
+		})
+	}
+	return result, nil
+}
+
+func safeCoordinatorCheckpointPath(value string) bool {
+	_, safe := coordinator.SafeRelativeChangedPath(value)
+	return safe
 }
 
 func boundCoordinatorGraph(graph model.RelationshipGraph) ([]model.RelationshipNode, []coordinator.DependencySnapshot, bool) {
@@ -1025,6 +1183,56 @@ func boundCoordinatorGraph(graph model.RelationshipGraph) ([]model.RelationshipN
 	}
 	selectID(graph.FocusTaskID)
 	selectID(graph.RootTaskID)
+
+	// RelationshipGraph already applies a larger Store-side bound. Rebuild
+	// the smaller external snapshot priority explicitly instead of trusting
+	// source order: a directly blocking prerequisite can sort after hundreds
+	// of unrelated connected nodes.
+	for _, edge := range graph.Dependencies {
+		if edge.DependentID == graph.FocusTaskID {
+			selectID(edge.PrerequisiteID)
+		}
+	}
+	for _, edge := range graph.Dependencies {
+		if edge.PrerequisiteID == graph.FocusTaskID {
+			selectID(edge.DependentID)
+		}
+	}
+	parentByChild := make(map[string]string, len(graph.Hierarchy))
+	for _, edge := range graph.Hierarchy {
+		parentByChild[edge.SubtaskID] = edge.ParentTaskID
+	}
+	for current := graph.FocusTaskID; current != ""; {
+		parent := parentByChild[current]
+		if parent == "" || selected[parent] {
+			break
+		}
+		selectID(parent)
+		current = parent
+	}
+	for _, edge := range graph.Hierarchy {
+		if edge.ParentTaskID == graph.FocusTaskID {
+			selectID(edge.SubtaskID)
+		}
+	}
+	for _, node := range graph.Nodes {
+		if node.Task.ID != graph.FocusTaskID {
+			continue
+		}
+		if node.ParentTaskID != nil {
+			selectID(*node.ParentTaskID)
+		}
+		for _, id := range node.BlockedBy {
+			selectID(id)
+		}
+		for _, id := range node.Unlocks {
+			selectID(id)
+		}
+		for _, id := range node.SubtaskIDs {
+			selectID(id)
+		}
+		break
+	}
 	for _, node := range graph.Nodes {
 		selectID(node.Task.ID)
 	}

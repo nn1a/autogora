@@ -9,12 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 const (
@@ -51,28 +51,30 @@ type Result struct {
 type ErrorKind string
 
 const (
-	ErrorInvalidInput   ErrorKind = "invalid_input"
-	ErrorManualMode     ErrorKind = "manual_mode"
-	ErrorRepository     ErrorKind = "repository"
-	ErrorSourceChanged  ErrorKind = "source_changed"
-	ErrorNonFastForward ErrorKind = "non_fast_forward"
-	ErrorDirtyWorktree  ErrorKind = "dirty_worktree"
-	ErrorRemoteConflict ErrorKind = "remote_conflict"
-	ErrorCommandTimeout ErrorKind = "command_timeout"
-	ErrorCommandFailed  ErrorKind = "command_failed"
-	ErrorCanceled       ErrorKind = "canceled"
+	ErrorInvalidInput        ErrorKind = "invalid_input"
+	ErrorManualMode          ErrorKind = "manual_mode"
+	ErrorRepository          ErrorKind = "repository"
+	ErrorSourceChanged       ErrorKind = "source_changed"
+	ErrorNonFastForward      ErrorKind = "non_fast_forward"
+	ErrorDirtyWorktree       ErrorKind = "dirty_worktree"
+	ErrorRemoteConflict      ErrorKind = "remote_conflict"
+	ErrorCommandTimeout      ErrorKind = "command_timeout"
+	ErrorTeardownUnconfirmed ErrorKind = "teardown_unconfirmed"
+	ErrorCommandFailed       ErrorKind = "command_failed"
+	ErrorCanceled            ErrorKind = "canceled"
 )
 
 var (
-	ErrInvalidInput   = errors.New("invalid publication input")
-	ErrManualMode     = errors.New("manual publication cannot be executed")
-	ErrRepository     = errors.New("publication repository validation failed")
-	ErrSourceChanged  = errors.New("publication source no longer matches its snapshot")
-	ErrNonFastForward = errors.New("publication is not a fast-forward")
-	ErrDirtyWorktree  = errors.New("publication target worktree is dirty")
-	ErrRemoteConflict = errors.New("publication remote branch or pull request conflicts")
-	ErrCommandTimeout = errors.New("publication command timed out")
-	ErrCommandFailed  = errors.New("publication command failed")
+	ErrInvalidInput        = errors.New("invalid publication input")
+	ErrManualMode          = errors.New("manual publication cannot be executed")
+	ErrRepository          = errors.New("publication repository validation failed")
+	ErrSourceChanged       = errors.New("publication source no longer matches its snapshot")
+	ErrNonFastForward      = errors.New("publication is not a fast-forward")
+	ErrDirtyWorktree       = errors.New("publication target worktree is dirty")
+	ErrRemoteConflict      = errors.New("publication remote branch or pull request conflicts")
+	ErrCommandTimeout      = errors.New("publication command timed out")
+	ErrCommandFailed       = errors.New("publication command failed")
+	ErrTeardownUnconfirmed = processguard.ErrTeardownUnconfirmed
 )
 
 type Error struct {
@@ -146,8 +148,8 @@ func (b *limitedBuffer) Write(value []byte) (int, error) {
 func (b *limitedBuffer) String() string { return b.buffer.String() }
 
 // ExecRunner is the production runner. It bounds output while the child is
-// running, disables interactive Git/GitHub prompts, and relies exclusively on
-// CommandContext for process cancellation.
+// running, disables interactive Git/GitHub prompts, and waits for guarded
+// descendant teardown before returning.
 type ExecRunner struct{}
 
 func (ExecRunner) Run(
@@ -156,7 +158,12 @@ func (ExecRunner) Run(
 	file string,
 	args ...string,
 ) (CommandOutput, error) {
-	command := exec.CommandContext(ctx, file, args...)
+	command := processguard.NewCommandContext(
+		ctx,
+		MaxCommandTimeout,
+		file,
+		args...,
+	)
 	command.Dir = directory
 	command.Env = commandEnvironment()
 	stdout := limitedBuffer{limit: MaxCommandOutputBytes}
@@ -251,6 +258,12 @@ func (e *Engine) run(
 	if err == nil {
 		return result, nil
 	}
+	if errors.Is(err, processguard.ErrTeardownUnconfirmed) {
+		return result, &Error{
+			Kind: ErrorTeardownUnconfirmed, Operation: "run command",
+			Err: errors.Join(ErrCommandFailed, err),
+		}
+	}
 	if parentErr := ctx.Err(); parentErr != nil {
 		return result, &Error{Kind: ErrorCanceled, Operation: "run command", Err: parentErr}
 	}
@@ -339,7 +352,9 @@ func semanticError(kind ErrorKind, operation string, sentinel error, detail stri
 func commandControlError(err error) error {
 	var execution *Error
 	if errors.As(err, &execution) &&
-		(execution.Kind == ErrorCommandTimeout || execution.Kind == ErrorCanceled) {
+		(execution.Kind == ErrorCommandTimeout ||
+			execution.Kind == ErrorCanceled ||
+			execution.Kind == ErrorTeardownUnconfirmed) {
 		return err
 	}
 	return nil

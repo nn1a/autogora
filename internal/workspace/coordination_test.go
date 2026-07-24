@@ -45,7 +45,7 @@ func completePrerequisiteWithChangeSet(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0); err != nil {
+	if _, err := opened.FinalizeRunTerminal(ctx, scope, 0); err != nil {
 		t.Fatal(err)
 	}
 	return changeSet

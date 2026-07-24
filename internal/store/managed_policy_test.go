@@ -32,7 +32,16 @@ func TestManagedRunWritePolicyDistinguishesKnownAndLegacyRuns(t *testing.T) {
 	if err != nil || policy == nil || *policy {
 		t.Fatalf("known read-only policy = %v, err=%v", policy, err)
 	}
-	if _, err := opened.RecoverAbandonedRun(ctx, known.Run.ID, model.RunStatusReclaimed, "next fixture", false); err != nil {
+	countFailure := false
+	if _, err := opened.FailRun(
+		ctx,
+		RunScope{RunID: known.Run.ID, ClaimToken: known.ClaimToken},
+		"next fixture",
+		FailRunOptions{
+			Outcome:      model.RunStatusReclaimed,
+			CountFailure: &countFailure,
+		},
+	); err != nil {
 		t.Fatal(err)
 	}
 

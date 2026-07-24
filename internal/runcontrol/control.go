@@ -21,16 +21,17 @@ type Termination struct {
 
 // ProcessMayStillBeRunning is the conservative ownership check used before a
 // caller releases run-scoped leases. A live PID retains ownership when its
-// identity matches or cannot be verified. A verified mismatch is another
-// process and does not. On Unix, a leader that exited can still retain
-// ownership through descendants in its dedicated process group.
+// identity matches or cannot be verified. A verified mismatch does not prove
+// that the original worker stopped: on Unix, its dedicated process group can
+// outlive the leader while another process reuses the numeric PID. Probe that
+// group before releasing ownership whenever the PID itself is not the worker.
 func ProcessMayStillBeRunning(pid *int, expectedIdentity *string) bool {
 	if pid == nil || *pid <= 0 {
 		return false
 	}
 	state := processidentity.Inspect(*pid, expectedIdentity)
-	if state.Alive {
-		return !state.Verified || state.Matches
+	if state.Alive && (!state.Verified || state.Matches) {
+		return true
 	}
 	return ProcessTreeAlive(pid)
 }
@@ -82,31 +83,64 @@ func TerminateRun(ctx context.Context, opened *store.Store, runID, reason string
 	if err != nil {
 		return Termination{}, err
 	}
+	managed, err := opened.IsRunManaged(ctx, runID)
+	if err != nil {
+		return Termination{}, err
+	}
+	if !managed {
+		reclaim, reclaimErr := opened.GetDeferredReclaim(ctx, runID)
+		if reclaimErr != nil {
+			return Termination{}, reclaimErr
+		}
+		if reclaim == nil {
+			return Termination{}, fmt.Errorf(
+				"run recovery fence disappeared: %s",
+				runID,
+			)
+		}
+		observation := store.ObserveRunForRecovery(
+			inspection.Run,
+			processIdentity,
+			reclaim,
+		)
+		if _, err := opened.RequireObservedRunRecoveryIntervention(
+			ctx,
+			observation,
+			15,
+			"External run termination requires explicit confirmation that the worker and host writes stopped",
+			model.RunStatusReclaimed,
+			false,
+		); err != nil {
+			return Termination{}, err
+		}
+	}
 	signaled := SignalRunProcess(inspection.Run.PID, processIdentity)
 	if signaled {
 		detail, err := opened.GetTask(ctx, inspection.Task.ID)
 		return Termination{RunID: runID, PID: inspection.Run.PID, Signaled: true, Pending: true, Task: detail}, err
 	}
-	managed, err := opened.IsRunManaged(ctx, runID)
-	if err != nil {
-		return Termination{}, err
-	}
-	processState := processidentity.State{}
-	if inspection.Run.PID != nil {
-		processState = processidentity.Inspect(*inspection.Run.PID, processIdentity)
-	}
-	if managed || (processState.Alive && (!processState.Verified || processState.Matches)) {
+	if managed || ProcessMayStillBeRunning(inspection.Run.PID, processIdentity) {
 		// A dispatcher-managed run can be between process turns or can have a
 		// workspace whose final state has not been inspected yet. Keep the
 		// durable termination intent pending so the dispatcher can preserve
 		// partial work before it releases the task for another worker. An
-		// unmanaged process also stays pending when its PID is still occupied
-		// and cannot be proven stale; releasing it could overlap two writers.
+		// unmanaged process also stays pending when its PID cannot be proven
+		// stale or descendants still own its process group; releasing it could
+		// overlap two writers.
 		detail, err := opened.GetTask(ctx, inspection.Task.ID)
 		return Termination{RunID: runID, PID: inspection.Run.PID, Pending: true, Task: detail}, err
 	}
-	detail, err := opened.RecoverAbandonedRun(ctx, runID, model.RunStatusReclaimed, reason, false)
-	return Termination{RunID: runID, PID: inspection.Run.PID, Pending: false, Task: detail}, err
+	// An external PID disappearing is not proof that its host, plugin, or
+	// network-disconnected agent stopped writing. Keep the durable operator
+	// fence until ConfirmRunRecoveryQuiescence records both attestations.
+	detail, err := opened.GetTask(ctx, inspection.Task.ID)
+	return Termination{
+		RunID: runID,
+		PID:   inspection.Run.PID,
+		// Unmanaged runs always remain pending for audited confirmation.
+		Pending: true,
+		Task:    detail,
+	}, err
 }
 
 func TerminateTaskRun(ctx context.Context, opened *store.Store, taskID, reason string) (Termination, error) {

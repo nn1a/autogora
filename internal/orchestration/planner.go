@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 type PlannerKind string
@@ -87,14 +88,16 @@ func runPlannerProcess(ctx context.Context, command string, args []string, cwd s
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, command, args...)
+	cmd := processguard.NewCommandContext(runCtx, timeout, command, args...)
 	cmd.Dir = cwd
 	cmd.Env = os.Environ()
-	configurePlannerProcess(cmd)
+	configurePlannerProcess(cmd.Cmd)
 	// A coding-agent CLI may leave a descendant holding an inherited output
 	// descriptor after its leader exits. Bound that pipe wait so cleanup can
 	// terminate the owned process tree instead of blocking forever.
-	cmd.WaitDelay = plannerProcessWaitDelay
+	if !processguard.IsGuardCommand(cmd.Cmd) {
+		cmd.WaitDelay = plannerProcessWaitDelay
+	}
 	var stdout, stderr limitedBuffer
 	stdout.limit, stderr.limit = plannerOutputLimit, plannerOutputLimit
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -107,7 +110,7 @@ func runPlannerProcess(ctx context.Context, command string, args []string, cwd s
 			err,
 		)
 	}
-	releaseProcessTree, err := attachPlannerProcessTree(cmd)
+	releaseProcessTree, err := attachPlannerProcessTree(cmd.Cmd)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -170,6 +173,9 @@ func plannerProcessError(
 	stderr string,
 	err error,
 ) error {
+	if errors.Is(err, processguard.ErrTeardownUnconfirmed) {
+		return fmt.Errorf("planner process teardown is unconfirmed: %w", err)
+	}
 	if parentErr := ctx.Err(); parentErr != nil {
 		return parentErr
 	}

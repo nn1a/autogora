@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -259,25 +260,152 @@ func preservedWorkspaceReason(ctx context.Context, workspaces *workspace.Manager
 	return reason, true
 }
 
+func managedWorkerTreeAlive(
+	processState processidentity.State,
+	descendantsAlive bool,
+) bool {
+	identityMismatch := processState.Alive &&
+		processState.Verified &&
+		!processState.Matches
+	return (processState.Alive && !identityMismatch) || descendantsAlive
+}
+
+func refreshLostRecoveryObservation(
+	ctx context.Context,
+	opened *store.Store,
+	runID string,
+	recoveryErr error,
+	options Options,
+) (bool, error) {
+	if !errors.Is(recoveryErr, store.ErrRunRecoveryObservationChanged) &&
+		!errors.Is(recoveryErr, store.ErrRunRecoveryFenceNotReady) &&
+		!errors.Is(recoveryErr, store.ErrRunRecoveryOwned) {
+		return false, nil
+	}
+	inspection, err := opened.GetRun(ctx, runID)
+	if err != nil {
+		return true, errors.Join(recoveryErr, err)
+	}
+	reclaim, err := opened.GetDeferredReclaim(ctx, runID)
+	if err != nil {
+		return true, errors.Join(recoveryErr, err)
+	}
+	options.log(
+		"skipped stale recovery for %s after refreshing run status=%s heartbeat=%s fence=%t: %v",
+		runID,
+		inspection.Run.Status,
+		inspection.Run.HeartbeatAt,
+		reclaim != nil,
+		recoveryErr,
+	)
+	return true, nil
+}
+
 func recoverRunWithWorkspaceProtection(ctx context.Context, opened *store.Store, workspaces *workspace.Manager, runID, taskID string,
-	outcome model.RunStatus, reason string, countFailure bool, unsafeReason string, options Options,
+	observation store.RunRecoveryObservation, outcome model.RunStatus, reason string, countFailure bool, unsafeReason string, options Options,
 ) error {
+	if err := opened.ValidateObservedRunRecoveryOwnership(
+		ctx,
+		observation,
+	); err != nil {
+		return err
+	}
 	allowWrites, err := opened.GetManagedRunWritePolicy(ctx, runID)
 	if err != nil {
 		return err
 	}
-	if allowWrites != nil && !*allowWrites {
-		return recoverRunDurably(ctx, opened, runID, outcome, reason, countFailure)
+	terminalRequest, err := opened.GetRunTerminalRequest(ctx, runID)
+	if err != nil {
+		return err
+	}
+	hasPendingTerminal := terminalRequest != nil &&
+		terminalRequest.FinalizedAt == nil
+	if allowWrites != nil && !*allowWrites && !hasPendingTerminal {
+		recovery, recoveryErr := opened.GetRunRecoveryCheckpoint(ctx, runID)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		if recovery == nil ||
+			recovery.State != model.RecoveryCheckpointAdopted {
+			return recoverObservedRunDurably(
+				ctx,
+				opened,
+				observation,
+				outcome,
+				reason,
+				countFailure,
+			)
+		}
 	}
 	bound, err := opened.GetRunWorkspace(ctx, runID)
 	if err != nil {
 		return err
 	}
-	preservedReason, preserve := preservedWorkspaceReason(ctx, workspaces, bound, reason, unsafeReason)
-	if !preserve {
-		return recoverRunDurably(ctx, opened, runID, outcome, reason, countFailure)
+	integrationResolution, err := opened.HasRunIntegrationResolution(ctx, runID)
+	if err != nil {
+		return err
 	}
-	if err = recoverRunBlockedDurably(ctx, opened, runID, store.RecoverBlockedRunInput{
+	if integrationResolution && strings.TrimSpace(unsafeReason) == "" {
+		unsafeReason = "the stopped run owns a Finalizer integration-resolution handoff; preserve its conflict workspace for explicit review"
+	}
+	if !integrationResolution && strings.TrimSpace(unsafeReason) == "" && bound != nil &&
+		bound.Kind == model.WorkspaceWorktree {
+		checkpointed, checkpointErr := checkpointAbandonedRunFailure(
+			ctx,
+			opened,
+			workspaces,
+			runID,
+			taskID,
+			observation,
+			bound,
+			terminalRequest,
+			outcome,
+			reason,
+			countFailure,
+		)
+		if checkpointed {
+			options.log("checkpointed abandoned-run work for %s at %s", taskID, bound.Path)
+			return nil
+		}
+		if checkpointErr != nil {
+			unsafeReason = "recovery checkpoint capture failed: " + checkpointErr.Error()
+		}
+	}
+	if terminalRequest != nil && terminalRequest.FinalizedAt == nil {
+		if terminalRequest.Kind == "block" {
+			_, finalizeErr := retryStoreOperation(ctx, func() (model.TaskDetail, error) {
+				return opened.FinalizeObservedRunTerminal(ctx, observation, 0)
+			})
+			if finalizeErr != nil {
+				return finalizeErr
+			}
+			options.log("finalized stopped worker block request for %s", taskID)
+			return nil
+		}
+		return recoverObservedRunBlockedDurably(ctx, opened, observation, store.RecoverBlockedRunInput{
+			Outcome: outcome,
+			Reason: "Worker requested completion, but Autogora could not verify finalization after the process stopped; " +
+				"the workspace remains available for review",
+			Kind: model.BlockKindNeedsInput,
+		})
+	}
+	if err := opened.ValidateObservedRunRecoveryOwnership(
+		ctx,
+		observation,
+	); err != nil {
+		return err
+	}
+	preservedReason, preserve := preservedWorkspaceReason(ctx, workspaces, bound, reason, unsafeReason)
+	if err := opened.ValidateObservedRunRecoveryOwnership(
+		ctx,
+		observation,
+	); err != nil {
+		return err
+	}
+	if !preserve {
+		return recoverObservedRunDurably(ctx, opened, observation, outcome, reason, countFailure)
+	}
+	if err = recoverObservedRunBlockedDurably(ctx, opened, observation, store.RecoverBlockedRunInput{
 		Outcome: outcome, Reason: preservedReason, Kind: model.BlockKindNeedsInput,
 	}); err != nil {
 		return err
@@ -294,6 +422,12 @@ func recoverAbandonedRuns(ctx context.Context, opened *store.Store, board string
 	workspaces := workspace.New(nil)
 	now := time.Now()
 	for _, item := range active {
+		if options.testHooks != nil &&
+			options.testHooks.recoveryObserved != nil {
+			if err := options.testHooks.recoveryObserved(ctx, item); err != nil {
+				return err
+			}
+		}
 		deferred, err := opened.GetDeferredReclaim(ctx, item.Run.ID)
 		if err != nil {
 			return err
@@ -303,139 +437,378 @@ func recoverAbandonedRuns(ctx context.Context, opened *store.Store, board string
 		expired := !now.Before(parseTimestamp(item.Run.ClaimExpiresAt))
 		stale := elapsed >= options.StaleTimeout && heartbeatAge >= options.HeartbeatMaxStale
 		timedOut := item.Task.MaxRuntimeSeconds != nil && elapsed >= time.Duration(*item.Task.MaxRuntimeSeconds)*time.Second
-		var processIdentity *string
+		processIdentity, err := opened.GetRunProcessIdentity(ctx, item.Run.ID)
+		if err != nil {
+			return err
+		}
 		processState := processidentity.State{}
 		if item.Run.PID != nil {
-			processIdentity, err = opened.GetRunProcessIdentity(ctx, item.Run.ID)
-			if err != nil {
-				return err
-			}
 			processState = processidentity.Inspect(*item.Run.PID, processIdentity)
 		}
+		observation := store.ObserveRunForRecovery(
+			item.Run,
+			processIdentity,
+			deferred,
+		)
 		identityMatches := processState.Alive && processState.Verified && processState.Matches
 		identityMismatch := processState.Alive && processState.Verified && !processState.Matches
 		// Dispatcher workers use a dedicated process group on Unix. The leader
-		// can exit before descendants, so conservatively keep ownership while
-		// that group still exists. This check never sends a signal; a reused
-		// group ID can delay recovery but cannot terminate an unrelated process.
-		descendantsAlive := !processState.Alive && runcontrol.ProcessTreeAlive(item.Run.PID)
+		// can exit before descendants or its PID can be reused while the old
+		// group remains alive, so conservatively keep ownership in both cases.
+		// This check never sends a signal; a reused group ID can delay recovery
+		// but cannot terminate an unrelated process.
+		descendantsAlive := (!processState.Alive || identityMismatch) &&
+			runcontrol.ProcessTreeAlive(item.Run.PID)
 		// An occupied PID with no verifiable identity may still be the worker,
 		// so it keeps ownership. It is never safe to signal or force-kill it.
-		workerAlive := (processState.Alive && !identityMismatch) || descendantsAlive
+		workerAlive := managedWorkerTreeAlive(processState, descendantsAlive)
+		operatorQuiesced := store.RecoveryQuiescenceAttestationCurrent(
+			item.Run,
+			processIdentity,
+			deferred,
+		)
+		operatorAttestationPresent := deferred != nil &&
+			deferred.OperatorQuiescedGeneration != nil
+		// A current explicit confirmation can resolve a missing/reused process
+		// identity, but it never overrides a verified live matching worker.
+		workerAliveForRecovery := workerAlive
+		if operatorQuiesced && !identityMatches {
+			workerAliveForRecovery = false
+		}
 		crashed := item.Run.PID != nil && elapsed >= *options.CrashGrace && !workerAlive
+		managed, err := opened.IsRunManaged(ctx, item.Run.ID)
+		if err != nil {
+			return err
+		}
 		deferredExpired := false
 		if deferred != nil {
 			deferredExpired = !now.Before(parseTimestamp(deferred.ExpiresAt))
 		}
-		deferTermination := func(reason string, timedOut bool) error {
-			signaled := runcontrol.SignalRunProcess(item.Run.PID, processIdentity)
-			if processState.Alive && !signaled {
-				reason += "; recorded PID identity could not be verified; no signal was sent"
-			}
-			seconds := max(1, int(options.TerminationGrace.Seconds()))
-			if timedOut {
-				_, err = opened.DeferTimedOutRun(ctx, item.Run.ID, seconds, reason)
+		fenceSeconds := max(1, int(options.TerminationGrace.Seconds()))
+		unsafeOwnershipReason := "Automatic recovery cannot prove ownership or quiescence of the managed process tree; inspect and stop it before retrying recovery"
+		fenceRecovery := func(
+			reason string,
+			outcome model.RunStatus,
+			countFailure bool,
+			requiresOperator bool,
+		) (store.RunRecoveryObservation, error) {
+			var fenced model.Run
+			if requiresOperator {
+				fenced, err = opened.RequireObservedRunRecoveryIntervention(
+					ctx,
+					observation,
+					fenceSeconds,
+					reason,
+					outcome,
+					countFailure,
+				)
 			} else {
-				_, err = opened.DeferReclaim(ctx, item.Run.ID, seconds, reason)
+				fenced, err = opened.FenceObservedRunRecovery(
+					ctx,
+					observation,
+					fenceSeconds,
+					reason,
+					outcome,
+					countFailure,
+				)
 			}
-			return err
+			if err != nil {
+				return store.RunRecoveryObservation{}, err
+			}
+			currentFence, loadErr := opened.GetDeferredReclaim(ctx, item.Run.ID)
+			if loadErr != nil {
+				return store.RunRecoveryObservation{}, loadErr
+			}
+			if currentFence == nil {
+				return store.RunRecoveryObservation{}, errors.New(
+					"run recovery fence disappeared after acquisition",
+				)
+			}
+			return store.ObserveRunForRecovery(
+				fenced,
+				processIdentity,
+				currentFence,
+			), nil
 		}
-		forceTermination := func() error {
-			forced := runcontrol.ForceKillRunProcess(item.Run.PID, processIdentity)
-			reason := deferred.Reason
-			if forced {
-				reason += "; force termination sent after grace period"
-			} else {
-				reason += "; force termination could not be delivered"
+		recoverWithFence := func(
+			recoveryObservation store.RunRecoveryObservation,
+			outcome model.RunStatus,
+			reason string,
+			countFailure bool,
+		) error {
+			owned, acquired, claimErr := opened.ClaimObservedRunRecovery(
+				ctx,
+				recoveryObservation,
+				2*time.Minute,
+			)
+			if claimErr != nil {
+				return claimErr
 			}
-			seconds := max(1, int(options.TerminationGrace.Seconds()))
-			if deferred.Outcome == model.RunStatusTimedOut {
-				_, err = opened.DeferTimedOutRun(ctx, item.Run.ID, seconds, reason)
-			} else {
-				_, err = opened.DeferReclaim(ctx, item.Run.ID, seconds, reason)
+			if !acquired {
+				return fmt.Errorf(
+					"%w: run %s",
+					store.ErrRunRecoveryOwned,
+					item.Run.ID,
+				)
 			}
-			return err
+			ownerGuard, guardErr := startRecoveryOwnershipGuard(
+				ctx,
+				opened,
+				owned,
+				options.log,
+			)
+			if guardErr != nil {
+				return guardErr
+			}
+			recoveryErr := recoverRunWithWorkspaceProtection(
+				ownerGuard.ctx,
+				opened,
+				workspaces,
+				item.Run.ID,
+				item.Task.ID,
+				owned,
+				outcome,
+				reason,
+				countFailure,
+				"",
+				options,
+			)
+			return errors.Join(recoveryErr, ownerGuard.Stop())
 		}
 		recoverDeferred := func() error {
-			return recoverRunWithWorkspaceProtection(ctx, opened, workspaces, item.Run.ID, item.Task.ID,
-				deferred.Outcome, deferred.Reason, deferred.CountFailure, "", options)
+			return recoverWithFence(
+				observation,
+				deferred.Outcome,
+				deferred.Reason,
+				deferred.CountFailure,
+			)
 		}
+		recoverStopped := func(
+			outcome model.RunStatus,
+			reason string,
+			countFailure bool,
+		) error {
+			if !managed && !operatorQuiesced {
+				_, fenceErr := fenceRecovery(
+					"External run recovery requires explicit confirmation that the worker and host writes stopped",
+					outcome,
+					countFailure,
+					true,
+				)
+				return fenceErr
+			}
+			fenced, fenceErr := fenceRecovery(
+				reason,
+				outcome,
+				countFailure,
+				false,
+			)
+			if fenceErr != nil {
+				return fenceErr
+			}
+			if managed {
+				// The managed host acknowledges this exact fence only after
+				// runClaim has unwound all host-owned Git work.
+				return nil
+			}
+			return recoverWithFence(fenced, outcome, reason, countFailure)
+		}
+		requireOperator := func(reason string) error {
+			_, interventionErr := fenceRecovery(
+				reason,
+				func() model.RunStatus {
+					if deferred != nil {
+						return deferred.Outcome
+					}
+					if timedOut {
+						return model.RunStatusTimedOut
+					}
+					if crashed {
+						return model.RunStatusCrashed
+					}
+					return model.RunStatusReclaimed
+				}(),
+				deferred != nil && deferred.CountFailure || timedOut || crashed,
+				true,
+			)
+			return interventionErr
+		}
+		// A durable reclaim fence takes precedence over fresh heartbeat math.
+		// Host lease renewal cannot hide or overwrite this state.
+		if deferred != nil {
+			switch {
+			case deferred.RequiresOperator:
+				options.log(
+					"recovery for %s remains fenced for operator intervention (%s)",
+					item.Task.ID,
+					func() string {
+						if deferred.DiagnosticCode == nil {
+							return "diagnostic unavailable"
+						}
+						return *deferred.DiagnosticCode
+					}(),
+				)
+			case operatorAttestationPresent && !operatorQuiesced:
+				if err := requireOperator(
+					"Operator quiescence confirmation no longer matches the current run state",
+				); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
+					}
+					return err
+				}
+				options.log(
+					"recovery confirmation for %s became stale and requires operator intervention",
+					item.Task.ID,
+				)
+			case !managed && !operatorQuiesced:
+				if err := requireOperator(
+					"External run recovery requires explicit confirmation that the worker and host writes stopped",
+				); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
+					}
+					return err
+				}
+				options.log(
+					"external run recovery for %s requires operator quiescence confirmation",
+					item.Task.ID,
+				)
+			case workerAliveForRecovery:
+				if err := requireOperator(unsafeOwnershipReason); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
+					}
+					return err
+				}
+				options.log("recovery for %s requires operator intervention", item.Task.ID)
+			case managed && deferred.HostAcknowledgedAt == nil &&
+				!operatorQuiesced:
+				if deferredExpired {
+					if err := requireOperator(unsafeOwnershipReason); err != nil {
+						if lost, refreshErr := refreshLostRecoveryObservation(
+							ctx, opened, item.Run.ID, err, options,
+						); lost {
+							if refreshErr != nil {
+								return refreshErr
+							}
+							continue
+						}
+						return err
+					}
+					options.log("managed host quiescence for %s requires operator intervention", item.Task.ID)
+				}
+			default:
+				if err := recoverDeferred(); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
+					}
+					return err
+				}
+				options.log("recovered %s after fenced termination", item.Task.ID)
+			}
+			continue
+		}
+
 		switch {
 		case timedOut:
 			if workerAlive {
-				if deferred == nil || deferred.Outcome != model.RunStatusTimedOut {
-					reason := fmt.Sprintf("Maximum runtime exceeded after %d seconds", int(elapsed.Seconds()))
-					if err := deferTermination(reason, true); err != nil {
-						return err
+				if err := requireOperator(unsafeOwnershipReason); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
 					}
-					options.log("requested timeout termination for PID %d on %s", *item.Run.PID, item.Task.ID)
-				} else if deferredExpired && identityMatches {
-					if err := forceTermination(); err != nil {
-						return err
-					}
-					options.log("escalated timeout termination for PID %d on %s", *item.Run.PID, item.Task.ID)
-				} else if deferredExpired {
-					options.log("refused timeout escalation for unverified PID %d on %s", *item.Run.PID, item.Task.ID)
+					return err
 				}
+				options.log("timed-out worker %s requires operator intervention", item.Task.ID)
 				continue
 			}
-			if err := recoverRunWithWorkspaceProtection(ctx, opened, workspaces, item.Run.ID, item.Task.ID, model.RunStatusTimedOut,
-				fmt.Sprintf("Maximum runtime exceeded after %d seconds", int(elapsed.Seconds())), true, "", options); err != nil {
+			reason := fmt.Sprintf("Maximum runtime exceeded after %d seconds", int(elapsed.Seconds()))
+			if err := recoverStopped(model.RunStatusTimedOut, reason, true); err != nil {
+				if lost, refreshErr := refreshLostRecoveryObservation(
+					ctx, opened, item.Run.ID, err, options,
+				); lost {
+					if refreshErr != nil {
+						return refreshErr
+					}
+					continue
+				}
 				return err
 			}
-			options.log("timed out %s", item.Task.ID)
-		case crashed && deferred != nil:
-			if err := recoverDeferred(); err != nil {
-				return err
-			}
-			options.log("recovered %s after requested termination", item.Task.ID)
+			options.log("fenced timed-out run %s", item.Task.ID)
 		case crashed:
 			reason := fmt.Sprintf("Worker PID %d is no longer alive", *item.Run.PID)
 			if identityMismatch {
 				reason = fmt.Sprintf("Recorded worker PID %d now belongs to a different process; Autogora did not signal it", *item.Run.PID)
 			}
-			if err := recoverRunWithWorkspaceProtection(ctx, opened, workspaces, item.Run.ID, item.Task.ID, model.RunStatusCrashed,
-				reason, true, "", options); err != nil {
+			if err := recoverStopped(model.RunStatusCrashed, reason, true); err != nil {
+				if lost, refreshErr := refreshLostRecoveryObservation(
+					ctx, opened, item.Run.ID, err, options,
+				); lost {
+					if refreshErr != nil {
+						return refreshErr
+					}
+					continue
+				}
 				return err
 			}
-			options.log("reclaimed crashed worker %s", item.Task.ID)
+			options.log("fenced crashed worker %s", item.Task.ID)
 		case expired || stale:
 			if workerAlive {
-				if deferred == nil {
-					reason := "Claim TTL expired"
-					if stale {
-						reason = "Heartbeat became stale"
+				if err := requireOperator(unsafeOwnershipReason); err != nil {
+					if lost, refreshErr := refreshLostRecoveryObservation(
+						ctx, opened, item.Run.ID, err, options,
+					); lost {
+						if refreshErr != nil {
+							return refreshErr
+						}
+						continue
 					}
-					if err := deferTermination(reason, false); err != nil {
-						return err
-					}
-					options.log("deferred reclaim while terminating PID %d for %s", *item.Run.PID, item.Task.ID)
-				} else if deferredExpired && identityMatches {
-					if err := forceTermination(); err != nil {
-						return err
-					}
-					options.log("escalated stale-worker termination for PID %d on %s", *item.Run.PID, item.Task.ID)
-				} else if deferredExpired {
-					options.log("refused stale-worker escalation for unverified PID %d on %s", *item.Run.PID, item.Task.ID)
+					return err
 				}
+				options.log("stale worker %s requires operator intervention", item.Task.ID)
 				continue
 			}
-			if deferred != nil {
-				if err := recoverDeferred(); err != nil {
-					return err
-				}
-				options.log("recovered %s after requested termination", item.Task.ID)
-			} else {
-				reason := "Claim TTL expired"
-				if stale {
-					reason = "Heartbeat became stale"
-				}
-				if err := recoverRunWithWorkspaceProtection(ctx, opened, workspaces, item.Run.ID, item.Task.ID,
-					model.RunStatusReclaimed, reason, false, "", options); err != nil {
-					return err
-				}
-				options.log("reclaimed %s: %s", item.Task.ID, reason)
+			reason := "Claim TTL expired"
+			if stale {
+				reason = "Heartbeat became stale"
 			}
+			if err := recoverStopped(model.RunStatusReclaimed, reason, false); err != nil {
+				if lost, refreshErr := refreshLostRecoveryObservation(
+					ctx, opened, item.Run.ID, err, options,
+				); lost {
+					if refreshErr != nil {
+						return refreshErr
+					}
+					continue
+				}
+				return err
+			}
+			options.log("fenced reclaim for %s: %s", item.Task.ID, reason)
 		}
 	}
 	return nil
@@ -1200,18 +1573,89 @@ func failRunDurably(ctx context.Context, opened *store.Store, scope store.RunSco
 	return errors.Join(err, inspectErr)
 }
 
-func recoverRunDurably(ctx context.Context, opened *store.Store, runID string, outcome model.RunStatus, reason string, countFailure bool) error {
+func recoverObservedRunDurably(
+	ctx context.Context,
+	opened *store.Store,
+	observation store.RunRecoveryObservation,
+	outcome model.RunStatus,
+	reason string,
+	countFailure bool,
+) error {
 	_, err := retryStoreOperation(ctx, func() (model.TaskDetail, error) {
-		return opened.RecoverAbandonedRun(ctx, runID, outcome, reason, countFailure)
+		return opened.RecoverObservedAbandonedRun(
+			ctx,
+			observation,
+			outcome,
+			reason,
+			countFailure,
+		)
 	})
 	return err
 }
 
-func recoverRunBlockedDurably(ctx context.Context, opened *store.Store, runID string, input store.RecoverBlockedRunInput) error {
+func recoverRunBlockedDurably(
+	ctx context.Context,
+	opened *store.Store,
+	scope store.RunScope,
+	input store.RecoverBlockedRunInput,
+) error {
 	_, err := retryStoreOperation(ctx, func() (model.TaskDetail, error) {
-		return opened.RecoverRunBlocked(ctx, runID, input)
+		return opened.RecoverRunBlocked(ctx, scope, input)
 	})
 	return err
+}
+
+func recoverObservedRunBlockedDurably(
+	ctx context.Context,
+	opened *store.Store,
+	observation store.RunRecoveryObservation,
+	input store.RecoverBlockedRunInput,
+) error {
+	_, err := retryStoreOperation(ctx, func() (model.TaskDetail, error) {
+		return opened.RecoverObservedRunBlocked(ctx, observation, input)
+	})
+	return err
+}
+
+func pendingBlockRequestMatches(
+	request *model.TerminalRequest,
+	reason string,
+	kind model.BlockKind,
+) bool {
+	if request == nil || request.Kind != "block" || request.FinalizedAt != nil {
+		return false
+	}
+	if request.Reason == nil || *request.Reason != strings.TrimSpace(reason) {
+		return false
+	}
+	if kind == "" {
+		return request.BlockKind == nil
+	}
+	return request.BlockKind != nil && *request.BlockKind == kind
+}
+
+func pendingGoalCompletionRequestMatches(
+	request *model.TerminalRequest,
+	summary string,
+	turn int,
+	judgeReason string,
+) bool {
+	if request == nil || request.Kind != "complete" ||
+		request.FinalizedAt != nil || request.Summary == nil ||
+		*request.Summary != strings.TrimSpace(summary) ||
+		request.Result != nil || len(request.Artifacts) != 0 {
+		return false
+	}
+	expected, err := json.Marshal(map[string]any{
+		"goalMode":    true,
+		"turns":       turn,
+		"judgeReason": judgeReason,
+	})
+	if err != nil {
+		return false
+	}
+	actual, err := json.Marshal(request.Metadata)
+	return err == nil && string(actual) == string(expected)
 }
 
 func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspaces *workspace.Manager, prepared *model.ClaimedTask, scope store.RunScope, exitCode int) (model.TaskDetail, error) {
@@ -1223,6 +1667,46 @@ func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspace
 	}
 	if request == nil {
 		return model.TaskDetail{}, fmt.Errorf("run has no terminal request: %s", scope.RunID)
+	}
+	if request.Kind == "block" &&
+		prepared.IntegrationResolution == nil &&
+		prepared.Workspace != nil &&
+		prepared.Workspace.Kind == model.WorkspaceWorktree {
+		inspection, err := workspaces.InspectChanges(ctx, *prepared.Workspace)
+		if err != nil {
+			return model.TaskDetail{}, err
+		}
+		if inspection.Changed {
+			_, input, err := captureRecoverySnapshot(
+				ctx,
+				opened,
+				workspaces,
+				prepared,
+			)
+			if err != nil {
+				return model.TaskDetail{}, err
+			}
+			return retryStoreOperation(ctx, func() (model.TaskDetail, error) {
+				if checkpoint := prepared.RecoveryCheckpoint; checkpoint != nil {
+					_, detail, callErr := opened.SupersedeRecoveryCheckpointAndFinalizeBlock(
+						ctx,
+						scope,
+						checkpoint.ID,
+						checkpoint.ReservationToken,
+						input,
+						exitCode,
+					)
+					return detail, callErr
+				}
+				_, detail, callErr := opened.RegisterRecoveryCheckpointAndFinalizeBlock(
+					ctx,
+					scope,
+					input,
+					exitCode,
+				)
+				return detail, callErr
+			})
+		}
 	}
 	if request.Kind == "complete" && prepared.Workspace != nil && prepared.Workspace.Kind == model.WorkspaceWorktree {
 		existing, err := retryStoreOperation(ctx, func() (*model.ChangeSet, error) {
@@ -1251,7 +1735,7 @@ func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspace
 		}
 	}
 	return retryStoreOperation(ctx, func() (model.TaskDetail, error) {
-		return opened.FinalizeRunTerminal(ctx, scope.RunID, exitCode)
+		return opened.FinalizeRunTerminal(ctx, scope, exitCode)
 	})
 }
 
@@ -1301,9 +1785,75 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
-	profile, err := resolveRunProfile(ctx, manager, opened, claim.Task.Task, options)
+	managedLease, err := startManagedRunLeaseGuard(
+		ctx,
+		opened,
+		scope,
+		options.log,
+	)
 	if err != nil {
 		durable, cancel := durableContext()
+		defer cancel()
+		if persistErr := failRunDurably(
+			durable,
+			opened,
+			scope,
+			"Unable to establish dispatcher run lease: "+err.Error(),
+			store.FailRunOptions{FailureLimit: options.FailureLimit},
+		); persistErr != nil {
+			return fmt.Errorf(
+				"persist managed run lease failure for %s: %w",
+				claim.Task.Task.ID,
+				errors.Join(err, persistErr),
+			)
+		}
+		return nil
+	}
+	ctx = managedLease.ctx
+	defer func() {
+		if leaseErr := managedLease.Stop(); leaseErr != nil {
+			runErr = errors.Join(
+				runErr,
+				fmt.Errorf(
+					"managed run lease for %s: %w",
+					claim.Task.Task.ID,
+					leaseErr,
+				),
+			)
+		}
+	}()
+	checkManagedLease := func(stage string) error {
+		// Dispatcher cancellation follows the existing durable terminalization
+		// path. Only confirmed lease loss fences host mutations immediately.
+		if leaseErr := managedLease.Err(); leaseErr != nil {
+			return fmt.Errorf(
+				"managed run ownership lost during %s for %s: %w",
+				stage,
+				claim.Task.Task.ID,
+				leaseErr,
+			)
+		}
+		return nil
+	}
+	durableRunContext := managedLease.DurableContext
+	reachManagedRunPhase := func(phase string) error {
+		if options.testHooks == nil || options.testHooks.managedRunPhase == nil {
+			return nil
+		}
+		if hookErr := options.testHooks.managedRunPhase(ctx, phase); hookErr != nil {
+			return fmt.Errorf("managed run phase %s: %w", phase, hookErr)
+		}
+		return checkManagedLease(phase)
+	}
+	if err := reachManagedRunPhase("lease-established"); err != nil {
+		return err
+	}
+	profile, err := resolveRunProfile(ctx, manager, opened, claim.Task.Task, options)
+	if err != nil {
+		if leaseErr := checkManagedLease("agent profile resolution"); leaseErr != nil {
+			return leaseErr
+		}
+		durable, cancel := durableRunContext()
 		defer cancel()
 		countFailure := false
 		if persistErr := failRunDurably(durable, opened, scope, "Agent profile resolution failed: "+err.Error(), store.FailRunOptions{
@@ -1313,13 +1863,19 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
+	if err := checkManagedLease("agent profile resolution"); err != nil {
+		return err
+	}
 	if profile.GlobalRegistered {
 		var acquired bool
 		agentLease, acquired, err = agentcapacity.New(manager).AcquireWorker(
 			ctx, profile.Name, profile.MaxConcurrent, claim.Task.Task.Board, claim.Run.ID,
 		)
 		if err != nil || !acquired {
-			durable, cancel := durableContext()
+			if leaseErr := checkManagedLease("agent capacity acquisition"); leaseErr != nil {
+				return leaseErr
+			}
+			durable, cancel := durableRunContext()
 			defer cancel()
 			countFailure := false
 			reason := fmt.Sprintf("Global agent capacity is full for profile %s", profile.Name)
@@ -1336,17 +1892,26 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return nil
 		}
 	}
+	if err := checkManagedLease("agent capacity acquisition"); err != nil {
+		return err
+	}
 	configured, err := opened.RecordRunAgentConfig(ctx, scope, store.RecordRunAgentConfigInput{
 		Profile: profile.Name, Runtime: profile.Runtime, Model: profile.Model, Provider: profile.Provider, Source: profile.Source,
 		FallbackFrom: profile.FallbackFrom, AllowRuntimeOverride: profile.Runtime != claim.Run.Runtime,
 	})
 	if err != nil {
-		durable, cancel := durableContext()
+		if leaseErr := checkManagedLease("agent configuration pinning"); leaseErr != nil {
+			return leaseErr
+		}
+		durable, cancel := durableRunContext()
 		defer cancel()
 		if persistErr := failRunDurably(durable, opened, scope, "Unable to pin agent configuration: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit}); persistErr != nil {
 			return fmt.Errorf("persist agent configuration failure for %s: %w", claim.Task.Task.ID, persistErr)
 		}
 		return nil
+	}
+	if err := checkManagedLease("agent configuration pinning"); err != nil {
+		return err
 	}
 	claim.Run.Runtime = configured.Runtime
 	claim.Task.Task.Runtime = configured.Runtime
@@ -1355,9 +1920,15 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	if options.WorkingDirectory != "" {
 		workspaces.SetWorkingDirectory(options.WorkingDirectory)
 	}
+	if err := reachManagedRunPhase("workspace-prepare"); err != nil {
+		return err
+	}
 	prepared, err := workspaces.Prepare(ctx, opened, claim)
 	if err != nil {
-		durable, cancel := durableContext()
+		if leaseErr := checkManagedLease("workspace preparation"); leaseErr != nil {
+			return leaseErr
+		}
+		durable, cancel := durableRunContext()
 		defer cancel()
 		failure := store.FailRunOptions{FailureLimit: options.FailureLimit}
 		if errors.Is(err, store.ErrResourceBusy) {
@@ -1371,8 +1942,88 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
+	if err := checkManagedLease("workspace preparation"); err != nil {
+		return err
+	}
+	var reservedRecoveryCheckpoint *model.RecoveryCheckpoint
+	if !options.AllowWrites {
+		active, activeErr := opened.GetActiveRecoveryCheckpoint(
+			ctx,
+			prepared.Task.Task.ID,
+		)
+		if activeErr != nil {
+			if leaseErr := checkManagedLease("recovery checkpoint inspection"); leaseErr != nil {
+				return leaseErr
+			}
+			return fmt.Errorf(
+				"inspect recovery checkpoint before read-only integration for %s: %w",
+				prepared.Task.Task.ID,
+				activeErr,
+			)
+		}
+		if active != nil {
+			reason := "Recovery checkpoint contains partial workspace changes; enable workspace writes before resuming this task"
+			durable, cancel := durableRunContext()
+			_, blockErr := opened.BlockRun(
+				durable,
+				scope,
+				store.BlockInput{
+					Reason: reason,
+					Kind:   model.BlockKindCapability,
+				},
+			)
+			if blockErr == nil {
+				_, blockErr = finalizeManagedTerminal(
+					durable,
+					opened,
+					workspaces,
+					prepared,
+					scope,
+					1,
+				)
+			}
+			cancel()
+			if blockErr != nil {
+				return fmt.Errorf(
+					"persist read-only recovery checkpoint block for %s: %w",
+					prepared.Task.Task.ID,
+					blockErr,
+				)
+			}
+			options.log(
+				"blocked read-only recovery checkpoint for %s before prerequisite integration",
+				prepared.Task.Task.ID,
+			)
+			return nil
+		}
+	} else {
+		reservedRecoveryCheckpoint, err = reserveRecoveryCheckpoint(
+			ctx,
+			opened,
+			prepared,
+		)
+		if err != nil {
+			if leaseErr := checkManagedLease("recovery checkpoint reservation"); leaseErr != nil {
+				return leaseErr
+			}
+			return fmt.Errorf(
+				"reserve recovery checkpoint before prerequisite integration for %s: %w",
+				prepared.Task.Task.ID,
+				err,
+			)
+		}
+	}
+	if err := checkManagedLease("recovery checkpoint reservation"); err != nil {
+		return err
+	}
+	if err := reachManagedRunPhase("prerequisite-integration"); err != nil {
+		return err
+	}
 	if _, err := workspaces.IntegratePrerequisiteChangeSets(ctx, opened, prepared); err != nil {
-		durable, cancel := durableContext()
+		if leaseErr := checkManagedLease("prerequisite integration"); leaseErr != nil {
+			return leaseErr
+		}
+		durable, cancel := durableRunContext()
 		defer cancel()
 		var integrationErr *workspace.PrerequisiteIntegrationError
 		if errors.As(err, &integrationErr) {
@@ -1381,7 +2032,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 				_, blockErr = finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			}
 			if blockErr != nil {
-				recoveryErr := recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+				recoveryErr := recoverRunBlockedDurably(durable, opened, scope, store.RecoverBlockedRunInput{
 					Outcome: model.RunStatusBlocked, Reason: integrationErr.Reason, Kind: integrationErr.BlockKind,
 				})
 				return fmt.Errorf("finalize prerequisite integration block for %s: %w", claim.Task.Task.ID, errors.Join(blockErr, recoveryErr))
@@ -1400,6 +2051,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
+	if err := checkManagedLease("prerequisite integration"); err != nil {
+		return err
+	}
 	blockPreparedResolution := func(reason string, exitCode int) (bool, error) {
 		if prepared.IntegrationResolution == nil {
 			return false, nil
@@ -1407,9 +2061,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		if prepared.Workspace != nil {
 			reason += "; unresolved finalizer workspace preserved at " + prepared.Workspace.Path
 		}
-		durable, cancel := durableContext()
+		durable, cancel := durableRunContext()
 		defer cancel()
-		err := recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+		err := recoverRunBlockedDurably(durable, opened, scope, store.RecoverBlockedRunInput{
 			Outcome: model.RunStatusBlocked, Reason: reason,
 			Kind: model.BlockKindNeedsInput, ExitCode: &exitCode,
 		})
@@ -1419,6 +2073,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	workspaceRoot, workspaceErr := manager.WorkspaceRoot(prepared.Task.Task.Board)
 	attachmentsRoot, attachmentsErr := manager.AttachmentsRoot(prepared.Task.Task.Board)
 	if rootsErr != nil || workspaceErr != nil || attachmentsErr != nil {
+		if leaseErr := checkManagedLease("board path resolution"); leaseErr != nil {
+			return leaseErr
+		}
 		err := errors.Join(rootsErr, workspaceErr, attachmentsErr)
 		if blocked, blockErr := blockPreparedResolution("Board path resolution failed before finalizer launch: "+err.Error(), 1); blocked {
 			if blockErr != nil {
@@ -1426,7 +2083,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			}
 			return nil
 		}
-		durable, cancel := durableContext()
+		durable, cancel := durableRunContext()
 		defer cancel()
 		if persistErr := failRunDurably(durable, opened, scope, "Board path resolution failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit}); persistErr != nil {
 			return fmt.Errorf("persist board path failure for %s: %w", claim.Task.Task.ID, persistErr)
@@ -1434,13 +2091,16 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return nil
 	}
 	if err := os.MkdirAll(logsRoot, 0o755); err != nil {
+		if leaseErr := checkManagedLease("log directory creation"); leaseErr != nil {
+			return leaseErr
+		}
 		if blocked, blockErr := blockPreparedResolution("Log directory creation failed before finalizer launch: "+err.Error(), 1); blocked {
 			if blockErr != nil {
 				return fmt.Errorf("preserve finalizer resolution after log directory failure for %s: %w", prepared.Task.Task.ID, blockErr)
 			}
 			return nil
 		}
-		durable, cancel := durableContext()
+		durable, cancel := durableRunContext()
 		defer cancel()
 		persistErr := failRunDurably(durable, opened, scope, "Log directory creation failed: "+err.Error(), store.FailRunOptions{FailureLimit: options.FailureLimit})
 		options.log("log directory failure %s: %v", prepared.Task.Task.ID, err)
@@ -1449,8 +2109,11 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		return nil
 	}
+	if err := checkManagedLease("host setup"); err != nil {
+		return err
+	}
 	logPath := filepath.Join(logsRoot, prepared.Task.Task.ID+"-"+prepared.Run.ID+".log")
-	runnerOptions := RunnerOptions{DBPath: options.DBPath, CLIPath: options.CLIPath, Profile: configured.Profile,
+	runnerOptions := RunnerOptions{Context: ctx, DBPath: options.DBPath, CLIPath: options.CLIPath, Profile: configured.Profile,
 		Command: profile.Command, Model: configured.Model, Provider: configured.Provider, AllowWrites: options.AllowWrites,
 		WorkspaceRoot: workspaceRoot, AttachmentsRoot: attachmentsRoot, LogsRoot: logsRoot,
 		ClineApprovalDir: clineApprovalDir, Getenv: options.Getenv}
@@ -1464,13 +2127,66 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	runStarted := parseTimestamp(prepared.Run.ClaimedAt)
 	blockManagedRun := func(durable context.Context, reason string, kind model.BlockKind, exitCode int) error {
 		if _, requestErr := opened.BlockRun(durable, scope, store.BlockInput{Reason: reason, Kind: kind}); requestErr != nil {
-			recoveryErr := recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+			currentRequest, inspectErr := opened.GetRunTerminalRequest(
+				durable,
+				scope.RunID,
+			)
+			if inspectErr == nil &&
+				pendingBlockRequestMatches(currentRequest, reason, kind) {
+				if _, finalizeErr := finalizeManagedTerminal(
+					durable,
+					opened,
+					workspaces,
+					prepared,
+					scope,
+					exitCode,
+				); finalizeErr == nil {
+					return nil
+				} else {
+					requestErr = errors.Join(requestErr, finalizeErr)
+				}
+			} else if inspectErr != nil {
+				requestErr = errors.Join(requestErr, inspectErr)
+			}
+			checkpointed, checkpointErr := checkpointManagedRunBlock(
+				durable,
+				opened,
+				workspaces,
+				prepared,
+				scope,
+				reason,
+				kind,
+				exitCode,
+			)
+			if checkpointed {
+				return nil
+			}
+			if checkpointErr != nil {
+				return errors.Join(requestErr, checkpointErr)
+			}
+			recoveryErr := recoverRunBlockedDurably(durable, opened, scope, store.RecoverBlockedRunInput{
 				Outcome: model.RunStatusBlocked, Reason: reason, Kind: kind, ExitCode: &exitCode,
 			})
 			return errors.Join(requestErr, recoveryErr)
 		}
 		if _, finalizeErr := finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, exitCode); finalizeErr != nil {
-			recoveryErr := recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+			checkpointed, checkpointErr := checkpointManagedRunBlock(
+				durable,
+				opened,
+				workspaces,
+				prepared,
+				scope,
+				reason,
+				kind,
+				exitCode,
+			)
+			if checkpointed {
+				return nil
+			}
+			if checkpointErr != nil {
+				return errors.Join(finalizeErr, checkpointErr)
+			}
+			recoveryErr := recoverRunBlockedDurably(durable, opened, scope, store.RecoverBlockedRunInput{
 				Outcome: model.RunStatusBlocked, Reason: reason, Kind: kind, ExitCode: &exitCode,
 			})
 			return errors.Join(finalizeErr, recoveryErr)
@@ -1479,9 +2195,15 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	}
 	var goalPlanner orchestration.Planner
 	if goalMode && options.GoalJudge == nil {
+		if err := checkManagedLease("goal judge configuration"); err != nil {
+			return err
+		}
 		metadata, metadataErr := manager.Read(prepared.Task.Task.Board)
 		profileSet, profileErr := configuredProfiles(manager, prepared.Task.Task.Board, options)
 		if metadataErr != nil || profileErr != nil {
+			if leaseErr := checkManagedLease("goal judge configuration"); leaseErr != nil {
+				return leaseErr
+			}
 			reason := "Goal judge configuration failed: " + errors.Join(metadataErr, profileErr).Error()
 			if blocked, blockErr := blockPreparedResolution(reason, 1); blocked {
 				if blockErr != nil {
@@ -1489,7 +2211,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 				}
 				return nil
 			}
-			durable, cancel := durableContext()
+			durable, cancel := durableRunContext()
 			defer cancel()
 			if persistErr := blockManagedRun(durable, reason, model.BlockKindTransient, 0); persistErr != nil {
 				return fmt.Errorf("persist goal judge configuration block for %s: %w", taskID, persistErr)
@@ -1502,6 +2224,9 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		goalPlanner, err = createRolePlanner(manager, opened, metadata, profileSet, options, agentconfig.RoleJudge, plannerCWD)
 		if err != nil {
+			if leaseErr := checkManagedLease("goal judge setup"); leaseErr != nil {
+				return leaseErr
+			}
 			reason := "Goal judge setup failed: " + err.Error()
 			if blocked, blockErr := blockPreparedResolution(reason, 1); blocked {
 				if blockErr != nil {
@@ -1509,12 +2234,66 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 				}
 				return nil
 			}
-			durable, cancel := durableContext()
+			durable, cancel := durableRunContext()
 			defer cancel()
 			if persistErr := blockManagedRun(durable, reason, model.BlockKindTransient, 0); persistErr != nil {
 				return fmt.Errorf("persist goal judge setup block for %s: %w", taskID, persistErr)
 			}
 			return nil
+		}
+		if err := checkManagedLease("goal judge setup"); err != nil {
+			return err
+		}
+	}
+	if prepared.IntegrationResolution == nil &&
+		reservedRecoveryCheckpoint != nil {
+		recovered, recoveryErr := adoptReservedRecoveryCheckpoint(
+			ctx,
+			opened,
+			workspaces,
+			prepared,
+			reservedRecoveryCheckpoint,
+		)
+		if recoveryErr != nil {
+			if leaseErr := checkManagedLease("recovery checkpoint adoption"); leaseErr != nil {
+				return leaseErr
+			}
+			reason := "Recovery checkpoint adoption failed: recovery_checkpoint_adoption_requires_review"
+			if !recoverySetupCanTerminalize(recoveryErr) {
+				return fmt.Errorf(
+					"recovery checkpoint state is uncertain for %s; preserved active run: %w",
+					taskID,
+					recoveryErr,
+				)
+			}
+			durable, cancel := durableRunContext()
+			persistErr := blockManagedRun(
+				durable,
+				reason,
+				model.BlockKindNeedsInput,
+				1,
+			)
+			cancel()
+			if persistErr != nil {
+				return fmt.Errorf(
+					"persist recovery checkpoint adoption block for %s: %w",
+					taskID,
+					errors.Join(recoveryErr, persistErr),
+				)
+			}
+			options.log("blocked invalid recovery checkpoint for %s: %v", taskID, recoveryErr)
+			return nil
+		}
+		if recovered != nil {
+			options.log(
+				"adopted recovery checkpoint %s from run %s for %s",
+				recovered.ID,
+				recovered.SourceRunID,
+				taskID,
+			)
+		}
+		if err := checkManagedLease("recovery checkpoint adoption"); err != nil {
+			return err
 		}
 	}
 	cleanupIfDone := func(current model.TaskDetail) {
@@ -1526,12 +2305,55 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 	}
 	blockPreservedRun := func(durable context.Context, reason string, exitCode int) error {
-		return recoverRunBlockedDurably(durable, opened, scope.RunID, store.RecoverBlockedRunInput{
+		return recoverRunBlockedDurably(durable, opened, scope, store.RecoverBlockedRunInput{
 			Outcome: model.RunStatusBlocked, Reason: reason, Kind: model.BlockKindNeedsInput, ExitCode: &exitCode,
 		})
 	}
-	preserveIfChanged := func(durable context.Context, reason string, exitCode int) (bool, error) {
-		if !options.AllowWrites || prepared.Workspace == nil {
+	persistCheckpointOrPreserve := func(
+		durable context.Context,
+		reason string,
+		runError string,
+		exitCode int,
+		failure store.FailRunOptions,
+	) (bool, error) {
+		if prepared.Workspace == nil {
+			return false, nil
+		}
+		if prepared.Workspace.Kind == model.WorkspaceWorktree &&
+			prepared.IntegrationResolution == nil {
+			checkpointed, checkpointErr := checkpointManagedRunFailure(
+				durable,
+				opened,
+				workspaces,
+				prepared,
+				scope,
+				runError,
+				failure,
+			)
+			if checkpointed {
+				options.log("checkpointed partial work for %s", taskID)
+				return true, nil
+			}
+			if checkpointErr != nil {
+				// Once an earlier checkpoint is adopted, ordinary blocked
+				// terminalization is deliberately forbidden. Leave the run
+				// active for durable retry instead of losing its lineage.
+				if prepared.RecoveryCheckpoint != nil {
+					return true, checkpointErr
+				}
+				preservedReason, preserve := preservedWorkspaceReason(
+					durable,
+					workspaces,
+					prepared.Workspace,
+					reason,
+					"recovery checkpoint capture failed: "+checkpointErr.Error(),
+				)
+				if !preserve {
+					return true, checkpointErr
+				}
+				blockErr := blockPreservedRun(durable, preservedReason, exitCode)
+				return true, errors.Join(checkpointErr, blockErr)
+			}
 			return false, nil
 		}
 		preservedReason, preserve := preservedWorkspaceReason(durable, workspaces, prepared.Workspace, reason, "")
@@ -1546,8 +2368,14 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		return true, nil
 	}
 	persistExecutionFailure := func(durable context.Context, preserveReason, runError string, exitCode int, failure store.FailRunOptions) error {
-		preserved, err := preserveIfChanged(durable, preserveReason, exitCode)
-		if err != nil || preserved {
+		handled, err := persistCheckpointOrPreserve(
+			durable,
+			preserveReason,
+			runError,
+			exitCode,
+			failure,
+		)
+		if err != nil || handled {
 			return err
 		}
 		return failRunDurably(durable, opened, scope, runError, failure)
@@ -1591,6 +2419,12 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	}
 
 	for {
+		if err := checkManagedLease("runner launch"); err != nil {
+			return err
+		}
+		if err := reachManagedRunPhase("runner-launch"); err != nil {
+			return err
+		}
 		var command RunnerCommand
 		if continuation != "" && (sessionID != "" || prepared.Task.Task.Runtime == model.RuntimeCline) {
 			command, err = BuildGoalContinuationCommand(*prepared, runnerOptions, sessionID, continuation)
@@ -1598,17 +2432,25 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			command, err = BuildRunnerCommand(*prepared, runnerOptions, sessionID)
 		}
 		if err != nil {
+			if leaseErr := checkManagedLease("runner command construction"); leaseErr != nil {
+				return leaseErr
+			}
 			if blocked, blockErr := blockPreparedResolution("Runner command construction failed before finalizer launch: "+err.Error(), 1); blocked {
 				if blockErr != nil {
 					return fmt.Errorf("preserve finalizer resolution after runner construction failure for %s: %w", taskID, blockErr)
 				}
 				return nil
 			}
-			durable, cancel := durableContext()
-			preserved, persistErr := preserveIfChanged(durable, "Runner command construction failed after work began: "+err.Error(), 1)
-			if persistErr == nil && !preserved {
-				persistErr = failRunDurably(durable, opened, scope, err.Error(), store.FailRunOptions{Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit})
-			}
+			durable, cancel := durableRunContext()
+			persistErr := persistExecutionFailure(
+				durable,
+				"Runner command construction failed after work began: "+err.Error(),
+				err.Error(),
+				1,
+				store.FailRunOptions{
+					Outcome: model.RunStatusSpawnFailed, FailureLimit: options.FailureLimit,
+				},
+			)
 			cancel()
 			if persistErr != nil {
 				return fmt.Errorf("persist runner construction failure for %s: %w", taskID, persistErr)
@@ -1626,18 +2468,29 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		healthObservation, observationErr := health.Begin(ctx, configured.Profile, profile.GlobalRegistered)
 		if observationErr != nil {
+			if leaseErr := checkManagedLease("agent health reservation"); leaseErr != nil {
+				return leaseErr
+			}
 			if blocked, blockErr := blockPreparedResolution("Agent health observation failed before finalizer launch: "+observationErr.Error(), 1); blocked {
 				if blockErr != nil {
 					return fmt.Errorf("preserve finalizer resolution after agent health failure for %s: %w", taskID, blockErr)
 				}
 				return nil
 			}
-			durable, cancel := durableContext()
+			durable, cancel := durableRunContext()
 			countFailure := false
-			persistErr := failRunDurably(durable, opened, scope, "Unable to reserve agent availability observation: "+observationErr.Error(), store.FailRunOptions{
-				Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
-				CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
-			})
+			reason := "Unable to reserve agent availability observation: " + observationErr.Error()
+			persistErr := persistExecutionFailure(
+				durable,
+				reason,
+				reason,
+				1,
+				store.FailRunOptions{
+					Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+					CooldownSeconds: max(1, int(options.Interval.Seconds())),
+					FailureLimit:    options.FailureLimit,
+				},
+			)
 			cancel()
 			if persistErr != nil {
 				return fmt.Errorf(
@@ -1655,7 +2508,17 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		} else {
 			execution = ExecuteTurn(ctx, command, opened, scope, processes, logPath, runtimeLimit)
 		}
-		durable, cancel := durableContext()
+		if leaseErr := managedLease.Err(); leaseErr != nil {
+			return fmt.Errorf(
+				"managed run ownership lost after runner exit for %s: %w",
+				taskID,
+				leaseErr,
+			)
+		}
+		if err := reachManagedRunPhase("terminal-reconciliation"); err != nil {
+			return err
+		}
+		durable, cancel := durableRunContext()
 		currentDetail, getErr := retryStoreOperation(durable, func() (model.TaskDetail, error) {
 			return opened.GetTask(durable, taskID)
 		})
@@ -1695,10 +2558,17 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return nil
 		}
 		if deferred != nil {
-			preserved, persistErr := preserveIfChanged(durable, deferred.Reason, execution.Code)
-			if persistErr == nil && !preserved {
-				persistErr = recoverRunDurably(durable, opened, prepared.Run.ID, deferred.Outcome, deferred.Reason, deferred.CountFailure)
-			}
+			countFailure := deferred.CountFailure
+			persistErr := persistExecutionFailure(
+				durable,
+				deferred.Reason,
+				deferred.Reason,
+				execution.Code,
+				store.FailRunOptions{
+					Outcome: deferred.Outcome, CountFailure: &countFailure,
+					FailureLimit: options.FailureLimit,
+				},
+			)
 			cancel()
 			if persistErr != nil {
 				return fmt.Errorf("persist deferred reclaim for %s: %w", taskID, persistErr)
@@ -1730,6 +2600,89 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		terminalCanFinalize := terminalRequest != nil && terminalRequest.FinalizedAt == nil &&
 			(executionSucceeded || terminalRequest.Kind == "block")
 		if terminalCanFinalize {
+			if terminalRequest.Kind == "complete" &&
+				prepared.IntegrationResolution != nil &&
+				reservedRecoveryCheckpoint != nil {
+				resolvedBase, resolutionErr := workspaces.ValidateIntegrationResolutionResult(
+					durable,
+					opened,
+					prepared,
+				)
+				if resolutionErr != nil {
+					resolutionErr = &recoverySetupError{
+						cause: fmt.Errorf(
+							"validate integration resolution before recovery adoption: %w",
+							resolutionErr,
+						),
+						// The checkpoint remains reserved and the conflict
+						// worktree remains under the resolution handoff.
+						terminalSafe: true,
+					}
+				}
+				if resolutionErr == nil {
+					_, resolutionErr = adoptReservedRecoveryCheckpointAfterIntegration(
+						durable,
+						opened,
+						workspaces,
+						prepared,
+						reservedRecoveryCheckpoint,
+						resolvedBase,
+					)
+				}
+				if resolutionErr != nil {
+					if !recoverySetupCanTerminalize(resolutionErr) {
+						cancel()
+						return fmt.Errorf(
+							"post-resolution recovery state is uncertain for %s; preserved active run: %w",
+							taskID,
+							resolutionErr,
+						)
+					}
+					safeReason := "Finalizer integration recovery requires review: recovery_checkpoint_integration_failed"
+					discardErr := opened.DiscardRunTerminalRequest(
+						durable,
+						scope,
+						safeReason,
+					)
+					var persistErr error
+					if discardErr == nil {
+						persistErr = blockManagedRun(
+							durable,
+							safeReason,
+							model.BlockKindNeedsInput,
+							execution.Code,
+						)
+					}
+					cancel()
+					options.log(
+						"blocked post-resolution recovery for %s: %v",
+						taskID,
+						resolutionErr,
+					)
+					if discardErr != nil || persistErr != nil {
+						return fmt.Errorf(
+							"preserve post-resolution recovery failure for %s: %w",
+							taskID,
+							errors.Join(
+								resolutionErr,
+								discardErr,
+								persistErr,
+							),
+						)
+					}
+					return nil
+				}
+				prepared.IntegrationResolution = nil
+				resolutionStartGate = nil
+				resolutionStarted = false
+				reservedRecoveryCheckpoint = nil
+				cancel()
+				options.log(
+					"applied reserved recovery checkpoint after integration resolution for %s; launching an independent Finalizer verification turn",
+					taskID,
+				)
+				continue
+			}
 			if goalMode && terminalRequest.Kind == "complete" {
 				if err := retryStoreAction(durable, func() error {
 					return opened.DiscardRunTerminalRequest(durable, scope, "goal completion requires independent judgment")
@@ -1744,10 +2697,33 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 					if prepared.Workspace != nil {
 						reason += "; workspace: " + prepared.Workspace.Path
 					}
+					checkpointed, checkpointErr := checkpointManagedRunBlock(
+						durable,
+						opened,
+						workspaces,
+						prepared,
+						scope,
+						reason,
+						model.BlockKindNeedsInput,
+						execution.Code,
+					)
+					if checkpointed {
+						cancel()
+						options.log(
+							"checkpointed terminal finalization failure %s: %v",
+							taskID,
+							finalizeErr,
+						)
+						return nil
+					}
 					recoveryErr := blockPreservedRun(durable, reason, execution.Code)
 					cancel()
 					options.log("terminal finalization failed %s: %v", taskID, finalizeErr)
-					return fmt.Errorf("finalize terminal request for %s: %w", taskID, errors.Join(finalizeErr, recoveryErr))
+					return fmt.Errorf(
+						"finalize terminal request for %s: %w",
+						taskID,
+						errors.Join(finalizeErr, checkpointErr, recoveryErr),
+					)
 				}
 				cancel()
 				cleanupIfDone(finalized)
@@ -1789,23 +2765,22 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			}
 			if healthErr != nil {
 				countFailure := false
-				persistErr := failRunDurably(durable, opened, scope, "Unable to record agent availability: "+healthErr.Error(), store.FailRunOptions{
-					Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
-					CooldownSeconds: max(1, int(options.Interval.Seconds())), FailureLimit: options.FailureLimit,
-				})
+				reason := "Unable to record agent availability: " + healthErr.Error()
+				persistErr := persistExecutionFailure(
+					durable,
+					reason,
+					reason,
+					execution.Code,
+					store.FailRunOptions{
+						Outcome: model.RunStatusReclaimed, CountFailure: &countFailure,
+						CooldownSeconds: max(1, int(options.Interval.Seconds())),
+						FailureLimit:    options.FailureLimit,
+					},
+				)
 				cancel()
 				if persistErr != nil {
 					return fmt.Errorf("persist agent health failure for %s: %w", taskID, errors.Join(healthErr, persistErr))
 				}
-				return nil
-			}
-			preserved, preserveErr := preserveIfChanged(durable, fmt.Sprintf("Agent %s became %s after work began", configured.Profile, availability.Status), execution.Code)
-			if preserveErr != nil {
-				cancel()
-				return fmt.Errorf("preserve unavailable-agent work for %s: %w", taskID, preserveErr)
-			}
-			if preserved {
-				cancel()
 				return nil
 			}
 			next, fallbackErr := resolveRunProfile(durable, manager, opened, prepared.Task.Task, options)
@@ -1815,8 +2790,20 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			if availability.Status == model.AgentHealthRateLimited && !fallbackAvailable {
 				cooldownSeconds = int(options.RateLimitCooldown.Seconds())
 			}
-			persistErr := failRunDurably(durable, opened, scope, detail, store.FailRunOptions{Outcome: availability.Outcome,
-				CountFailure: &countFailure, CooldownSeconds: cooldownSeconds, FailureLimit: options.FailureLimit})
+			persistErr := persistExecutionFailure(
+				durable,
+				fmt.Sprintf(
+					"Agent %s became %s after work began",
+					configured.Profile,
+					availability.Status,
+				),
+				detail,
+				execution.Code,
+				store.FailRunOptions{
+					Outcome: availability.Outcome, CountFailure: &countFailure,
+					CooldownSeconds: cooldownSeconds, FailureLimit: options.FailureLimit,
+				},
+			)
 			cancel()
 			if persistErr != nil {
 				return fmt.Errorf("persist agent availability outcome for %s: %w", taskID, persistErr)
@@ -1861,10 +2848,15 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		if sessionID == "" && prepared.Task.Task.Runtime != model.RuntimeCline {
 			reason := "Goal-mode runner did not report a resumable session id"
-			preserved, persistErr := preserveIfChanged(durable, reason, execution.Code)
-			if persistErr == nil && !preserved {
-				persistErr = failRunDurably(durable, opened, scope, reason, store.FailRunOptions{Outcome: model.RunStatusProtocolViolation, FailureLimit: options.FailureLimit})
-			}
+			persistErr := persistExecutionFailure(
+				durable,
+				reason,
+				reason,
+				execution.Code,
+				store.FailRunOptions{
+					Outcome: model.RunStatusProtocolViolation, FailureLimit: options.FailureLimit,
+				},
+			)
 			cancel()
 			if persistErr != nil {
 				return fmt.Errorf("persist missing goal session for %s: %w", taskID, persistErr)
@@ -1891,16 +2883,82 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			return fmt.Errorf("persist goal judgment for %s: %w", taskID, err)
 		}
 		if judgment.Complete {
-			if _, requestErr := opened.CompleteRun(durable, scope, store.CompletionInput{Summary: fmt.Sprintf("Goal accepted after %d turn(s): %s", turn, judgment.Reason), Metadata: map[string]any{"goalMode": true, "turns": turn, "judgeReason": judgment.Reason}}); requestErr != nil {
-				cancel()
-				return fmt.Errorf("persist goal completion request for %s: %w", taskID, requestErr)
+			summary := fmt.Sprintf(
+				"Goal accepted after %d turn(s): %s",
+				turn,
+				judgment.Reason,
+			)
+			completion := store.CompletionInput{
+				Summary: summary,
+				Metadata: map[string]any{
+					"goalMode":    true,
+					"turns":       turn,
+					"judgeReason": judgment.Reason,
+				},
+			}
+			if _, requestErr := retryStoreOperation(
+				durable,
+				func() (model.TaskDetail, error) {
+					return opened.CompleteRun(durable, scope, completion)
+				},
+			); requestErr != nil {
+				currentRequest, inspectErr := retryStoreOperation(
+					durable,
+					func() (*model.TerminalRequest, error) {
+						return opened.GetRunTerminalRequest(
+							durable,
+							prepared.Run.ID,
+						)
+					},
+				)
+				if inspectErr != nil ||
+					!pendingGoalCompletionRequestMatches(
+						currentRequest,
+						summary,
+						turn,
+						judgment.Reason,
+					) {
+					cancel()
+					return fmt.Errorf(
+						"persist goal completion request for %s: %w",
+						taskID,
+						errors.Join(requestErr, inspectErr),
+					)
+				}
+				options.log(
+					"reconciled committed goal completion request for %s",
+					taskID,
+				)
 			}
 			finalized, finalizeErr := finalizeManagedTerminal(durable, opened, workspaces, prepared, scope, 0)
 			if finalizeErr != nil {
 				reason := "Goal completion finalization failed; the workspace was preserved for review: " + finalizeErr.Error()
+				checkpointed, checkpointErr := checkpointManagedRunBlock(
+					durable,
+					opened,
+					workspaces,
+					prepared,
+					scope,
+					reason,
+					model.BlockKindNeedsInput,
+					0,
+				)
+				if checkpointed {
+					cancel()
+					options.log(
+						"checkpointed goal finalization failure %s: %v",
+						taskID,
+						finalizeErr,
+					)
+					return nil
+				}
 				recoveryErr := blockPreservedRun(durable, reason, 0)
 				cancel()
-				return fmt.Errorf("finalize goal completion for %s: %w", taskID, errors.Join(finalizeErr, recoveryErr))
+				return fmt.Errorf(
+					"finalize goal completion for %s: %w",
+					taskID,
+					errors.Join(finalizeErr, checkpointErr, recoveryErr),
+				)
 			}
 			cancel()
 			cleanupIfDone(finalized)

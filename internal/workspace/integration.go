@@ -317,7 +317,9 @@ func independentPrerequisiteHeads(
 	if len(unique) == 0 {
 		return independent, nil
 	}
-	command := exec.CommandContext(ctx, "git", "-C", directory,
+	commandCtx, cancelCommand := context.WithTimeout(ctx, hostGitCommandLimit)
+	defer cancelCommand()
+	command := workspaceCommand(commandCtx, "git", "-C", directory,
 		"rev-list", "--topo-order", "--parents", "--stdin")
 	command.Env = append([]string(nil), os.Environ()...)
 	command.Env = append(command.Env, "GIT_TERMINAL_PROMPT=0")
@@ -329,38 +331,50 @@ func independentPrerequisiteHeads(
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
+		command.Close()
 		return nil, err
 	}
 	reachedByTarget := make(map[string]bool, len(unique))
 	seenTargets := make(map[string]bool, len(unique))
-	reader := bufio.NewReader(stdout)
 	var readErr error
-	for {
-		line, lineErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			fields := strings.Fields(line)
-			if len(fields) > 0 {
-				commit := strings.ToLower(fields[0])
-				reached := reachedByTarget[commit]
-				delete(reachedByTarget, commit)
-				if targetHeads[commit] {
-					seenTargets[commit] = true
-					independent[commit] = !reached
-					reached = true
-				}
-				if reached {
-					for _, parent := range fields[1:] {
-						reachedByTarget[strings.ToLower(parent)] = true
+	readDone := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(stdout)
+		for {
+			line, lineErr := reader.ReadString('\n')
+			if len(line) > 0 {
+				fields := strings.Fields(line)
+				if len(fields) > 0 {
+					commit := strings.ToLower(fields[0])
+					reached := reachedByTarget[commit]
+					delete(reachedByTarget, commit)
+					if targetHeads[commit] {
+						seenTargets[commit] = true
+						independent[commit] = !reached
+						reached = true
+					}
+					if reached {
+						for _, parent := range fields[1:] {
+							reachedByTarget[strings.ToLower(parent)] = true
+						}
 					}
 				}
 			}
-		}
-		if lineErr != nil {
-			if !errors.Is(lineErr, io.EOF) {
-				readErr = lineErr
+			if lineErr != nil {
+				if errors.Is(lineErr, io.EOF) {
+					readDone <- nil
+				} else {
+					readDone <- lineErr
+				}
+				return
 			}
-			break
 		}
+	}()
+	select {
+	case readErr = <-readDone:
+	case <-commandCtx.Done():
+		_ = stdout.Close()
+		readErr = errors.Join(commandCtx.Err(), <-readDone)
 	}
 	waitErr := command.Wait()
 	if readErr != nil || waitErr != nil {
@@ -846,6 +860,94 @@ func (m *Manager) VerifyPrerequisiteChangeSets(ctx context.Context, opened *stor
 	err := m.verifyPrerequisiteChangeSets(ctx, opened, taskID, workspace, descendant)
 	persistExceptionalIntegrationIncident(opened, taskID, err)
 	return err
+}
+
+// ValidateIntegrationResolutionResult returns the clean resolver commit only
+// after every pinned handoff is present. The caller can compose recovery work
+// on that commit before atomically promoting it to the persisted output base.
+func (m *Manager) ValidateIntegrationResolutionResult(
+	ctx context.Context,
+	opened *store.Store,
+	claim *model.ClaimedTask,
+) (string, error) {
+	if opened == nil || claim == nil || claim.Workspace == nil ||
+		claim.IntegrationResolution == nil {
+		return "", errors.New(
+			"integration resolution base requires a prepared resolver claim",
+		)
+	}
+	workspace := *claim.Workspace
+	if workspace.Kind != model.WorkspaceWorktree || !workspace.Generated {
+		return "", errors.New(
+			"integration resolution base requires a generated worktree",
+		)
+	}
+	unmerged, err := gitOutputWithEnv(
+		ctx,
+		workspace.Path,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"ls-files",
+		"-u",
+		"-z",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"inspect resolved integration index: %w",
+			err,
+		)
+	}
+	if len(unmerged) != 0 {
+		return "", errors.New(
+			"integration resolver left unresolved index entries",
+		)
+	}
+	status, err := gitOutputWithEnv(
+		ctx,
+		workspace.Path,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"status",
+		"--porcelain=v1",
+		"-z",
+		"--untracked-files=all",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"inspect resolved integration workspace: %w",
+			err,
+		)
+	}
+	if len(status) != 0 {
+		return "", errors.New(
+			"integration resolver must commit its resolution before completion",
+		)
+	}
+	head, err := gitTextWithEnv(
+		ctx,
+		workspace.Path,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"rev-parse",
+		"--verify",
+		"HEAD^{commit}",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"resolve integration commit: %w",
+			err,
+		)
+	}
+	if err := m.VerifyPrerequisiteChangeSets(
+		ctx,
+		opened,
+		claim.Task.Task.ID,
+		workspace,
+		head,
+	); err != nil {
+		return "", fmt.Errorf(
+			"resolved integration omitted a prerequisite: %w",
+			err,
+		)
+	}
+	return head, nil
 }
 
 func (m *Manager) verifyPrerequisiteChangeSets(ctx context.Context, opened *store.Store, taskID string, workspace model.RunWorkspace, descendant string) error {

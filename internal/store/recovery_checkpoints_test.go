@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nn1a/autogora/internal/model"
 )
@@ -92,6 +94,92 @@ func registerFailedRecoverySource(
 	return checkpoint
 }
 
+func TestRecoveryCheckpointFailureRetryRequiresExactTerminalEffect(t *testing.T) {
+	fixture := newRecoveryCheckpointFixture(t, 6)
+	ctx := context.Background()
+	scope := RunScope{
+		RunID:      fixture.claim.Run.ID,
+		ClaimToken: fixture.claim.ClaimToken,
+	}
+	input := recoveryCheckpointInput(
+		fixture.claim.Run.ID,
+		"/worktree/exact-retry",
+		'a',
+		'd',
+	)
+	options := FailRunOptions{Outcome: model.RunStatusCrashed}
+	checkpoint, detail, err := fixture.store.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		scope,
+		input,
+		"worker process crashed",
+		options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, retriedDetail, err := fixture.store.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		scope,
+		input,
+		"worker process crashed",
+		options,
+	)
+	if err != nil ||
+		retried.ID != checkpoint.ID ||
+		retriedDetail.Task.Status != detail.Task.Status {
+		t.Fatalf(
+			"exact response-loss retry checkpoint=%+v task=%+v err=%v",
+			retried,
+			retriedDetail.Task,
+			err,
+		)
+	}
+	countFailure := false
+	mismatches := []struct {
+		name    string
+		runErr  string
+		options FailRunOptions
+	}{
+		{
+			name:    "different error",
+			runErr:  "another failure",
+			options: options,
+		},
+		{
+			name:   "different outcome",
+			runErr: "worker process crashed",
+			options: FailRunOptions{
+				Outcome: model.RunStatusTimedOut,
+			},
+		},
+		{
+			name:   "different failure accounting",
+			runErr: "worker process crashed",
+			options: FailRunOptions{
+				Outcome:      model.RunStatusCrashed,
+				CountFailure: &countFailure,
+			},
+		},
+	}
+	for _, test := range mismatches {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := fixture.store.RegisterRecoveryCheckpointAndFailRun(
+				ctx,
+				scope,
+				input,
+				test.runErr,
+				test.options,
+			); err == nil || !strings.Contains(
+				err.Error(),
+				"does not match terminal effect",
+			) {
+				t.Fatalf("mismatched response-loss retry error = %v", err)
+			}
+		})
+	}
+}
+
 func claimRecoveryRun(
 	t *testing.T,
 	opened *Store,
@@ -103,6 +191,68 @@ func claimRecoveryRun(
 		t.Fatalf("claim recovery run: claim=%v err=%v", claim, err)
 	}
 	return claim, RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+}
+
+func observedRecoveryOwnerForCheckpointTest(
+	t *testing.T,
+	opened *Store,
+	scope RunScope,
+) RunRecoveryObservation {
+	t.Helper()
+	ctx := context.Background()
+	managed, err := opened.IsRunManaged(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !managed {
+		if err := opened.MarkRunManagedWithPolicy(ctx, scope, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := opened.GetRun(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := opened.GetRunProcessIdentity(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.FenceObservedRunRecovery(
+		ctx,
+		ObserveRunForRecovery(inspection.Run, identity),
+		30,
+		"checkpoint recovery test fence",
+		model.RunStatusReclaimed,
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	fence, err := opened.GetDeferredReclaim(ctx, scope.RunID)
+	if err != nil || fence == nil {
+		t.Fatalf("checkpoint recovery fence = %#v, err=%v", fence, err)
+	}
+	acknowledged, err := opened.AcknowledgeRunRecoveryFence(
+		ctx,
+		scope,
+		fence.FenceToken,
+		fence.FenceGeneration,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err = opened.GetRun(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, acquired, err := opened.ClaimObservedRunRecovery(
+		ctx,
+		ObserveRunForRecovery(inspection.Run, identity, &acknowledged),
+		time.Minute,
+	)
+	if err != nil || !acquired {
+		t.Fatalf("checkpoint recovery owner acquired=%v err=%v", acquired, err)
+	}
+	return owned
 }
 
 func reserveRecoveryCheckpoint(
@@ -249,6 +399,134 @@ func TestRecoveryCheckpointLifecycleIsHiddenAndCompletionConsumptionIsAtomic(t *
 	}
 	if dependentAfter.Task.Status != model.TaskStatusReady {
 		t.Fatalf("successful task completion did not unlock dependent: %s", dependentAfter.Task.Status)
+	}
+}
+
+func TestActiveRecoveryCheckpointPreventsEveryDoneTransition(t *testing.T) {
+	fixture := newRecoveryCheckpointFixture(t, 5)
+	ctx := context.Background()
+	checkpoint := registerFailedRecoverySource(t, fixture)
+
+	if _, err := fixture.store.CompleteTask(
+		ctx,
+		fixture.task.Task.ID,
+		CompletionInput{Summary: "administrative completion"},
+	); err == nil || !strings.Contains(err.Error(), "active recovery checkpoint") {
+		t.Fatalf("administrative completion error = %v", err)
+	}
+	active, err := fixture.store.GetActiveRecoveryCheckpoint(
+		ctx,
+		fixture.task.Task.ID,
+	)
+	if err != nil || active == nil || active.ID != checkpoint.ID ||
+		active.State != model.RecoveryCheckpointPending {
+		t.Fatalf("checkpoint after administrative rejection = %+v err=%v", active, err)
+	}
+
+	if _, err := fixture.store.db.ExecContext(
+		ctx,
+		"UPDATE tasks SET status = 'done' WHERE id = ?",
+		fixture.task.Task.ID,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"task cannot be done with an active recovery checkpoint",
+	) {
+		t.Fatalf("raw Done transition error = %v", err)
+	}
+
+	claim, scope := claimRecoveryRun(t, fixture.store, fixture.task.Task.ID)
+	if err := fixture.store.MarkRunManagedWithPolicy(ctx, scope, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.RequestRunCompletion(
+		ctx,
+		scope,
+		CompletionInput{Summary: "ordinary run ignored pending recovery"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.FinalizeRunTerminal(
+		ctx,
+		scope,
+		0,
+	); err == nil || !strings.Contains(err.Error(), "active recovery checkpoint") {
+		t.Fatalf("worker completion error = %v", err)
+	}
+	inspection, err := fixture.store.GetRun(ctx, claim.Run.ID)
+	if err != nil || inspection.Run.Status != model.RunStatusRunning ||
+		inspection.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("rejected run completion = %+v err=%v", inspection, err)
+	}
+	active, err = fixture.store.GetActiveRecoveryCheckpoint(
+		ctx,
+		fixture.task.Task.ID,
+	)
+	if err != nil || active == nil ||
+		active.State != model.RecoveryCheckpointPending {
+		t.Fatalf("checkpoint after worker rejection = %+v err=%v", active, err)
+	}
+}
+
+func TestOpenRejectsDoneTaskWithActiveRecoveryCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "recovery-worker"
+	task, err := opened.CreateTask(ctx, CreateTaskInput{
+		Title:      "corrupt completion state",
+		Assignee:   &assignee,
+		Runtime:    model.RuntimeCodex,
+		MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim source run: claim=%+v err=%v", claim, err)
+	}
+	countFailure := false
+	if _, _, err := opened.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+		recoveryCheckpointInput(claim.Run.ID, "/worktree/corrupt", 'a', 'd'),
+		"source run stopped",
+		FailRunOptions{
+			Outcome:      model.RunStatusCrashed,
+			CountFailure: &countFailure,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.db.ExecContext(
+		ctx,
+		"DROP TRIGGER recovery_checkpoint_prevent_done_with_active",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.db.ExecContext(
+		ctx,
+		"UPDATE tasks SET status = 'done' WHERE id = ?",
+		task.Task.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, "default", "")
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"done task "+task.Task.ID+" has active checkpoint",
+	) {
+		t.Fatalf("corrupt recovery open error = %v", err)
 	}
 }
 
@@ -868,7 +1146,7 @@ func TestSupervisorAtomicallyRegistersCheckpointAndRecoversOrdinaryBlockedRun(t 
 	}
 	checkpoint, detail, err := fixture.store.RegisterRecoveryCheckpointAndRecoverRunBlocked(
 		ctx,
-		fixture.claim.Run.ID,
+		scope,
 		input,
 		blocked,
 	)
@@ -888,7 +1166,7 @@ func TestSupervisorAtomicallyRegistersCheckpointAndRecoversOrdinaryBlockedRun(t 
 	}
 	again, againDetail, err := fixture.store.RegisterRecoveryCheckpointAndRecoverRunBlocked(
 		ctx,
-		fixture.claim.Run.ID,
+		scope,
 		input,
 		blocked,
 	)
@@ -897,6 +1175,142 @@ func TestSupervisorAtomicallyRegistersCheckpointAndRecoversOrdinaryBlockedRun(t 
 		againDetail.Task.Status != detail.Task.Status {
 		t.Fatalf(
 			"idempotent supervisor ordinary block=%+v task=%+v err=%v",
+			again,
+			againDetail.Task,
+			err,
+		)
+	}
+}
+
+func TestActiveHostCheckpointRecoveryBridgeRejectsConcurrentFence(t *testing.T) {
+	fixture := newRecoveryCheckpointFixture(t, 6)
+	ctx := context.Background()
+	scope := RunScope{
+		RunID:      fixture.claim.Run.ID,
+		ClaimToken: fixture.claim.ClaimToken,
+	}
+	if err := fixture.store.MarkRunManagedWithPolicy(
+		ctx,
+		scope,
+		true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := fixture.store.GetRun(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.FenceObservedRunRecovery(
+		ctx,
+		ObserveRunForRecovery(inspection.Run, nil),
+		30,
+		"Supervisor won before active-host checkpoint fallback",
+		model.RunStatusReclaimed,
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := 1
+	if _, _, err := fixture.store.RegisterRecoveryCheckpointAndRecoverRunBlocked(
+		ctx,
+		scope,
+		recoveryCheckpointInput(
+			scope.RunID,
+			"/worktree/fenced-active-host",
+			'a',
+			'd',
+		),
+		RecoverBlockedRunInput{
+			Outcome:  model.RunStatusBlocked,
+			Reason:   "late active-host fallback",
+			Kind:     model.BlockKindNeedsInput,
+			ExitCode: &exitCode,
+		},
+	); !errors.Is(err, ErrRunTerminationPending) {
+		t.Fatalf(
+			"fenced active-host checkpoint error = %v, want ErrRunTerminationPending",
+			err,
+		)
+	}
+	if checkpoint, err := getRecoveryCheckpointBySourceRun(
+		ctx,
+		fixture.store.db,
+		scope.RunID,
+	); err != nil {
+		t.Fatal(err)
+	} else if checkpoint != nil {
+		t.Fatalf("fenced active host registered checkpoint: %#v", checkpoint)
+	}
+	inspection, err = fixture.store.GetRun(ctx, scope.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Run.Status != model.RunStatusRunning ||
+		inspection.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("fenced active host terminalized run: %#v", inspection)
+	}
+}
+
+func TestSupervisorStoppedBlockFinalizerPreservesRequestedReasonAndKind(t *testing.T) {
+	fixture := newRecoveryCheckpointFixture(t, 6)
+	ctx := context.Background()
+	scope := RunScope{
+		RunID:      fixture.claim.Run.ID,
+		ClaimToken: fixture.claim.ClaimToken,
+	}
+	if err := fixture.store.MarkRunManaged(ctx, scope); err != nil {
+		t.Fatal(err)
+	}
+	const reason = "wait for an external prerequisite"
+	if _, err := fixture.store.BlockRun(ctx, scope, BlockInput{
+		Reason: reason,
+		Kind:   model.BlockKindDependency,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	input := recoveryCheckpointInput(
+		fixture.claim.Run.ID,
+		"/worktree/stopped-ordinary-block",
+		'a',
+		'd',
+	)
+	owned := observedRecoveryOwnerForCheckpointTest(
+		t,
+		fixture.store,
+		scope,
+	)
+	checkpoint, detail, err := fixture.store.RegisterRecoveryCheckpointAndFinalizeObservedStoppedBlock(
+		ctx,
+		owned,
+		input,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.State != model.RecoveryCheckpointPending ||
+		detail.Task.Status != model.TaskStatusTodo ||
+		detail.Task.BlockReason == nil ||
+		*detail.Task.BlockReason != reason ||
+		detail.Task.BlockKind == nil ||
+		*detail.Task.BlockKind != model.BlockKindDependency {
+		t.Fatalf("stopped block checkpoint=%+v task=%+v", checkpoint, detail.Task)
+	}
+	request, err := fixture.store.GetRunTerminalRequest(ctx, fixture.claim.Run.ID)
+	if err != nil || request == nil || request.FinalizedAt == nil {
+		t.Fatalf("stopped block request was not finalized: %+v err=%v", request, err)
+	}
+	again, againDetail, err := fixture.store.RegisterRecoveryCheckpointAndFinalizeObservedStoppedBlock(
+		ctx,
+		owned,
+		input,
+		0,
+	)
+	if err != nil ||
+		again.ID != checkpoint.ID ||
+		againDetail.Task.Status != detail.Task.Status {
+		t.Fatalf(
+			"idempotent stopped block=%+v task=%+v err=%v",
 			again,
 			againDetail.Task,
 			err,
@@ -947,7 +1361,7 @@ func TestSupervisorAtomicallySupersedesCheckpointAndRecoversBlockedRun(t *testin
 	}
 	replacement, detail, err := fixture.store.SupersedeRecoveryCheckpointAndRecoverRunBlocked(
 		ctx,
-		claim.Run.ID,
+		scope,
 		cumulative,
 		blocked,
 	)
@@ -981,7 +1395,7 @@ func TestSupervisorAtomicallySupersedesCheckpointAndRecoversBlockedRun(t *testin
 
 	again, againDetail, err := fixture.store.SupersedeRecoveryCheckpointAndRecoverRunBlocked(
 		ctx,
-		claim.Run.ID,
+		scope,
 		cumulative,
 		blocked,
 	)
@@ -1006,9 +1420,18 @@ func TestSupervisorAtomicallyCheckpointsAbandonedOrdinaryAndRecoveryRuns(t *test
 		'a',
 		'd',
 	)
-	checkpoint, detail, err := ordinary.store.RegisterRecoveryCheckpointAndRecoverAbandonedRun(
+	ordinaryScope := RunScope{
+		RunID:      ordinary.claim.Run.ID,
+		ClaimToken: ordinary.claim.ClaimToken,
+	}
+	ordinaryOwner := observedRecoveryOwnerForCheckpointTest(
+		t,
+		ordinary.store,
+		ordinaryScope,
+	)
+	checkpoint, detail, err := ordinary.store.RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
 		ctx,
-		ordinary.claim.Run.ID,
+		ordinaryOwner,
 		ordinaryInput,
 		model.RunStatusCrashed,
 		"supervisor observed process exit",
@@ -1022,9 +1445,9 @@ func TestSupervisorAtomicallyCheckpointsAbandonedOrdinaryAndRecoveryRuns(t *test
 		detail.Task.Status != model.TaskStatusReady {
 		t.Fatalf("supervisor ordinary checkpoint=%+v task=%+v", checkpoint, detail.Task)
 	}
-	again, againDetail, err := ordinary.store.RegisterRecoveryCheckpointAndRecoverAbandonedRun(
+	again, againDetail, err := ordinary.store.RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
 		ctx,
-		ordinary.claim.Run.ID,
+		ordinaryOwner,
 		ordinaryInput,
 		model.RunStatusCrashed,
 		"supervisor observed process exit",
@@ -1033,6 +1456,47 @@ func TestSupervisorAtomicallyCheckpointsAbandonedOrdinaryAndRecoveryRuns(t *test
 	if err != nil || again.ID != checkpoint.ID ||
 		againDetail.Task.Status != detail.Task.Status {
 		t.Fatalf("idempotent supervisor ordinary retry=%+v task=%+v err=%v", again, againDetail.Task, err)
+	}
+	for _, mismatch := range []struct {
+		name         string
+		outcome      model.RunStatus
+		runError     string
+		countFailure bool
+	}{
+		{
+			name:         "outcome",
+			outcome:      model.RunStatusTimedOut,
+			runError:     "supervisor observed process exit",
+			countFailure: true,
+		},
+		{
+			name:         "error",
+			outcome:      model.RunStatusCrashed,
+			runError:     "different process failure",
+			countFailure: true,
+		},
+		{
+			name:         "failure accounting",
+			outcome:      model.RunStatusCrashed,
+			runError:     "supervisor observed process exit",
+			countFailure: false,
+		},
+	} {
+		t.Run("ordinary retry rejects "+mismatch.name, func(t *testing.T) {
+			if _, _, err := ordinary.store.RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
+				ctx,
+				ordinaryOwner,
+				ordinaryInput,
+				mismatch.outcome,
+				mismatch.runError,
+				mismatch.countFailure,
+			); err == nil || !strings.Contains(
+				err.Error(),
+				"does not match terminal effect",
+			) {
+				t.Fatalf("mismatched abandoned retry error = %v", err)
+			}
+		})
 	}
 
 	recovery := newRecoveryCheckpointFixture(t, 6)
@@ -1057,9 +1521,14 @@ func TestSupervisorAtomicallyCheckpointsAbandonedOrdinaryAndRecoveryRuns(t *test
 		'1',
 	)
 	cumulative.OutputBaseCommit = adoptedBase
-	replacement, recoveredDetail, err := recovery.store.RegisterRecoveryCheckpointAndRecoverAbandonedRun(
+	recoveryOwner := observedRecoveryOwnerForCheckpointTest(
+		t,
+		recovery.store,
+		recoveryScope,
+	)
+	replacement, recoveredDetail, err := recovery.store.RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
 		ctx,
-		recoveryClaim.Run.ID,
+		recoveryOwner,
 		cumulative,
 		model.RunStatusTimedOut,
 		"supervisor observed recovery timeout",
@@ -1082,9 +1551,9 @@ func TestSupervisorAtomicallyCheckpointsAbandonedOrdinaryAndRecoveryRuns(t *test
 		*superseded.SupersededByID != replacement.ID {
 		t.Fatalf("supervisor superseded checkpoint=%+v err=%v", superseded, err)
 	}
-	repeatedReplacement, repeatedDetail, err := recovery.store.RegisterRecoveryCheckpointAndRecoverAbandonedRun(
+	repeatedReplacement, repeatedDetail, err := recovery.store.RegisterRecoveryCheckpointAndRecoverObservedAbandonedRun(
 		ctx,
-		recoveryClaim.Run.ID,
+		recoveryOwner,
 		cumulative,
 		model.RunStatusTimedOut,
 		"supervisor observed recovery timeout",
@@ -1361,7 +1830,7 @@ func TestRecoveryCheckpointSchemaRejectsInvalidChangedFilesJSON(t *testing.T) {
 	}
 }
 
-func TestSchema23UpgradesVersion22WithRecoveryCheckpoints(t *testing.T) {
+func TestSchema24UpgradesVersion22WithRecoveryCheckpoints(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "version-22.db")
 	initial, err := Open(dbPath, "default", "")
@@ -1413,7 +1882,7 @@ func TestSchema23UpgradesVersion22WithRecoveryCheckpoints(t *testing.T) {
 		WHERE type = 'trigger' AND name LIKE 'recovery_checkpoint_%'`).Scan(&triggerCount); err != nil {
 		t.Fatal(err)
 	}
-	if version != 23 || schemaVersion != 23 || tableCount != 1 || triggerCount != 11 {
+	if version != 24 || schemaVersion != 24 || tableCount != 1 || triggerCount != 12 {
 		t.Fatalf(
 			"v22 migration version=%d constant=%d tables=%d triggers=%d",
 			version,

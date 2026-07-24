@@ -118,17 +118,32 @@ type Proposal struct {
 }
 
 type IncidentSnapshot struct {
-	IncidentID      string               `json:"incidentId"`
-	Trigger         string               `json:"trigger"`
-	Severity        string               `json:"severity"`
-	Summary         string               `json:"summary"`
-	Details         map[string]any       `json:"details,omitempty"`
-	GraphRevision   int64                `json:"graphRevision"`
-	FocusTaskID     string               `json:"focusTaskId,omitempty"`
-	Nodes           []NodeSnapshot       `json:"nodes"`
-	Dependencies    []DependencySnapshot `json:"dependencies"`
-	Diagnostics     []IssueSnapshot      `json:"diagnostics"`
-	AvailableAgents []AgentSnapshot      `json:"availableAgents"`
+	IncidentID          string                       `json:"incidentId"`
+	Trigger             string                       `json:"trigger"`
+	Severity            string                       `json:"severity"`
+	Summary             string                       `json:"summary"`
+	Details             map[string]any               `json:"details,omitempty"`
+	GraphRevision       int64                        `json:"graphRevision"`
+	FocusTaskID         string                       `json:"focusTaskId,omitempty"`
+	Nodes               []NodeSnapshot               `json:"nodes"`
+	Dependencies        []DependencySnapshot         `json:"dependencies"`
+	RecoveryCheckpoints []RecoveryCheckpointSnapshot `json:"recoveryCheckpoints,omitempty"`
+	Diagnostics         []IssueSnapshot              `json:"diagnostics"`
+	AvailableAgents     []AgentSnapshot              `json:"availableAgents"`
+}
+
+// RecoveryCheckpointSnapshot exposes only the bounded recovery context needed
+// to reason about an incident. Git locations, durable refs, claim credentials,
+// and reservation credentials never cross the Coordinator boundary.
+type RecoveryCheckpointSnapshot struct {
+	ID                  string                        `json:"id"`
+	State               model.RecoveryCheckpointState `json:"state"`
+	SourceRunID         string                        `json:"sourceRunId"`
+	ChangedFileCount    int                           `json:"changedFileCount"`
+	BoundedChangedFiles []string                      `json:"boundedChangedFiles"`
+	CreatedAt           string                        `json:"createdAt"`
+	AdoptedAt           *string                       `json:"adoptedAt,omitempty"`
+	SupersedeReason     *string                       `json:"supersedeReason,omitempty"`
 }
 
 type DependencySnapshot struct {
@@ -189,6 +204,14 @@ func (a Analyzer) Analyze(ctx context.Context, snapshot IncidentSnapshot) (Propo
 	if strings.TrimSpace(snapshot.IncidentID) == "" {
 		return Proposal{}, errors.New("coordinator snapshot requires an incident ID")
 	}
+	if len(snapshot.Nodes) > 200 || len(snapshot.Dependencies) > 800 ||
+		len(snapshot.RecoveryCheckpoints) > 3 || len(snapshot.AvailableAgents) > 100 {
+		return Proposal{}, errors.New("coordinator snapshot exceeds the bounded analysis limit")
+	}
+	snapshot = SanitizeIncidentSnapshot(snapshot)
+	if snapshot.IncidentID == "" {
+		return Proposal{}, errors.New("coordinator snapshot incident ID is unsafe")
+	}
 	maxActions := a.MaxActions
 	if maxActions < 1 {
 		maxActions = 3
@@ -200,7 +223,8 @@ func (a Analyzer) Analyze(ctx context.Context, snapshot IncidentSnapshot) (Propo
 	if err != nil {
 		return Proposal{}, err
 	}
-	if len(snapshot.Nodes) > 200 || len(snapshot.Dependencies) > 800 || len(snapshot.AvailableAgents) > 100 ||
+	if len(snapshot.Nodes) > 200 || len(snapshot.Dependencies) > 800 ||
+		len(snapshot.RecoveryCheckpoints) > 3 || len(snapshot.AvailableAgents) > 100 ||
 		len(encoded) > 512*1024 {
 		return Proposal{}, errors.New("coordinator snapshot exceeds the bounded analysis limit")
 	}

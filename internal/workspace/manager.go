@@ -5,15 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nn1a/autogora/internal/boards"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 	"github.com/nn1a/autogora/internal/runcontrol"
 	"github.com/nn1a/autogora/internal/store"
 )
+
+const hostGitCommandLimit = 10 * time.Minute
 
 type Manager struct {
 	boards      *boards.Manager
@@ -57,12 +60,16 @@ func isNonEmptyDirectory(path string) bool {
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, name, args...)
+	command := workspaceCommand(ctx, name, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func workspaceCommand(ctx context.Context, name string, args ...string) *processguard.Command {
+	return processguard.NewCommandContext(ctx, hostGitCommandLimit, name, args...)
 }
 
 func gitRoot(ctx context.Context, path string) (string, bool) {

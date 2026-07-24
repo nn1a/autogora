@@ -4,6 +4,7 @@ package dispatcher
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 // preflightWorkerCommand rejects deterministic exec failures before the
@@ -95,45 +98,29 @@ func supportedUnixBinaryMagic(value []byte) bool {
 	}
 }
 
-// newWorkerCommand starts a tiny shell barrier in the worker's eventual
-// process slot. The shell cannot exec the coding agent until the dispatcher
-// records this exact PID and identity. If the dispatcher dies first, its pipe
-// closes and the barrier exits without running the agent.
-func newWorkerCommand(command RunnerCommand) (*workerCommand, error) {
-	reader, writer, err := os.Pipe()
+// newWorkerCommand starts a platform guard behind a pipe barrier. On Linux the
+// guard remains the durable process for the whole turn, becomes a child
+// subreaper, and does not start the coding agent until the dispatcher records
+// the guard PID and identity.
+func newWorkerCommand(ctx context.Context, command RunnerCommand) (*workerCommand, error) {
+	guarded, err := processguard.NewFencedCommand(ctx, command.Command, command.Args...)
 	if err != nil {
 		return nil, err
 	}
-	args := []string{
-		"-c",
-		`IFS= read -r autogora_start <&3 || exit 125; exec "$@"`,
-		"autogora-start-barrier",
-		command.Command,
-	}
-	args = append(args, command.Args...)
-	child := exec.Command("/bin/sh", args...)
-	child.ExtraFiles = []*os.File{reader}
-	cleanup := func() {
-		_ = reader.Close()
-		_ = writer.Close()
-	}
 	return &workerCommand{
-		child: child,
-		release: func() (bool, error) {
-			written, writeErr := writer.Write([]byte{'\n'})
-			closeWriterErr := writer.Close()
-			closeReaderErr := reader.Close()
-			if written == 1 {
-				return true, nil
-			}
-			return false, errors.Join(writeErr, closeWriterErr, closeReaderErr, io.ErrShortWrite)
-		},
-		cleanup: cleanup,
+		child:   guarded.Command,
+		start:   guarded.Start,
+		wait:    guarded.Wait,
+		release: guarded.Release,
+		cleanup: guarded.Close,
 	}, nil
 }
 
 func configureProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 }
 
 func attachProcessTree(cmd *exec.Cmd) (func(), error) {
@@ -148,6 +135,12 @@ func attachProcessTree(cmd *exec.Cmd) (func(), error) {
 		}
 		_ = syscall.Kill(-pid, syscall.SIGTERM)
 		if waitForProcessGroup(pid, time.Second) {
+			return
+		}
+		if processguard.IsGuardCommand(cmd) {
+			// The Linux guard escalates its descendants itself. Killing the
+			// subreaper would destroy teardown proof and let setsid children
+			// escape. Leave a non-quiescent guard for recovery/operator action.
 			return
 		}
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
@@ -173,7 +166,7 @@ func terminateProcess(cmd *exec.Cmd, force bool) error {
 		return nil
 	}
 	signal := syscall.SIGTERM
-	if force {
+	if force && !processguard.IsGuardCommand(cmd) {
 		signal = syscall.SIGKILL
 	}
 	return syscall.Kill(-cmd.Process.Pid, signal)

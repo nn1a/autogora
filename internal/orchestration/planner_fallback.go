@@ -11,6 +11,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 // PlannerFailureKind identifies failures that make another configured agent a
@@ -51,6 +52,9 @@ func (e *PlannerFailure) Unwrap() error {
 // supported coding-agent CLIs because those tools do not share exit codes.
 func ClassifyPlannerFailure(err error) (PlannerFailureKind, bool) {
 	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, processguard.ErrTeardownUnconfirmed) {
 		return "", false
 	}
 	var failure *PlannerFailure

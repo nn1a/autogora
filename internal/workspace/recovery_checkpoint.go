@@ -590,6 +590,260 @@ func ValidateRecoveryCheckpoint(ctx context.Context, checkpoint RecoveryCheckpoi
 	return nil
 }
 
+// LoadPublishedRecoveryCheckpoint reconstructs the immutable snapshot that a
+// stopped run published before its database transaction completed. The source
+// worktree may already be gone, so only the persisted run workspace, exact
+// run-scoped ref, and pinned ancestry are trusted. A nil result means the run
+// never published that ref.
+func (m *Manager) LoadPublishedRecoveryCheckpoint(
+	ctx context.Context,
+	runWorkspace model.RunWorkspace,
+	sourceStartCommit string,
+) (*RecoveryCheckpoint, error) {
+	if runWorkspace.Kind != model.WorkspaceWorktree ||
+		runWorkspace.RepositoryPath == nil ||
+		strings.TrimSpace(*runWorkspace.RepositoryPath) == "" ||
+		runWorkspace.BaseCommit == nil ||
+		strings.TrimSpace(*runWorkspace.BaseCommit) == "" {
+		return nil, errors.New(
+			"published recovery checkpoint requires a prepared git worktree record",
+		)
+	}
+	repositoryIdentity, err := exactRecoveryWorktreeIdentity(
+		ctx,
+		*runWorkspace.RepositoryPath,
+		"published recovery checkpoint repository",
+	)
+	if err != nil {
+		return nil, err
+	}
+	worktreePath, err := canonicalPath(runWorkspace.Path)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"resolve published recovery worktree path: %w",
+			err,
+		)
+	}
+	outputBase, err := resolvePinnedCommit(
+		ctx,
+		repositoryIdentity.TopLevel,
+		*runWorkspace.BaseCommit,
+		"published recovery output base",
+	)
+	if err != nil {
+		return nil, err
+	}
+	sourceStart, err := resolvePinnedCommit(
+		ctx,
+		repositoryIdentity.TopLevel,
+		sourceStartCommit,
+		"published recovery source start",
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAncestor(
+		ctx,
+		repositoryIdentity.TopLevel,
+		outputBase,
+		sourceStart,
+		"published recovery source start does not descend from its output base",
+	); err != nil {
+		return nil, err
+	}
+	ref, err := recoveryCheckpointRef(runWorkspace.RunID)
+	if err != nil {
+		return nil, err
+	}
+	head, exists, err := exactRefHead(
+		ctx,
+		repositoryIdentity.TopLevel,
+		ref,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	head, err = resolvePinnedCommit(
+		ctx,
+		repositoryIdentity.TopLevel,
+		head,
+		"published recovery head",
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAncestor(
+		ctx,
+		repositoryIdentity.TopLevel,
+		sourceStart,
+		head,
+		"published recovery head does not descend from its run start",
+	); err != nil {
+		return nil, err
+	}
+	changedOutput, err := gitOutputWithEnv(
+		ctx,
+		repositoryIdentity.TopLevel,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"diff",
+		"--name-only",
+		"-z",
+		outputBase,
+		head,
+	)
+	if err != nil {
+		return nil, err
+	}
+	result := &RecoveryCheckpoint{
+		RunID:             runWorkspace.RunID,
+		RepositoryPath:    repositoryIdentity.TopLevel,
+		WorktreePath:      worktreePath,
+		OutputBaseCommit:  outputBase,
+		SourceStartCommit: sourceStart,
+		HeadCommit:        head,
+		DurableRef:        ref,
+		ChangedFiles:      splitNullTerminated(changedOutput),
+	}
+	if err := ValidateRecoveryCheckpoint(ctx, *result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ReissueAdoptedRecoveryCheckpoint protects the last database-confirmed
+// adoption when its target worktree has disappeared. It never reconstructs
+// unobserved working-tree changes: the new run-scoped ref points exactly at the
+// confirmed adopted HEAD and records that same commit as its start boundary.
+func (m *Manager) ReissueAdoptedRecoveryCheckpoint(
+	ctx context.Context,
+	source RecoveryCheckpoint,
+	runID string,
+	missingWorktreePath string,
+	adoptedOutputBaseCommit string,
+	adoptedHeadCommit string,
+) (RecoveryCheckpoint, error) {
+	if err := ValidateRecoveryCheckpoint(ctx, source); err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	if strings.TrimSpace(missingWorktreePath) == "" {
+		return RecoveryCheckpoint{}, errors.New(
+			"reissued recovery checkpoint requires its missing worktree path",
+		)
+	}
+	worktreePath, err := canonicalPath(missingWorktreePath)
+	if err != nil {
+		return RecoveryCheckpoint{}, fmt.Errorf(
+			"resolve missing recovery worktree path: %w",
+			err,
+		)
+	}
+	outputBase, err := resolvePinnedCommit(
+		ctx,
+		source.RepositoryPath,
+		adoptedOutputBaseCommit,
+		"reissued recovery output base",
+	)
+	if err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	adoptedHead, err := resolvePinnedCommit(
+		ctx,
+		source.RepositoryPath,
+		adoptedHeadCommit,
+		"reissued recovery adopted HEAD",
+	)
+	if err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	for _, relation := range []struct {
+		ancestor string
+		reason   string
+	}{
+		{
+			ancestor: outputBase,
+			reason:   "reissued recovery adopted HEAD does not contain its output base",
+		},
+		{
+			ancestor: source.HeadCommit,
+			reason:   "reissued recovery adopted HEAD does not contain the source checkpoint",
+		},
+	} {
+		if err := requireAncestor(
+			ctx,
+			source.RepositoryPath,
+			relation.ancestor,
+			adoptedHead,
+			relation.reason,
+		); err != nil {
+			return RecoveryCheckpoint{}, err
+		}
+	}
+	ref, err := recoveryCheckpointRef(runID)
+	if err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	existing, exists, err := exactRefHead(ctx, source.RepositoryPath, ref)
+	if err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	if exists {
+		if !strings.EqualFold(existing, adoptedHead) {
+			return RecoveryCheckpoint{}, errors.New(
+				"immutable reissued recovery checkpoint already points to different work",
+			)
+		}
+	} else if _, err := gitOutputWithEnv(
+		ctx,
+		source.RepositoryPath,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"update-ref",
+		ref,
+		adoptedHead,
+		"",
+	); err != nil {
+		winner, winnerExists, readErr := exactRefHead(
+			ctx,
+			source.RepositoryPath,
+			ref,
+		)
+		if readErr != nil || !winnerExists ||
+			!strings.EqualFold(winner, adoptedHead) {
+			return RecoveryCheckpoint{}, errors.Join(err, readErr)
+		}
+	}
+	changedOutput, err := gitOutputWithEnv(
+		ctx,
+		source.RepositoryPath,
+		map[string]string{"GIT_TERMINAL_PROMPT": "0"},
+		"diff",
+		"--name-only",
+		"-z",
+		outputBase,
+		adoptedHead,
+	)
+	if err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	result := RecoveryCheckpoint{
+		RunID:             strings.TrimSpace(runID),
+		RepositoryPath:    source.RepositoryPath,
+		WorktreePath:      worktreePath,
+		OutputBaseCommit:  outputBase,
+		SourceStartCommit: adoptedHead,
+		SourceHeadCommit:  adoptedHead,
+		HeadCommit:        adoptedHead,
+		DurableRef:        ref,
+		ChangedFiles:      splitNullTerminated(changedOutput),
+	}
+	if err := ValidateRecoveryCheckpoint(ctx, result); err != nil {
+		return RecoveryCheckpoint{}, err
+	}
+	return result, nil
+}
+
 func rollbackRecoveryAdoption(ctx context.Context, path, initialHead string) error {
 	rollbackErr := rollbackIntegration(ctx, path, initialHead)
 	status, statusErr := gitOutputWithEnv(ctx, path, map[string]string{"GIT_TERMINAL_PROMPT": "0"},

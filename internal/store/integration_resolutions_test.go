@@ -56,7 +56,11 @@ func TestReserveIntegrationResolutionIsClaimScopedIdempotentAndBounded(t *testin
 		}, BlockInput{Reason: "resolution needs review: " + claim.Run.ID, Kind: model.BlockKindNeedsInput}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0); err != nil {
+		if _, err := opened.FinalizeRunTerminal(
+			ctx,
+			RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+			0,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -467,5 +471,762 @@ func TestLatestSchemaCreatesIntegrationResolutionLedgerForVersion20Database(t *t
 			tableCount,
 			schemaVersion,
 		)
+	}
+	var resolvedAtColumn int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM pragma_table_info('integration_resolution_attempts')
+		WHERE name = 'resolved_at'`).Scan(&resolvedAtColumn); err != nil {
+		t.Fatal(err)
+	}
+	if resolvedAtColumn != 1 {
+		t.Fatalf("resolved_at columns = %d, want 1", resolvedAtColumn)
+	}
+}
+
+type integrationRecoveryFixture struct {
+	store       *Store
+	task        model.TaskDetail
+	scope       RunScope
+	checkpoint  model.RecoveryCheckpoint
+	workspace   model.RunWorkspace
+	fingerprint string
+}
+
+func newIntegrationRecoveryFixture(
+	t *testing.T,
+	startResolution bool,
+) integrationRecoveryFixture {
+	t.Helper()
+	ctx := context.Background()
+	opened, err := Open(filepath.Join(t.TempDir(), "autogora.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+
+	assignee := "finalizer"
+	task, err := opened.CreateTask(ctx, CreateTaskInput{
+		Title:        "resolve prerequisites before recovery",
+		Assignee:     &assignee,
+		Runtime:      model.RuntimeCodex,
+		WorkflowRole: model.WorkflowRoleFinalizer,
+		MaxRetries:   3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := opened.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || source == nil {
+		t.Fatalf("claim source run: claim=%+v err=%v", source, err)
+	}
+	countFailure := false
+	checkpoint, _, err := opened.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		RunScope{RunID: source.Run.ID, ClaimToken: source.ClaimToken},
+		recoveryCheckpointInput(source.Run.ID, "/worktree/integration-source", 'a', 'd'),
+		"source run stopped with partial work",
+		FailRunOptions{
+			Outcome:      model.RunStatusCrashed,
+			CountFailure: &countFailure,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claim, scope := claimRecoveryRun(t, opened, task.Task.ID)
+	if err := opened.MarkRunManagedWithPolicy(ctx, scope, true); err != nil {
+		t.Fatal(err)
+	}
+	repository := "/repository"
+	base := recoveryCommit('a')
+	workspace, err := opened.BindRunWorkspace(ctx, scope, BindRunWorkspaceInput{
+		Path:           filepath.Join(t.TempDir(), claim.Run.ID),
+		Kind:           model.WorkspaceWorktree,
+		RepositoryPath: &repository,
+		BaseCommit:     &base,
+		Generated:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint = reserveRecoveryCheckpoint(t, opened, scope, checkpoint)
+	fingerprint := recoveryFingerprint('e')
+	resolution, err := opened.ReserveIntegrationResolution(
+		ctx,
+		scope,
+		ReserveIntegrationResolutionInput{
+			WorkspacePath:       workspace.Path,
+			PrerequisiteID:      "prerequisite",
+			ChangeSetID:         "changeset",
+			ConflictFingerprint: fingerprint,
+			ConflictingFiles:    []string{"conflict.go"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if startResolution {
+		started, err := opened.StartIntegrationResolutionAttempt(
+			ctx,
+			scope,
+			StartIntegrationResolutionInput{
+				ConflictFingerprint: fingerprint,
+				ExpectedAttempt:     resolution.Attempt,
+				ExpectedMaxAttempts: resolution.MaxAttempts,
+			},
+		)
+		if err != nil || !started.StartedNow {
+			t.Fatalf("start integration resolution: result=%+v err=%v", started, err)
+		}
+	}
+	if _, err := opened.RequestRunCompletion(
+		ctx,
+		scope,
+		CompletionInput{Summary: "conflicts resolved"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	return integrationRecoveryFixture{
+		store:       opened,
+		task:        task,
+		scope:       scope,
+		checkpoint:  checkpoint,
+		workspace:   workspace,
+		fingerprint: fingerprint,
+	}
+}
+
+func TestConfirmRecoveryAfterIntegrationResolutionIsAtomicAndIdempotent(t *testing.T) {
+	fixture := newIntegrationRecoveryFixture(t, true)
+	ctx := context.Background()
+	resolvedBase := recoveryCommit('e')
+	adoptedHead := recoveryCommit('f')
+
+	confirmed, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		resolvedBase,
+		adoptedHead,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.State != model.RecoveryCheckpointAdopted ||
+		confirmed.AdoptedOutputBaseCommit == nil ||
+		*confirmed.AdoptedOutputBaseCommit != resolvedBase ||
+		confirmed.AdoptedHeadCommit == nil ||
+		*confirmed.AdoptedHeadCommit != adoptedHead {
+		t.Fatalf("confirmed checkpoint = %+v", confirmed)
+	}
+	workspace, err := fixture.store.GetRunWorkspace(ctx, fixture.scope.RunID)
+	if err != nil || workspace == nil || workspace.BaseCommit == nil ||
+		*workspace.BaseCommit != resolvedBase {
+		t.Fatalf("resolved workspace = %+v err=%v", workspace, err)
+	}
+	request, err := fixture.store.GetRunTerminalRequest(ctx, fixture.scope.RunID)
+	if err != nil || request != nil {
+		t.Fatalf("resolver completion request = %+v err=%v", request, err)
+	}
+	var resolvedAt string
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT resolved_at
+		FROM integration_resolution_attempts WHERE run_id = ?`,
+		fixture.scope.RunID,
+	).Scan(&resolvedAt); err != nil || strings.TrimSpace(resolvedAt) == "" {
+		t.Fatalf("resolved_at = %q err=%v", resolvedAt, err)
+	}
+	unresolved, err := fixture.store.HasRunIntegrationResolution(
+		ctx,
+		fixture.scope.RunID,
+	)
+	if err != nil || unresolved {
+		t.Fatalf("resolved handoff remains unresolved: unresolved=%t err=%v", unresolved, err)
+	}
+	inspection, err := fixture.store.GetRun(ctx, fixture.scope.RunID)
+	if err != nil || inspection.Run.Status != model.RunStatusRunning ||
+		inspection.Task.Status != model.TaskStatusRunning {
+		t.Fatalf("bridge terminalized run: inspection=%+v err=%v", inspection, err)
+	}
+
+	var eventCount int
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM task_events WHERE run_id = ? AND kind IN (
+			'recovery_checkpoint_adopted',
+			'integration_resolution_resolved',
+			'terminal_request_discarded'
+		)`, fixture.scope.RunID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		resolvedBase,
+		adoptedHead,
+	)
+	if err != nil || retried.ID != confirmed.ID || retried.AdoptedAt == nil ||
+		confirmed.AdoptedAt == nil || *retried.AdoptedAt != *confirmed.AdoptedAt {
+		t.Fatalf("idempotent confirmation = %+v err=%v", retried, err)
+	}
+	var retriedEventCount int
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM task_events WHERE run_id = ? AND kind IN (
+			'recovery_checkpoint_adopted',
+			'integration_resolution_resolved',
+			'terminal_request_discarded'
+		)`, fixture.scope.RunID).Scan(&retriedEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if retriedEventCount != eventCount {
+		t.Fatalf("idempotent retry appended events: before=%d after=%d", eventCount, retriedEventCount)
+	}
+	if _, err := fixture.store.StartIntegrationResolutionAttempt(
+		ctx,
+		fixture.scope,
+		StartIntegrationResolutionInput{
+			ConflictFingerprint: fixture.fingerprint,
+			ExpectedAttempt:     1,
+			ExpectedMaxAttempts: 3,
+		},
+	); err == nil || !strings.Contains(err.Error(), "already resolved") {
+		t.Fatalf("resolved integration restarted: %v", err)
+	}
+	if _, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		recoveryCommit('9'),
+		adoptedHead,
+	); err == nil || !strings.Contains(err.Error(), "different recovery state") {
+		t.Fatalf("different confirmation retry error = %v", err)
+	}
+	if _, err := fixture.store.RequestRunCompletion(
+		ctx,
+		fixture.scope,
+		CompletionInput{Summary: "Finalizer verified the resolved graph"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		resolvedBase,
+		adoptedHead,
+	); err == nil || !strings.Contains(err.Error(), "new terminal request") {
+		t.Fatalf("bridge retry discarded Finalizer completion: %v", err)
+	}
+	if _, err := fixture.store.RecordRunChangeSet(
+		ctx,
+		fixture.scope,
+		RecordChangeSetInput{
+			RunID:          fixture.scope.RunID,
+			RepositoryPath: "/repository",
+			WorktreePath:   fixture.workspace.Path,
+			BaseCommit:     resolvedBase,
+			HeadCommit:     adoptedHead,
+			DurableRef:     "refs/autogora/results/" + fixture.scope.RunID,
+			State:          "ready",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := fixture.store.FinalizeRunTerminal(
+		ctx,
+		fixture.scope,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := fixture.store.GetRecoveryCheckpoint(
+		ctx,
+		fixture.checkpoint.ID,
+	)
+	if err != nil || consumed == nil ||
+		consumed.State != model.RecoveryCheckpointConsumed ||
+		completed.Task.Status != model.TaskStatusDone {
+		t.Fatalf("verified completion: task=%s checkpoint=%+v err=%v", completed.Task.Status, consumed, err)
+	}
+}
+
+func TestConfirmedIntegrationRecoveryBaseIsImmutableThroughFinalizeAndReopen(t *testing.T) {
+	fixture := newIntegrationRecoveryFixture(t, true)
+	ctx := context.Background()
+	resolvedBase := recoveryCommit('e')
+	adoptedHead := recoveryCommit('f')
+	if _, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		resolvedBase,
+		adoptedHead,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	unchanged, err := fixture.store.UpdateRunWorkspaceBase(
+		ctx,
+		fixture.scope,
+		resolvedBase,
+	)
+	if err != nil || unchanged.BaseCommit == nil ||
+		*unchanged.BaseCommit != resolvedBase {
+		t.Fatalf("idempotent base update: workspace=%+v err=%v", unchanged, err)
+	}
+	if _, err := fixture.store.UpdateRunWorkspaceBase(
+		ctx,
+		fixture.scope,
+		recoveryCommit('9'),
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"immutable after integration recovery confirmation",
+	) {
+		t.Fatalf("confirmed base application update error = %v", err)
+	}
+	if _, err := fixture.store.db.ExecContext(ctx, `UPDATE run_workspaces
+		SET base_commit = ? WHERE run_id = ?`,
+		recoveryCommit('8'),
+		fixture.scope.RunID,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"immutable after integration recovery confirmation",
+	) {
+		t.Fatalf("confirmed base direct update error = %v", err)
+	}
+	workspace, err := fixture.store.GetRunWorkspace(ctx, fixture.scope.RunID)
+	if err != nil || workspace == nil || workspace.BaseCommit == nil ||
+		*workspace.BaseCommit != resolvedBase {
+		t.Fatalf("rejected updates changed workspace: workspace=%+v err=%v", workspace, err)
+	}
+
+	if _, err := fixture.store.RequestRunCompletion(
+		ctx,
+		fixture.scope,
+		CompletionInput{Summary: "Finalizer verified the immutable bridge"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.RecordRunChangeSet(
+		ctx,
+		fixture.scope,
+		RecordChangeSetInput{
+			RunID:          fixture.scope.RunID,
+			RepositoryPath: "/repository",
+			WorktreePath:   fixture.workspace.Path,
+			BaseCommit:     resolvedBase,
+			HeadCommit:     adoptedHead,
+			DurableRef:     "refs/autogora/results/" + fixture.scope.RunID,
+			State:          "ready",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := fixture.store.FinalizeRunTerminal(
+		ctx,
+		fixture.scope,
+		0,
+	)
+	if err != nil || completed.Task.Status != model.TaskStatusDone {
+		t.Fatalf("finalize confirmed bridge: task=%s err=%v", completed.Task.Status, err)
+	}
+
+	dbPath := fixture.store.DBPath()
+	if err := fixture.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dbPath, "default", "")
+	if err != nil {
+		t.Fatalf("reopen finalized bridge: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.db.ExecContext(ctx, `UPDATE run_workspaces
+		SET base_commit = ? WHERE run_id = ?`,
+		recoveryCommit('7'),
+		fixture.scope.RunID,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"immutable after integration recovery confirmation",
+	) {
+		t.Fatalf("reopened confirmed base direct update error = %v", err)
+	}
+	reopenedWorkspace, err := reopened.GetRunWorkspace(ctx, fixture.scope.RunID)
+	if err != nil || reopenedWorkspace == nil ||
+		reopenedWorkspace.BaseCommit == nil ||
+		*reopenedWorkspace.BaseCommit != resolvedBase {
+		t.Fatalf("reopened workspace: workspace=%+v err=%v", reopenedWorkspace, err)
+	}
+	reopenedCheckpoint, err := reopened.GetRecoveryCheckpoint(
+		ctx,
+		fixture.checkpoint.ID,
+	)
+	if err != nil || reopenedCheckpoint == nil ||
+		reopenedCheckpoint.State != model.RecoveryCheckpointConsumed {
+		t.Fatalf("reopened checkpoint: checkpoint=%+v err=%v", reopenedCheckpoint, err)
+	}
+	reopenedTask, err := reopened.GetTask(ctx, fixture.task.Task.ID)
+	if err != nil || reopenedTask.Task.Status != model.TaskStatusDone {
+		t.Fatalf("reopened task: task=%+v err=%v", reopenedTask.Task, err)
+	}
+}
+
+func TestConfirmRecoveryAfterIntegrationResolutionRollsBackLateFailure(t *testing.T) {
+	fixture := newIntegrationRecoveryFixture(t, true)
+	ctx := context.Background()
+	if _, err := fixture.store.db.ExecContext(ctx, `CREATE TRIGGER reject_resolution_request_delete
+		BEFORE DELETE ON run_terminal_requests
+		WHEN OLD.run_id = '`+fixture.scope.RunID+`'
+		BEGIN
+			SELECT RAISE(ABORT, 'test resolution rollback');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+		ctx,
+		fixture.scope,
+		fixture.checkpoint.ID,
+		fixture.checkpoint.ReservationToken,
+		recoveryCommit('e'),
+		recoveryCommit('f'),
+	)
+	if err == nil || !strings.Contains(err.Error(), "test resolution rollback") {
+		t.Fatalf("forced bridge error = %v", err)
+	}
+	checkpoint, err := fixture.store.GetRecoveryCheckpoint(ctx, fixture.checkpoint.ID)
+	if err != nil || checkpoint == nil ||
+		checkpoint.State != model.RecoveryCheckpointReserved {
+		t.Fatalf("checkpoint escaped rollback: checkpoint=%+v err=%v", checkpoint, err)
+	}
+	workspace, err := fixture.store.GetRunWorkspace(ctx, fixture.scope.RunID)
+	if err != nil || workspace == nil || workspace.BaseCommit == nil ||
+		*workspace.BaseCommit != *fixture.workspace.BaseCommit {
+		t.Fatalf("workspace escaped rollback: workspace=%+v err=%v", workspace, err)
+	}
+	var resolvedAt sql.NullString
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT resolved_at
+		FROM integration_resolution_attempts WHERE run_id = ?`,
+		fixture.scope.RunID,
+	).Scan(&resolvedAt); err != nil {
+		t.Fatal(err)
+	}
+	request, err := fixture.store.GetRunTerminalRequest(ctx, fixture.scope.RunID)
+	if err != nil || request == nil || request.Kind != "complete" ||
+		resolvedAt.Valid {
+		t.Fatalf("resolution escaped rollback: request=%+v resolved=%+v err=%v", request, resolvedAt, err)
+	}
+	var transitionEvents int
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM task_events WHERE run_id = ? AND kind IN (
+			'recovery_checkpoint_adopted',
+			'integration_resolution_resolved',
+			'terminal_request_discarded'
+		)`, fixture.scope.RunID).Scan(&transitionEvents); err != nil {
+		t.Fatal(err)
+	}
+	if transitionEvents != 0 {
+		t.Fatalf("rolled-back transition events = %d", transitionEvents)
+	}
+}
+
+func TestConfirmRecoveryAfterIntegrationResolutionRejectsUnsafeBoundaries(t *testing.T) {
+	t.Run("unstarted", func(t *testing.T) {
+		fixture := newIntegrationRecoveryFixture(t, false)
+		_, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+			context.Background(),
+			fixture.scope,
+			fixture.checkpoint.ID,
+			fixture.checkpoint.ReservationToken,
+			recoveryCommit('e'),
+			recoveryCommit('f'),
+		)
+		if err == nil || !strings.Contains(err.Error(), "process-start boundary") {
+			t.Fatalf("unstarted confirmation error = %v", err)
+		}
+	})
+
+	t.Run("immutable change set", func(t *testing.T) {
+		fixture := newIntegrationRecoveryFixture(t, true)
+		if _, err := fixture.store.RecordRunChangeSet(
+			context.Background(),
+			fixture.scope,
+			RecordChangeSetInput{
+				RunID:          fixture.scope.RunID,
+				RepositoryPath: "/repository",
+				WorktreePath:   fixture.workspace.Path,
+				BaseCommit:     recoveryCommit('a'),
+				HeadCommit:     recoveryCommit('e'),
+				DurableRef:     "refs/autogora/results/" + fixture.scope.RunID,
+				State:          "ready",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		_, err := fixture.store.ConfirmRecoveryAfterIntegrationResolution(
+			context.Background(),
+			fixture.scope,
+			fixture.checkpoint.ID,
+			fixture.checkpoint.ReservationToken,
+			recoveryCommit('e'),
+			recoveryCommit('f'),
+		)
+		if err == nil || !strings.Contains(err.Error(), "immutable change set") {
+			t.Fatalf("captured change set confirmation error = %v", err)
+		}
+	})
+
+	t.Run("ordinary adoption API", func(t *testing.T) {
+		fixture := newIntegrationRecoveryFixture(t, true)
+		_, err := fixture.store.ConfirmRecoveryCheckpointAdoption(
+			context.Background(),
+			fixture.scope,
+			fixture.checkpoint.ID,
+			fixture.checkpoint.ReservationToken,
+			recoveryCommit('e'),
+			recoveryCommit('f'),
+		)
+		if err == nil || !strings.Contains(err.Error(), "atomic resolution confirmation") {
+			t.Fatalf("ordinary adoption error = %v", err)
+		}
+	})
+}
+
+func TestSchema24AddsResolvedAtWithoutLosingStartedIntegrationAttempt(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignee := "finalizer"
+	task, err := opened.CreateTask(ctx, CreateTaskInput{
+		Title:        "preserve integration attempt",
+		Assignee:     &assignee,
+		Runtime:      model.RuntimeCodex,
+		WorkflowRole: model.WorkflowRoleFinalizer,
+		MaxRetries:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: claim=%+v err=%v", claim, err)
+	}
+	scope := RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	if err := opened.MarkRunManagedWithPolicy(ctx, scope, true); err != nil {
+		t.Fatal(err)
+	}
+	workspacePath := filepath.Join(t.TempDir(), claim.Run.ID)
+	if _, err := opened.BindRunWorkspace(ctx, scope, BindRunWorkspaceInput{
+		Path: workspacePath, Kind: model.WorkspaceWorktree, Generated: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := recoveryFingerprint('8')
+	reservation, err := opened.ReserveIntegrationResolution(
+		ctx,
+		scope,
+		ReserveIntegrationResolutionInput{
+			WorkspacePath:       workspacePath,
+			PrerequisiteID:      "parent",
+			ChangeSetID:         "change",
+			ConflictFingerprint: fingerprint,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.StartIntegrationResolutionAttempt(
+		ctx,
+		scope,
+		StartIntegrationResolutionInput{
+			ConflictFingerprint: fingerprint,
+			ExpectedAttempt:     reservation.Attempt,
+			ExpectedMaxAttempts: reservation.MaxAttempts,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	downgradeIntegrationResolutionSchemaToV23(t, path)
+
+	reopened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var attempt, version int
+	var startedAt string
+	var resolvedAt sql.NullString
+	if err := reopened.db.QueryRowContext(ctx, `SELECT attempt, started_at, resolved_at
+		FROM integration_resolution_attempts WHERE run_id = ?`,
+		claim.Run.ID,
+	).Scan(&attempt, &startedAt, &resolvedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 1 || strings.TrimSpace(startedAt) == "" ||
+		resolvedAt.Valid || version != schemaVersion {
+		t.Fatalf(
+			"migrated attempt: attempt=%d started=%q resolved=%+v version=%d",
+			attempt,
+			startedAt,
+			resolvedAt,
+			version,
+		)
+	}
+}
+
+func TestSchema24ConcurrentOpenSerializesResolvedAtMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	initial, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	downgradeIntegrationResolutionSchemaToV23(t, path)
+
+	type openResult struct {
+		store *Store
+		err   error
+	}
+	const callers = 8
+	start := make(chan struct{})
+	results := make(chan openResult, callers)
+	for range callers {
+		go func() {
+			<-start
+			opened, err := Open(path, "default", "")
+			results <- openResult{store: opened, err: err}
+		}()
+	}
+	close(start)
+
+	stores := make([]*Store, 0, callers)
+	var openErr error
+	for range callers {
+		result := <-results
+		if result.err != nil {
+			openErr = errors.Join(openErr, result.err)
+			continue
+		}
+		stores = append(stores, result.store)
+	}
+	defer func() {
+		for _, opened := range stores {
+			_ = opened.Close()
+		}
+	}()
+	if openErr != nil {
+		t.Fatalf("concurrent v23 open: %v", openErr)
+	}
+
+	ctx := context.Background()
+	var version, resolvedAtColumns, invariantTriggers int
+	if err := stores[0].db.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM pragma_table_info('integration_resolution_attempts')
+		WHERE name = 'resolved_at'`).Scan(&resolvedAtColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'trigger' AND name IN (
+			'integration_resolution_insert_requires_started_recovery',
+			'integration_resolution_update_requires_started_recovery',
+			'run_workspace_prevent_confirmed_integration_base_change'
+		)`).Scan(&invariantTriggers); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion || resolvedAtColumns != 1 ||
+		invariantTriggers != 3 {
+		t.Fatalf(
+			"concurrent migration: version=%d columns=%d triggers=%d",
+			version,
+			resolvedAtColumns,
+			invariantTriggers,
+		)
+	}
+}
+
+func downgradeIntegrationResolutionSchemaToV23(t *testing.T, path string) {
+	t.Helper()
+	ctx := context.Background()
+	raw, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		PRAGMA foreign_keys = OFF;
+		DROP TRIGGER IF EXISTS integration_resolution_insert_requires_started_recovery;
+		DROP TRIGGER IF EXISTS integration_resolution_update_requires_started_recovery;
+		DROP TRIGGER IF EXISTS run_workspace_prevent_confirmed_integration_base_change;
+		DROP INDEX IF EXISTS idx_integration_resolution_attempts_task;
+		ALTER TABLE integration_resolution_attempts
+			RENAME TO integration_resolution_attempts_v24;
+		CREATE TABLE integration_resolution_attempts (
+			task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			conflict_fingerprint TEXT NOT NULL
+				CHECK (length(conflict_fingerprint) = 64
+					AND conflict_fingerprint NOT GLOB '*[^0-9a-f]*'),
+			run_id TEXT NOT NULL UNIQUE REFERENCES task_runs(id) ON DELETE CASCADE,
+			attempt INTEGER CHECK (attempt IS NULL OR attempt >= 1),
+			max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+			workspace_path TEXT NOT NULL,
+			prerequisite_id TEXT NOT NULL,
+			change_set_id TEXT NOT NULL,
+			conflicting_files_json TEXT NOT NULL DEFAULT '[]',
+			prepared_at TEXT NOT NULL,
+			started_at TEXT,
+			CHECK (
+				(attempt IS NULL AND started_at IS NULL)
+				OR (attempt IS NOT NULL AND started_at IS NOT NULL)
+			),
+			CHECK (attempt IS NULL OR attempt <= max_attempts),
+			PRIMARY KEY (task_id, conflict_fingerprint, run_id),
+			UNIQUE (task_id, conflict_fingerprint, attempt)
+		);
+		INSERT INTO integration_resolution_attempts(
+			task_id, conflict_fingerprint, run_id, attempt, max_attempts,
+			workspace_path, prerequisite_id, change_set_id,
+			conflicting_files_json, prepared_at, started_at
+		)
+		SELECT task_id, conflict_fingerprint, run_id, attempt, max_attempts,
+			workspace_path, prerequisite_id, change_set_id,
+			conflicting_files_json, prepared_at, started_at
+		FROM integration_resolution_attempts_v24;
+		DROP TABLE integration_resolution_attempts_v24;
+		CREATE INDEX idx_integration_resolution_attempts_task
+			ON integration_resolution_attempts(
+				task_id, conflict_fingerprint, attempt DESC
+			);
+		PRAGMA user_version = 23;
+		PRAGMA foreign_keys = ON;
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

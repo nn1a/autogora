@@ -113,7 +113,7 @@ func newFinalizerConflictFixture(t *testing.T, maxRetries int) finalizerConflict
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := opened.FinalizeRunTerminal(ctx, claim.Run.ID, 0); err != nil {
+		if _, err := opened.FinalizeRunTerminal(ctx, scope, 0); err != nil {
 			t.Fatal(err)
 		}
 		return head
@@ -141,6 +141,280 @@ func runFinalizerFixture(t *testing.T, fixture finalizerConflictFixture, cliPath
 		},
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func registerFinalizerRecoveryCheckpoint(
+	t *testing.T,
+	fixture finalizerConflictFixture,
+	relativePath string,
+	contents string,
+) model.RecoveryCheckpoint {
+	t.Helper()
+	ctx := context.Background()
+	opened, err := fixture.manager.OpenStore(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{
+		TaskID: fixture.finalizerID, ClaimTTLSeconds: 60,
+	})
+	if err != nil || claim == nil {
+		t.Fatalf("claim checkpoint source = %#v, err=%v", claim, err)
+	}
+	scope := store.RunScope{
+		RunID: claim.Run.ID, ClaimToken: claim.ClaimToken,
+	}
+	if err := opened.MarkRunManagedWithPolicy(ctx, scope, true); err != nil {
+		t.Fatal(err)
+	}
+	workspaces := workspace.New(fixture.manager)
+	workspaces.SetAllowWrites(true)
+	prepared, err := workspaces.Prepare(ctx, opened, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Workspace == nil || prepared.Workspace.BaseCommit == nil {
+		t.Fatalf("checkpoint source workspace = %#v", prepared.Workspace)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Workspace.Path, relativePath),
+		[]byte(contents),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := workspaces.CaptureRecoveryCheckpoint(
+		ctx,
+		*prepared.Workspace,
+		*prepared.Workspace.BaseCommit,
+		prepared.Task.Task.ID,
+		prepared.Task.Task.Title,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := opened.GetTask(ctx, fixture.finalizerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskFingerprint, prerequisiteFingerprint := recoverySemanticFingerprints(
+		latest,
+	)
+	countFailure := false
+	checkpoint, detail, err := opened.RegisterRecoveryCheckpointAndFailRun(
+		ctx,
+		scope,
+		storeRecoveryCheckpointInput(
+			snapshot,
+			taskFingerprint,
+			prerequisiteFingerprint,
+		),
+		"fixture partial Finalizer work",
+		store.FailRunOptions{
+			Outcome:      model.RunStatusReclaimed,
+			CountFailure: &countFailure,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusReady ||
+		checkpoint.State != model.RecoveryCheckpointPending {
+		t.Fatalf(
+			"checkpoint source terminal state: task=%s checkpoint=%s",
+			detail.Task.Status,
+			checkpoint.State,
+		)
+	}
+	return checkpoint
+}
+
+func TestFinalizerConflictCannotBypassCompatibleRecoveryCheckpoint(t *testing.T) {
+	fixture := newFinalizerConflictFixture(t, 2)
+	checkpoint := registerFinalizerRecoveryCheckpoint(
+		t,
+		fixture,
+		"recovered.txt",
+		"partial work that must survive the resolver\n",
+	)
+	cliPath := buildAutogora(t)
+	phaseDir := t.TempDir()
+	t.Setenv("AUTOGORA_TEST_RECOVERY_PHASE_DIR", phaseDir)
+	worker := executableFixture(t, `
+if test -n "${AUTOGORA_INTEGRATION_RESOLUTION_MANIFEST:-}"; then
+  test ! -e recovered.txt
+  printf 'resolved before recovery adoption\n' > README.md
+  git add README.md
+  git -c user.name=Autogora -c user.email=autogora@localhost commit -q --no-edit
+  touch "$AUTOGORA_TEST_RECOVERY_PHASE_DIR/resolver"
+  "$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "prerequisites resolved" >/dev/null
+  exit 0
+fi
+test -f recovered.txt
+grep -q 'partial work that must survive' recovered.txt
+test -z "$(git ls-files -u)"
+printf 'verified after recovery adoption\n' > verified.txt
+touch "$AUTOGORA_TEST_RECOVERY_PHASE_DIR/verifier"
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "combined result verified" >/dev/null`)
+	runFinalizerFixture(t, fixture, cliPath, worker)
+
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	detail, err := opened.GetTask(context.Background(), fixture.finalizerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusDone ||
+		len(detail.ChangeSets) != 1 {
+		t.Fatalf("finalizer result = %#v", detail)
+	}
+	if _, err := os.Stat(filepath.Join(phaseDir, "resolver")); err != nil {
+		t.Fatalf("resolver phase did not run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(phaseDir, "verifier")); err != nil {
+		t.Fatalf("verification phase did not run: %v", err)
+	}
+	active, err := opened.GetActiveRecoveryCheckpoint(
+		context.Background(),
+		fixture.finalizerID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != nil {
+		t.Fatalf("Done finalizer retained active checkpoint: %#v", active)
+	}
+	consumed, err := opened.GetRecoveryCheckpoint(
+		context.Background(),
+		checkpoint.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed.State != model.RecoveryCheckpointConsumed {
+		t.Fatalf("checkpoint state = %s, want consumed", consumed.State)
+	}
+	changeSet := detail.ChangeSets[0]
+	for _, path := range []string{"README.md", "recovered.txt", "verified.txt"} {
+		if output := finalizerGit(
+			t,
+			fixture.repository,
+			"show",
+			changeSet.HeadCommit+":"+path,
+		); strings.TrimSpace(output) == "" {
+			t.Fatalf("final change set omitted %s", path)
+		}
+	}
+}
+
+func TestFinalizerConflictReleasesReservedRecoveryWhenResolverBlocks(t *testing.T) {
+	fixture := newFinalizerConflictFixture(t, 2)
+	checkpoint := registerFinalizerRecoveryCheckpoint(
+		t,
+		fixture,
+		"recovered.txt",
+		"partial work remains retryable\n",
+	)
+	cliPath := buildAutogora(t)
+	worker := executableFixture(t, `
+test -n "${AUTOGORA_INTEGRATION_RESOLUTION_MANIFEST:-}"
+"$AUTOGORA_CLI" block "$AUTOGORA_TASK_ID" "resolver needs human input" --kind needs_input >/dev/null`)
+	runFinalizerFixture(t, fixture, cliPath, worker)
+
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	detail, err := opened.GetTask(context.Background(), fixture.finalizerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusBlocked {
+		t.Fatalf("resolver block task state = %s", detail.Task.Status)
+	}
+	preserved, err := opened.GetRecoveryCheckpoint(
+		context.Background(),
+		checkpoint.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved == nil || preserved.State != model.RecoveryCheckpointPending ||
+		preserved.ReservedRunID != nil || preserved.ReservationToken != "" {
+		t.Fatalf("blocked resolver checkpoint = %#v", preserved)
+	}
+}
+
+func TestFinalizerConflictExplicitlySupersedesStaleRecoveryCheckpoint(t *testing.T) {
+	fixture := newFinalizerConflictFixture(t, 2)
+	checkpoint := registerFinalizerRecoveryCheckpoint(
+		t,
+		fixture,
+		"stale-recovered.txt",
+		"obsolete partial work\n",
+	)
+	opened, err := fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedBody := "requirements changed after the partial checkpoint"
+	if _, err := opened.UpdateTask(
+		context.Background(),
+		fixture.finalizerID,
+		store.UpdateTaskInput{Body: &updatedBody},
+	); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cliPath := buildAutogora(t)
+	worker := executableFixture(t, `
+test -n "${AUTOGORA_INTEGRATION_RESOLUTION_MANIFEST:-}"
+test ! -e stale-recovered.txt
+printf 'resolved without obsolete recovery\n' > README.md
+git add README.md
+git -c user.name=Autogora -c user.email=autogora@localhost commit -q --no-edit
+"$AUTOGORA_CLI" complete "$AUTOGORA_TASK_ID" --summary "stale recovery excluded" >/dev/null`)
+	runFinalizerFixture(t, fixture, cliPath, worker)
+
+	opened, err = fixture.manager.OpenStore(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	detail, err := opened.GetTask(context.Background(), fixture.finalizerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != model.TaskStatusDone {
+		t.Fatalf("stale checkpoint finalizer state = %s", detail.Task.Status)
+	}
+	superseded, err := opened.GetRecoveryCheckpoint(
+		context.Background(),
+		checkpoint.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded == nil ||
+		superseded.State != model.RecoveryCheckpointSuperseded ||
+		superseded.SupersedeReason == nil ||
+		!strings.Contains(*superseded.SupersedeReason, "specification changed") {
+		t.Fatalf("stale checkpoint = %#v", superseded)
+	}
+	for _, path := range detail.ChangeSets[0].ChangedFiles {
+		if path == "stale-recovered.txt" {
+			t.Fatal("obsolete recovery file unexpectedly entered final change set")
+		}
 	}
 }
 
@@ -649,6 +923,10 @@ func TestPreparedFinalizerConflictIsRecoveredAfterClaimTTL(t *testing.T) {
 	}
 	options := Options{}
 	options.normalize()
+	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgeCurrentRunRecoveryFence(t, ctx, opened, scope)
 	if err := recoverAbandonedRuns(ctx, opened, "default", options); err != nil {
 		t.Fatal(err)
 	}

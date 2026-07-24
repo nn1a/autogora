@@ -25,6 +25,7 @@ var booleanOptions = map[string]bool{
 	"force": true, "dry-run": true, "allow-writes": true, "auto-decompose": true,
 	"replace": true, "reset-data-dir": true, "save": true, "auto-start": true,
 	"apply": true, "autopilot": true,
+	"confirm-worker-stopped": true, "confirm-host-writes-stopped": true,
 }
 
 func parseOptions(args []string) (options, error) {

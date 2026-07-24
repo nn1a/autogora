@@ -811,7 +811,16 @@ func requireCoordinationIncidentPostcondition(
 	tx *sql.Tx,
 	incident model.CoordinationIncident,
 ) error {
-	if incident.Trigger != model.CoordinationTriggerIntegrationConflict {
+	switch incident.Trigger {
+	case model.CoordinationTriggerRunInvariant:
+		return requireCoordinationRunInvariantPostcondition(
+			ctx,
+			tx,
+			incident,
+		)
+	case model.CoordinationTriggerIntegrationConflict:
+		// Continue with the integration-specific postcondition below.
+	default:
 		return nil
 	}
 	if incident.TaskID == nil || strings.TrimSpace(*incident.TaskID) == "" {
@@ -857,6 +866,250 @@ func requireCoordinationIncidentPostcondition(
 		)
 	}
 	return nil
+}
+
+type coordinationRunInvariantIncidentDetails struct {
+	CurrentRunID    string                        `json:"currentRunId"`
+	DiagnosticCode  string                        `json:"diagnosticCode"`
+	FenceGeneration int                           `json:"fenceGeneration"`
+	CheckpointID    string                        `json:"checkpointId"`
+	CheckpointState model.RecoveryCheckpointState `json:"checkpointState"`
+	RunStatus       model.RunStatus               `json:"runStatus"`
+	Reason          string                        `json:"reason"`
+}
+
+// requireCoordinationRunInvariantPostcondition prevents a Coordinator
+// proposal—including an explicitly approved one—from declaring an unsafe
+// process-ownership fence resolved. Coordinator actions cannot prove that an
+// unverifiable process tree or host Git writer stopped; only deterministic
+// recovery may remove the fence after ownership actually quiesces.
+func requireCoordinationRunInvariantPostcondition(
+	ctx context.Context,
+	tx *sql.Tx,
+	incident model.CoordinationIncident,
+) error {
+	if incident.TaskID == nil || strings.TrimSpace(*incident.TaskID) == "" {
+		return errors.New("run-invariant coordination incident has no focus task")
+	}
+	task, err := requireTask(ctx, tx, strings.TrimSpace(*incident.TaskID))
+	if err != nil {
+		return err
+	}
+	var expected coordinationRunInvariantIncidentDetails
+	if len(incident.Details) > 0 {
+		if err := json.Unmarshal(incident.Details, &expected); err != nil {
+			return fmt.Errorf(
+				"decode run-invariant coordination incident %s postcondition: %w",
+				incident.ID,
+				err,
+			)
+		}
+	}
+	switch strings.TrimSpace(expected.Reason) {
+	case "operator_recovery_required":
+		return requireCoordinationOperatorRecoveryPostcondition(
+			ctx,
+			tx,
+			incident,
+			expected,
+		)
+	case "recovery_checkpoint_adoption_exhausted":
+		return requireCoordinationCheckpointPostcondition(
+			ctx,
+			tx,
+			incident,
+			task,
+			expected,
+		)
+	case "current_run_on_non_running_task",
+		"running_task_without_current_run",
+		"referenced_run_missing",
+		"referenced_run_belongs_to_another_task",
+		"referenced_run_terminal",
+		"running_owner_missing_from_active_runs":
+		return requireCoordinationRunOwnershipPostcondition(
+			ctx,
+			tx,
+			incident,
+			task,
+			expected,
+		)
+	default:
+		return fmt.Errorf(
+			"run-invariant coordination incident %s has unsupported safety reason %q",
+			incident.ID,
+			expected.Reason,
+		)
+	}
+}
+
+func requireCoordinationOperatorRecoveryPostcondition(
+	ctx context.Context,
+	tx *sql.Tx,
+	incident model.CoordinationIncident,
+	expected coordinationRunInvariantIncidentDetails,
+) error {
+	runID := strings.TrimSpace(expected.CurrentRunID)
+	if runID == "" || expected.FenceGeneration < 1 {
+		return fmt.Errorf(
+			"run-invariant coordination incident %s has incomplete operator fence identity",
+			incident.ID,
+		)
+	}
+	var requiresOperator bool
+	var diagnosticCode string
+	var fenceGeneration int
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT requires_operator, COALESCE(diagnostic_code, ''), fence_generation
+		 FROM run_reclaim_requests
+		 WHERE run_id = ?`,
+		runID,
+	).Scan(&requiresOperator, &diagnosticCode, &fenceGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !requiresOperator ||
+		fenceGeneration != expected.FenceGeneration ||
+		(strings.TrimSpace(expected.DiagnosticCode) != "" &&
+			strings.TrimSpace(expected.DiagnosticCode) != diagnosticCode) {
+		return nil
+	}
+	return fmt.Errorf(
+		"run-invariant coordination incident %s remains active: run %s retains operator recovery fence generation %d (%s)",
+		incident.ID,
+		runID,
+		fenceGeneration,
+		diagnosticCode,
+	)
+}
+
+func requireCoordinationCheckpointPostcondition(
+	ctx context.Context,
+	tx *sql.Tx,
+	incident model.CoordinationIncident,
+	task model.Task,
+	expected coordinationRunInvariantIncidentDetails,
+) error {
+	checkpointID := strings.TrimSpace(expected.CheckpointID)
+	if checkpointID == "" {
+		return fmt.Errorf(
+			"run-invariant coordination incident %s has no checkpoint identity",
+			incident.ID,
+		)
+	}
+	var state model.RecoveryCheckpointState
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT state
+		 FROM recovery_checkpoints
+		 WHERE id = ? AND task_id = ?`,
+		checkpointID,
+		task.ID,
+	).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if state != model.RecoveryCheckpointPending {
+		return nil
+	}
+	return fmt.Errorf(
+		"run-invariant coordination incident %s remains active: task %s retains pending recovery checkpoint %s",
+		incident.ID,
+		task.ID,
+		checkpointID,
+	)
+}
+
+func requireCoordinationRunOwnershipPostcondition(
+	ctx context.Context,
+	tx *sql.Tx,
+	incident model.CoordinationIncident,
+	task model.Task,
+	expected coordinationRunInvariantIncidentDetails,
+) error {
+	runID := strings.TrimSpace(expected.CurrentRunID)
+	currentRunID := ""
+	if task.CurrentRunID != nil {
+		currentRunID = strings.TrimSpace(*task.CurrentRunID)
+	}
+	persists := false
+	switch strings.TrimSpace(expected.Reason) {
+	case "current_run_on_non_running_task":
+		persists = task.Status != model.TaskStatusRunning &&
+			currentRunID != "" &&
+			(runID == "" || currentRunID == runID)
+	case "running_task_without_current_run":
+		persists = task.Status == model.TaskStatusRunning && currentRunID == ""
+	default:
+		if runID == "" {
+			return fmt.Errorf(
+				"run-invariant coordination incident %s has no referenced run identity",
+				incident.ID,
+			)
+		}
+		if task.Status != model.TaskStatusRunning || currentRunID != runID {
+			return nil
+		}
+		var ownerTaskID string
+		var runStatus model.RunStatus
+		err := tx.QueryRowContext(
+			ctx,
+			`SELECT task_id, status FROM task_runs WHERE id = ?`,
+			runID,
+		).Scan(&ownerTaskID, &runStatus)
+		switch strings.TrimSpace(expected.Reason) {
+		case "referenced_run_missing":
+			persists = errors.Is(err, sql.ErrNoRows)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		case "referenced_run_belongs_to_another_task":
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			persists = ownerTaskID != task.ID
+		case "referenced_run_terminal":
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			persists = ownerTaskID == task.ID &&
+				runStatus != model.RunStatusRunning &&
+				(expected.RunStatus == "" || runStatus == expected.RunStatus)
+		case "running_owner_missing_from_active_runs":
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			// A task/run pair satisfying the exact active-run join is no
+			// longer missing. Any remaining mismatch keeps the incident open.
+			persists = ownerTaskID != task.ID ||
+				runStatus != model.RunStatusRunning
+		}
+	}
+	if !persists {
+		return nil
+	}
+	return fmt.Errorf(
+		"run-invariant coordination incident %s remains active: task %s retains %s",
+		incident.ID,
+		task.ID,
+		expected.Reason,
+	)
 }
 
 func (s *Store) executeCoordinationApply(

@@ -3,6 +3,7 @@ package orchestration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/agentconfig"
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/processguard"
 )
 
 func TestGlobalPlannerCandidatesFollowDefaultsAndFallbackGraphs(t *testing.T) {
@@ -500,6 +502,7 @@ func TestClassifyPlannerFailure(t *testing.T) {
 		{err: &PlannerFailure{Kind: PlannerFailureTimeout, Err: context.DeadlineExceeded}, want: PlannerFailureTimeout, ok: true},
 		{err: errors.New("provider says authentication required"), want: PlannerFailureAuth, ok: true},
 		{err: errors.New("RESOURCE EXHAUSTED"), want: PlannerFailureRateLimited, ok: true},
+		{err: fmt.Errorf("cleanup: %w", processguard.ErrTeardownUnconfirmed), ok: false},
 		{err: errors.New("planner did not return a JSON object")},
 	}
 	for _, test := range tests {

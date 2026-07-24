@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nn1a/autogora/internal/processguard"
 	"github.com/nn1a/autogora/internal/processidentity"
 	"github.com/nn1a/autogora/internal/store"
 )
@@ -33,15 +34,17 @@ type TurnExecution struct {
 // independent of the turn context.
 type TurnStartCompensation func(context.Context) error
 
-// TurnStartGate performs the final durable transition immediately before a
-// fenced worker process is created. Its compensation remains valid until the
-// fence releases coding-agent code.
+// TurnStartGate performs the final durable transition after the fenced worker
+// process and its identity are durable, immediately before the fence releases
+// coding-agent code. Its compensation remains valid until that release.
 type TurnStartGate func(context.Context) (TurnStartCompensation, error)
 
 // workerCommand holds the platform-specific start fence around the coding
 // agent. release is the only operation allowed to let user code run.
 type workerCommand struct {
 	child   *exec.Cmd
+	start   func() error
+	wait    func() error
 	release func() (bool, error)
 	cleanup func()
 }
@@ -131,14 +134,21 @@ func exitDetails(err error) (int, string) {
 	return -1, err.Error()
 }
 
-func stopAndWait(command *exec.Cmd, done <-chan error) error {
+func stopAndWait(ctx context.Context, command *exec.Cmd, done <-chan error) error {
 	_ = terminateProcess(command, false)
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(5 * time.Second):
 		_ = terminateProcess(command, true)
-		return <-done
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			err := processguard.ErrTeardownUnconfirmed
+			processguard.ReportTeardownFailure(ctx, err)
+			return err
+		}
 	}
 }
 
@@ -200,7 +210,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	if err != nil {
 		return TurnExecution{Code: -1, SpawnError: err}
 	}
-	worker, err := newWorkerCommand(command)
+	worker, err := newWorkerCommand(ctx, command)
 	if err != nil {
 		return TurnExecution{Code: -1, SpawnError: err}
 	}
@@ -211,31 +221,21 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	tail := &tailBuffer{limit: 128 * 1024}
 	writer := io.MultiWriter(logFile, tail)
 	child.Stdout, child.Stderr = writer, writer
-	var compensate TurnStartCompensation
-	if len(startGate) == 1 && startGate[0] != nil {
-		compensate, err = startGate[0](ctx)
-		if err != nil {
-			return TurnExecution{
-				Code:       -1,
-				SpawnError: compensateUnstartedTurn(compensate, fmt.Errorf("run turn start gate: %w", err)),
-			}
-		}
-	}
 	if err := ctx.Err(); err != nil {
-		return canceledTurnExecution(compensateUnstartedTurn(compensate, err))
+		return canceledTurnExecution(err)
 	}
-	if err := child.Start(); err != nil {
-		if child.Process == nil {
-			err = compensateUnstartedTurn(compensate, err)
-		}
+	if err := worker.start(); err != nil {
 		return TurnExecution{Code: -1, SpawnError: err}
 	}
 	releaseProcessTree, err := attachProcessTree(child)
 	if err != nil {
 		_ = child.Process.Kill()
-		_, _ = child.Process.Wait()
-		err = compensateUnstartedTurn(compensate, fmt.Errorf("protect worker process tree: %w", err))
-		return TurnExecution{Code: -1, SpawnError: err, Output: tail.String()}
+		_ = worker.wait()
+		return TurnExecution{
+			Code:       -1,
+			SpawnError: fmt.Errorf("protect worker process tree: %w", err),
+			Output:     tail.String(),
+		}
 	}
 	defer releaseProcessTree()
 	processes.add(child)
@@ -243,35 +243,71 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	processIdentity, err := processidentity.Capture(child.Process.Pid)
 	if err != nil {
 		done := make(chan error, 1)
-		go func() { done <- child.Wait() }()
-		_ = stopAndWait(child, done)
-		err = compensateUnstartedTurn(compensate, fmt.Errorf("capture worker process identity: %w", err))
-		return TurnExecution{Code: -1, SpawnError: err, Output: tail.String()}
+		go func() { done <- worker.wait() }()
+		_ = stopAndWait(ctx, child, done)
+		return TurnExecution{
+			Code:       -1,
+			SpawnError: fmt.Errorf("capture worker process identity: %w", err),
+			Output:     tail.String(),
+		}
 	}
 	if _, err := opened.RecordSpawnWithIdentity(ctx, scope, child.Process.Pid, logPath, processIdentity); err != nil {
 		done := make(chan error, 1)
-		go func() { done <- child.Wait() }()
-		_ = stopAndWait(child, done)
-		err = compensateUnstartedTurn(compensate, fmt.Errorf("record worker spawn: %w", err))
-		return TurnExecution{Code: -1, SpawnError: err, Output: tail.String()}
+		go func() { done <- worker.wait() }()
+		_ = stopAndWait(ctx, child, done)
+		return TurnExecution{
+			Code:       -1,
+			SpawnError: fmt.Errorf("record worker spawn: %w", err),
+			Output:     tail.String(),
+		}
 	}
 	var stopBroker func()
 	if command.ToolApproval != nil {
 		stopBroker, err = startToolApprovalBroker(ctx, *command.ToolApproval)
 		if err != nil {
 			done := make(chan error, 1)
-			go func() { done <- child.Wait() }()
-			_ = stopAndWait(child, done)
-			err = compensateUnstartedTurn(compensate, err)
+			go func() { done <- worker.wait() }()
+			_ = stopAndWait(ctx, child, done)
 			return TurnExecution{Code: -1, SpawnError: err, Output: tail.String()}
 		}
 		defer stopBroker()
 	}
+	var compensate TurnStartCompensation
+	if err := ctx.Err(); err != nil {
+		done := make(chan error, 1)
+		go func() { done <- worker.wait() }()
+		_ = stopAndWait(ctx, child, done)
+		return canceledTurnExecution(err)
+	}
+	if len(startGate) == 1 && startGate[0] != nil {
+		compensate, err = startGate[0](ctx)
+		if err != nil {
+			done := make(chan error, 1)
+			go func() { done <- worker.wait() }()
+			_ = stopAndWait(ctx, child, done)
+			return TurnExecution{
+				Code: -1,
+				SpawnError: compensateUnstartedTurn(
+					compensate,
+					fmt.Errorf("run turn start gate: %w", err),
+				),
+				Output: tail.String(),
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		done := make(chan error, 1)
+		go func() { done <- worker.wait() }()
+		_ = stopAndWait(ctx, child, done)
+		return canceledTurnExecution(
+			compensateUnstartedTurn(compensate, err),
+		)
+	}
 	released, err := worker.release()
 	if err != nil {
 		done := make(chan error, 1)
-		go func() { done <- child.Wait() }()
-		_ = stopAndWait(child, done)
+		go func() { done <- worker.wait() }()
+		_ = stopAndWait(ctx, child, done)
 		if !released {
 			err = compensateUnstartedTurn(compensate, fmt.Errorf("release worker start barrier: %w", err))
 		} else {
@@ -286,7 +322,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 	compensate = nil
 
 	done := make(chan error, 1)
-	go func() { done <- child.Wait() }()
+	go func() { done <- worker.wait() }()
 	var waitErr error
 	result := TurnExecution{Code: -1}
 	if runtimeLimit == nil {
@@ -294,7 +330,7 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		case waitErr = <-done:
 		case <-ctx.Done():
 			result.Canceled = true
-			waitErr = stopAndWait(child, done)
+			waitErr = stopAndWait(ctx, child, done)
 		}
 	} else {
 		limit := *runtimeLimit
@@ -307,13 +343,17 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 		case waitErr = <-done:
 		case <-ctx.Done():
 			result.Canceled = true
-			waitErr = stopAndWait(child, done)
+			waitErr = stopAndWait(ctx, child, done)
 		case <-timer.C:
 			result.TimedOut = true
-			waitErr = stopAndWait(child, done)
+			waitErr = stopAndWait(ctx, child, done)
 		}
 	}
 	result.Code, result.Signal = exitDetails(waitErr)
+	if errors.Is(waitErr, processguard.ErrTeardownUnconfirmed) {
+		result.SpawnError = waitErr
+		processguard.ReportTeardownFailure(ctx, waitErr)
+	}
 	result.Output = tail.String()
 	result.SessionID = SessionIDFromOutput(result.Output)
 	return result

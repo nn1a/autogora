@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -83,21 +84,21 @@ func TestWorkerStartBarrierPipeCloseDoesNotRunWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := newWorkerCommand(command)
+	worker, err := newWorkerCommand(context.Background(), command)
 	if err != nil {
 		t.Fatal(err)
 	}
 	worker.child.Dir = command.CWD
 	worker.child.Env = mergedEnvironment(command.Env)
 	configureProcess(worker.child)
-	if err := worker.child.Start(); err != nil {
+	if err := worker.start(); err != nil {
 		worker.cleanup()
 		t.Fatal(err)
 	}
 	// Closing the dispatcher-owned descriptors models process teardown. The
 	// inherited read side sees EOF and exits without crossing the gate.
 	worker.cleanup()
-	if err := worker.child.Wait(); err == nil {
+	if err := worker.wait(); err == nil {
 		t.Fatal("barrier shell unexpectedly succeeded after parent pipe close")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -153,8 +154,14 @@ func TestExecuteTurnRecordsEventualWorkerPID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.Run.PID == nil || *inspection.Run.PID != actualPID {
-		t.Fatalf("recorded PID = %v, eventual worker PID = %d", inspection.Run.PID, actualPID)
+	if inspection.Run.PID == nil {
+		t.Fatal("durable worker PID was not recorded")
+	}
+	if runtime.GOOS == "linux" && *inspection.Run.PID == actualPID {
+		t.Fatalf("recorded PID = %d, want Linux guard PID distinct from target %d", *inspection.Run.PID, actualPID)
+	}
+	if runtime.GOOS != "linux" && *inspection.Run.PID != actualPID {
+		t.Fatalf("recorded PID = %d, eventual worker PID = %d", *inspection.Run.PID, actualPID)
 	}
 	identity, err := opened.GetRunProcessIdentity(ctx, claim.Run.ID)
 	if err != nil {

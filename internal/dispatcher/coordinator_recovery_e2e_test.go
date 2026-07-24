@@ -249,7 +249,7 @@ esac`, recovery.Task.ID, downstream.Task.ID, finalizer.Task.ID))
 			node.BlockKind == nil ||
 			*node.BlockKind != model.BlockKindCapability ||
 			node.BlockReason == nil ||
-			*node.BlockReason != "required compiler is unavailable" ||
+			*node.BlockReason != "capability_block" ||
 			node.BlockRecurrences != 2 ||
 			node.PreservedWork ||
 			node.WorkspaceDirty {

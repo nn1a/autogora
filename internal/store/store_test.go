@@ -385,7 +385,11 @@ func TestManagedCompletionWaitsForProcessExitAndCapturesFinalArtifacts(t *testin
 	if err := os.WriteFile(artifact, []byte("after request and before exit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	completed, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 0)
+	completed, err := store.FinalizeRunTerminal(
+		ctx,
+		RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+		0,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +423,11 @@ func TestManagedBlockWaitsForProcessExit(t *testing.T) {
 	if requested.Task.Status != model.TaskStatusRunning || requested.Task.CurrentRunID == nil {
 		t.Fatalf("block request released the active worker: %+v", requested.Task)
 	}
-	blocked, err := store.FinalizeRunTerminal(ctx, claim.Run.ID, 75)
+	blocked, err := store.FinalizeRunTerminal(
+		ctx,
+		RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken},
+		75,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

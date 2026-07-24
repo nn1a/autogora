@@ -157,7 +157,7 @@ func TestExecuteTurnRejectsMissingExecutableBeforeStartGate(t *testing.T) {
 	}
 }
 
-func TestExecuteTurnCompensatesBeforeWorkerRelease(t *testing.T) {
+func TestExecuteTurnInvokesAndCompensatesGateAfterDurableSpawn(t *testing.T) {
 	ctx := context.Background()
 	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
 	if err != nil {
@@ -173,22 +173,76 @@ func TestExecuteTurnCompensatesBeforeWorkerRelease(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("claim: %+v, %v", claim, err)
 	}
+	marker := filepath.Join(t.TempDir(), "worker-started")
 	gateCalls, compensationCalls := 0, 0
 	result := ExecuteTurn(ctx, RunnerCommand{
-		Command: "/bin/sh", Args: []string{"-c", "sleep 30"}, CWD: t.TempDir(),
-	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: "invalid-token"}, NewProcessSet(),
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf started >"$1"`, "sh", marker},
+		CWD:     t.TempDir(),
+	}, opened, store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}, NewProcessSet(),
 		filepath.Join(t.TempDir(), "run.log"), nil, func(context.Context) (TurnStartCompensation, error) {
 			gateCalls++
+			inspection, inspectErr := opened.GetRun(ctx, claim.Run.ID)
+			if inspectErr != nil {
+				t.Fatalf("inspect fenced spawn in gate: %v", inspectErr)
+			}
+			if inspection.Run.PID == nil {
+				t.Fatal("start gate ran before the worker PID was durable")
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("worker crossed its fence before the start gate: %v", statErr)
+			}
 			return func(context.Context) error {
 				compensationCalls++
 				return nil
-			}, nil
+			}, errors.New("reject charged transition")
 		})
-	if result.SpawnError == nil || !strings.Contains(result.SpawnError.Error(), "record worker spawn") {
-		t.Fatalf("spawn error = %v, want spawn-record failure after process start", result.SpawnError)
+	if result.SpawnError == nil || !strings.Contains(result.SpawnError.Error(), "run turn start gate") {
+		t.Fatalf("spawn error = %v, want start-gate failure", result.SpawnError)
 	}
 	if gateCalls != 1 || compensationCalls != 1 {
 		t.Fatalf("gate calls = %d, compensation calls = %d; want 1 each", gateCalls, compensationCalls)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker ran after the rejected start gate: %v", err)
+	}
+}
+
+func TestExecuteTurnDoesNotChargeGateBeforeSpawnRecord(t *testing.T) {
+	ctx := context.Background()
+	opened, err := store.Open(filepath.Join(t.TempDir(), "executor.db"), "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	assignee := "worker"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title: "spawn record before budget charge", Assignee: &assignee,
+		Runtime: model.RuntimeCodex,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(ctx, store.ClaimOptions{TaskID: task.Task.ID})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v, %v", claim, err)
+	}
+	gateCalls := 0
+	result := ExecuteTurn(ctx, RunnerCommand{
+		Command: "/bin/sh", Args: []string{"-c", "exit 0"}, CWD: t.TempDir(),
+	}, opened, store.RunScope{
+		RunID: claim.Run.ID, ClaimToken: "invalid-token",
+	}, NewProcessSet(), filepath.Join(t.TempDir(), "run.log"), nil,
+		func(context.Context) (TurnStartCompensation, error) {
+			gateCalls++
+			return nil, nil
+		})
+	if result.SpawnError == nil ||
+		!strings.Contains(result.SpawnError.Error(), "record worker spawn") {
+		t.Fatalf("spawn error = %v, want spawn-record failure", result.SpawnError)
+	}
+	if gateCalls != 0 {
+		t.Fatalf("start gate charged before durable spawn: calls=%d", gateCalls)
 	}
 }
 

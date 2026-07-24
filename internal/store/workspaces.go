@@ -148,6 +148,18 @@ func (s *Store) UpdateRunWorkspaceBase(ctx context.Context, scope RunScope, base
 		if workspace.BaseCommit != nil && *workspace.BaseCommit == baseCommit {
 			return nil
 		}
+		var integrationRecoveryConfirmed bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM integration_resolution_attempts
+			WHERE run_id = ? AND resolved_at IS NOT NULL
+		)`, run.ID).Scan(&integrationRecoveryConfirmed); err != nil {
+			return err
+		}
+		if integrationRecoveryConfirmed {
+			return errors.New(
+				"run workspace base is immutable after integration recovery confirmation",
+			)
+		}
 		var previous any
 		if workspace.BaseCommit != nil {
 			previous = *workspace.BaseCommit
