@@ -22,15 +22,17 @@ var safeRepositoryComponentPattern = regexp.MustCompile(
 )
 
 type publicationRemote struct {
-	name               string
 	repositorySelector string
 	repositoryIdentity string
 	pushURL            string
+	pushEffectIdentity string
 }
 
 type remoteRepositoryIdentity struct {
-	selector string
-	identity string
+	selector       string
+	identity       string
+	targetURL      string
+	effectIdentity string
 }
 
 type pullRequestRecord struct {
@@ -76,6 +78,7 @@ func parseRemoteRepositoryIdentity(
 
 	host := ""
 	path := ""
+	targetURL := ""
 	if strings.Contains(raw, "://") {
 		parsed, err := url.Parse(raw)
 		if err != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
@@ -87,7 +90,8 @@ func parseRemoteRepositoryIdentity(
 				"publication remote URL is not an unambiguous repository URL",
 			)
 		}
-		switch strings.ToLower(parsed.Scheme) {
+		scheme := strings.ToLower(parsed.Scheme)
+		switch scheme {
 		case "https":
 			if parsed.User != nil {
 				return remoteRepositoryIdentity{}, semanticError(
@@ -129,6 +133,16 @@ func parseRemoteRepositoryIdentity(
 		}
 		host = parsed.Hostname()
 		path = strings.TrimPrefix(parsed.Path, "/")
+		// Rebuild the target rather than retaining caller text. The accepted
+		// URL forms cannot contain credentials other than the conventional
+		// public SSH "git" user. Host names and schemes are case-insensitive,
+		// while repository path case is preserved.
+		switch scheme {
+		case "https":
+			targetURL = "https://" + strings.ToLower(host) + "/" + path
+		case "ssh":
+			targetURL = "ssh://git@" + strings.ToLower(host) + "/" + path
+		}
 	} else {
 		left, right, found := strings.Cut(raw, ":")
 		if !found || strings.Count(raw, ":") != 1 {
@@ -149,6 +163,7 @@ func parseRemoteRepositoryIdentity(
 			)
 		}
 		host, path = remoteHost, right
+		targetURL = "git@" + strings.ToLower(host) + ":" + path
 	}
 
 	host = strings.ToLower(host)
@@ -183,9 +198,22 @@ func parseRemoteRepositoryIdentity(
 		}
 	}
 	selector := host + "/" + components[0] + "/" + components[1]
+	effectIdentity, err := publicationeffect.RepositoryIdentityFromRemote(
+		targetURL,
+	)
+	if err != nil {
+		return remoteRepositoryIdentity{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication remote",
+			ErrInvalidInput,
+			"publication remote cannot be represented as a canonical effect target",
+		)
+	}
 	return remoteRepositoryIdentity{
-		selector: selector,
-		identity: strings.ToLower(selector),
+		selector:       selector,
+		identity:       strings.ToLower(selector),
+		targetURL:      targetURL,
+		effectIdentity: effectIdentity,
 	}, nil
 }
 
@@ -317,10 +345,10 @@ func (e *Engine) configuredRemote(
 		)
 	}
 	return publicationRemote{
-		name:               remote,
-		repositorySelector: fetchIdentity.selector,
+		repositorySelector: fetchIdentity.identity,
 		repositoryIdentity: fetchIdentity.identity,
-		pushURL:            pushURLs[0],
+		pushURL:            pushIdentity.targetURL,
+		pushEffectIdentity: pushIdentity.effectIdentity,
 	}, nil
 }
 
@@ -332,7 +360,7 @@ func (e *Engine) remoteBranchHead(
 ) (string, error) {
 	ref := "refs/heads/" + branch
 	output, err := e.gitText(ctx, publication.repository, "inspect remote publication branch",
-		"ls-remote", "--heads", remote.name, ref)
+		"ls-remote", "--heads", remote.pushURL, ref)
 	if err != nil {
 		return "", err
 	}
@@ -389,7 +417,7 @@ func (e *Engine) ensurePullRequestBranch(
 	refspec := publication.head + ":" + ref
 	descriptor, describeErr := publicationeffect.NewPRBranchPush(
 		publicationeffect.PRBranchPushInput{
-			RepositoryIdentity: remote.repositoryIdentity,
+			RepositoryIdentity: remote.pushEffectIdentity,
 			RemoteURL:          remote.pushURL,
 			SourceOID:          publication.head,
 			TargetRef:          ref,
@@ -409,7 +437,7 @@ func (e *Engine) ensurePullRequestBranch(
 		"push pull-request branch",
 		"git", "push", "--porcelain",
 		"--force-with-lease="+ref+":",
-		remote.name,
+		remote.pushURL,
 		refspec,
 	); err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {

@@ -19,6 +19,7 @@ type expectedCommand struct {
 	args      []string
 	output    CommandOutput
 	err       error
+	mutating  bool
 }
 
 type fakeExitError struct{ code int }
@@ -48,11 +49,32 @@ func (r *scriptedRunner) Run(
 	}
 	step := r.steps[r.index]
 	r.index++
+	comparedArgs := args
+	if file == "git" && step.file == "git" {
+		if step.mutating {
+			if len(args) > 0 && args[0] == "--no-optional-locks" {
+				r.t.Fatalf(
+					"mutating Git command %d disabled optional locks: %q",
+					r.index,
+					args,
+				)
+			}
+		} else {
+			if len(args) == 0 || args[0] != "--no-optional-locks" {
+				r.t.Fatalf(
+					"read-only Git command %d did not disable optional locks: %q",
+					r.index,
+					args,
+				)
+			}
+			comparedArgs = args[1:]
+		}
+	}
 	if directory != step.directory || file != step.file ||
-		!reflect.DeepEqual(args, step.args) {
+		!reflect.DeepEqual(comparedArgs, step.args) {
 		r.t.Fatalf(
 			"command %d = dir %q, %s %q\nwant dir %q, %s %q",
-			r.index, directory, file, args,
+			r.index, directory, file, comparedArgs,
 			step.directory, step.file, step.args,
 		)
 	}
@@ -110,6 +132,8 @@ type fakePullRequestFixture struct {
 	targetHead  string
 	branch      string
 }
+
+const testPushURL = "git@example.test:Owner/Repo.git"
 
 func newFakePullRequestFixture(t *testing.T) fakePullRequestFixture {
 	t.Helper()
@@ -209,10 +233,10 @@ func fakePullRequestPreflight(fixture fakePullRequestFixture) []expectedCommand 
 	return append(steps,
 		git(fixture.repository,
 			[]string{"remote", "get-url", "--all", "origin"},
-			"https://example.test/owner/repo.git\n"),
+			"https://Example.test/Owner/Repo.git\n"),
 		git(fixture.repository,
 			[]string{"remote", "get-url", "--push", "--all", "origin"},
-			"git@example.test:owner/repo.git\n"),
+			"git@Example.test:Owner/Repo.git\n"),
 		git(fixture.repository,
 			[]string{"check-ref-format", "--branch", fixture.branch}, ""),
 	)
@@ -221,29 +245,37 @@ func fakePullRequestPreflight(fixture fakePullRequestFixture) []expectedCommand 
 func TestParseRemoteRepositoryIdentity(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name     string
-		value    string
-		selector string
-		identity string
-		valid    bool
+		name           string
+		value          string
+		selector       string
+		identity       string
+		targetURL      string
+		effectIdentity string
+		valid          bool
 	}{
 		{
 			name: "https", value: "https://GitHub.com/Owner/Repo.git",
-			selector: "github.com/Owner/Repo",
-			identity: "github.com/owner/repo",
-			valid:    true,
+			selector:       "github.com/Owner/Repo",
+			identity:       "github.com/owner/repo",
+			targetURL:      "https://github.com/Owner/Repo.git",
+			effectIdentity: "github.com/Owner/Repo",
+			valid:          true,
 		},
 		{
-			name: "ssh URL", value: "ssh://git@github.example/Owner/Repo.git",
-			selector: "github.example/Owner/Repo",
-			identity: "github.example/owner/repo",
-			valid:    true,
+			name: "ssh URL", value: "ssh://git@GitHub.example/Owner/Repo.git",
+			selector:       "github.example/Owner/Repo",
+			identity:       "github.example/owner/repo",
+			targetURL:      "ssh://git@github.example/Owner/Repo.git",
+			effectIdentity: "github.example/Owner/Repo",
+			valid:          true,
 		},
 		{
-			name: "scp", value: "git@github.example:Owner/Repo.git",
-			selector: "github.example/Owner/Repo",
-			identity: "github.example/owner/repo",
-			valid:    true,
+			name: "scp", value: "git@GitHub.example:Owner/Repo.git",
+			selector:       "github.example/Owner/Repo",
+			identity:       "github.example/owner/repo",
+			targetURL:      "git@github.example:Owner/Repo.git",
+			effectIdentity: "github.example/Owner/Repo",
+			valid:          true,
 		},
 		{name: "https credentials", value: "https://token@github.com/owner/repo.git"},
 		{name: "https password", value: "https://user:secret@github.com/owner/repo.git"},
@@ -270,14 +302,29 @@ func TestParseRemoteRepositoryIdentity(t *testing.T) {
 				return
 			}
 			if err != nil || identity.selector != test.selector ||
-				identity.identity != test.identity {
+				identity.identity != test.identity ||
+				identity.targetURL != test.targetURL ||
+				identity.effectIdentity != test.effectIdentity {
 				t.Fatalf(
-					"remote identity=%+v err=%v want selector=%q identity=%q",
+					"remote identity=%+v err=%v want selector=%q identity=%q target=%q effect=%q",
 					identity,
 					err,
 					test.selector,
 					test.identity,
+					test.targetURL,
+					test.effectIdentity,
 				)
+			}
+			if _, err := publicationeffect.NewPRBranchPush(
+				publicationeffect.PRBranchPushInput{
+					RepositoryIdentity: identity.effectIdentity,
+					RemoteURL:          identity.targetURL,
+					SourceOID:          strings.Repeat("a", 40),
+					TargetRef:          "refs/heads/autogora/test",
+					ExpectedAbsent:     true,
+				},
+			); err != nil {
+				t.Fatalf("canonical remote cannot describe a push: %v", err)
 			}
 		})
 	}
@@ -388,6 +435,8 @@ func TestPullRequestRejectsAmbiguousOrDifferentRemoteTargets(t *testing.T) {
 				Options{Runner: runner},
 			); !errors.Is(err, ErrInvalidInput) {
 				t.Fatalf("remote target error=%v", err)
+			} else if strings.Contains(err.Error(), "token@example.test") {
+				t.Fatalf("remote validation leaked credentials: %v", err)
 			}
 			runner.assertDone()
 		})
@@ -398,10 +447,10 @@ func TestPullRequestPushCASRaceReusesMatchingRemoteBranch(t *testing.T) {
 	fixture := newFakePullRequestFixture(t)
 	ref := "refs/heads/" + fixture.branch
 	remote := publicationRemote{
-		name:               "origin",
 		repositorySelector: "example.test/owner/repo",
 		repositoryIdentity: "example.test/owner/repo",
-		pushURL:            "git@example.test:owner/repo.git",
+		pushURL:            testPushURL,
+		pushEffectIdentity: "example.test/Owner/Repo",
 	}
 	runner := &scriptedRunner{
 		t: t,
@@ -417,7 +466,7 @@ func TestPullRequestPushCASRaceReusesMatchingRemoteBranch(t *testing.T) {
 			{
 				directory: fixture.repository,
 				file:      "git",
-				args:      []string{"ls-remote", "--heads", "origin", ref},
+				args:      []string{"ls-remote", "--heads", testPushURL, ref},
 			},
 			{
 				directory: fixture.repository,
@@ -425,14 +474,15 @@ func TestPullRequestPushCASRaceReusesMatchingRemoteBranch(t *testing.T) {
 				args: []string{
 					"push", "--porcelain",
 					"--force-with-lease=" + ref + ":",
-					"origin", fixture.head + ":" + ref,
+					testPushURL, fixture.head + ":" + ref,
 				},
-				err: fakeExitError{code: 1},
+				err:      fakeExitError{code: 1},
+				mutating: true,
 			},
 			{
 				directory: fixture.repository,
 				file:      "git",
-				args:      []string{"ls-remote", "--heads", "origin", ref},
+				args:      []string{"ls-remote", "--heads", testPushURL, ref},
 				output: CommandOutput{
 					Stdout: fixture.head + "\t" + ref + "\n",
 				},
@@ -466,18 +516,19 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"ls-remote", "--heads", "origin", ref},
+			args: []string{"ls-remote", "--heads", testPushURL, ref},
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
 			args: []string{
 				"push", "--porcelain", "--force-with-lease=" + ref + ":",
-				"origin", fixture.head + ":" + ref,
+				testPushURL, fixture.head + ":" + ref,
 			},
+			mutating: true,
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args:   []string{"ls-remote", "--heads", "origin", ref},
+			args:   []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{Stdout: fixture.head + "\t" + ref + "\n"},
 		},
 		expectedCommand{
@@ -520,8 +571,8 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 	}
 	expectedPush, err := publicationeffect.NewPRBranchPush(
 		publicationeffect.PRBranchPushInput{
-			RepositoryIdentity: "example.test/owner/repo",
-			RemoteURL:          "git@example.test:owner/repo.git",
+			RepositoryIdentity: "example.test/Owner/Repo",
+			RemoteURL:          testPushURL,
 			SourceOID:          fixture.head,
 			TargetRef:          ref,
 			ExpectedAbsent:     true,
@@ -609,7 +660,7 @@ func TestPullRequestCreateRaceReusesNewOpenPR(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"ls-remote", "--heads", "origin", ref},
+			args: []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{
 				Stdout: fixture.head + "\t" + ref + "\n",
 			},
@@ -663,7 +714,7 @@ func TestPullRequestReusesExistingBranchAndPR(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args:   []string{"ls-remote", "--heads", "origin", ref},
+			args:   []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{Stdout: fixture.head + "\t" + ref + "\n"},
 		},
 		expectedCommand{
@@ -702,7 +753,7 @@ func TestPullRequestRefusesRemoteBranchCollision(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"ls-remote", "--heads", "origin", ref},
+			args: []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{
 				Stdout: strings.Repeat("c", 40) + "\t" + ref + "\n",
 			},
@@ -733,7 +784,7 @@ func TestPullRequestReadOnlyReuseBypassesEffectExecutor(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"ls-remote", "--heads", "origin", ref},
+			args: []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{
 				Stdout: fixture.head + "\t" + ref + "\n",
 			},
@@ -802,7 +853,7 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"ls-remote", "--heads", "origin", ref},
+			args: []string{"ls-remote", "--heads", testPushURL, ref},
 			output: CommandOutput{
 				Stdout: fixture.head + "\t" + ref + "\n",
 			},

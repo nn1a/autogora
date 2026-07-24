@@ -15,6 +15,8 @@ import (
 
 var objectIDPattern = regexp.MustCompile(`\A[0-9a-fA-F]+\z`)
 
+const localUpdateInsteadReceivePack = "git -c receive.denyCurrentBranch=updateInstead receive-pack"
+
 type validatedPublication struct {
 	publication        model.Publication
 	repository         string
@@ -259,6 +261,13 @@ func (e *Engine) readCommand(
 	file string,
 	args ...string,
 ) (commandResult, error) {
+	if file == "git" {
+		// Git classifies index refreshes taken by otherwise observational
+		// commands (notably status) as optional locks. Disable those writes so
+		// every command on this path remains a probe. Mutation commands use
+		// effectCommand and do not receive this option.
+		args = append([]string{"--no-optional-locks"}, args...)
+	}
 	result, err := e.run(ctx, directory, file, args...)
 	if err == nil {
 		return result, nil
@@ -716,13 +725,18 @@ func (e *Engine) publishLocalFF(
 		}
 		if _, err := e.effectCommand(ctx, descriptor, targetWorktree,
 			"fast-forward checked-out target",
-			"git", "merge", "--ff-only", "--no-edit", publication.head); err != nil {
+			"git", "push", "--porcelain",
+			"--receive-pack="+localUpdateInsteadReceivePack,
+			"--force-with-lease="+publication.targetRef+":"+publication.targetHead,
+			targetWorktree,
+			publication.head+":"+publication.targetRef,
+		); err != nil {
 			if controlErr := commandControlError(err); controlErr != nil {
 				return result, controlErr
 			}
 			return result, semanticError(
 				ErrorNonFastForward, "fast-forward checked-out target",
-				ErrNonFastForward, "Git refused the fast-forward merge",
+				ErrNonFastForward, "Git refused the exact target fast-forward",
 			)
 		}
 	}

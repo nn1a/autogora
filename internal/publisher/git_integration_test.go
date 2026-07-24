@@ -41,6 +41,7 @@ type recordedEffect struct {
 type recordingEffectExecutor struct {
 	runner  CommandRunner
 	effects []recordedEffect
+	before  func(publicationeffect.Descriptor, EffectCommand)
 }
 
 func (e *recordingEffectExecutor) ExecuteEffect(
@@ -56,6 +57,9 @@ func (e *recordingEffectExecutor) ExecuteEffect(
 			Args:      append([]string(nil), command.Args...),
 		},
 	})
+	if e.before != nil {
+		e.before(descriptor, command)
+	}
 	return e.runner.Run(
 		ctx,
 		command.Directory,
@@ -179,6 +183,23 @@ func TestLocalFFCheckedOutTargetAndIdempotency(t *testing.T) {
 	if len(effects.effects) != 1 {
 		t.Fatalf("checked-out publication effects = %+v", effects.effects)
 	}
+	wantCommand := EffectCommand{
+		Directory: fixture.repository,
+		File:      "git",
+		Args: []string{
+			"push",
+			"--porcelain",
+			"--receive-pack=" + localUpdateInsteadReceivePack,
+			"--force-with-lease=refs/heads/main:" + fixture.base,
+			fixture.repository,
+			fixture.head + ":refs/heads/main",
+		},
+	}
+	if got := effects.effects[0].command; got.Directory != wantCommand.Directory ||
+		got.File != wantCommand.File ||
+		!reflect.DeepEqual(got.Args, wantCommand.Args) {
+		t.Fatalf("checked-out effect command = %+v, want %+v", got, wantCommand)
+	}
 	gitCommonDir := runGit(
 		t,
 		fixture.repository,
@@ -223,6 +244,54 @@ func TestLocalFFCheckedOutTargetAndIdempotency(t *testing.T) {
 	}
 	if second.Status != ResultAlreadyPublished {
 		t.Fatalf("idempotent result = %+v", second)
+	}
+}
+
+func TestLocalFFUpdatesCheckedOutLinkedWorktree(t *testing.T) {
+	fixture := newGitFixture(t)
+	runGit(t, fixture.repository, "branch", "host-work", fixture.base)
+	runGit(t, fixture.repository, "checkout", "host-work")
+	targetWorktree := filepath.Join(
+		filepath.Dir(fixture.repository),
+		"target worktree",
+	)
+	runGit(t, fixture.repository, "worktree", "add", targetWorktree, "main")
+
+	runner := &recordingExecRunner{}
+	effects := &recordingEffectExecutor{runner: runner}
+	result, err := Execute(context.Background(), fixture.publication, Options{
+		Runner:         runner,
+		EffectExecutor: effects,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != ResultPublished || len(effects.effects) != 1 {
+		t.Fatalf("linked-worktree result=%+v effects=%+v", result, effects.effects)
+	}
+	if command := effects.effects[0].command; command.Directory != targetWorktree ||
+		len(command.Args) < 5 || command.Args[4] != targetWorktree {
+		t.Fatalf("linked-worktree effect command = %+v", command)
+	}
+	if current := runGit(
+		t,
+		targetWorktree,
+		"rev-parse",
+		"HEAD",
+	); current != fixture.head {
+		t.Fatalf("linked target HEAD = %s, want %s", current, fixture.head)
+	}
+	content, readErr := os.ReadFile(filepath.Join(targetWorktree, "result.txt"))
+	if readErr != nil || string(content) != "captured\n" {
+		t.Fatalf("linked target files were not updated: %q, %v", content, readErr)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"branch",
+		"--show-current",
+	); current != "host-work" {
+		t.Fatalf("host worktree branch changed to %q", current)
 	}
 }
 
@@ -350,7 +419,7 @@ func TestLocalFFCompareAndSwapStartDenialRemainsControlError(t *testing.T) {
 	}
 }
 
-func TestLocalFFMergeStartDenialRemainsControlError(t *testing.T) {
+func TestLocalFFCheckedOutPushStartDenialRemainsControlError(t *testing.T) {
 	fixture := newGitFixture(t)
 	runner := &recordingExecRunner{}
 	gateCause := errors.New("publication authorization changed")
@@ -365,7 +434,7 @@ func TestLocalFFMergeStartDenialRemainsControlError(t *testing.T) {
 			) (bool, error) {
 				command := runner.commands[len(runner.commands)-1]
 				if command.file == "git" && len(command.args) > 0 &&
-					command.args[0] == "merge" {
+					command.args[0] == "push" {
 					return false, gateCause
 				}
 				return release()
@@ -376,7 +445,7 @@ func TestLocalFFMergeStartDenialRemainsControlError(t *testing.T) {
 	if !errors.As(err, &startErr) || startErr.Released ||
 		!errors.Is(err, gateCause) ||
 		errors.Is(err, ErrNonFastForward) {
-		t.Fatalf("merge start error=%v detail=%#v", err, startErr)
+		t.Fatalf("checked-out push start error=%v detail=%#v", err, startErr)
 	}
 	if current := runGit(
 		t,
@@ -384,7 +453,109 @@ func TestLocalFFMergeStartDenialRemainsControlError(t *testing.T) {
 		"rev-parse",
 		"main",
 	); current != fixture.base {
-		t.Fatalf("denied merge moved main to %s", current)
+		t.Fatalf("denied checked-out push moved main to %s", current)
+	}
+}
+
+func TestLocalFFCheckoutRaceNeverAdvancesTheNewCurrentBranch(t *testing.T) {
+	fixture := newGitFixture(t)
+	runner := &recordingExecRunner{}
+	switched := false
+	effects := &recordingEffectExecutor{
+		runner: runner,
+		before: func(
+			descriptor publicationeffect.Descriptor,
+			_ EffectCommand,
+		) {
+			if descriptor.Kind() != publicationeffect.KindLocalWorktreeFF {
+				return
+			}
+			runGit(t, fixture.repository, "branch", "user-work", fixture.base)
+			runGit(t, fixture.repository, "checkout", "user-work")
+			switched = true
+		},
+	}
+	result, err := Execute(context.Background(), fixture.publication, Options{
+		Runner:         runner,
+		EffectExecutor: effects,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !switched || result.Status != ResultPublished {
+		t.Fatalf("checkout race switched=%t result=%+v", switched, result)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"branch",
+		"--show-current",
+	); current != "user-work" {
+		t.Fatalf("race changed current branch to %q", current)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"user-work",
+	); current != fixture.base {
+		t.Fatalf("race advanced user-work to %s", current)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"main",
+	); current != fixture.head {
+		t.Fatalf("race did not advance exact main ref: %s", current)
+	}
+	if _, err := os.Stat(filepath.Join(
+		fixture.repository,
+		"result.txt",
+	)); !os.IsNotExist(err) {
+		t.Fatalf("race modified the newly checked-out worktree: %v", err)
+	}
+}
+
+func TestLocalFFDirtyRaceCannotAdvanceCheckedOutTarget(t *testing.T) {
+	fixture := newGitFixture(t)
+	runner := &recordingExecRunner{}
+	effects := &recordingEffectExecutor{
+		runner: runner,
+		before: func(
+			descriptor publicationeffect.Descriptor,
+			_ EffectCommand,
+		) {
+			if descriptor.Kind() == publicationeffect.KindLocalWorktreeFF {
+				writeTestFile(
+					t,
+					filepath.Join(fixture.repository, "README.md"),
+					"do not overwrite\n",
+				)
+			}
+		},
+	}
+	_, err := Execute(context.Background(), fixture.publication, Options{
+		Runner:         runner,
+		EffectExecutor: effects,
+	})
+	if !errors.Is(err, ErrNonFastForward) {
+		t.Fatalf("dirty race error = %v", err)
+	}
+	if current := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"main",
+	); current != fixture.base {
+		t.Fatalf("dirty race advanced main to %s", current)
+	}
+	content, readErr := os.ReadFile(filepath.Join(
+		fixture.repository,
+		"README.md",
+	))
+	if readErr != nil || string(content) != "do not overwrite\n" {
+		t.Fatalf("dirty race lost user work: %q, %v", content, readErr)
 	}
 }
 
