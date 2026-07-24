@@ -847,6 +847,186 @@ func clearPublicationAttemptCredentials(state *publicationAttemptPermitState) {
 	state.sessionToken = ""
 }
 
+func validatePublicationCommandStartCapability(
+	automation *AutomationPermit,
+	state *publicationAttemptPermitState,
+	board string,
+) error {
+	if automation == nil {
+		return ErrAutomationPermitClosed
+	}
+	if state == nil {
+		return ErrPublicationAttemptPermitClosed
+	}
+	if state.finished {
+		return ErrPublicationAttemptPermitClosed
+	}
+	if state.intent.ID == "" ||
+		state.intent.Board != board ||
+		state.intent.SessionID == "" ||
+		state.intent.GateGeneration < 0 ||
+		state.claimToken == "" ||
+		state.gateToken == "" ||
+		state.sessionToken == "" ||
+		state.authorityPath == "" ||
+		state.lockPath == "" ||
+		automation.authorityPath != state.authorityPath ||
+		automation.lockPath != state.lockPath ||
+		automation.generation != state.intent.GateGeneration ||
+		automation.token != state.gateToken ||
+		automation.sessionID != state.intent.SessionID ||
+		automation.sessionBoard != state.sessionBoard ||
+		automation.sessionToken != state.sessionToken ||
+		(state.sessionBoard != "*" && state.sessionBoard != board) {
+		return ErrPublicationAttemptScope
+	}
+	return nil
+}
+
+// WithPublicationAttemptCommandStart revalidates one exact automatic
+// publication attempt and invokes release at the irreversible process-start
+// boundary. The caller supplies a fresh session AutomationPermit for every
+// command and closes it after this method returns.
+//
+// Lock order is the AutomationPermit's already-held authority OS shared lock,
+// its mutex, the attempt mutex, then the board's immediate transaction. The
+// release callback must only open an already-started process fence; it must not
+// call Store methods or close either permit.
+func (s *Store) WithPublicationAttemptCommandStart(
+	ctx context.Context,
+	automation *AutomationPermit,
+	attempt *PublicationAttemptPermit,
+	release func() (bool, error),
+) (released bool, resultErr error) {
+	if release == nil {
+		return false, errors.New(
+			"publication command release callback is required",
+		)
+	}
+	if attempt == nil || attempt.state == nil {
+		return false, ErrPublicationAttemptPermitClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	transactionContext := context.WithoutCancel(ctx)
+	state := attempt.state
+	err := s.withAutomationPermitForBoard(
+		ctx,
+		automation,
+		s.board,
+		func() error {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			board, err := normalizePublicationBoard(
+				state.intent.Board,
+				s.board,
+			)
+			if err != nil {
+				return ErrPublicationAttemptScope
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := validatePublicationCommandStartCapability(
+				automation,
+				state,
+				board,
+			); err != nil {
+				return err
+			}
+			return s.withWrite(transactionContext, func(tx *sql.Tx) error {
+				storedIntent, err := publicationAttemptIntent(
+					transactionContext,
+					tx,
+					state.intent.ID,
+				)
+				if err != nil {
+					return err
+				}
+				if err := validatePublicationAttemptScope(
+					storedIntent,
+					state,
+					board,
+				); err != nil {
+					return err
+				}
+				if state.finished {
+					return ErrPublicationAttemptPermitClosed
+				}
+				if _, exists, err := publicationAttemptResult(
+					transactionContext,
+					tx,
+					storedIntent.ID,
+				); err != nil {
+					return err
+				} else if exists {
+					return ErrPublicationAttemptPermitClosed
+				}
+				current, err := publicationForBoard(
+					transactionContext,
+					tx,
+					storedIntent.PublicationID,
+					board,
+				)
+				if err != nil {
+					return err
+				}
+				if current.Status != model.PublicationPublishing ||
+					current.ClaimEpoch != storedIntent.ClaimEpoch ||
+					current.ClaimToken != state.claimToken ||
+					current.ClaimExpiresAt == nil {
+					return ErrPublicationAttemptScope
+				}
+				if current.UpdatedAt != storedIntent.PublicationUpdatedAt ||
+					*current.ClaimExpiresAt != storedIntent.ClaimExpiresAt ||
+					!publicationMatchesAttemptEffect(current, storedIntent) {
+					return ErrPublicationAttemptScope
+				}
+				// Session expiry advances without taking the authority lock.
+				// Keep the exact stored expiry so it can be sampled again
+				// after every other validation that may wait.
+				sessionExpiresAt, err :=
+					s.validateAutomationPermitLockedWithExpiry(
+						transactionContext,
+						automation,
+					)
+				if err != nil {
+					return err
+				}
+				currentTime, _, err := s.publicationCurrent()
+				if err != nil {
+					return err
+				}
+				if err := requireLivePublicationClaim(
+					current,
+					state.claimToken,
+					storedIntent.ClaimEpoch,
+					currentTime,
+				); err != nil {
+					return err
+				}
+				if err := validateAutomationSessionExpiry(
+					sessionExpiresAt,
+					time.Now().UTC(),
+				); err != nil {
+					return err
+				}
+				// This is the caller-cancellation linearization point. If
+				// cancellation wins, the process fence stays closed. If
+				// release wins, its result is authoritative and the detached
+				// transaction keeps the write barrier until release returns.
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				released, err = release()
+				return err
+			})
+		},
+	)
+	return released, err
+}
+
 // FinishAutomatedPublicationAttempt stores an immutable exact result. Known
 // results and the terminal publication transition commit together. It accepts
 // a matching result after claim expiry because cleanup must not turn a known
