@@ -406,6 +406,10 @@ func (s *Store) RunWithAutomationGateOpen(
 // automatic mutation or process-start boundary. It must not be retained for a
 // worker's lifetime.
 type AutomationPermit struct {
+	// self makes the acquired pointer part of the capability identity. A value
+	// copy retains the original pointer and therefore cannot use or close the
+	// copied lock handle.
+	self          *AutomationPermit
 	mu            sync.Mutex
 	lock          automationFileLock
 	authorityPath string
@@ -423,6 +427,9 @@ func (p *AutomationPermit) String() string {
 	if p == nil {
 		return "automation permit (nil)"
 	}
+	if p.self != p {
+		return "automation permit (invalid)"
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -436,6 +443,9 @@ func (p *AutomationPermit) GoString() string { return p.String() }
 func (p *AutomationPermit) Close() error {
 	if p == nil {
 		return nil
+	}
+	if p.self != p {
+		return ErrAutomationPermitClosed
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -544,7 +554,7 @@ func (s *Store) AcquireAutomationPermitForSession(
 			lock.Close(),
 		)
 	}
-	return &AutomationPermit{
+	permit := &AutomationPermit{
 		lock:          lock,
 		authorityPath: runtime.authorityPath,
 		lockPath:      runtime.lockPath,
@@ -553,7 +563,9 @@ func (s *Store) AcquireAutomationPermitForSession(
 		sessionID:     lease.SessionID,
 		sessionBoard:  lease.Board,
 		sessionToken:  lease.leaseToken,
-	}, nil
+	}
+	permit.self = permit
+	return permit, nil
 }
 
 type AutomationQuarantinedError struct {
@@ -572,7 +584,7 @@ func (s *Store) ValidateAutomationPermit(
 	ctx context.Context,
 	permit *AutomationPermit,
 ) error {
-	if permit == nil {
+	if permit == nil || permit.self != permit {
 		return ErrAutomationPermitClosed
 	}
 	permit.mu.Lock()
@@ -588,7 +600,8 @@ func (s *Store) validateAutomationPermitLocked(
 	if err != nil {
 		return err
 	}
-	if permit.closed || permit.lock == nil || permit.token == "" {
+	if permit.self != permit ||
+		permit.closed || permit.lock == nil || permit.token == "" {
 		return ErrAutomationPermitClosed
 	}
 	if permit.sessionID == "" || permit.sessionBoard == "" || permit.sessionToken == "" {
@@ -639,7 +652,7 @@ func (s *Store) withAutomationPermitForBoard(
 	board string,
 	mutate func() error,
 ) error {
-	if permit == nil {
+	if permit == nil || permit.self != permit {
 		return ErrAutomationPermitClosed
 	}
 	if mutate == nil {

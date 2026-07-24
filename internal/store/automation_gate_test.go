@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,12 @@ func registerAutomationTestSession(
 		t.Fatalf("register session = %s, acquired=%v, err=%v", lease, acquired, err)
 	}
 	return lease
+}
+
+func copyAutomationPermitForTest(permit *AutomationPermit) *AutomationPermit {
+	copied := reflect.New(reflect.TypeOf(permit).Elem())
+	copied.Elem().Set(reflect.ValueOf(permit).Elem())
+	return copied.Interface().(*AutomationPermit)
 }
 
 func activateAutomationTestSource(
@@ -1372,6 +1379,98 @@ func TestAutomationPermitRejectsExpiredReleasedAndWrongSession(t *testing.T) {
 	}
 	if _, err := opened.AcquireAutomationPermitForSession(ctx, expired); !errors.Is(err, ErrAutomationHostNotIdle) {
 		t.Fatalf("expired session permit error = %v", err)
+	}
+}
+
+func TestAutomationPermitValueCopyCannotUseOrReleaseOriginalCapability(t *testing.T) {
+	ctx := context.Background()
+	opened := openAutomationTestStore(t)
+	lease := registerAutomationTestSession(
+		t,
+		opened,
+		"default",
+		"dispatcher-copied-permit",
+	)
+	permit, err := opened.AcquireAutomationPermitForSession(ctx, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied := copyAutomationPermitForTest(permit)
+
+	if err := opened.ValidateAutomationPermit(ctx, copied); !errors.Is(
+		err,
+		ErrAutomationPermitClosed,
+	) {
+		t.Fatalf("copied permit validation error = %v", err)
+	}
+	mutated := false
+	if err := opened.WithAutomationPermit(ctx, copied, func() error {
+		mutated = true
+		return nil
+	}); !errors.Is(err, ErrAutomationPermitClosed) {
+		t.Fatalf("copied permit mutation error = %v", err)
+	}
+	if mutated {
+		t.Fatal("copied permit ran the guarded mutation")
+	}
+	if err := copied.Close(); !errors.Is(err, ErrAutomationPermitClosed) {
+		t.Fatalf("copied permit close error = %v", err)
+	}
+	for label, rendered := range map[string]string{
+		"string":    copied.String(),
+		"go-string": copied.GoString(),
+		"formatted": fmt.Sprintf("%+v %#v", copied, copied),
+	} {
+		if strings.Contains(rendered, lease.leaseToken) ||
+			strings.Contains(rendered, opened.automation.lockPath) {
+			t.Fatalf("%s rendered a copied permit secret: %s", label, rendered)
+		}
+	}
+
+	blockedContext, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	_, _, blockedErr := opened.ActivateAutomationQuarantine(
+		blockedContext,
+		AutomationQuarantineSourceInput{
+			Board:             "default",
+			Kind:              automationTestSourceKind,
+			SourceID:          "copied-permit-must-not-unlock",
+			ObservedUpdatedAt: "epoch-one",
+			DiagnosticCode:    "copied_permit_close",
+		},
+	)
+	if !errors.Is(blockedErr, context.DeadlineExceeded) {
+		t.Fatalf("quarantine behind copied Close error = %v", blockedErr)
+	}
+	if err := opened.ValidateAutomationPermit(ctx, permit); err != nil {
+		t.Fatalf("original permit after copied Close: %v", err)
+	}
+	mutated = false
+	if err := opened.WithAutomationPermit(ctx, permit, func() error {
+		mutated = true
+		return nil
+	}); err != nil {
+		t.Fatalf("original permit mutation: %v", err)
+	}
+	if !mutated {
+		t.Fatal("original permit did not run the guarded mutation")
+	}
+
+	if err := permit.Close(); err != nil {
+		t.Fatal(err)
+	}
+	copiedAfterClose := copyAutomationPermitForTest(permit)
+	if err := opened.ValidateAutomationPermit(
+		ctx,
+		copiedAfterClose,
+	); !errors.Is(err, ErrAutomationPermitClosed) {
+		t.Fatalf("post-close copy validation error = %v", err)
+	}
+	if err := copiedAfterClose.Close(); !errors.Is(
+		err,
+		ErrAutomationPermitClosed,
+	) {
+		t.Fatalf("post-close copy close error = %v", err)
 	}
 }
 
