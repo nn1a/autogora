@@ -21,6 +21,7 @@ import (
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/notifications"
 	"github.com/nn1a/autogora/internal/orchestration"
+	"github.com/nn1a/autogora/internal/processguard"
 	"github.com/nn1a/autogora/internal/processidentity"
 	"github.com/nn1a/autogora/internal/publisher"
 	"github.com/nn1a/autogora/internal/runcontrol"
@@ -340,6 +341,21 @@ func recoverRunWithWorkspaceProtection(ctx context.Context, opened *store.Store,
 	bound, err := opened.GetRunWorkspace(ctx, runID)
 	if err != nil {
 		return err
+	}
+	if failure := automaticRecoveryCapabilityFailure(
+		bound,
+		currentAutomaticMutationCapability(),
+	); failure != nil {
+		return recoverObservedRunBlockedDurably(
+			ctx,
+			opened,
+			observation,
+			store.RecoverBlockedRunInput{
+				Outcome: outcome,
+				Reason:  failure.Error(),
+				Kind:    model.BlockKindCapability,
+			},
+		)
 	}
 	integrationResolution, err := opened.HasRunIntegrationResolution(ctx, runID)
 	if err != nil {
@@ -1741,6 +1757,24 @@ func finalizeManagedTerminal(ctx context.Context, opened *store.Store, workspace
 
 func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store, claim *model.ClaimedTask, options Options, processes *ProcessSet, clineApprovalDir string) (runErr error) {
 	scope := store.RunScope{RunID: claim.Run.ID, ClaimToken: claim.ClaimToken}
+	blocked, err := blockUnsupportedAutomaticClaim(
+		ctx,
+		manager,
+		opened,
+		claim,
+		options,
+		currentAutomaticMutationCapability(),
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"persist automatic mutation capability block for %s: %w",
+			claim.Task.Task.ID,
+			err,
+		)
+	}
+	if blocked {
+		return nil
+	}
 	var agentLease *agentcapacity.Lease
 	defer func() {
 		if agentLease == nil {
@@ -1917,6 +1951,7 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 	claim.Task.Task.Runtime = configured.Runtime
 	workspaces := workspace.New(manager)
 	workspaces.SetAllowWrites(options.AllowWrites)
+	workspaces.SetAutomaticMutationContainmentRequired(true)
 	if options.WorkingDirectory != "" {
 		workspaces.SetWorkingDirectory(options.WorkingDirectory)
 	}
@@ -1930,6 +1965,33 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		durable, cancel := durableRunContext()
 		defer cancel()
+		if errors.Is(
+			err,
+			processguard.ErrAutomaticMutationContainmentUnavailable,
+		) {
+			failure := automaticMutationCapabilityFailure(
+				currentAutomaticMutationCapability(),
+				"automatic Git worktree preparation, integration, and checkpoint capture",
+			)
+			if persistErr := persistAutomaticMutationCapabilityBlock(
+				durable,
+				opened,
+				scope,
+				failure.Error(),
+			); persistErr != nil {
+				return fmt.Errorf(
+					"persist workspace mutation capability block for %s: %w",
+					claim.Task.Task.ID,
+					errors.Join(err, persistErr),
+				)
+			}
+			options.log(
+				"blocked %s at automatic workspace mutation boundary: %v",
+				claim.Task.Task.ID,
+				failure,
+			)
+			return nil
+		}
 		failure := store.FailRunOptions{FailureLimit: options.FailureLimit}
 		if errors.Is(err, store.ErrResourceBusy) {
 			countFailure := false

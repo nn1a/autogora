@@ -170,6 +170,24 @@ func executePublication(
 	options Options,
 	current time.Time,
 ) (bool, error) {
+	return executePublicationWithCapability(
+		ctx,
+		opened,
+		value,
+		options,
+		current,
+		currentAutomaticMutationCapability(),
+	)
+}
+
+func executePublicationWithCapability(
+	ctx context.Context,
+	opened *store.Store,
+	value model.Publication,
+	options Options,
+	current time.Time,
+	capability automaticMutationCapability,
+) (bool, error) {
 	claimed, acquired, err := opened.ClaimPublication(
 		ctx,
 		value.ID,
@@ -188,6 +206,46 @@ func executePublication(
 	}
 	if !acquired {
 		return false, nil
+	}
+	if capabilityErr := automaticPublicationCapabilityFailure(
+		claimed,
+		capability,
+	); capabilityErr != nil {
+		finishedAt := options.currentTime()
+		persistenceContext, cancelPersistence := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			publicationPersistenceTimeout,
+		)
+		defer cancelPersistence()
+		_, failErr := opened.FailPublication(
+			persistenceContext,
+			claimed.ID,
+			store.FailPublicationInput{
+				ExpectedUpdatedAt: claimed.UpdatedAt,
+				ClaimToken:        claimed.ClaimToken,
+				Current:           finishedAt,
+				Error:             boundedPublicationFailure(capabilityErr),
+			},
+		)
+		if failErr != nil {
+			return true, errors.Join(
+				fmt.Errorf(
+					"block unsupported automatic publication %s: %w",
+					claimed.ID,
+					capabilityErr,
+				),
+				fmt.Errorf(
+					"persist publication %s capability failure: %w",
+					claimed.ID,
+					failErr,
+				),
+			)
+		}
+		return true, fmt.Errorf(
+			"block unsupported automatic publication %s: %w",
+			claimed.ID,
+			capabilityErr,
+		)
 	}
 	executionContext, cancel := context.WithTimeout(ctx, options.PublicationTimeout)
 	result, executionErr := options.PublicationExecutor(

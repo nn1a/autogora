@@ -19,15 +19,26 @@ import (
 const hostGitCommandLimit = 10 * time.Minute
 
 type Manager struct {
-	boards      *boards.Manager
-	cwd         string
-	allowWrites bool
+	boards                               *boards.Manager
+	cwd                                  string
+	allowWrites                          bool
+	automaticMutationContainmentRequired bool
 }
 
 func New(manager *boards.Manager) *Manager { return &Manager{boards: manager} }
 
 func (m *Manager) SetWorkingDirectory(path string) { m.cwd = path }
 func (m *Manager) SetAllowWrites(value bool)       { m.allowWrites = value }
+func (m *Manager) SetAutomaticMutationContainmentRequired(value bool) {
+	m.automaticMutationContainmentRequired = value
+}
+
+func (m *Manager) requireAutomaticMutationContainment(operation string) error {
+	if !m.automaticMutationContainmentRequired {
+		return nil
+	}
+	return processguard.RequireAutomaticMutationContainment(operation)
+}
 
 func expandHome(path string) (string, error) {
 	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, `~\`) {
@@ -296,6 +307,11 @@ func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model
 		if !ok {
 			return nil, fmt.Errorf("worktree workspace requires a git repository: %s", source)
 		}
+		if err := m.requireAutomaticMutationContainment(
+			"automatic Git worktree creation",
+		); err != nil {
+			return nil, err
+		}
 		base, err := addWorktree(ctx, repository, path, task.Branch)
 		if err != nil {
 			return nil, err
@@ -345,6 +361,11 @@ func (m *Manager) Prepare(ctx context.Context, opened *store.Store, claim *model
 			}
 			path = filepath.Join(workspaceRoot, task.ID, claim.Run.ID)
 			generated = true
+			if err := m.requireAutomaticMutationContainment(
+				"automatic Git worktree creation",
+			); err != nil {
+				return nil, err
+			}
 			base, err := addWorktree(ctx, repository, path, task.Branch)
 			if err != nil {
 				return nil, err
