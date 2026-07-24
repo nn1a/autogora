@@ -209,19 +209,31 @@ func (s *Store) withWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 }
 
 // withWriteUnchecked exists only for board-removal barrier maintenance,
-// callback-scoped exact operator recovery, and exact in-flight publication
-// result cleanup. All ordinary store mutations must use withWrite so an
-// already-open Store cannot modify a board after removal begins.
+// callback-scoped exact operator recovery, and exact in-flight publication or
+// publication-effect result cleanup. All ordinary store mutations must use
+// withWrite so an already-open Store cannot modify a board after removal
+// begins.
 func (s *Store) withWriteUnchecked(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Rollback is safe after a failed commit and, critically, also
+			// runs while a panic unwinds through a mutation callback.
+			_ = tx.Rollback()
+		}
+	}()
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func requireTask(ctx context.Context, q querier, taskID string) (model.Task, error) {

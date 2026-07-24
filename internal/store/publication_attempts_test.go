@@ -1111,7 +1111,7 @@ func TestSchema30AddsImmutablePublicationAttemptLedger(t *testing.T) {
 	`).Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || schemaVersion != 30 ||
+	if version != schemaVersion || schemaVersion != 31 ||
 		tables != 2 || triggers != 7 || foreignKeys != 0 {
 		t.Fatalf(
 			"publication attempt migration version=%d constant=%d tables=%d triggers=%d foreignKeys=%d",
@@ -1160,6 +1160,12 @@ func TestSchema30MigratesNullableProvenanceAndRejectsOldEvidence(
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER
+			publication_attempt_results_require_resolved_effects;
+		DROP TRIGGER
+			publication_attempt_results_require_unknown_effect_outcome;
+		DROP TABLE publication_effect_results;
+		DROP TABLE publication_effect_intents;
 		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
 		DROP TRIGGER publication_attempt_results_require_v30_evidence;
 		ALTER TABLE publication_attempt_intents
@@ -1250,6 +1256,12 @@ func TestSchema30ConcurrentOpenSerializesProvenanceMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER
+			publication_attempt_results_require_resolved_effects;
+		DROP TRIGGER
+			publication_attempt_results_require_unknown_effect_outcome;
+		DROP TABLE publication_effect_results;
+		DROP TABLE publication_effect_intents;
 		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
 		DROP TRIGGER publication_attempt_results_require_v30_evidence;
 		ALTER TABLE publication_attempt_intents
@@ -1298,7 +1310,7 @@ func TestOpenRejectsNewerSchemaWithoutMutation(t *testing.T) {
 	}
 	if _, err := raw.ExecContext(ctx, `
 		DROP INDEX idx_publication_attempt_intents_publication;
-		PRAGMA user_version = 31;
+		PRAGMA user_version = 32;
 	`); err != nil {
 		raw.Close()
 		t.Fatal(err)
@@ -1311,7 +1323,7 @@ func TestOpenRejectsNewerSchemaWithoutMutation(t *testing.T) {
 		t.Fatal("newer schema unexpectedly opened")
 	} else if !strings.Contains(
 		err.Error(),
-		"schema version 31 is newer than supported version 30",
+		"schema version 32 is newer than supported version 31",
 	) {
 		t.Fatalf("newer schema error=%v", err)
 	}
@@ -1342,7 +1354,7 @@ func TestOpenRejectsNewerSchemaWithoutMutation(t *testing.T) {
 	`).Scan(&provenanceColumns); err != nil {
 		t.Fatal(err)
 	}
-	if version != 31 || indexCount != 0 || provenanceColumns != 1 {
+	if version != 32 || indexCount != 0 || provenanceColumns != 1 {
 		t.Fatalf(
 			"newer schema mutated: version=%d index=%d provenanceColumns=%d",
 			version,

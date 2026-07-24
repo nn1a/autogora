@@ -134,7 +134,8 @@ type publicationAttemptPermitState struct {
 	mu       sync.Mutex
 	finished bool
 
-	intent PublicationAttemptIntent
+	intent  PublicationAttemptIntent
+	effects map[string]*publicationEffectPermitState
 
 	claimToken string
 
@@ -1346,6 +1347,14 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 			}
 			if state.finished {
 				return ErrPublicationAttemptResultConflict
+			}
+			if err := validatePublicationAttemptEffectOutcomes(
+				ctx,
+				tx,
+				storedIntent.ID,
+				input.Outcome,
+			); err != nil {
+				return err
 			}
 
 			current, err := publicationForBoard(

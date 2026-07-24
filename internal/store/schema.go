@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 30
+const schemaVersion = 31
 
 type Store struct {
 	db               *sql.DB
@@ -142,6 +142,13 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.requireSupportedCoordinationProposalSchema(ctx); err != nil {
 		return err
 	}
+	// A real v30 database must cross the v31 effect-ledger boundary in one
+	// immediate transaction before the broad idempotent schema ensure runs.
+	// Older and empty databases do not yet have the v30 parent contract, so
+	// they are handled after their existing migrations complete.
+	if err := s.ensurePublicationEffectSchema(ctx, false); err != nil {
+		return err
+	}
 	var definition string
 	err := s.db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").Scan(&definition)
 	switch {
@@ -194,6 +201,12 @@ func (s *Store) initialize(ctx context.Context) error {
 		return err
 	}
 	if err := s.validateRecoveryCompletionInvariants(ctx); err != nil {
+		return err
+	}
+	// Empty and pre-v30 stores must finish their historical migrations before
+	// the v31 ledger performs a database-wide foreign-key integrity check.
+	// A real v30/v31 store was already handled by the first call above.
+	if err := s.ensurePublicationEffectSchema(ctx, true); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {

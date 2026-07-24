@@ -881,7 +881,7 @@ func TestPlannerLedgerMigratesV28AndPreservesExistingTasks(
 	`).Scan(&errorHashColumns); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || schemaVersion != 30 ||
+	if version != schemaVersion || schemaVersion != 31 ||
 		tableCount != 2 || triggerCount != 5 ||
 		errorHashColumns != 1 {
 		t.Fatalf(
