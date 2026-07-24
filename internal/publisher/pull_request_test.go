@@ -210,8 +210,247 @@ func fakePullRequestPreflight(fixture fakePullRequestFixture) []expectedCommand 
 			[]string{"remote", "get-url", "--all", "origin"},
 			"https://example.test/owner/repo.git\n"),
 		git(fixture.repository,
+			[]string{"remote", "get-url", "--push", "--all", "origin"},
+			"git@example.test:owner/repo.git\n"),
+		git(fixture.repository,
 			[]string{"check-ref-format", "--branch", fixture.branch}, ""),
 	)
+}
+
+func TestParseRemoteRepositoryIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		value    string
+		selector string
+		identity string
+		valid    bool
+	}{
+		{
+			name: "https", value: "https://GitHub.com/Owner/Repo.git",
+			selector: "github.com/Owner/Repo",
+			identity: "github.com/owner/repo",
+			valid:    true,
+		},
+		{
+			name: "ssh URL", value: "ssh://git@github.example/Owner/Repo.git",
+			selector: "github.example/Owner/Repo",
+			identity: "github.example/owner/repo",
+			valid:    true,
+		},
+		{
+			name: "scp", value: "git@github.example:Owner/Repo.git",
+			selector: "github.example/Owner/Repo",
+			identity: "github.example/owner/repo",
+			valid:    true,
+		},
+		{name: "https credentials", value: "https://token@github.com/owner/repo.git"},
+		{name: "https password", value: "https://user:secret@github.com/owner/repo.git"},
+		{name: "ssh password", value: "ssh://git:secret@github.com/owner/repo.git"},
+		{name: "ssh non git user", value: "ssh://person@github.com/owner/repo.git"},
+		{name: "scp non git user", value: "person@github.com:owner/repo.git"},
+		{name: "query", value: "https://github.com/owner/repo.git?token=secret"},
+		{name: "fragment", value: "https://github.com/owner/repo.git#fragment"},
+		{name: "escaped path", value: "https://github.com/owner%2Frepo.git"},
+		{name: "nested path", value: "https://github.com/group/owner/repo.git"},
+		{name: "local path", value: "/tmp/owner/repo.git"},
+		{name: "file URL", value: "file:///tmp/owner/repo.git"},
+		{name: "port", value: "https://github.com:443/owner/repo.git"},
+		{name: "control", value: "https://github.com/owner/repo.git\n"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			identity, err := parseRemoteRepositoryIdentity(test.value)
+			if !test.valid {
+				if !errors.Is(err, ErrInvalidInput) {
+					t.Fatalf("invalid remote error=%v identity=%+v", err, identity)
+				}
+				return
+			}
+			if err != nil || identity.selector != test.selector ||
+				identity.identity != test.identity {
+				t.Fatalf(
+					"remote identity=%+v err=%v want selector=%q identity=%q",
+					identity,
+					err,
+					test.selector,
+					test.identity,
+				)
+			}
+		})
+	}
+}
+
+func TestPullRequestURLIsBoundToConfiguredRepository(t *testing.T) {
+	t.Parallel()
+	remote := publicationRemote{
+		repositorySelector: "example.test/Owner/Repo",
+		repositoryIdentity: "example.test/owner/repo",
+	}
+	for _, test := range []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{
+			name:  "exact repository",
+			value: "https://example.test/Owner/Repo/pull/42",
+			valid: true,
+		},
+		{
+			name:  "case insensitive repository",
+			value: "https://EXAMPLE.test/owner/repo/pull/7",
+			valid: true,
+		},
+		{name: "wrong host", value: "https://other.test/owner/repo/pull/42"},
+		{name: "wrong owner", value: "https://example.test/other/repo/pull/42"},
+		{name: "wrong repo", value: "https://example.test/owner/other/pull/42"},
+		{name: "zero number", value: "https://example.test/owner/repo/pull/0"},
+		{name: "negative number", value: "https://example.test/owner/repo/pull/-1"},
+		{name: "query", value: "https://example.test/owner/repo/pull/42?token=x"},
+		{name: "fragment", value: "https://example.test/owner/repo/pull/42#diff"},
+		{name: "credentials", value: "https://token@example.test/owner/repo/pull/42"},
+		{name: "insecure", value: "http://example.test/owner/repo/pull/42"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			value, err := validPullRequestURL(test.value, remote)
+			if test.valid {
+				if err != nil || value != test.value {
+					t.Fatalf("valid URL=%q err=%v", value, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrCommandFailed) {
+				t.Fatalf("invalid URL value=%q err=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestPullRequestRejectsAmbiguousOrDifferentRemoteTargets(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		fetch string
+		push  string
+	}{
+		{
+			name: "multiple fetch URLs",
+			fetch: "https://example.test/owner/repo.git\n" +
+				"https://mirror.test/owner/repo.git\n",
+			push: "git@example.test:owner/repo.git\n",
+		},
+		{
+			name:  "multiple push URLs",
+			fetch: "https://example.test/owner/repo.git\n",
+			push: "git@example.test:owner/repo.git\n" +
+				"git@mirror.test:owner/repo.git\n",
+		},
+		{
+			name:  "different target",
+			fetch: "https://example.test/owner/repo.git\n",
+			push:  "git@example.test:owner/other.git\n",
+		},
+		{
+			name:  "embedded credential",
+			fetch: "https://token@example.test/owner/repo.git\n",
+			push:  "git@example.test:owner/repo.git\n",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFakePullRequestFixture(t)
+			steps := fakeValidationSteps(fixture)
+			steps = append(
+				steps,
+				expectedCommand{
+					directory: fixture.repository,
+					file:      "git",
+					args:      []string{"remote", "get-url", "--all", "origin"},
+					output:    CommandOutput{Stdout: test.fetch},
+				},
+				expectedCommand{
+					directory: fixture.repository,
+					file:      "git",
+					args: []string{
+						"remote", "get-url", "--push", "--all", "origin",
+					},
+					output: CommandOutput{Stdout: test.push},
+				},
+			)
+			runner := &scriptedRunner{t: t, steps: steps}
+			if _, err := Execute(
+				context.Background(),
+				fixture.publication,
+				Options{Runner: runner},
+			); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("remote target error=%v", err)
+			}
+			runner.assertDone()
+		})
+	}
+}
+
+func TestPullRequestPushCASRaceReusesMatchingRemoteBranch(t *testing.T) {
+	fixture := newFakePullRequestFixture(t)
+	ref := "refs/heads/" + fixture.branch
+	remote := publicationRemote{
+		name:               "origin",
+		repositorySelector: "example.test/owner/repo",
+		repositoryIdentity: "example.test/owner/repo",
+	}
+	runner := &scriptedRunner{
+		t: t,
+		steps: []expectedCommand{
+			{
+				directory: fixture.repository,
+				file:      "git",
+				args: []string{
+					"for-each-ref", "--format=%(objectname)%00%(refname)",
+					"--", ref,
+				},
+			},
+			{
+				directory: fixture.repository,
+				file:      "git",
+				args:      []string{"ls-remote", "--heads", "origin", ref},
+			},
+			{
+				directory: fixture.repository,
+				file:      "git",
+				args: []string{
+					"push", "--porcelain",
+					"--force-with-lease=" + ref + ":",
+					"origin", fixture.head + ":" + ref,
+				},
+				err: fakeExitError{code: 1},
+			},
+			{
+				directory: fixture.repository,
+				file:      "git",
+				args:      []string{"ls-remote", "--heads", "origin", ref},
+				output: CommandOutput{
+					Stdout: fixture.head + "\t" + ref + "\n",
+				},
+			},
+		},
+	}
+	engine := New(Options{Runner: runner})
+	existed, err := engine.ensurePullRequestBranch(
+		context.Background(),
+		validatedPublication{
+			repository: fixture.repository,
+			head:       fixture.head,
+		},
+		remote,
+		fixture.branch,
+	)
+	if err != nil || !existed {
+		t.Fatalf("CAS race existed=%t err=%v", existed, err)
+	}
+	runner.assertDone()
 }
 
 func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
@@ -229,7 +468,10 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
-			args: []string{"push", "--porcelain", "origin", fixture.head + ":" + ref},
+			args: []string{
+				"push", "--porcelain", "--force-with-lease=" + ref + ":",
+				"origin", fixture.head + ":" + ref,
+			},
 		},
 		expectedCommand{
 			directory: fixture.repository, file: "git",
@@ -239,7 +481,8 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"pr", "list", "--repo", "example.test/owner/repo",
+				"--head", fixture.branch, "--base", "main",
 				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
 			},
 			output: CommandOutput{Stdout: "[]\n"},
@@ -247,7 +490,8 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "create", "--base", "main", "--head", fixture.branch,
+				"pr", "create", "--repo", "example.test/owner/repo",
+				"--base", "main", "--head", fixture.branch,
 				"--title", "Autogora: publish Task / Unsafe Name",
 				"--body", pullRequestBody(validatedPublication{
 					publication: fixture.publication, head: fixture.head,
@@ -268,13 +512,25 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		result.URL == nil || *result.URL != "https://example.test/owner/repo/pull/42" {
 		t.Fatalf("pull-request result = %+v", result)
 	}
+	foundAbsentRefLease := false
 	for _, step := range steps {
 		joined := strings.Join(step.args, " ")
-		for _, forbidden := range []string{"--force", "reset", "stash", "rebase"} {
+		for _, argument := range step.args {
+			if argument == "--force" {
+				t.Fatalf("unsafe command was issued: %s %s", step.file, joined)
+			}
+			if argument == "--force-with-lease="+ref+":" {
+				foundAbsentRefLease = true
+			}
+		}
+		for _, forbidden := range []string{"reset", "stash", "rebase"} {
 			if strings.Contains(joined, forbidden) {
 				t.Fatalf("unsafe command was issued: %s %s", step.file, joined)
 			}
 		}
+	}
+	if !foundAbsentRefLease {
+		t.Fatal("pull-request branch push did not use an absent-ref lease")
 	}
 }
 
@@ -284,7 +540,8 @@ func TestPullRequestCreateRaceReusesNewOpenPR(t *testing.T) {
 	ref := "refs/heads/" + fixture.branch
 	url := "https://example.test/owner/repo/pull/99"
 	listArgs := []string{
-		"pr", "list", "--head", fixture.branch, "--base", "main",
+		"pr", "list", "--repo", "example.test/owner/repo",
+		"--head", fixture.branch, "--base", "main",
 		"--state", "open", "--limit", "100", "--json", "url,headRefOid",
 	}
 	steps = append(steps,
@@ -308,7 +565,8 @@ func TestPullRequestCreateRaceReusesNewOpenPR(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "create", "--base", "main", "--head", fixture.branch,
+				"pr", "create", "--repo", "example.test/owner/repo",
+				"--base", "main", "--head", fixture.branch,
 				"--title", "Autogora: publish Task / Unsafe Name",
 				"--body", pullRequestBody(validatedPublication{
 					publication: fixture.publication, head: fixture.head,
@@ -355,7 +613,8 @@ func TestPullRequestReusesExistingBranchAndPR(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"pr", "list", "--repo", "example.test/owner/repo",
+				"--head", fixture.branch, "--base", "main",
 				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
 			},
 			output: CommandOutput{Stdout: `[{"url":"` + url +
@@ -426,7 +685,8 @@ func TestPullRequestReleaseGateRunsForEveryCommand(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"pr", "list", "--repo", "example.test/owner/repo",
+				"--head", fixture.branch, "--base", "main",
 				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
 			},
 			output: CommandOutput{Stdout: `[{"url":"` + url +
@@ -519,7 +779,8 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 	steps := fakePullRequestPreflight(fixture)
 	ref := "refs/heads/" + fixture.branch
 	createArgs := []string{
-		"pr", "create", "--base", "main", "--head", fixture.branch,
+		"pr", "create", "--repo", "example.test/owner/repo",
+		"--base", "main", "--head", fixture.branch,
 		"--title", "Autogora: publish Task / Unsafe Name",
 		"--body", pullRequestBody(validatedPublication{
 			publication: fixture.publication, head: fixture.head,
@@ -543,7 +804,8 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 		expectedCommand{
 			directory: fixture.repository, file: "gh",
 			args: []string{
-				"pr", "list", "--head", fixture.branch, "--base", "main",
+				"pr", "list", "--repo", "example.test/owner/repo",
+				"--head", fixture.branch, "--base", "main",
 				"--state", "open", "--limit", "100", "--json", "url,headRefOid",
 			},
 			output: CommandOutput{Stdout: "[]\n"},

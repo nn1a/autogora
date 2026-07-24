@@ -6,11 +6,29 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
 
 var safeRemotePattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
+var safeRemoteHostPattern = regexp.MustCompile(
+	`\A[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\z`,
+)
+var safeRepositoryComponentPattern = regexp.MustCompile(
+	`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`,
+)
+
+type publicationRemote struct {
+	name               string
+	repositorySelector string
+	repositoryIdentity string
+}
+
+type remoteRepositoryIdentity struct {
+	selector string
+	identity string
+}
 
 type pullRequestRecord struct {
 	URL        string `json:"url"`
@@ -28,6 +46,144 @@ func validateRemote(raw string) (string, error) {
 		)
 	}
 	return remote, nil
+}
+
+func parseRemoteRepositoryIdentity(
+	raw string,
+) (remoteRepositoryIdentity, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) || len(raw) > 8*1024 ||
+		strings.IndexByte(raw, 0) >= 0 {
+		return remoteRepositoryIdentity{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication remote",
+			ErrInvalidInput,
+			"publication remote URL must be non-empty, bounded, and unmodified",
+		)
+	}
+	for _, value := range raw {
+		if unicode.IsControl(value) {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote URL contains control characters",
+			)
+		}
+	}
+
+	host := ""
+	path := ""
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+			parsed.Hostname() == "" || parsed.Port() != "" {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote URL is not an unambiguous repository URL",
+			)
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "https":
+			if parsed.User != nil {
+				return remoteRepositoryIdentity{}, semanticError(
+					ErrorInvalidInput,
+					"resolve publication remote",
+					ErrInvalidInput,
+					"publication remote URL must not contain embedded credentials",
+				)
+			}
+		case "ssh":
+			password, hasPassword := "", false
+			if parsed.User != nil {
+				password, hasPassword = parsed.User.Password()
+			}
+			if parsed.User == nil || parsed.User.Username() != "git" ||
+				hasPassword || password != "" {
+				return remoteRepositoryIdentity{}, semanticError(
+					ErrorInvalidInput,
+					"resolve publication remote",
+					ErrInvalidInput,
+					"SSH publication remotes must use the credential-free git user",
+				)
+			}
+		default:
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote URL must use HTTPS or SSH",
+			)
+		}
+		if parsed.EscapedPath() != parsed.Path {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote URL must not contain escaped path components",
+			)
+		}
+		host = parsed.Hostname()
+		path = strings.TrimPrefix(parsed.Path, "/")
+	} else {
+		left, right, found := strings.Cut(raw, ":")
+		if !found || strings.Count(raw, ":") != 1 {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote must identify one hosted repository",
+			)
+		}
+		user, remoteHost, found := strings.Cut(left, "@")
+		if !found || user != "git" || remoteHost == "" {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"SCP publication remotes must use the credential-free git user",
+			)
+		}
+		host, path = remoteHost, right
+	}
+
+	host = strings.ToLower(host)
+	if !safeRemoteHostPattern.MatchString(host) ||
+		strings.Contains(host, "..") {
+		return remoteRepositoryIdentity{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication remote",
+			ErrInvalidInput,
+			"publication remote host is not safe",
+		)
+	}
+	path = strings.TrimSuffix(path, ".git")
+	components := strings.Split(path, "/")
+	if len(components) != 2 {
+		return remoteRepositoryIdentity{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication remote",
+			ErrInvalidInput,
+			"publication remote must identify exactly one owner and repository",
+		)
+	}
+	for _, component := range components {
+		if component == "." || component == ".." ||
+			!safeRepositoryComponentPattern.MatchString(component) {
+			return remoteRepositoryIdentity{}, semanticError(
+				ErrorInvalidInput,
+				"resolve publication remote",
+				ErrInvalidInput,
+				"publication remote owner or repository is not safe",
+			)
+		}
+	}
+	selector := host + "/" + components[0] + "/" + components[1]
+	return remoteRepositoryIdentity{
+		selector: selector,
+		identity: strings.ToLower(selector),
+	}, nil
 }
 
 func sanitizedTaskID(raw string) (string, error) {
@@ -97,40 +253,82 @@ func (e *Engine) pullRequestBranch(
 func (e *Engine) configuredRemote(
 	ctx context.Context,
 	publication validatedPublication,
-) (string, error) {
+) (publicationRemote, error) {
 	remote, err := validateRemote(publication.publication.Remote)
 	if err != nil {
-		return "", err
+		return publicationRemote{}, err
 	}
-	output, err := e.gitText(ctx, publication.repository, "resolve publication remote",
+	fetchOutput, err := e.gitText(
+		ctx,
+		publication.repository,
+		"resolve publication remote",
 		"remote", "get-url", "--all", remote)
 	if err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
-			return "", controlErr
+			return publicationRemote{}, controlErr
 		}
-		return "", semanticError(
+		return publicationRemote{}, semanticError(
 			ErrorInvalidInput, "resolve publication remote", ErrInvalidInput,
 			fmt.Sprintf("configured remote %s does not exist", remote),
 		)
 	}
-	if len(nonEmptyLines(output)) == 0 {
-		return "", semanticError(
-			ErrorInvalidInput, "resolve publication remote", ErrInvalidInput,
-			fmt.Sprintf("configured remote %s has no URL", remote),
+	pushOutput, err := e.gitText(
+		ctx,
+		publication.repository,
+		"resolve publication push remote",
+		"remote", "get-url", "--push", "--all", remote,
+	)
+	if err != nil {
+		if controlErr := commandControlError(err); controlErr != nil {
+			return publicationRemote{}, controlErr
+		}
+		return publicationRemote{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication push remote",
+			ErrInvalidInput,
+			fmt.Sprintf("configured remote %s has no push URL", remote),
 		)
 	}
-	return remote, nil
+	fetchURLs := nonEmptyLines(fetchOutput)
+	pushURLs := nonEmptyLines(pushOutput)
+	if len(fetchURLs) != 1 || len(pushURLs) != 1 {
+		return publicationRemote{}, semanticError(
+			ErrorInvalidInput, "resolve publication remote", ErrInvalidInput,
+			"publication remote must have exactly one fetch URL and one push URL",
+		)
+	}
+	fetchIdentity, err := parseRemoteRepositoryIdentity(fetchURLs[0])
+	if err != nil {
+		return publicationRemote{}, err
+	}
+	pushIdentity, err := parseRemoteRepositoryIdentity(pushURLs[0])
+	if err != nil {
+		return publicationRemote{}, err
+	}
+	if fetchIdentity.identity != pushIdentity.identity {
+		return publicationRemote{}, semanticError(
+			ErrorInvalidInput,
+			"resolve publication remote",
+			ErrInvalidInput,
+			"publication fetch and push URLs identify different repositories",
+		)
+	}
+	return publicationRemote{
+		name:               remote,
+		repositorySelector: fetchIdentity.selector,
+		repositoryIdentity: fetchIdentity.identity,
+	}, nil
 }
 
 func (e *Engine) remoteBranchHead(
 	ctx context.Context,
 	publication validatedPublication,
-	remote string,
+	remote publicationRemote,
 	branch string,
 ) (string, error) {
 	ref := "refs/heads/" + branch
 	output, err := e.gitText(ctx, publication.repository, "inspect remote publication branch",
-		"ls-remote", "--heads", remote, ref)
+		"ls-remote", "--heads", remote.name, ref)
 	if err != nil {
 		return "", err
 	}
@@ -157,7 +355,7 @@ func (e *Engine) remoteBranchHead(
 func (e *Engine) ensurePullRequestBranch(
 	ctx context.Context,
 	publication validatedPublication,
-	remote string,
+	remote publicationRemote,
 	branch string,
 ) (bool, error) {
 	ref := "refs/heads/" + branch
@@ -186,7 +384,34 @@ func (e *Engine) ensurePullRequestBranch(
 	}
 	refspec := publication.head + ":" + ref
 	if _, err := e.command(ctx, publication.repository, "push pull-request branch",
-		"git", "push", "--porcelain", remote, refspec); err != nil {
+		"git", "push", "--porcelain",
+		"--force-with-lease="+ref+":",
+		remote.name,
+		refspec,
+	); err != nil {
+		if controlErr := commandControlError(err); controlErr != nil {
+			return false, controlErr
+		}
+		observed, observeErr := e.remoteBranchHead(
+			ctx,
+			publication,
+			remote,
+			branch,
+		)
+		if observeErr != nil {
+			return false, err
+		}
+		if sameObjectID(observed, publication.head) {
+			return true, nil
+		}
+		if observed != "" {
+			return false, semanticError(
+				ErrorRemoteConflict,
+				"push pull-request branch",
+				ErrRemoteConflict,
+				"remote publication branch changed while it was being created",
+			)
+		}
 		return false, err
 	}
 	remoteHead, err = e.remoteBranchHead(ctx, publication, remote, branch)
@@ -205,10 +430,12 @@ func (e *Engine) ensurePullRequestBranch(
 func (e *Engine) listPullRequests(
 	ctx context.Context,
 	publication validatedPublication,
+	remote publicationRemote,
 	branch string,
 ) ([]pullRequestRecord, error) {
 	output, err := e.command(ctx, publication.repository, "list pull requests", "gh",
 		"pr", "list",
+		"--repo", remote.repositorySelector,
 		"--head", branch,
 		"--base", publication.target,
 		"--state", "open",
@@ -234,7 +461,11 @@ func (e *Engine) listPullRequests(
 	return records, nil
 }
 
-func pullRequestURL(records []pullRequestRecord, head string) (*string, error) {
+func pullRequestURL(
+	records []pullRequestRecord,
+	head string,
+	remote publicationRemote,
+) (*string, error) {
 	var found *string
 	for _, record := range records {
 		if !sameObjectID(record.HeadRefOID, head) {
@@ -243,7 +474,7 @@ func pullRequestURL(records []pullRequestRecord, head string) (*string, error) {
 				"an existing pull request for the publication branch has a different head",
 			)
 		}
-		value, err := validPullRequestURL(record.URL)
+		value, err := validPullRequestURL(record.URL, remote)
 		if err != nil {
 			return nil, err
 		}
@@ -254,7 +485,10 @@ func pullRequestURL(records []pullRequestRecord, head string) (*string, error) {
 	return found, nil
 }
 
-func validPullRequestURL(raw string) (string, error) {
+func validPullRequestURL(
+	raw string,
+	remote publicationRemote,
+) (string, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" || len(value) > 8*1024 {
 		return "", semanticError(
@@ -263,11 +497,34 @@ func validPullRequestURL(raw string) (string, error) {
 		)
 	}
 	parsed, err := url.Parse(value)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") ||
-		parsed.Host == "" {
+	if err != nil {
 		return "", semanticError(
 			ErrorCommandFailed, "validate pull-request URL", ErrCommandFailed,
-			"gh returned an invalid pull-request URL",
+			"gh returned a pull-request URL for a different or invalid repository",
+		)
+	}
+	selector := strings.Split(remote.repositoryIdentity, "/")
+	path := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	number := uint64(0)
+	if len(path) == 4 {
+		number, _ = strconv.ParseUint(path[3], 10, 64)
+	}
+	if parsed.Scheme != "https" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" ||
+		parsed.Port() != "" ||
+		parsed.EscapedPath() != parsed.Path ||
+		len(selector) != 3 ||
+		len(path) != 4 ||
+		!strings.EqualFold(parsed.Hostname(), selector[0]) ||
+		!strings.EqualFold(path[0], selector[1]) ||
+		!strings.EqualFold(path[1], selector[2]) ||
+		path[2] != "pull" ||
+		number == 0 {
+		return "", semanticError(
+			ErrorCommandFailed, "validate pull-request URL", ErrCommandFailed,
+			"gh returned a pull-request URL for a different or invalid repository",
 		)
 	}
 	return value, nil
@@ -292,10 +549,16 @@ func pullRequestBody(publication validatedPublication) string {
 	)
 }
 
-func createdPullRequestURL(stdout string) (string, error) {
+func createdPullRequestURL(
+	stdout string,
+	remote publicationRemote,
+) (string, error) {
 	fields := strings.Fields(stdout)
 	for index := len(fields) - 1; index >= 0; index-- {
-		if value, err := validPullRequestURL(fields[index]); err == nil {
+		if value, err := validPullRequestURL(
+			fields[index],
+			remote,
+		); err == nil {
 			return value, nil
 		}
 	}
@@ -308,26 +571,28 @@ func createdPullRequestURL(stdout string) (string, error) {
 func (e *Engine) createPullRequest(
 	ctx context.Context,
 	publication validatedPublication,
+	remote publicationRemote,
 	branch string,
 ) (string, error) {
 	output, err := e.command(ctx, publication.repository, "create pull request", "gh",
 		"pr", "create",
+		"--repo", remote.repositorySelector,
 		"--base", publication.target,
 		"--head", branch,
 		"--title", pullRequestTitle(publication),
 		"--body", pullRequestBody(publication),
 	)
 	if err == nil {
-		return createdPullRequestURL(output.stdout)
+		return createdPullRequestURL(output.stdout, remote)
 	}
 	if controlErr := commandControlError(err); controlErr != nil {
 		return "", controlErr
 	}
-	records, listErr := e.listPullRequests(ctx, publication, branch)
+	records, listErr := e.listPullRequests(ctx, publication, remote, branch)
 	if listErr != nil {
 		return "", err
 	}
-	existing, reuseErr := pullRequestURL(records, publication.head)
+	existing, reuseErr := pullRequestURL(records, publication.head, remote)
 	if reuseErr != nil {
 		return "", reuseErr
 	}
@@ -362,11 +627,11 @@ func (e *Engine) publishPullRequest(
 	if err != nil {
 		return result, err
 	}
-	records, err := e.listPullRequests(ctx, publication, branch)
+	records, err := e.listPullRequests(ctx, publication, remote, branch)
 	if err != nil {
 		return result, err
 	}
-	existing, err := pullRequestURL(records, publication.head)
+	existing, err := pullRequestURL(records, publication.head, remote)
 	if err != nil {
 		return result, err
 	}
@@ -376,7 +641,7 @@ func (e *Engine) publishPullRequest(
 		result.Message = "pull request already exists for the captured head commit"
 		return result, nil
 	}
-	url, err := e.createPullRequest(ctx, publication, branch)
+	url, err := e.createPullRequest(ctx, publication, remote, branch)
 	if err != nil {
 		return result, err
 	}
