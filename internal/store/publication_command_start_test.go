@@ -1141,6 +1141,110 @@ func TestPublicationAttemptCommandStartRejectsPublicationTupleChange(t *testing.
 	}
 }
 
+func TestPublicationAttemptRejectsExecutorInputProvenanceChange(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name   string
+		column string
+		value  func(model.Task) any
+	}{
+		{
+			name:   "task",
+			column: "task_id",
+			value: func(other model.Task) any {
+				return other.ID
+			},
+		},
+		{
+			name:   "repository path",
+			column: "repository_path",
+			value: func(model.Task) any {
+				return "/tampered/repository"
+			},
+		},
+		{
+			name:   "worktree path",
+			column: "worktree_path",
+			value: func(model.Task) any {
+				return "/tampered/worktree"
+			},
+		},
+		{
+			name:   "source snapshot",
+			column: "source_snapshot_json",
+			value: func(model.Task) any {
+				return `{"tampered":true}`
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			opened := openAutomationTestStore(t)
+			other, _ := createPendingPublicationAttemptFixture(
+				t,
+				opened,
+				"provenance_other_"+strings.ReplaceAll(test.name, " ", "_"),
+			)
+			_, pending := createPendingPublicationAttemptFixture(
+				t,
+				opened,
+				"provenance_"+strings.ReplaceAll(test.name, " ", "_"),
+			)
+			_, attempt, lease := beginPublicationAttemptFixture(
+				t,
+				opened,
+				pending,
+				"publisher-provenance-"+strings.ReplaceAll(test.name, " ", "-"),
+				time.Minute,
+			)
+			if _, err := opened.db.ExecContext(
+				ctx,
+				"UPDATE publications SET "+test.column+" = ? WHERE id = ?",
+				test.value(other),
+				pending.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			permit := acquirePublicationCommandPermit(t, opened, lease)
+			called := false
+			released, err := opened.WithPublicationAttemptCommandStart(
+				ctx,
+				permit,
+				attempt,
+				func() (bool, error) {
+					called = true
+					return true, nil
+				},
+			)
+			if closeErr := permit.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if !errors.Is(err, ErrPublicationAttemptScope) ||
+				released || called {
+				t.Fatalf(
+					"changed provenance release=%v called=%v err=%v",
+					released,
+					called,
+					err,
+				)
+			}
+			if _, err := opened.FinishAutomatedPublicationAttempt(
+				ctx,
+				attempt,
+				PublicationAttemptResultInput{
+					Outcome:        PublicationAttemptFailed,
+					ExecutorStatus: PublicationExecutorFailed,
+					ErrorKind:      PublicationErrorSourceChanged,
+					Error:          "executor input provenance changed",
+				},
+			); !errors.Is(err, ErrPublicationAttemptScope) {
+				t.Fatalf("changed provenance finish error=%v", err)
+			}
+		})
+	}
+}
+
 func TestPublicationAttemptCommandStartRejectsNilRelease(t *testing.T) {
 	opened := openAutomationTestStore(t)
 	_, pending := createPendingPublicationAttemptFixture(t, opened, "nil_release")

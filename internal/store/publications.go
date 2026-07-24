@@ -29,6 +29,7 @@ const (
 
 	MaxPublicationErrorBytes          = 4 * 1024
 	MaxPublicationPolicySnapshotBytes = 64 * 1024
+	MaxPublicationSourceSnapshotBytes = 4 * 1024 * 1024
 
 	maxPublicationBoardBytes   = 128
 	maxPublicationBranchBytes  = 512
@@ -404,6 +405,12 @@ func publicationSource(
 	})
 	if err != nil {
 		return model.ChangeSet{}, nil, err
+	}
+	if len(source) > MaxPublicationSourceSnapshotBytes {
+		return model.ChangeSet{}, nil, fmt.Errorf(
+			"publication source snapshot must be at most %d bytes",
+			MaxPublicationSourceSnapshotBytes,
+		)
 	}
 	return changeSet, source, nil
 }

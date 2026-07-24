@@ -162,6 +162,44 @@ func TestEnsurePublicationPreservesPolicyAndSourceSnapshots(t *testing.T) {
 	}
 }
 
+func TestEnsurePublicationRejectsOversizedSourceSnapshot(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	_, changeSet := createPublicationSource(
+		t,
+		opened,
+		"oversized-source-snapshot",
+		model.WorkflowRoleFinalizer,
+		model.TaskStatusDone,
+		model.RunStatusCompleted,
+		"ready",
+	)
+	changedFiles, err := json.Marshal([]string{
+		strings.Repeat("x", MaxPublicationSourceSnapshotBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.db.ExecContext(ctx, `
+		UPDATE task_change_sets
+		SET changed_files_json = ?
+		WHERE id = ?
+	`, string(changedFiles), changeSet.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := opened.EnsurePublication(
+		ctx,
+		publicationPolicyInput(changeSet.ID, false),
+	); err == nil ||
+		!strings.Contains(err.Error(), "source snapshot must be at most") {
+		t.Fatalf("oversized source snapshot error=%v", err)
+	}
+}
+
 func TestEnsurePublicationNoChangeIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	opened, err := Open(":memory:", "default", "")
@@ -940,7 +978,7 @@ func TestExistingPublicationSchemaAddsClaimEpoch(t *testing.T) {
 	).Scan(&version); versionErr != nil {
 		t.Fatal(versionErr)
 	}
-	if version != schemaVersion || schemaVersion != 29 ||
+	if version != schemaVersion || schemaVersion != 30 ||
 		columnType != "INTEGER" || notNull != 1 || defaultValue != "0" {
 		t.Fatalf(
 			"claim epoch migration: version=%d constant=%d type=%q notNull=%d default=%q",

@@ -92,6 +92,49 @@ func beginPublicationAttemptFixture(
 	return claimed, operation, lease
 }
 
+func TestPublicationExecutionProvenanceCanonicalizesAndBoundsSnapshot(
+	t *testing.T,
+) {
+	value := model.Publication{
+		TaskID:         "task_provenance",
+		RepositoryPath: "/repo/provenance",
+		WorktreePath:   "/worktree/provenance",
+		SourceSnapshot: json.RawMessage(`{"second":2,"first":1}`),
+	}
+	first, err := publicationExecutionProvenanceFingerprint(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.SourceSnapshot = json.RawMessage(
+		"{\n  \"first\": 1,\n  \"second\": 2\n}",
+	)
+	second, err := publicationExecutionProvenanceFingerprint(value)
+	if err != nil || first != second {
+		t.Fatalf(
+			"canonical provenance first=%q second=%q err=%v",
+			first,
+			second,
+			err,
+		)
+	}
+	value.SourceSnapshot = nil
+	if _, err := publicationExecutionProvenanceFingerprint(value); err == nil {
+		t.Fatal("empty source snapshot unexpectedly accepted")
+	}
+	value.SourceSnapshot = json.RawMessage(
+		`{"value":"` +
+			strings.Repeat(
+				"x",
+				MaxPublicationSourceSnapshotBytes,
+			) +
+			`"}`,
+	)
+	if _, err := publicationExecutionProvenanceFingerprint(value); err == nil ||
+		!strings.Contains(err.Error(), "at most") {
+		t.Fatalf("oversized source snapshot error=%v", err)
+	}
+}
+
 func TestBeginAutomatedPublicationAttemptAtomicallyClaimsAndRecordsIntent(
 	t *testing.T,
 ) {
@@ -144,12 +187,27 @@ func TestBeginAutomatedPublicationAttemptAtomicallyClaimsAndRecordsIntent(
 		intent.HeadCommit != pending.HeadCommit ||
 		intent.DurableRef != pending.DurableRef ||
 		len(intent.SourceKey) != 64 ||
+		len(intent.ExecutionProvenanceFingerprint) != 64 ||
 		len(intent.EffectFingerprint) != 64 ||
 		intent.ClaimEpoch != claimed.ClaimEpoch ||
 		intent.PublicationUpdatedAt != claimed.UpdatedAt ||
 		intent.ClaimExpiresAt != *claimed.ClaimExpiresAt ||
 		intent.SessionID != lease.SessionID {
 		t.Fatalf("attempt intent = %+v", intent)
+	}
+	expectedProvenance, err :=
+		publicationExecutionProvenanceFingerprint(pending)
+	if err != nil ||
+		intent.ExecutionProvenanceFingerprint != expectedProvenance {
+		t.Fatalf(
+			"execution provenance=%q want=%q err=%v",
+			intent.ExecutionProvenanceFingerprint,
+			expectedProvenance,
+			err,
+		)
+	}
+	if len(intent.StartedAt) != len("2026-07-24T00:00:00.000000000Z") {
+		t.Fatalf("attempt startedAt is not fixed-width: %q", intent.StartedAt)
 	}
 	_, expectedSourceKey, err := normalizeAutomationSource(
 		AutomationQuarantineSourceInput{
@@ -180,8 +238,41 @@ func TestBeginAutomatedPublicationAttemptAtomicallyClaimsAndRecordsIntent(
 		t.Fatal(err)
 	}
 	if strings.Contains(string(encodedIntent), pending.RepositoryPath) ||
-		strings.Contains(string(encodedIntent), pending.WorktreePath) {
+		strings.Contains(string(encodedIntent), pending.WorktreePath) ||
+		strings.Contains(string(encodedIntent), string(pending.SourceSnapshot)) {
 		t.Fatalf("attempt intent leaked an execution path: %s", encodedIntent)
+	}
+	for _, mutate := range []func(*model.Publication){
+		func(value *model.Publication) { value.TaskID += "_different" },
+		func(value *model.Publication) {
+			value.RepositoryPath += "_different"
+		},
+		func(value *model.Publication) {
+			value.WorktreePath += "_different"
+		},
+		func(value *model.Publication) {
+			value.SourceSnapshot = json.RawMessage(
+				`{"changed":"source snapshot"}`,
+			)
+		},
+	} {
+		changed := pending
+		changed.SourceSnapshot = append(
+			json.RawMessage(nil),
+			pending.SourceSnapshot...,
+		)
+		mutate(&changed)
+		fingerprint, fingerprintErr :=
+			publicationExecutionProvenanceFingerprint(changed)
+		if fingerprintErr != nil {
+			t.Fatal(fingerprintErr)
+		}
+		if fingerprint == intent.ExecutionProvenanceFingerprint {
+			t.Fatalf(
+				"execution provenance ignored mutation: %+v",
+				changed,
+			)
+		}
 	}
 	changedEffect := intent
 	changedEffect.HeadCommit += "-different"
@@ -375,7 +466,9 @@ func TestFinishAutomatedPublicationAttemptAfterExpiryIsAtomicAndIdempotent(
 		result.Outcome != PublicationAttemptPublished ||
 		result.ExecutorStatus != PublicationExecutorPublished ||
 		result.URL == nil || *result.URL != url ||
-		result.Error != nil || result.ErrorKind != nil {
+		result.Error != nil || result.ErrorKind != nil ||
+		len(result.RecordedAt) !=
+			len("2026-07-24T00:00:00.000000000Z") {
 		t.Fatalf("published result = %+v, err=%v", result, err)
 	}
 	copiedOperation := *operation
@@ -946,7 +1039,7 @@ func TestListUnresolvedPublicationAttemptsScansPastRecoveredRawPages(
 	}
 }
 
-func TestSchema28AddsImmutablePublicationAttemptLedger(t *testing.T) {
+func TestSchema30AddsImmutablePublicationAttemptLedger(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "autogora.db")
 	initial, err := Open(path, "default", "")
@@ -997,9 +1090,11 @@ func TestSchema28AddsImmutablePublicationAttemptLedger(t *testing.T) {
 		WHERE type = 'trigger' AND name IN (
 			'publication_attempt_intents_prevent_update',
 			'publication_attempt_intents_prevent_delete',
+			'publication_attempt_intents_require_v30_evidence',
 			'publication_attempt_results_identity_guard',
 			'publication_attempt_results_prevent_update',
-			'publication_attempt_results_prevent_delete'
+			'publication_attempt_results_prevent_delete',
+			'publication_attempt_results_require_v30_evidence'
 		)
 	`).Scan(&triggers); err != nil {
 		t.Fatal(err)
@@ -1016,8 +1111,8 @@ func TestSchema28AddsImmutablePublicationAttemptLedger(t *testing.T) {
 	`).Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || schemaVersion != 29 ||
-		tables != 2 || triggers != 5 || foreignKeys != 0 {
+	if version != schemaVersion || schemaVersion != 30 ||
+		tables != 2 || triggers != 7 || foreignKeys != 0 {
 		t.Fatalf(
 			"publication attempt migration version=%d constant=%d tables=%d triggers=%d foreignKeys=%d",
 			version,
@@ -1039,5 +1134,220 @@ func TestSchema28AddsImmutablePublicationAttemptLedger(t *testing.T) {
 		)
 	`); err == nil {
 		t.Fatal("orphan publication attempt result bypassed identity guard")
+	}
+}
+
+func TestSchema30MigratesNullableProvenanceAndRejectsOldEvidence(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIntent := insertPublicationAttemptRecoveryIntent(
+		t,
+		opened,
+		"pat_pre_provenance",
+		"2026-07-24T00:00:00.100000000Z",
+	)
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
+		DROP TRIGGER publication_attempt_results_require_v30_evidence;
+		ALTER TABLE publication_attempt_intents
+			DROP COLUMN execution_provenance_fingerprint;
+		PRAGMA user_version = 29;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var nullable, version, triggerCount int
+	if err := migrated.db.QueryRowContext(ctx, `
+		SELECT CASE WHEN "notnull" = 0 THEN 1 ELSE 0 END
+		FROM pragma_table_info('publication_attempt_intents')
+		WHERE name = 'execution_provenance_fingerprint'
+	`).Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrated.db.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrated.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'trigger' AND name IN (
+			'publication_attempt_intents_require_v30_evidence',
+			'publication_attempt_results_require_v30_evidence'
+		)
+	`).Scan(&triggerCount); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != 1 || version != schemaVersion || triggerCount != 2 {
+		t.Fatalf(
+			"migration nullable=%d version=%d triggers=%d",
+			nullable,
+			version,
+			triggerCount,
+		)
+	}
+	if _, err := migrated.GetPublicationAttempt(
+		ctx,
+		oldIntent.ID,
+	); err == nil ||
+		!strings.Contains(err.Error(), "lacks v30 execution provenance") {
+		t.Fatalf("old attempt evidence error=%v", err)
+	}
+	if _, err := migrated.db.ExecContext(ctx, `
+		INSERT INTO publication_attempt_results(
+			attempt_id, board, publication_id, claim_epoch, outcome,
+			executor_status, error_kind, result_url, error,
+			publication_updated_at, recorded_at
+		) VALUES (?, ?, ?, ?, 'failed', 'failed', 'internal', NULL,
+			'old attempt cannot execute', ?, ?)
+	`,
+		oldIntent.ID,
+		oldIntent.Board,
+		oldIntent.PublicationID,
+		oldIntent.ClaimEpoch,
+		oldIntent.PublicationUpdatedAt,
+		"2026-07-24T00:00:00.110000000Z",
+	); err == nil ||
+		!strings.Contains(err.Error(), "requires v30 evidence") {
+		t.Fatalf("old attempt result insert error=%v", err)
+	}
+}
+
+func TestSchema30ConcurrentOpenSerializesProvenanceMigration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
+		DROP TRIGGER publication_attempt_results_require_v30_evidence;
+		ALTER TABLE publication_attempt_intents
+			DROP COLUMN execution_provenance_fingerprint;
+		PRAGMA user_version = 29;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			value, openErr := Open(path, "default", "")
+			if openErr == nil {
+				openErr = value.Close()
+			}
+			results <- openErr
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent provenance migration error=%v", err)
+		}
+	}
+}
+
+func TestOpenRejectsNewerSchemaWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		DROP INDEX idx_publication_attempt_intents_publication;
+		PRAGMA user_version = 31;
+	`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if newer, err := Open(path, "default", ""); err == nil {
+		newer.Close()
+		t.Fatal("newer schema unexpectedly opened")
+	} else if !strings.Contains(
+		err.Error(),
+		"schema version 31 is newer than supported version 30",
+	) {
+		t.Fatalf("newer schema error=%v", err)
+	}
+	inspection, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspection.Close()
+	var version, indexCount, provenanceColumns int
+	if err := inspection.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspection.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index'
+			AND name = 'idx_publication_attempt_intents_publication'
+	`).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspection.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pragma_table_info(
+			'publication_attempt_intents'
+		)
+		WHERE name = 'execution_provenance_fingerprint'
+	`).Scan(&provenanceColumns); err != nil {
+		t.Fatal(err)
+	}
+	if version != 31 || indexCount != 0 || provenanceColumns != 1 {
+		t.Fatalf(
+			"newer schema mutated: version=%d index=%d provenanceColumns=%d",
+			version,
+			indexCount,
+			provenanceColumns,
+		)
 	}
 }

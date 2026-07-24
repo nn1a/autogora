@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 29
+const schemaVersion = 30
 
 type Store struct {
 	db               *sql.DB
@@ -136,6 +136,9 @@ func (s *Store) Board() string           { return s.board }
 func (s *Store) AttachmentsRoot() string { return s.attachmentsRoot }
 
 func (s *Store) initialize(ctx context.Context) error {
+	if err := s.requireSupportedSchemaVersion(ctx); err != nil {
+		return err
+	}
 	if err := s.requireSupportedCoordinationProposalSchema(ctx); err != nil {
 		return err
 	}
@@ -172,6 +175,9 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensurePublicationClaimEpochSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensurePublicationAttemptProvenanceSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureDependencySatisfaction(ctx); err != nil {
 		return err
 	}
@@ -193,6 +199,272 @@ func (s *Store) initialize(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
 	}
+	return nil
+}
+
+func (s *Store) requireSupportedSchemaVersion(
+	ctx context.Context,
+) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open schema version guard connection: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin schema version guard: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	var version int
+	if err := conn.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&version); err != nil {
+		return fmt.Errorf("inspect schema version under migration lock: %w", err)
+	}
+	if version > schemaVersion {
+		return fmt.Errorf(
+			"database schema version %d is newer than supported version %d",
+			version,
+			schemaVersion,
+		)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit schema version guard: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) ensurePublicationAttemptProvenanceSchema(
+	ctx context.Context,
+) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"open publication attempt provenance migration connection: %w",
+			err,
+		)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf(
+			"begin publication attempt provenance migration: %w",
+			err,
+		)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	var currentVersion int
+	if err := conn.QueryRowContext(
+		ctx,
+		"PRAGMA user_version",
+	).Scan(&currentVersion); err != nil {
+		return fmt.Errorf(
+			"inspect schema version during publication attempt migration: %w",
+			err,
+		)
+	}
+	if currentVersion > schemaVersion {
+		return fmt.Errorf(
+			"database schema version %d is newer than supported version %d",
+			currentVersion,
+			schemaVersion,
+		)
+	}
+	var tableExists int
+	if err := conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'publication_attempt_intents'
+	`).Scan(&tableExists); err != nil {
+		return fmt.Errorf(
+			"inspect publication attempt provenance table: %w",
+			err,
+		)
+	}
+	if tableExists == 0 {
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return fmt.Errorf(
+				"commit empty publication attempt provenance migration: %w",
+				err,
+			)
+		}
+		committed = true
+		return nil
+	}
+	rows, err := conn.QueryContext(
+		ctx,
+		"PRAGMA table_info(publication_attempt_intents)",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"inspect publication attempt provenance schema: %w",
+			err,
+		)
+	}
+	hasProvenance := false
+	provenanceCompatible := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf(
+				"scan publication attempt provenance schema: %w",
+				err,
+			)
+		}
+		if name == "execution_provenance_fingerprint" {
+			hasProvenance = true
+			provenanceCompatible =
+				strings.EqualFold(strings.TrimSpace(columnType), "TEXT") &&
+					primaryKey == 0 &&
+					!defaultValue.Valid &&
+					(notNull == 0 || notNull == 1)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf(
+			"inspect publication attempt provenance columns: %w",
+			err,
+		)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf(
+			"close publication attempt provenance columns: %w",
+			err,
+		)
+	}
+	if hasProvenance && !provenanceCompatible {
+		return errors.New(
+			"publication attempt execution provenance column is incompatible",
+		)
+	}
+	if !hasProvenance {
+		if _, err := conn.ExecContext(ctx, `
+			ALTER TABLE publication_attempt_intents
+			ADD COLUMN execution_provenance_fingerprint TEXT
+			CHECK (
+				execution_provenance_fingerprint IS NULL
+				OR (
+					typeof(execution_provenance_fingerprint) = 'text'
+					AND length(
+						CAST(execution_provenance_fingerprint AS BLOB)
+					) = 64
+					AND execution_provenance_fingerprint
+						NOT GLOB '*[^0-9a-f]*'
+				)
+			)
+		`); err != nil {
+			return fmt.Errorf(
+				"add publication attempt execution provenance: %w",
+				err,
+			)
+		}
+	}
+	var intentDefinition string
+	if err := conn.QueryRowContext(ctx, `
+		SELECT sql FROM sqlite_master
+		WHERE type = 'table' AND name = 'publication_attempt_intents'
+	`).Scan(&intentDefinition); err != nil {
+		return fmt.Errorf(
+			"inspect publication attempt provenance contract: %w",
+			err,
+		)
+	}
+	normalizedDefinition := strings.ToLower(
+		strings.Join(strings.Fields(intentDefinition), " "),
+	)
+	compactDefinition := strings.ReplaceAll(normalizedDefinition, " ", "")
+	for _, required := range []string{
+		"execution_provenance_fingerprinttext",
+		"length(cast(execution_provenance_fingerprintasblob))=64",
+		"execution_provenance_fingerprintnotglob'*[^0-9a-f]*'",
+	} {
+		if !strings.Contains(compactDefinition, required) {
+			return errors.New(
+				"publication attempt execution provenance column lacks its hash contract",
+			)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `
+		DROP TRIGGER IF EXISTS
+			publication_attempt_intents_require_v30_evidence;
+		DROP TRIGGER IF EXISTS
+			publication_attempt_results_require_v30_evidence;
+
+		CREATE TRIGGER
+			publication_attempt_intents_require_v30_evidence
+		BEFORE INSERT ON publication_attempt_intents
+		WHEN NEW.execution_provenance_fingerprint IS NULL
+			OR typeof(NEW.execution_provenance_fingerprint) <> 'text'
+			OR length(
+				CAST(NEW.execution_provenance_fingerprint AS BLOB)
+			) <> 64
+			OR NEW.execution_provenance_fingerprint GLOB '*[^0-9a-f]*'
+			OR typeof(NEW.started_at) <> 'text'
+			OR length(CAST(NEW.started_at AS BLOB)) <> 30
+			OR NEW.started_at NOT GLOB
+				'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
+		BEGIN
+			SELECT RAISE(
+				ABORT,
+				'publication attempt intent requires v30 evidence'
+			);
+		END;
+
+		CREATE TRIGGER
+			publication_attempt_results_require_v30_evidence
+		BEFORE INSERT ON publication_attempt_results
+		WHEN typeof(NEW.recorded_at) <> 'text'
+			OR length(CAST(NEW.recorded_at AS BLOB)) <> 30
+			OR NEW.recorded_at NOT GLOB
+				'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
+			OR NOT EXISTS (
+				SELECT 1 FROM publication_attempt_intents i
+				WHERE i.id = NEW.attempt_id
+					AND i.execution_provenance_fingerprint IS NOT NULL
+			)
+		BEGIN
+			SELECT RAISE(
+				ABORT,
+				'publication attempt result requires v30 evidence'
+			);
+		END;
+	`); err != nil {
+		return fmt.Errorf(
+			"ensure publication attempt v30 evidence triggers: %w",
+			err,
+		)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf(
+			"commit publication attempt provenance migration: %w",
+			err,
+		)
+	}
+	committed = true
 	return nil
 }
 
@@ -2318,6 +2590,12 @@ CREATE TABLE IF NOT EXISTS publication_attempt_intents (
       AND length(CAST(effect_fingerprint AS BLOB)) = 64
       AND effect_fingerprint NOT GLOB '*[^0-9a-f]*'
     ),
+  execution_provenance_fingerprint TEXT NOT NULL
+    CHECK (
+      typeof(execution_provenance_fingerprint) = 'text'
+      AND length(CAST(execution_provenance_fingerprint AS BLOB)) = 64
+      AND execution_provenance_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
   claim_epoch INTEGER NOT NULL
     CHECK (typeof(claim_epoch) = 'integer' AND claim_epoch >= 1),
   publication_updated_at TEXT NOT NULL
@@ -2343,8 +2621,10 @@ CREATE TABLE IF NOT EXISTS publication_attempt_intents (
   started_at TEXT NOT NULL
     CHECK (
       typeof(started_at) = 'text'
-      AND length(CAST(started_at AS BLOB)) BETWEEN 1 AND 128
+      AND length(CAST(started_at AS BLOB)) = 30
       AND instr(started_at, char(0)) = 0
+      AND started_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
     ),
   UNIQUE(board, publication_id, claim_epoch)
 );
@@ -2430,8 +2710,10 @@ CREATE TABLE IF NOT EXISTS publication_attempt_results (
   recorded_at TEXT NOT NULL
     CHECK (
       typeof(recorded_at) = 'text'
-      AND length(CAST(recorded_at AS BLOB)) BETWEEN 1 AND 128
+      AND length(CAST(recorded_at AS BLOB)) = 30
       AND instr(recorded_at, char(0)) = 0
+      AND recorded_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
     ),
   CHECK (
     (outcome = 'published'

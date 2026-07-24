@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nn1a/autogora/internal/model"
 )
@@ -64,25 +67,30 @@ const (
 
 // PublicationAttemptIntent is credential-free evidence that an exact
 // publication claim crossed the durable automatic execution boundary.
+// ExecutionProvenanceFingerprint binds the durable task, repository path,
+// worktree path, and canonical source snapshot without exposing those inputs.
+// Command-level repository and remote endpoint identity require separate
+// execution receipts.
 type PublicationAttemptIntent struct {
-	ID                   string                `json:"id"`
-	Board                string                `json:"board"`
-	PublicationID        string                `json:"publicationId"`
-	SourceKey            string                `json:"sourceKey"`
-	ChangeSetID          string                `json:"changeSetId"`
-	Mode                 model.PublicationMode `json:"mode"`
-	TargetBranch         string                `json:"targetBranch"`
-	Remote               string                `json:"remote"`
-	BaseCommit           string                `json:"baseCommit"`
-	HeadCommit           string                `json:"headCommit"`
-	DurableRef           string                `json:"durableRef"`
-	EffectFingerprint    string                `json:"effectFingerprint"`
-	ClaimEpoch           int64                 `json:"claimEpoch"`
-	PublicationUpdatedAt string                `json:"publicationUpdatedAt"`
-	ClaimExpiresAt       string                `json:"claimExpiresAt"`
-	SessionID            string                `json:"sessionId"`
-	GateGeneration       int64                 `json:"gateGeneration"`
-	StartedAt            string                `json:"startedAt"`
+	ID                             string                `json:"id"`
+	Board                          string                `json:"board"`
+	PublicationID                  string                `json:"publicationId"`
+	SourceKey                      string                `json:"sourceKey"`
+	ChangeSetID                    string                `json:"changeSetId"`
+	Mode                           model.PublicationMode `json:"mode"`
+	TargetBranch                   string                `json:"targetBranch"`
+	Remote                         string                `json:"remote"`
+	BaseCommit                     string                `json:"baseCommit"`
+	HeadCommit                     string                `json:"headCommit"`
+	DurableRef                     string                `json:"durableRef"`
+	ExecutionProvenanceFingerprint string                `json:"executionProvenanceFingerprint"`
+	EffectFingerprint              string                `json:"effectFingerprint"`
+	ClaimEpoch                     int64                 `json:"claimEpoch"`
+	PublicationUpdatedAt           string                `json:"publicationUpdatedAt"`
+	ClaimExpiresAt                 string                `json:"claimExpiresAt"`
+	SessionID                      string                `json:"sessionId"`
+	GateGeneration                 int64                 `json:"gateGeneration"`
+	StartedAt                      string                `json:"startedAt"`
 }
 
 // PublicationAttemptResult is an immutable outcome receipt. Unknown means the
@@ -175,8 +183,9 @@ func (p *PublicationAttemptPermit) Intent() PublicationAttemptIntent {
 
 const publicationAttemptIntentColumns = `i.id, i.board, i.publication_id,
 	i.source_key, i.change_set_id, i.mode, i.target_branch, i.remote,
-	i.base_commit, i.head_commit, i.durable_ref, i.effect_fingerprint,
-	i.claim_epoch, i.publication_updated_at, i.claim_expires_at, i.session_id,
+	i.base_commit, i.head_commit, i.durable_ref,
+	i.execution_provenance_fingerprint, i.effect_fingerprint, i.claim_epoch,
+	i.publication_updated_at, i.claim_expires_at, i.session_id,
 	i.gate_generation, i.started_at`
 
 const publicationAttemptResultColumns = `r.attempt_id, r.board,
@@ -185,6 +194,7 @@ const publicationAttemptResultColumns = `r.attempt_id, r.board,
 
 func scanPublicationAttemptIntent(row scanner) (PublicationAttemptIntent, error) {
 	var value PublicationAttemptIntent
+	var executionProvenanceFingerprint sql.NullString
 	err := row.Scan(
 		&value.ID,
 		&value.Board,
@@ -197,6 +207,7 @@ func scanPublicationAttemptIntent(row scanner) (PublicationAttemptIntent, error)
 		&value.BaseCommit,
 		&value.HeadCommit,
 		&value.DurableRef,
+		&executionProvenanceFingerprint,
 		&value.EffectFingerprint,
 		&value.ClaimEpoch,
 		&value.PublicationUpdatedAt,
@@ -207,6 +218,21 @@ func scanPublicationAttemptIntent(row scanner) (PublicationAttemptIntent, error)
 	)
 	if err != nil {
 		return PublicationAttemptIntent{}, err
+	}
+	if !executionProvenanceFingerprint.Valid ||
+		executionProvenanceFingerprint.String == "" {
+		return PublicationAttemptIntent{}, errors.New(
+			"publication attempt intent lacks v30 execution provenance",
+		)
+	}
+	value.ExecutionProvenanceFingerprint =
+		executionProvenanceFingerprint.String
+	if !validPublicationAttemptFingerprint(
+		value.ExecutionProvenanceFingerprint,
+	) {
+		return PublicationAttemptIntent{}, errors.New(
+			"publication attempt intent has an invalid execution provenance fingerprint",
+		)
 	}
 	if value.Mode != model.PublicationModeLocalFF &&
 		value.Mode != model.PublicationModePullRequest {
@@ -228,6 +254,12 @@ func scanPublicationAttemptIntent(row scanner) (PublicationAttemptIntent, error)
 		return PublicationAttemptIntent{}, errors.New(
 			"publication attempt intent has an invalid effect fingerprint",
 		)
+	}
+	if _, err := normalizePublicationAttemptLedgerTimestamp(
+		value.StartedAt,
+		"publication attempt startedAt",
+	); err != nil {
+		return PublicationAttemptIntent{}, err
 	}
 	return value, err
 }
@@ -251,7 +283,7 @@ func publicationAttemptSourceKey(
 
 func publicationEffectFingerprint(intent PublicationAttemptIntent) string {
 	canonical := strings.Join([]string{
-		"publication-effect-v1",
+		"publication-effect-v2",
 		intent.Board,
 		intent.PublicationID,
 		intent.ChangeSetID,
@@ -261,9 +293,175 @@ func publicationEffectFingerprint(intent PublicationAttemptIntent) string {
 		intent.BaseCommit,
 		intent.HeadCommit,
 		intent.DurableRef,
+		intent.ExecutionProvenanceFingerprint,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(sum[:])
+}
+
+func validPublicationAttemptFingerprint(value string) bool {
+	if len(value) != sha256.Size*2 ||
+		value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func canonicalPublicationSourceSnapshot(
+	raw json.RawMessage,
+) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, errors.New(
+			"publication source snapshot cannot be empty",
+		)
+	}
+	if len(raw) > MaxPublicationSourceSnapshotBytes {
+		return nil, fmt.Errorf(
+			"publication source snapshot must be at most %d bytes",
+			MaxPublicationSourceSnapshotBytes,
+		)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, fmt.Errorf(
+			"publication source snapshot must be valid JSON: %w",
+			err,
+		)
+	}
+	if _, ok := decoded.(map[string]any); !ok {
+		return nil, errors.New(
+			"publication source snapshot must be a JSON object",
+		)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New(
+				"publication source snapshot contains trailing JSON",
+			)
+		}
+		return nil, fmt.Errorf(
+			"publication source snapshot contains trailing data: %w",
+			err,
+		)
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"canonicalize publication source snapshot: %w",
+			err,
+		)
+	}
+	return canonical, nil
+}
+
+func publicationExecutionProvenanceFingerprint(
+	value model.Publication,
+) (string, error) {
+	taskID, err := validRecordID(
+		value.TaskID,
+		"publication attempt task id",
+	)
+	if err != nil || taskID == "" {
+		if err != nil {
+			return "", err
+		}
+		return "", errors.New("publication attempt task id cannot be empty")
+	}
+	if err := validatePublicationAttemptExecutionPath(
+		value.RepositoryPath,
+		"publication attempt repository path",
+	); err != nil {
+		return "", err
+	}
+	if err := validatePublicationAttemptExecutionPath(
+		value.WorktreePath,
+		"publication attempt worktree path",
+	); err != nil {
+		return "", err
+	}
+	sourceSnapshot, err := canonicalPublicationSourceSnapshot(
+		value.SourceSnapshot,
+	)
+	if err != nil {
+		return "", err
+	}
+	sourceSum := sha256.Sum256(sourceSnapshot)
+	canonical := strings.Join([]string{
+		"publication-execution-provenance-v1",
+		taskID,
+		value.RepositoryPath,
+		value.WorktreePath,
+		hex.EncodeToString(sourceSum[:]),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func validatePublicationAttemptExecutionPath(
+	value string,
+	field string,
+) error {
+	if value == "" || strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s cannot be empty", field)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s must be valid UTF-8", field)
+	}
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("%s cannot contain NUL", field)
+	}
+	if len(value) > 4096 {
+		return fmt.Errorf("%s must be at most 4096 bytes", field)
+	}
+	return nil
+}
+
+func normalizePublicationAttemptLedgerTimestamp(
+	value string,
+	field string,
+) (string, error) {
+	original := value
+	value, err := normalizedPublicationText(value, field, 128, true)
+	if err != nil {
+		return "", err
+	}
+	if value != original {
+		return "", fmt.Errorf(
+			"%s is not a fixed-width UTC ledger timestamp",
+			field,
+		)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "", fmt.Errorf("%s must be RFC3339: %w", field, err)
+	}
+	if parsed.Year() < 0 || parsed.Year() > 9999 ||
+		value != parsed.UTC().Format(publicationTimestampLayout) {
+		return "", fmt.Errorf(
+			"%s is not a fixed-width UTC ledger timestamp",
+			field,
+		)
+	}
+	return value, nil
+}
+
+func publicationAttemptLedgerTimestamp(value string) (string, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "", fmt.Errorf(
+			"derive publication attempt ledger timestamp: %w",
+			err,
+		)
+	}
+	if parsed.Year() < 0 || parsed.Year() > 9999 {
+		return "", errors.New(
+			"publication attempt ledger timestamp must fit RFC3339",
+		)
+	}
+	return parsed.UTC().Format(publicationTimestampLayout), nil
 }
 
 func scanPublicationAttemptResult(row scanner) (PublicationAttemptResult, error) {
@@ -289,6 +487,12 @@ func scanPublicationAttemptResult(row scanner) (PublicationAttemptResult, error)
 		value.ErrorKind = &kind
 	}
 	if err != nil {
+		return PublicationAttemptResult{}, err
+	}
+	if _, err := normalizePublicationAttemptLedgerTimestamp(
+		value.RecordedAt,
+		"publication attempt result recordedAt",
+	); err != nil {
 		return PublicationAttemptResult{}, err
 	}
 	input := PublicationAttemptResultInput{
@@ -366,6 +570,11 @@ func publicationMatchesAttemptEffect(
 	value model.Publication,
 	intent PublicationAttemptIntent,
 ) bool {
+	executionProvenanceFingerprint, err :=
+		publicationExecutionProvenanceFingerprint(value)
+	if err != nil {
+		return false
+	}
 	return value.Board == intent.Board &&
 		value.ID == intent.PublicationID &&
 		value.ChangeSetID == intent.ChangeSetID &&
@@ -375,6 +584,8 @@ func publicationMatchesAttemptEffect(
 		value.BaseCommit == intent.BaseCommit &&
 		value.HeadCommit == intent.HeadCommit &&
 		value.DurableRef == intent.DurableRef &&
+		executionProvenanceFingerprint ==
+			intent.ExecutionProvenanceFingerprint &&
 		publicationEffectFingerprint(intent) == intent.EffectFingerprint
 }
 
@@ -520,6 +731,35 @@ func normalizePublicationAttemptEffect(
 	value model.Publication,
 ) (model.Publication, error) {
 	var err error
+	value.TaskID, err = validRecordID(
+		value.TaskID,
+		"publication attempt task id",
+	)
+	if err != nil || value.TaskID == "" {
+		if err != nil {
+			return model.Publication{}, err
+		}
+		return model.Publication{}, errors.New(
+			"publication attempt task id cannot be empty",
+		)
+	}
+	if err := validatePublicationAttemptExecutionPath(
+		value.RepositoryPath,
+		"publication attempt repository path",
+	); err != nil {
+		return model.Publication{}, err
+	}
+	if err := validatePublicationAttemptExecutionPath(
+		value.WorktreePath,
+		"publication attempt worktree path",
+	); err != nil {
+		return model.Publication{}, err
+	}
+	if _, err := canonicalPublicationSourceSnapshot(
+		value.SourceSnapshot,
+	); err != nil {
+		return model.Publication{}, err
+	}
 	value.ChangeSetID, err = validRecordID(
 		value.ChangeSetID,
 		"publication attempt change set id",
@@ -652,6 +892,10 @@ func (s *Store) BeginAutomatedPublicationAttempt(
 				return fmt.Errorf("generate publication claim token: %w", err)
 			}
 			timestamp := now()
+			startedAt, err := publicationAttemptLedgerTimestamp(timestamp)
+			if err != nil {
+				return err
+			}
 			attemptID := newID("pat")
 			update, err := tx.ExecContext(ctx, `
 				UPDATE publications
@@ -685,23 +929,29 @@ func (s *Store) BeginAutomatedPublicationAttempt(
 				}
 			}
 			current.ClaimEpoch++
+			executionProvenanceFingerprint, err :=
+				publicationExecutionProvenanceFingerprint(current)
+			if err != nil {
+				return err
+			}
 			intent := PublicationAttemptIntent{
-				ID:                   attemptID,
-				Board:                board,
-				PublicationID:        current.ID,
-				ChangeSetID:          current.ChangeSetID,
-				Mode:                 current.Mode,
-				TargetBranch:         current.TargetBranch,
-				Remote:               current.Remote,
-				BaseCommit:           current.BaseCommit,
-				HeadCommit:           current.HeadCommit,
-				DurableRef:           current.DurableRef,
-				ClaimEpoch:           current.ClaimEpoch,
-				PublicationUpdatedAt: timestamp,
-				ClaimExpiresAt:       expiresAt,
-				SessionID:            permit.sessionID,
-				GateGeneration:       permit.generation,
-				StartedAt:            timestamp,
+				ID:                             attemptID,
+				Board:                          board,
+				PublicationID:                  current.ID,
+				ChangeSetID:                    current.ChangeSetID,
+				Mode:                           current.Mode,
+				TargetBranch:                   current.TargetBranch,
+				Remote:                         current.Remote,
+				BaseCommit:                     current.BaseCommit,
+				HeadCommit:                     current.HeadCommit,
+				DurableRef:                     current.DurableRef,
+				ExecutionProvenanceFingerprint: executionProvenanceFingerprint,
+				ClaimEpoch:                     current.ClaimEpoch,
+				PublicationUpdatedAt:           timestamp,
+				ClaimExpiresAt:                 expiresAt,
+				SessionID:                      permit.sessionID,
+				GateGeneration:                 permit.generation,
+				StartedAt:                      startedAt,
 			}
 			intent.SourceKey = publicationAttemptSourceKey(
 				intent.Board,
@@ -714,9 +964,10 @@ func (s *Store) BeginAutomatedPublicationAttempt(
 				INSERT INTO publication_attempt_intents(
 					id, board, publication_id, source_key, change_set_id, mode,
 					target_branch, remote, base_commit, head_commit, durable_ref,
-					effect_fingerprint, claim_epoch, publication_updated_at,
-					claim_expires_at, session_id, gate_generation, started_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					execution_provenance_fingerprint, effect_fingerprint,
+					claim_epoch, publication_updated_at, claim_expires_at,
+					session_id, gate_generation, started_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`,
 				intent.ID,
 				intent.Board,
@@ -729,6 +980,7 @@ func (s *Store) BeginAutomatedPublicationAttempt(
 				intent.BaseCommit,
 				intent.HeadCommit,
 				intent.DurableRef,
+				intent.ExecutionProvenanceFingerprint,
 				intent.EffectFingerprint,
 				intent.ClaimEpoch,
 				intent.PublicationUpdatedAt,
@@ -1115,7 +1367,13 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 				return ErrPublicationAttemptScope
 			}
 
-			recordedAt := now()
+			resultTimestamp := now()
+			recordedAt, err := publicationAttemptLedgerTimestamp(
+				resultTimestamp,
+			)
+			if err != nil {
+				return err
+			}
 			resultUpdatedAt := current.UpdatedAt
 			switch input.Outcome {
 			case PublicationAttemptPublished:
@@ -1129,8 +1387,8 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 						AND claim_token = ? AND claim_expires_at = ?
 				`,
 					nullableString(input.URL),
-					recordedAt,
-					recordedAt,
+					resultTimestamp,
+					resultTimestamp,
 					current.ID,
 					board,
 					current.UpdatedAt,
@@ -1148,7 +1406,7 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 				if changed != 1 {
 					return ErrPublicationAttemptScope
 				}
-				resultUpdatedAt = recordedAt
+				resultUpdatedAt = resultTimestamp
 			case PublicationAttemptFailed:
 				update, err := tx.ExecContext(ctx, `
 					UPDATE publications
@@ -1160,7 +1418,7 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 						AND claim_token = ? AND claim_expires_at = ?
 				`,
 					input.Error,
-					recordedAt,
+					resultTimestamp,
 					current.ID,
 					board,
 					current.UpdatedAt,
@@ -1178,7 +1436,7 @@ func (s *Store) FinishAutomatedPublicationAttempt(
 				if changed != 1 {
 					return ErrPublicationAttemptScope
 				}
-				resultUpdatedAt = recordedAt
+				resultUpdatedAt = resultTimestamp
 			case PublicationAttemptUnknown:
 				// Preserve the exact Publishing tuple for quarantine recovery.
 			default:
@@ -1358,6 +1616,7 @@ func (s *Store) listPublicationAttemptCandidatePage(
 	for rows.Next() {
 		var record PublicationAttemptRecord
 		var result PublicationAttemptResult
+		var executionProvenanceFingerprint sql.NullString
 		var resultAttemptID, resultBoard, resultPublicationID sql.NullString
 		var resultOutcome, resultExecutorStatus, resultErrorKind sql.NullString
 		var resultURL, resultError sql.NullString
@@ -1375,6 +1634,7 @@ func (s *Store) listPublicationAttemptCandidatePage(
 			&record.Intent.BaseCommit,
 			&record.Intent.HeadCommit,
 			&record.Intent.DurableRef,
+			&executionProvenanceFingerprint,
 			&record.Intent.EffectFingerprint,
 			&record.Intent.ClaimEpoch,
 			&record.Intent.PublicationUpdatedAt,
@@ -1395,6 +1655,21 @@ func (s *Store) listPublicationAttemptCandidatePage(
 			&resultRecordedAt,
 		); err != nil {
 			return nil, err
+		}
+		if !executionProvenanceFingerprint.Valid ||
+			executionProvenanceFingerprint.String == "" {
+			return nil, errors.New(
+				"publication attempt intent lacks v30 execution provenance",
+			)
+		}
+		record.Intent.ExecutionProvenanceFingerprint =
+			executionProvenanceFingerprint.String
+		if !validPublicationAttemptFingerprint(
+			record.Intent.ExecutionProvenanceFingerprint,
+		) {
+			return nil, errors.New(
+				"publication attempt intent has invalid execution provenance",
+			)
 		}
 		if resultAttemptID.Valid {
 			if !resultBoard.Valid || !resultPublicationID.Valid ||
@@ -1435,7 +1710,19 @@ func (s *Store) listPublicationAttemptCandidatePage(
 				"publication attempt intent has invalid derived evidence",
 			)
 		}
+		if _, err := normalizePublicationAttemptLedgerTimestamp(
+			record.Intent.StartedAt,
+			"publication attempt startedAt",
+		); err != nil {
+			return nil, err
+		}
 		if record.Result != nil {
+			if _, err := normalizePublicationAttemptLedgerTimestamp(
+				record.Result.RecordedAt,
+				"publication attempt result recordedAt",
+			); err != nil {
+				return nil, err
+			}
 			resultInput := PublicationAttemptResultInput{
 				Outcome:        record.Result.Outcome,
 				ExecutorStatus: record.Result.ExecutorStatus,
@@ -1575,13 +1862,13 @@ func (s *Store) ListUnresolvedPublicationAttempts(
 		)
 	}
 	if afterStartedAt != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, afterStartedAt)
+		afterStartedAt, err = normalizePublicationAttemptLedgerTimestamp(
+			afterStartedAt,
+			"publication attempt cursor startedAt",
+		)
 		if err != nil {
-			return nil, errors.New(
-				"publication attempt cursor startedAt must be RFC3339",
-			)
+			return nil, err
 		}
-		afterStartedAt = parsed.UTC().Format(time.RFC3339Nano)
 	}
 	if filter.Limit <= 0 {
 		filter.Limit = 100

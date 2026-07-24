@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,8 +13,9 @@ import (
 )
 
 const (
-	publicationAttemptRecoverySchemaVersion = 28
-	publicationAttemptRecoveryPageSize      = 100
+	publicationAttemptRecoveryLegacySchemaVersion = 28
+	publicationAttemptRecoverySchemaVersion       = 30
+	publicationAttemptRecoveryPageSize            = 100
 )
 
 // PublicationAttemptRecoveryCursor is the stable raw-ledger position returned
@@ -26,23 +28,24 @@ type PublicationAttemptRecoveryCursor struct {
 // PublicationAttemptRecoveryPublication is the token-free current publication
 // observation needed to compare a ledger intent with durable board state.
 type PublicationAttemptRecoveryPublication struct {
-	Present        bool                    `json:"present"`
-	ID             string                  `json:"id,omitempty"`
-	Board          string                  `json:"board,omitempty"`
-	ChangeSetID    string                  `json:"changeSetId,omitempty"`
-	Status         model.PublicationStatus `json:"status,omitempty"`
-	Mode           model.PublicationMode   `json:"mode,omitempty"`
-	TargetBranch   string                  `json:"targetBranch,omitempty"`
-	Remote         string                  `json:"remote,omitempty"`
-	BaseCommit     string                  `json:"baseCommit,omitempty"`
-	HeadCommit     string                  `json:"headCommit,omitempty"`
-	DurableRef     string                  `json:"durableRef,omitempty"`
-	URL            *string                 `json:"url,omitempty"`
-	Error          *string                 `json:"error,omitempty"`
-	ClaimEpoch     int64                   `json:"claimEpoch,omitempty"`
-	ClaimExpiresAt *string                 `json:"claimExpiresAt,omitempty"`
-	PublishedAt    *string                 `json:"publishedAt,omitempty"`
-	UpdatedAt      string                  `json:"updatedAt,omitempty"`
+	Present                        bool                    `json:"present"`
+	ID                             string                  `json:"id,omitempty"`
+	Board                          string                  `json:"board,omitempty"`
+	ChangeSetID                    string                  `json:"changeSetId,omitempty"`
+	Status                         model.PublicationStatus `json:"status,omitempty"`
+	Mode                           model.PublicationMode   `json:"mode,omitempty"`
+	TargetBranch                   string                  `json:"targetBranch,omitempty"`
+	Remote                         string                  `json:"remote,omitempty"`
+	BaseCommit                     string                  `json:"baseCommit,omitempty"`
+	HeadCommit                     string                  `json:"headCommit,omitempty"`
+	DurableRef                     string                  `json:"durableRef,omitempty"`
+	ExecutionProvenanceFingerprint string                  `json:"executionProvenanceFingerprint,omitempty"`
+	URL                            *string                 `json:"url,omitempty"`
+	Error                          *string                 `json:"error,omitempty"`
+	ClaimEpoch                     int64                   `json:"claimEpoch,omitempty"`
+	ClaimExpiresAt                 *string                 `json:"claimExpiresAt,omitempty"`
+	PublishedAt                    *string                 `json:"publishedAt,omitempty"`
+	UpdatedAt                      string                  `json:"updatedAt,omitempty"`
 }
 
 // PublicationAttemptRecoveryObservation is one raw unresolved attempt and the
@@ -66,24 +69,25 @@ type publicationAttemptRecoverySchemaObject struct {
 }
 
 var publicationAttemptRecoveryIntentColumns = map[string]publicationAttemptRecoverySchemaColumn{
-	"id":                     {dataType: "TEXT", primaryKey: 1},
-	"board":                  {dataType: "TEXT"},
-	"publication_id":         {dataType: "TEXT"},
-	"source_key":             {dataType: "TEXT"},
-	"change_set_id":          {dataType: "TEXT"},
-	"mode":                   {dataType: "TEXT"},
-	"target_branch":          {dataType: "TEXT"},
-	"remote":                 {dataType: "TEXT"},
-	"base_commit":            {dataType: "TEXT"},
-	"head_commit":            {dataType: "TEXT"},
-	"durable_ref":            {dataType: "TEXT"},
-	"effect_fingerprint":     {dataType: "TEXT"},
-	"claim_epoch":            {dataType: "INTEGER"},
-	"publication_updated_at": {dataType: "TEXT"},
-	"claim_expires_at":       {dataType: "TEXT"},
-	"session_id":             {dataType: "TEXT"},
-	"gate_generation":        {dataType: "INTEGER"},
-	"started_at":             {dataType: "TEXT"},
+	"id":                               {dataType: "TEXT", primaryKey: 1},
+	"board":                            {dataType: "TEXT"},
+	"publication_id":                   {dataType: "TEXT"},
+	"source_key":                       {dataType: "TEXT"},
+	"change_set_id":                    {dataType: "TEXT"},
+	"mode":                             {dataType: "TEXT"},
+	"target_branch":                    {dataType: "TEXT"},
+	"remote":                           {dataType: "TEXT"},
+	"base_commit":                      {dataType: "TEXT"},
+	"head_commit":                      {dataType: "TEXT"},
+	"durable_ref":                      {dataType: "TEXT"},
+	"execution_provenance_fingerprint": {dataType: "TEXT"},
+	"effect_fingerprint":               {dataType: "TEXT"},
+	"claim_epoch":                      {dataType: "INTEGER"},
+	"publication_updated_at":           {dataType: "TEXT"},
+	"claim_expires_at":                 {dataType: "TEXT"},
+	"session_id":                       {dataType: "TEXT"},
+	"gate_generation":                  {dataType: "INTEGER"},
+	"started_at":                       {dataType: "TEXT"},
 }
 
 var publicationAttemptRecoveryResultColumns = map[string]publicationAttemptRecoverySchemaColumn{
@@ -117,6 +121,10 @@ var publicationAttemptRecoveryObjects = map[string]publicationAttemptRecoverySch
 		objectType: "trigger",
 		table:      "publication_attempt_intents",
 	},
+	"publication_attempt_intents_require_v30_evidence": {
+		objectType: "trigger",
+		table:      "publication_attempt_intents",
+	},
 	"publication_attempt_results_identity_guard": {
 		objectType: "trigger",
 		table:      "publication_attempt_results",
@@ -126,6 +134,10 @@ var publicationAttemptRecoveryObjects = map[string]publicationAttemptRecoverySch
 		table:      "publication_attempt_results",
 	},
 	"publication_attempt_results_prevent_delete": {
+		objectType: "trigger",
+		table:      "publication_attempt_results",
+	},
+	"publication_attempt_results_require_v30_evidence": {
 		objectType: "trigger",
 		table:      "publication_attempt_results",
 	},
@@ -148,6 +160,12 @@ var publicationAttemptRecoveryTriggerContracts = map[string][]string{
 		"before delete on publication_attempt_intents",
 		"raise(abort, 'publication attempt intents are immutable')",
 	},
+	"publication_attempt_intents_require_v30_evidence": {
+		"before insert on publication_attempt_intents",
+		"new.execution_provenance_fingerprint is null",
+		"new.started_at not glob",
+		"publication attempt intent requires v30 evidence",
+	},
 	"publication_attempt_results_identity_guard": {
 		"before insert on publication_attempt_results",
 		"when not exists",
@@ -165,6 +183,14 @@ var publicationAttemptRecoveryTriggerContracts = map[string][]string{
 	"publication_attempt_results_prevent_delete": {
 		"before delete on publication_attempt_results",
 		"raise(abort, 'publication attempt results are immutable')",
+	},
+	"publication_attempt_results_require_v30_evidence": {
+		"before insert on publication_attempt_results",
+		"new.recorded_at not glob",
+		"from publication_attempt_intents i",
+		"i.id = new.attempt_id",
+		"i.execution_provenance_fingerprint is not null",
+		"publication attempt result requires v30 evidence",
 	},
 }
 
@@ -193,9 +219,11 @@ func publicationAttemptRecoverySchemaArtifacts(
 			'publication_attempt_results',
 			'publication_attempt_intents_prevent_update',
 			'publication_attempt_intents_prevent_delete',
+			'publication_attempt_intents_require_v30_evidence',
 			'publication_attempt_results_identity_guard',
 			'publication_attempt_results_prevent_update',
 			'publication_attempt_results_prevent_delete',
+			'publication_attempt_results_require_v30_evidence',
 			'idx_publication_attempt_intents_board_started',
 			'idx_publication_attempt_intents_publication'
 		)
@@ -419,6 +447,13 @@ func publicationAttemptRecoverySupported(
 			err,
 		)
 	}
+	if version > schemaVersion {
+		return false, fmt.Errorf(
+			"publication attempt recovery schema version %d is newer than supported version %d",
+			version,
+			schemaVersion,
+		)
+	}
 	objects, err := publicationAttemptRecoverySchemaArtifacts(ctx, q)
 	if err != nil {
 		return false, fmt.Errorf(
@@ -426,25 +461,70 @@ func publicationAttemptRecoverySupported(
 			err,
 		)
 	}
-	if version < publicationAttemptRecoverySchemaVersion &&
+	if version < publicationAttemptRecoveryLegacySchemaVersion &&
 		len(objects) == 0 {
 		return false, nil
 	}
-	if len(objects) != len(publicationAttemptRecoveryObjects) {
-		if version < publicationAttemptRecoverySchemaVersion {
+	fullV30Objects := len(objects) == len(publicationAttemptRecoveryObjects)
+	if fullV30Objects {
+		for name, wanted := range publicationAttemptRecoveryObjects {
+			got, ok := objects[name]
+			if !ok || got.objectType != wanted.objectType ||
+				got.table != wanted.table {
+				fullV30Objects = false
+				break
+			}
+		}
+	}
+	if version < publicationAttemptRecoverySchemaVersion &&
+		!fullV30Objects {
+		legacyObjectCount := 0
+		for name, wanted := range publicationAttemptRecoveryObjects {
+			if strings.Contains(name, "require_v30_evidence") {
+				continue
+			}
+			legacyObjectCount++
+			got, ok := objects[name]
+			if !ok || got.objectType != wanted.objectType ||
+				got.table != wanted.table {
+				if version <
+					publicationAttemptRecoveryLegacySchemaVersion {
+					return false, errors.New(
+						"pre-v28 publication attempt recovery schema is partially present",
+					)
+				}
+				return false, errors.New(
+					"pre-v30 publication attempt recovery schema is incomplete",
+				)
+			}
+		}
+		if len(objects) < legacyObjectCount {
 			return false, errors.New(
-				"pre-v28 publication attempt recovery schema is partially present",
+				"pre-v30 publication attempt recovery schema is incomplete",
 			)
 		}
+		var evidenceRows int
+		if err := q.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM publication_attempt_intents)
+				+
+				(SELECT COUNT(*) FROM publication_attempt_results)
+		`).Scan(&evidenceRows); err != nil {
+			return false, fmt.Errorf(
+				"inspect pre-v30 publication attempt evidence: %w",
+				err,
+			)
+		}
+		if evidenceRows != 0 {
+			return false, errors.New(
+				"pre-v30 publication attempt evidence lacks durable executor-input provenance",
+			)
+		}
+		return false, nil
+	}
+	if !fullV30Objects {
 		return false, errors.New(
 			"publication attempt recovery schema is incomplete",
-		)
-	}
-	if version > schemaVersion {
-		return false, fmt.Errorf(
-			"publication attempt recovery schema version %d is newer than supported version %d",
-			version,
-			schemaVersion,
 		)
 	}
 	for name, wanted := range publicationAttemptRecoveryObjects {
@@ -549,6 +629,39 @@ func canonicalPublicationAttemptRecoveryTimestamp(
 	return value, nil
 }
 
+func canonicalPublicationAttemptRecoveryFixedTimestamp(
+	value string,
+	field string,
+	required bool,
+) (string, error) {
+	if !required && value == "" {
+		return "", nil
+	}
+	normalized, err := canonicalPublicationAttemptRecoveryTimestamp(
+		value,
+		field,
+		required,
+	)
+	if err != nil || normalized == "" {
+		return normalized, err
+	}
+	if normalized != mustPublicationAttemptFixedTimestamp(normalized) {
+		return "", fmt.Errorf(
+			"%s is not a fixed-width UTC ledger timestamp",
+			field,
+		)
+	}
+	return normalized, nil
+}
+
+func mustPublicationAttemptFixedTimestamp(value string) string {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return ""
+	}
+	return parsed.UTC().Format(publicationTimestampLayout)
+}
+
 func canonicalPublicationAttemptRecoveryID(
 	value string,
 	field string,
@@ -580,7 +693,7 @@ func normalizePublicationAttemptRecoveryCursor(
 	if err != nil {
 		return PublicationAttemptRecoveryCursor{}, err
 	}
-	cursor.StartedAt, err = canonicalPublicationAttemptRecoveryTimestamp(
+	cursor.StartedAt, err = canonicalPublicationAttemptRecoveryFixedTimestamp(
 		cursor.StartedAt,
 		"publication attempt recovery cursor startedAt",
 		false,
@@ -675,15 +788,21 @@ func validatePublicationAttemptRecoveryIntent(
 			"publication attempt recovery intent has invalid generations",
 		)
 	}
+	if _, err := canonicalPublicationAttemptRecoveryTimestamp(
+		value.PublicationUpdatedAt,
+		"publication attempt recovery publication updatedAt",
+		true,
+	); err != nil {
+		return err
+	}
 	for _, timestamp := range []struct {
 		value string
 		field string
 	}{
-		{value.PublicationUpdatedAt, "publication updatedAt"},
 		{value.ClaimExpiresAt, "claim expiresAt"},
 		{value.StartedAt, "startedAt"},
 	} {
-		if _, err := canonicalPublicationAttemptRecoveryTimestamp(
+		if _, err := canonicalPublicationAttemptRecoveryFixedTimestamp(
 			timestamp.value,
 			"publication attempt recovery "+timestamp.field,
 			true,
@@ -704,6 +823,13 @@ func validatePublicationAttemptRecoveryIntent(
 	if value.EffectFingerprint != publicationEffectFingerprint(value) {
 		return errors.New(
 			"publication attempt recovery intent has an invalid effect fingerprint",
+		)
+	}
+	if !validPublicationAttemptFingerprint(
+		value.ExecutionProvenanceFingerprint,
+	) {
+		return errors.New(
+			"publication attempt recovery intent has an invalid execution provenance fingerprint",
 		)
 	}
 	return nil
@@ -742,20 +868,19 @@ func validatePublicationAttemptRecoveryResult(
 			"publication attempt recovery result has an invalid identity",
 		)
 	}
-	for _, timestamp := range []struct {
-		value string
-		field string
-	}{
-		{value.PublicationUpdatedAt, "result publication updatedAt"},
-		{value.RecordedAt, "result recordedAt"},
-	} {
-		if _, err := canonicalPublicationAttemptRecoveryTimestamp(
-			timestamp.value,
-			"publication attempt recovery "+timestamp.field,
-			true,
-		); err != nil {
-			return err
-		}
+	if _, err := canonicalPublicationAttemptRecoveryTimestamp(
+		value.PublicationUpdatedAt,
+		"publication attempt recovery result publication updatedAt",
+		true,
+	); err != nil {
+		return err
+	}
+	if _, err := canonicalPublicationAttemptRecoveryFixedTimestamp(
+		value.RecordedAt,
+		"publication attempt recovery result recordedAt",
+		true,
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -766,23 +891,30 @@ func publicationAttemptRecoveryCurrent(
 	publicationID string,
 ) (PublicationAttemptRecoveryPublication, error) {
 	var value PublicationAttemptRecoveryPublication
+	var taskID, repositoryPath, worktreePath string
+	var sourceSnapshot []byte
 	var rawURL, publicationError, claimExpiresAt, publishedAt sql.NullString
 	err := q.QueryRowContext(ctx, `
-		SELECT id, board, change_set_id, status, mode, target_branch, remote,
-			base_commit, head_commit, durable_ref, url, error, claim_epoch,
-			claim_expires_at, published_at, updated_at
+		SELECT id, board, task_id, change_set_id, status, mode,
+			target_branch, remote, repository_path, worktree_path,
+			base_commit, head_commit, durable_ref, source_snapshot_json,
+			url, error, claim_epoch, claim_expires_at, published_at, updated_at
 		FROM publications WHERE id = ?
 	`, publicationID).Scan(
 		&value.ID,
 		&value.Board,
+		&taskID,
 		&value.ChangeSetID,
 		&value.Status,
 		&value.Mode,
 		&value.TargetBranch,
 		&value.Remote,
+		&repositoryPath,
+		&worktreePath,
 		&value.BaseCommit,
 		&value.HeadCommit,
 		&value.DurableRef,
+		&sourceSnapshot,
 		&rawURL,
 		&publicationError,
 		&value.ClaimEpoch,
@@ -801,6 +933,24 @@ func publicationAttemptRecoveryCurrent(
 	value.Error = stringPointer(publicationError)
 	value.ClaimExpiresAt = stringPointer(claimExpiresAt)
 	value.PublishedAt = stringPointer(publishedAt)
+	executionProvenanceFingerprint, err :=
+		publicationExecutionProvenanceFingerprint(model.Publication{
+			TaskID:         taskID,
+			RepositoryPath: repositoryPath,
+			WorktreePath:   worktreePath,
+			SourceSnapshot: append(
+				json.RawMessage(nil),
+				sourceSnapshot...,
+			),
+		})
+	if err != nil {
+		return PublicationAttemptRecoveryPublication{}, fmt.Errorf(
+			"derive publication attempt recovery current execution provenance: %w",
+			err,
+		)
+	}
+	value.ExecutionProvenanceFingerprint =
+		executionProvenanceFingerprint
 
 	for _, id := range []struct {
 		value string
@@ -903,7 +1053,11 @@ func publicationAttemptRecoveryCurrent(
 		if timestamp.value == nil {
 			continue
 		}
-		if _, err := canonicalPublicationAttemptRecoveryTimestamp(
+		validate := canonicalPublicationAttemptRecoveryTimestamp
+		if timestamp.field == "current claim expiresAt" {
+			validate = canonicalPublicationAttemptRecoveryFixedTimestamp
+		}
+		if _, err := validate(
 			*timestamp.value,
 			"publication attempt recovery "+timestamp.field,
 			timestamp.required,

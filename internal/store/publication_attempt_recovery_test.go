@@ -95,6 +95,32 @@ func TestCanonicalPublicationAttemptRecoveryTimestampRejectsAlternateForms(
 	}
 }
 
+func TestCanonicalPublicationAttemptRecoveryFixedTimestampRejectsVariableWidth(
+	t *testing.T,
+) {
+	for _, value := range []string{
+		"2026-07-24T01:02:03Z",
+		"2026-07-24T01:02:03.1Z",
+		"2026-07-24T01:02:03.11Z",
+	} {
+		if _, err := canonicalPublicationAttemptRecoveryFixedTimestamp(
+			value,
+			"ledger timestamp",
+			true,
+		); err == nil {
+			t.Fatalf("variable-width ledger timestamp %q accepted", value)
+		}
+	}
+	value := "2026-07-24T01:02:03.100000000Z"
+	if got, err := canonicalPublicationAttemptRecoveryFixedTimestamp(
+		value,
+		"ledger timestamp",
+		true,
+	); err != nil || got != value {
+		t.Fatalf("fixed ledger timestamp=%q err=%v", got, err)
+	}
+}
+
 func TestPublicationAttemptRecoveryReaderReportsPreV28Unsupported(
 	t *testing.T,
 ) {
@@ -185,7 +211,126 @@ func TestPublicationAttemptRecoveryReaderAcceptsCompleteLedgerWithStaleVersion(
 	}
 }
 
-func TestPublicationAttemptRecoveryReaderRejectsMalformedV28Schema(
+func TestPublicationAttemptRecoveryReaderPreV30WithoutEvidenceAllowsLegacy(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := createPublicationAttemptRecoveryDatabase(t)
+	mutatePublicationAttemptRecoveryDatabase(t, path, `
+		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
+		DROP TRIGGER publication_attempt_results_require_v30_evidence;
+		PRAGMA user_version = 29;
+	`)
+	reader, err := OpenPublicationRecoveryReader(ctx, path, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	values, next, supported, err :=
+		reader.ListPublicationAttemptRecoveryPage(
+			ctx,
+			PublicationAttemptFilter{},
+		)
+	if err != nil || supported || len(values) != 0 ||
+		next != (PublicationAttemptRecoveryCursor{}) {
+		t.Fatalf(
+			"empty pre-v30 ledger values=%+v next=%+v supported=%v err=%v",
+			values,
+			next,
+			supported,
+			err,
+		)
+	}
+}
+
+func TestPublicationAttemptRecoveryReaderPreV30EvidenceFailsClosed(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertPublicationAttemptRecoveryIntent(
+		t,
+		opened,
+		"pat_pre_v30",
+		"2026-07-24T00:00:00.100000000Z",
+	)
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mutatePublicationAttemptRecoveryDatabase(t, path, `
+		DROP TRIGGER publication_attempt_intents_require_v30_evidence;
+		DROP TRIGGER publication_attempt_results_require_v30_evidence;
+		PRAGMA user_version = 29;
+	`)
+	reader, err := OpenPublicationRecoveryReader(ctx, path, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	_, _, _, err = reader.ListPublicationAttemptRecoveryPage(
+		ctx,
+		PublicationAttemptFilter{},
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"lacks durable executor-input provenance",
+		) {
+		t.Fatalf("pre-v30 evidence error=%v", err)
+	}
+}
+
+func TestPublicationAttemptRecoveryReaderAcceptsCompleteV30EvidenceWithStaleVersion(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "autogora.db")
+	opened, err := Open(path, "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := insertPublicationAttemptRecoveryIntent(
+		t,
+		opened,
+		"pat_v30_stale_version",
+		"2026-07-24T00:00:00.110000000Z",
+	)
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mutatePublicationAttemptRecoveryDatabase(
+		t,
+		path,
+		"PRAGMA user_version = 29",
+	)
+	reader, err := OpenPublicationRecoveryReader(ctx, path, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	values, next, supported, err :=
+		reader.ListPublicationAttemptRecoveryPage(
+			ctx,
+			PublicationAttemptFilter{},
+		)
+	if err != nil || !supported || len(values) != 1 ||
+		values[0].Attempt.Intent != intent ||
+		next != (PublicationAttemptRecoveryCursor{}) {
+		t.Fatalf(
+			"stale-version v30 values=%+v next=%+v supported=%v err=%v",
+			values,
+			next,
+			supported,
+			err,
+		)
+	}
+}
+
+func TestPublicationAttemptRecoveryReaderRejectsMalformedSchema(
 	t *testing.T,
 ) {
 	ctx := context.Background()
@@ -222,6 +367,20 @@ func TestPublicationAttemptRecoveryReaderRejectsMalformedV28Schema(
 			`,
 			want: "incompatible SQL contract",
 		},
+		{
+			name: "forged v30 evidence trigger",
+			mutate: `
+				DROP TRIGGER
+					publication_attempt_intents_require_v30_evidence;
+				CREATE TRIGGER
+					publication_attempt_intents_require_v30_evidence
+				BEFORE INSERT ON publication_attempt_intents
+				BEGIN
+					SELECT 1;
+				END;
+			`,
+			want: "incompatible SQL contract",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := createPublicationAttemptRecoveryDatabase(t)
@@ -240,7 +399,7 @@ func TestPublicationAttemptRecoveryReaderRejectsMalformedV28Schema(
 				PublicationAttemptFilter{},
 			)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("malformed v28 schema error = %v", err)
+				t.Fatalf("malformed publication attempt schema error = %v", err)
 			}
 		})
 	}
@@ -254,18 +413,19 @@ func insertPublicationAttemptRecoveryIntent(
 ) PublicationAttemptIntent {
 	t.Helper()
 	intent := PublicationAttemptIntent{
-		ID:                   id,
-		Board:                "default",
-		PublicationID:        "pub_" + strings.TrimPrefix(id, "pat_"),
-		ChangeSetID:          "chg_" + strings.TrimPrefix(id, "pat_"),
-		Mode:                 model.PublicationModeLocalFF,
-		TargetBranch:         "main",
-		Remote:               "origin",
-		BaseCommit:           "base-" + id,
-		HeadCommit:           "head-" + id,
-		DurableRef:           "refs/autogora/" + id,
-		ClaimEpoch:           1,
-		PublicationUpdatedAt: startedAt,
+		ID:                             id,
+		Board:                          "default",
+		PublicationID:                  "pub_" + strings.TrimPrefix(id, "pat_"),
+		ChangeSetID:                    "chg_" + strings.TrimPrefix(id, "pat_"),
+		Mode:                           model.PublicationModeLocalFF,
+		TargetBranch:                   "main",
+		Remote:                         "origin",
+		BaseCommit:                     "base-" + id,
+		HeadCommit:                     "head-" + id,
+		DurableRef:                     "refs/autogora/" + id,
+		ExecutionProvenanceFingerprint: strings.Repeat("b", 64),
+		ClaimEpoch:                     1,
+		PublicationUpdatedAt:           startedAt,
 		ClaimExpiresAt: time.Date(
 			2026,
 			7,
@@ -275,7 +435,7 @@ func insertPublicationAttemptRecoveryIntent(
 			0,
 			0,
 			time.UTC,
-		).Format(time.RFC3339Nano),
+		).Format(publicationTimestampLayout),
 		SessionID:      "dispatcher-pagination",
 		GateGeneration: 1,
 		StartedAt:      startedAt,
@@ -291,9 +451,10 @@ func insertPublicationAttemptRecoveryIntent(
 		INSERT INTO publication_attempt_intents(
 			id, board, publication_id, source_key, change_set_id, mode,
 			target_branch, remote, base_commit, head_commit, durable_ref,
-			effect_fingerprint, claim_epoch, publication_updated_at,
-			claim_expires_at, session_id, gate_generation, started_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			execution_provenance_fingerprint, effect_fingerprint, claim_epoch,
+			publication_updated_at, claim_expires_at, session_id,
+			gate_generation, started_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		intent.ID,
 		intent.Board,
@@ -306,6 +467,7 @@ func insertPublicationAttemptRecoveryIntent(
 		intent.BaseCommit,
 		intent.HeadCommit,
 		intent.DurableRef,
+		intent.ExecutionProvenanceFingerprint,
 		intent.EffectFingerprint,
 		intent.ClaimEpoch,
 		intent.PublicationUpdatedAt,
@@ -331,13 +493,19 @@ func TestPublicationAttemptRecoveryReaderUsesBoundedMonotonicPages(
 	base := time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)
 	intents := make([]PublicationAttemptIntent, 0, 102)
 	for index := 0; index < 102; index++ {
+		startedAt := base.Add(100 * time.Millisecond).
+			Format(publicationTimestampLayout)
+		if index >= 100 {
+			startedAt = base.Add(110 * time.Millisecond).
+				Format(publicationTimestampLayout)
+		}
 		intents = append(
 			intents,
 			insertPublicationAttemptRecoveryIntent(
 				t,
 				opened,
 				fmt.Sprintf("pat_%03d", index),
-				base.Format(time.RFC3339Nano),
+				startedAt,
 			),
 		)
 	}
@@ -584,6 +752,8 @@ func TestPublicationAttemptRecoveryReaderObservesReceiptAndCurrentState(
 		observation.Publication.BaseCommit != intent.BaseCommit ||
 		observation.Publication.HeadCommit != intent.HeadCommit ||
 		observation.Publication.DurableRef != intent.DurableRef ||
+		observation.Publication.ExecutionProvenanceFingerprint !=
+			intent.ExecutionProvenanceFingerprint ||
 		observation.Publication.ClaimEpoch != intent.ClaimEpoch ||
 		observation.Publication.UpdatedAt != intent.PublicationUpdatedAt {
 		t.Fatalf("observation = %+v", observation)
@@ -594,7 +764,10 @@ func TestPublicationAttemptRecoveryReaderObservesReceiptAndCurrentState(
 	}
 	if claimCredential == "" ||
 		strings.Contains(string(encoded), claimCredential) ||
-		strings.Contains(string(encoded), "claimToken") {
+		strings.Contains(string(encoded), "claimToken") ||
+		strings.Contains(string(encoded), pending.RepositoryPath) ||
+		strings.Contains(string(encoded), pending.WorktreePath) ||
+		strings.Contains(string(encoded), string(pending.SourceSnapshot)) {
 		t.Fatalf("observation leaked claim token: %s", encoded)
 	}
 
