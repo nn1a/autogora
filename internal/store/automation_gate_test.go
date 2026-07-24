@@ -369,6 +369,12 @@ func TestAutomationPermitRejectsExpiredReleasedAndWrongSession(t *testing.T) {
 	}); err != nil || manual == nil {
 		t.Fatalf("manual claim was gated = %+v, err=%v", manual, err)
 	}
+	if released, err := opened.ReleaseAutomationDispatcherSession(
+		ctx,
+		lease,
+	); err != nil || !released {
+		t.Fatalf("release expired session = %v, err=%v", released, err)
+	}
 
 	releaseLease := registerAutomationTestSession(t, opened, "default", "dispatcher-release")
 	if released, err := opened.ReleaseAutomationDispatcherSession(ctx, releaseLease); err != nil || !released {

@@ -303,7 +303,13 @@ func ExecuteTurn(ctx context.Context, command RunnerCommand, opened *store.Store
 			compensateUnstartedTurn(compensate, err),
 		)
 	}
-	released, err := worker.release()
+	release := WorkerRelease(worker.release)
+	released := false
+	if command.ReleaseGate != nil {
+		released, err = command.ReleaseGate(ctx, release)
+	} else {
+		released, err = release()
+	}
 	if err != nil {
 		done := make(chan error, 1)
 		go func() { done <- worker.wait() }()

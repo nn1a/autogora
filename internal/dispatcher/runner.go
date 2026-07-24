@@ -28,6 +28,14 @@ type PolicyFile struct {
 	Content string
 }
 
+// WorkerRelease resumes a process that has already been started behind the
+// platform fence and recorded durably, but has not executed coding-agent code.
+type WorkerRelease func() (bool, error)
+
+// WorkerReleaseGate serializes the final process release with global
+// automation quarantine activation.
+type WorkerReleaseGate func(context.Context, WorkerRelease) (bool, error)
+
 type RunnerCommand struct {
 	Command      string
 	Args         []string
@@ -35,6 +43,7 @@ type RunnerCommand struct {
 	Env          map[string]string
 	ToolApproval *ToolApproval
 	PolicyFile   *PolicyFile
+	ReleaseGate  WorkerReleaseGate
 }
 
 type RunnerOptions struct {

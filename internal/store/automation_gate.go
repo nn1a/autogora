@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,6 +62,9 @@ const (
 	MaxAutomationSessionTTL = 15 * time.Minute
 
 	automationTimestampLayout = "2006-01-02T15:04:05.000000000Z"
+
+	automationExpiredSessionSourceKind = "dispatcher_session_expired"
+	automationExpiredSessionDiagnostic = "session_expired_without_release"
 )
 
 type automationGateRuntime struct {
@@ -822,6 +826,80 @@ func randomAutomationToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+func activateAutomationQuarantineTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	input AutomationQuarantineSourceInput,
+	sourceKey string,
+	timestamp string,
+) (AutomationQuarantine, bool, error) {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM automation_quarantine_sources WHERE source_key = ?
+	)`, sourceKey).Scan(&exists); err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	record, err := readAutomationGate(ctx, tx)
+	if err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	if exists {
+		value, err := publicAutomationGate(ctx, tx, record)
+		return value, false, err
+	}
+	var activeSourceCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM automation_quarantine_sources WHERE disposition = 'active'`,
+	).Scan(&activeSourceCount); err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	if activeSourceCount >= 1000 {
+		return AutomationQuarantine{}, false, errors.New(
+			"automation quarantine has too many active sources",
+		)
+	}
+	if record.Generation == math.MaxInt64 {
+		return AutomationQuarantine{}, false, errors.New(
+			"automation quarantine generation is exhausted",
+		)
+	}
+	token, err := randomAutomationToken()
+	if err != nil {
+		return AutomationQuarantine{}, false, fmt.Errorf(
+			"generate automation generation token: %w",
+			err,
+		)
+	}
+	generation := record.Generation + 1
+	if _, err := tx.ExecContext(ctx, `INSERT INTO automation_quarantine_sources(
+		source_key, generation, board, kind, source_id, observed_updated_at,
+		observed_claim_epoch, diagnostic_code, disposition, observed_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+		sourceKey, generation, input.Board, input.Kind, input.SourceID,
+		input.ObservedUpdatedAt, input.ObservedClaimEpoch, input.DiagnosticCode,
+		timestamp,
+	); err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE automation_quarantine_gate
+		SET active = 1, generation = ?, permit_token = ?, activated_at = ?,
+			cleared_at = NULL, confirmation_started_at = NULL,
+			confirmation_actor = NULL, confirmation_reason = NULL,
+			confirmation_helpers_stopped = 0,
+			confirmation_external_writes_stopped = 0
+		WHERE singleton = 1`,
+		generation, token, timestamp,
+	); err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	record, err = readAutomationGate(ctx, tx)
+	if err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	value, err := publicAutomationGate(ctx, tx, record)
+	return value, true, err
+}
+
 // ActivateAutomationQuarantine serializes source observation and gate rotation
 // with an exclusive operating-system lock.
 func (s *Store) ActivateAutomationQuarantine(
@@ -862,66 +940,14 @@ func (s *Store) ActivateAutomationQuarantine(
 			_ = tx.Rollback()
 		}
 	}()
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM automation_quarantine_sources WHERE source_key = ?
-	)`, sourceKey).Scan(&exists); err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	record, err := readAutomationGate(ctx, tx)
-	if err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	if exists {
-		value, err := publicAutomationGate(ctx, tx, record)
-		return value, false, err
-	}
-	var activeSourceCount int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM automation_quarantine_sources WHERE disposition = 'active'`,
-	).Scan(&activeSourceCount); err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	if activeSourceCount >= 1000 {
-		return AutomationQuarantine{}, false, errors.New(
-			"automation quarantine has too many active sources",
-		)
-	}
-	token, err := randomAutomationToken()
-	if err != nil {
-		return AutomationQuarantine{}, false, fmt.Errorf(
-			"generate automation generation token: %w",
-			err,
-		)
-	}
-	generation := record.Generation + 1
 	timestamp := time.Now().UTC().Format(automationTimestampLayout)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO automation_quarantine_sources(
-		source_key, generation, board, kind, source_id, observed_updated_at,
-		observed_claim_epoch, diagnostic_code, disposition, observed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
-		sourceKey, generation, input.Board, input.Kind, input.SourceID,
-		input.ObservedUpdatedAt, input.ObservedClaimEpoch, input.DiagnosticCode,
+	value, activated, err = activateAutomationQuarantineTx(
+		ctx,
+		tx,
+		input,
+		sourceKey,
 		timestamp,
-	); err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE automation_quarantine_gate
-		SET active = 1, generation = ?, permit_token = ?, activated_at = ?,
-			cleared_at = NULL, confirmation_started_at = NULL,
-			confirmation_actor = NULL, confirmation_reason = NULL,
-			confirmation_helpers_stopped = 0,
-			confirmation_external_writes_stopped = 0
-		WHERE singleton = 1`,
-		generation, token, timestamp,
-	); err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	record, err = readAutomationGate(ctx, tx)
-	if err != nil {
-		return AutomationQuarantine{}, false, err
-	}
-	value, err = publicAutomationGate(ctx, tx, record)
+	)
 	if err != nil {
 		return AutomationQuarantine{}, false, err
 	}
@@ -929,7 +955,7 @@ func (s *Store) ActivateAutomationQuarantine(
 		return AutomationQuarantine{}, false, err
 	}
 	committed = true
-	return value, true, nil
+	return value, activated, nil
 }
 
 type AutomationSourceDisposition string
@@ -1539,6 +1565,114 @@ func (s *Store) withAutomationAuthorityLock(
 	return s.withWrite(ctx, fn)
 }
 
+func overlappingExpiredAutomationSessions(
+	ctx context.Context,
+	tx *sql.Tx,
+	board string,
+	timestamp string,
+) ([]AutomationDispatcherSessionLease, error) {
+	rows, err := tx.QueryContext(ctx,
+		"SELECT "+automationDispatcherSessionColumns+`
+		FROM automation_dispatcher_sessions
+		WHERE released_at IS NULL AND expires_at <= ?
+			AND (? = '*' OR board = '*' OR board = ?)
+		ORDER BY expires_at, session_id`,
+		timestamp,
+		board,
+		board,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var leases []AutomationDispatcherSessionLease
+	for rows.Next() {
+		lease, err := scanAutomationDispatcherSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		leases = append(leases, lease)
+	}
+	return leases, rows.Err()
+}
+
+func quarantineExpiredAutomationSessions(
+	ctx context.Context,
+	tx *sql.Tx,
+	board string,
+	timestamp string,
+) (AutomationQuarantine, bool, error) {
+	expired, err := overlappingExpiredAutomationSessions(ctx, tx, board, timestamp)
+	if err != nil || len(expired) == 0 {
+		return AutomationQuarantine{}, false, err
+	}
+	var gate AutomationQuarantine
+	for _, lease := range expired {
+		input, sourceKey, err := normalizeAutomationSource(
+			AutomationQuarantineSourceInput{
+				Board:             lease.Board,
+				Kind:              automationExpiredSessionSourceKind,
+				SourceID:          lease.SessionID,
+				ObservedUpdatedAt: lease.ExpiresAt,
+				DiagnosticCode:    automationExpiredSessionDiagnostic,
+			},
+		)
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		gate, _, err = activateAutomationQuarantineTx(
+			ctx,
+			tx,
+			input,
+			sourceKey,
+			timestamp,
+		)
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE automation_dispatcher_sessions
+			SET released_at = ?
+			WHERE session_id = ? AND board = ? AND lease_token = ?
+				AND released_at IS NULL AND expires_at <= ?`,
+			timestamp,
+			lease.SessionID,
+			lease.Board,
+			lease.leaseToken,
+			timestamp,
+		)
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		if changed != 1 {
+			return AutomationQuarantine{}, false, ErrAutomationGateConflict
+		}
+	}
+	return gate, true, nil
+}
+
+func hasLiveOverlappingAutomationSession(
+	ctx context.Context,
+	tx *sql.Tx,
+	board string,
+	timestamp string,
+) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM automation_dispatcher_sessions
+		WHERE released_at IS NULL AND expires_at > ?
+			AND (? = '*' OR board = '*' OR board = ?)
+	)`,
+		timestamp,
+		board,
+		board,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (s *Store) RegisterAutomationDispatcherSession(
 	ctx context.Context,
 	board string,
@@ -1559,7 +1693,27 @@ func (s *Store) RegisterAutomationDispatcherSession(
 	}
 	var lease AutomationDispatcherSessionLease
 	acquired := false
+	var admissionErr error
 	err = s.withAutomationAuthorityLock(ctx, true, func(tx *sql.Tx) error {
+		current := time.Now().UTC()
+		timestamp = current.Format(automationTimestampLayout)
+		expiresAt = current.Add(ttl).Format(automationTimestampLayout)
+
+		quarantine, converted, err := quarantineExpiredAutomationSessions(
+			ctx,
+			tx,
+			board,
+			timestamp,
+		)
+		if err != nil {
+			return err
+		}
+		if converted {
+			admissionErr = &AutomationQuarantinedError{
+				Generation: quarantine.Generation,
+			}
+			return nil
+		}
 		gate, err := readAutomationGate(ctx, tx)
 		if err != nil {
 			return err
@@ -1572,39 +1726,54 @@ func (s *Store) RegisterAutomationDispatcherSession(
 				" FROM automation_dispatcher_sessions WHERE session_id = ?",
 			sessionID,
 		))
-		if errors.Is(err, sql.ErrNoRows) {
-			_, err = tx.ExecContext(ctx, `INSERT INTO automation_dispatcher_sessions(
-				session_id, board, lease_token, registered_at, renewed_at, expires_at
-			) VALUES (?, ?, ?, ?, ?, ?)`,
-				sessionID,
-				board,
-				token,
-				timestamp,
-				timestamp,
-				expiresAt,
-			)
-			if err != nil {
-				return err
-			}
-			lease = AutomationDispatcherSessionLease{
-				SessionID:    sessionID,
-				Board:        board,
-				leaseToken:   token,
-				RegisteredAt: timestamp,
-				RenewedAt:    timestamp,
-				ExpiresAt:    expiresAt,
-			}
-			acquired = true
+		if err == nil {
+			// Session IDs identify one process lifetime and are never recycled.
+			// Keeping the row also keeps its generation acknowledgements auditable.
+			lease.leaseToken = ""
 			return nil
 		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		conflict, err := hasLiveOverlappingAutomationSession(
+			ctx,
+			tx,
+			board,
+			timestamp,
+		)
 		if err != nil {
 			return err
 		}
-		// Session IDs identify one process lifetime and are never recycled.
-		// Keeping the row also keeps its generation acknowledgements auditable.
-		lease.leaseToken = ""
+		if conflict {
+			return ErrAutomationHostNotIdle
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO automation_dispatcher_sessions(
+			session_id, board, lease_token, registered_at, renewed_at, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?)`,
+			sessionID,
+			board,
+			token,
+			timestamp,
+			timestamp,
+			expiresAt,
+		)
+		if err != nil {
+			return err
+		}
+		lease = AutomationDispatcherSessionLease{
+			SessionID:    sessionID,
+			Board:        board,
+			leaseToken:   token,
+			RegisteredAt: timestamp,
+			RenewedAt:    timestamp,
+			ExpiresAt:    expiresAt,
+		}
+		acquired = true
 		return nil
 	})
+	if admissionErr != nil && err == nil {
+		err = admissionErr
+	}
 	return lease, acquired, err
 }
 

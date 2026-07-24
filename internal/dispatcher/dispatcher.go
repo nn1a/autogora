@@ -79,6 +79,7 @@ type Options struct {
 	AgentConfigLoader        AgentConfigLoader
 	OnLog                    func(string)
 	testHooks                *dispatcherTestHooks
+	automationSession        *automationDispatcherSession
 }
 
 func (o *Options) normalize() {
@@ -2519,6 +2520,11 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 			}
 			return nil
 		}
+		if options.automationSession != nil {
+			command.ReleaseGate = options.automationSession.workerReleaseGate(
+				opened,
+			)
+		}
 		var runtimeLimit *time.Duration
 		if prepared.Task.Task.MaxRuntimeSeconds != nil {
 			value := time.Duration(*prepared.Task.Task.MaxRuntimeSeconds)*time.Second - time.Since(runStarted)
@@ -2798,6 +2804,28 @@ func runClaim(ctx context.Context, manager *boards.Manager, opened *store.Store,
 		}
 		availability, agentUnavailable := classifyAgentAvailability(execution)
 		switch {
+		case errors.Is(execution.SpawnError, errAutomaticWorkerStartBlocked):
+			countFailure := false
+			persistErr := failRunDurably(
+				durable,
+				opened,
+				scope,
+				automaticWorkerStartBlockedReason,
+				store.FailRunOptions{
+					Outcome:      model.RunStatusReclaimed,
+					CountFailure: &countFailure,
+					FailureLimit: options.FailureLimit,
+				},
+			)
+			cancel()
+			if persistErr != nil {
+				return fmt.Errorf(
+					"reclaim worker start authorization failure for %s: %w",
+					taskID,
+					errors.Join(execution.SpawnError, persistErr),
+				)
+			}
+			return nil
 		case execution.TimedOut || (runtimeLimit != nil && *runtimeLimit <= 0):
 			persistErr := persistExecutionFailure(durable, "Runner timed out after work began: "+detail, detail, execution.Code,
 				store.FailRunOptions{Outcome: model.RunStatusTimedOut, FailureLimit: options.FailureLimit})
@@ -3105,7 +3133,7 @@ func maintainBoard(ctx context.Context, manager *boards.Manager, board string, o
 }
 
 func maintainBoards(ctx context.Context, manager *boards.Manager, boardSlugs []string, options Options) error {
-	if err := maintainGlobalCoordination(ctx, manager, options); err != nil {
+	if err := options.maintainGlobalCoordination(ctx, manager); err != nil {
 		return err
 	}
 	for _, board := range boardSlugs {
@@ -3126,6 +3154,32 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		return err
 	}
 	ctx, cancelDispatcher := context.WithCancel(ctx)
+	automation, err := startAutomationDispatcherSession(
+		ctx,
+		manager,
+		cancelDispatcher,
+	)
+	if err != nil {
+		cancelDispatcher()
+		if !options.Once &&
+			errors.Is(err, store.ErrAutomationHostNotIdle) {
+			return errors.Join(ErrDispatcherAlreadyRunning, err)
+		}
+		return err
+	}
+	ctx = processguard.WithTeardownFailureReporter(
+		ctx,
+		automation.reportTeardownFailure,
+	)
+	options.automationSession = automation
+	automationStopped := true
+	defer func() {
+		shutdownErr := automation.Shutdown(automationStopped)
+		runErr = errors.Join(runErr, automation.Err(), shutdownErr)
+	}()
+	if err := automation.CheckGate(ctx); err != nil {
+		return err
+	}
 	var leader *supervisorLease
 	if !options.Once {
 		leader, err = startSupervisorLease(ctx, cancelDispatcher, manager)
@@ -3225,9 +3279,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		return processErrors
 	}
 	generatedClineApprovalDir := ""
-	planning := startPlanningQueue(ctx, manager, options)
-	coordination := startCoordinationQueue(ctx, manager, options)
-	publication := startPublicationQueue(ctx, manager, options)
+	var planning *planningQueue
+	var coordination *coordinationQueue
+	var publication *publicationQueue
 	oncePlanningWaited := false
 	onceCoordinationWaited := false
 	nextClaimBoard := ""
@@ -3238,16 +3292,25 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		if runErr == nil {
 			runErr = handleWorkerResults()
 		}
-		if !planning.Wait(options.PlanningShutdownGrace) {
+		planningStopped := planning == nil ||
+			planning.Wait(options.PlanningShutdownGrace)
+		if !planningStopped {
 			options.log("planner did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
 		}
-		if !coordination.Wait(options.PlanningShutdownGrace) {
+		coordinationStopped := coordination == nil ||
+			coordination.Wait(options.PlanningShutdownGrace)
+		if !coordinationStopped {
 			options.log("Coordinator did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
 		}
-		if !publication.Wait(options.PlanningShutdownGrace) {
+		publicationStopped := publication == nil ||
+			publication.Wait(options.PlanningShutdownGrace)
+		if !publicationStopped {
 			options.log("Publisher did not stop within %s; dispatcher shutdown will continue", options.PlanningShutdownGrace)
 		}
 		leader.Close()
+		automationStopped = planningStopped &&
+			coordinationStopped &&
+			publicationStopped
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
 			// Cancellation is the normal watch-mode shutdown signal. A storage
 			// call may observe it just before the loop's explicit ctx check.
@@ -3260,6 +3323,13 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			_ = os.RemoveAll(generatedClineApprovalDir)
 		}
 	}()
+	if err := automation.CheckGate(ctx); err != nil {
+		return err
+	}
+	automationStopped = false
+	planning = startPlanningQueue(ctx, manager, options)
+	coordination = startCoordinationQueue(ctx, manager, options)
+	publication = startPublicationQueue(ctx, manager, options)
 
 	for {
 		if err := handleWorkerResults(); err != nil {
@@ -3268,14 +3338,23 @@ func Run(ctx context.Context, options Options) (runErr error) {
 		if ctx.Err() != nil {
 			return nil
 		}
+		if err := automation.CheckGate(ctx); err != nil {
+			return err
+		}
 		boardSlugs, err := selectedBoards(ctx, manager, options)
 		if err != nil {
+			return err
+		}
+		if err := automation.CheckGate(ctx); err != nil {
 			return err
 		}
 		boardCircuits.retain(boardSlugs)
 		passBoards := boardSlugs
 		if resilientWatch {
-			if err := maintainGlobalCoordination(ctx, manager, options); err != nil {
+			if err := automation.CheckGate(ctx); err != nil {
+				return err
+			}
+			if err := options.maintainGlobalCoordination(ctx, manager); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
@@ -3283,6 +3362,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			}
 			passBoards = nil
 			for _, board := range boardCircuits.eligible(boardSlugs) {
+				if err := automation.CheckGate(ctx); err != nil {
+					return err
+				}
 				if err := options.maintainOneBoard(ctx, manager, board); err != nil {
 					if ctx.Err() != nil {
 						return nil
@@ -3300,13 +3382,28 @@ func Run(ctx context.Context, options Options) (runErr error) {
 			}
 			return err
 		}
-		deliverBoardNotifications(ctx, manager, passBoards, options)
+		if err := automation.CheckGate(ctx); err != nil {
+			return err
+		}
+		options.deliverNotifications(ctx, manager, passBoards)
+		if err := automation.CheckGate(ctx); err != nil {
+			return err
+		}
 		var planningDone <-chan struct{}
 		if !options.Once || !oncePlanningWaited {
+			options.recordQueueEnqueue("planning", passBoards)
 			planningDone = planning.Enqueue(passBoards)
 		}
 		if !options.Once {
+			if err := automation.CheckGate(ctx); err != nil {
+				return err
+			}
+			options.recordQueueEnqueue("coordination", passBoards)
 			coordination.Enqueue(passBoards)
+			if err := automation.CheckGate(ctx); err != nil {
+				return err
+			}
+			options.recordQueueEnqueue("publication", passBoards)
 			publication.Enqueue(passBoards)
 		}
 		launched := false
@@ -3353,10 +3450,22 @@ func Run(ctx context.Context, options Options) (runErr error) {
 					}
 					continue
 				}
-				claim, err := runOptions.claimBoardTask(ctx, opened, store.ClaimOptions{TaskID: options.TaskID, Board: board, WorkerID: fmt.Sprintf("dispatcher-%d", os.Getpid()), ExcludeManual: true,
-					ExpectedUpdatedAt: options.ExpectedUpdatedAt,
-					ClaimTTLSeconds:   options.ClaimTTLSeconds, MaxInProgress: options.MaxInProgress, MaxInProgressPerAssignee: options.MaxInProgressPerAssignee,
-					MaxInProgressByAssignee: profileLimits, ExcludedAssignees: excluded})
+				claim, err := claimBoardTaskWithAutomationSession(
+					ctx,
+					automation,
+					runOptions,
+					opened,
+					store.ClaimOptions{
+						TaskID: options.TaskID, Board: board,
+						WorkerID:      fmt.Sprintf("dispatcher-%d", os.Getpid()),
+						ExcludeManual: true, ExpectedUpdatedAt: options.ExpectedUpdatedAt,
+						ClaimTTLSeconds:          options.ClaimTTLSeconds,
+						MaxInProgress:            options.MaxInProgress,
+						MaxInProgressPerAssignee: options.MaxInProgressPerAssignee,
+						MaxInProgressByAssignee:  profileLimits,
+						ExcludedAssignees:        excluded,
+					},
+				)
 				if err != nil {
 					err = errors.Join(err, opened.Close())
 					if processErr := reportBoardFailure(board, "claim task", err); processErr != nil {
@@ -3427,6 +3536,9 @@ func Run(ctx context.Context, options Options) (runErr error) {
 						return err
 					}
 				case <-timer.C:
+					if err := automation.CheckGate(ctx); err != nil {
+						return err
+					}
 					if err := maintainBoards(ctx, manager, boardSlugs, options); err != nil {
 						if ctx.Err() != nil {
 							return nil
@@ -3449,6 +3561,10 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				}
 			}
 			if !launched && !onceCoordinationWaited {
+				if err := automation.CheckGate(ctx); err != nil {
+					return err
+				}
+				options.recordQueueEnqueue("coordination", passBoards)
 				coordinationDone := coordination.Enqueue(passBoards)
 				if coordinationDone != nil {
 					select {
@@ -3461,6 +3577,10 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				}
 				onceCoordinationWaited = true
 			}
+			if err := automation.CheckGate(ctx); err != nil {
+				return err
+			}
+			options.recordQueueEnqueue("publication", passBoards)
 			publicationDone := publication.Enqueue(passBoards)
 			if publicationDone != nil {
 				select {
@@ -3469,7 +3589,10 @@ func Run(ctx context.Context, options Options) (runErr error) {
 				case <-publicationDone:
 				}
 			}
-			deliverBoardNotifications(ctx, manager, passBoards, options)
+			if err := automation.CheckGate(ctx); err != nil {
+				return err
+			}
+			options.deliverNotifications(ctx, manager, passBoards)
 			return nil
 		}
 		timer := time.NewTimer(options.Interval)

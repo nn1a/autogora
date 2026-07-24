@@ -1345,9 +1345,12 @@ func TestDispatcherShutdownDoesNotWaitForeverForPlannerIgnoringContext(t *testin
 	cancel()
 	select {
 	case err := <-runResult:
-		if err != nil {
+		if !errors.Is(err, store.ErrAutomationQuarantined) {
 			close(plannerReleased)
-			t.Fatal(err)
+			t.Fatalf(
+				"uncertain planner shutdown error=%v, want quarantine",
+				err,
+			)
 		}
 	case <-time.After(time.Second):
 		close(plannerReleased)
@@ -1372,6 +1375,29 @@ logsDrained:
 	if !foundShutdownLog {
 		close(plannerReleased)
 		t.Fatal("dispatcher did not report the bounded planner shutdown")
+	}
+	authority, err := manager.OpenCoordinationStore(context.Background())
+	if err != nil {
+		close(plannerReleased)
+		t.Fatal(err)
+	}
+	sources, sourceErr := authority.ListAutomationQuarantineSources(
+		context.Background(),
+		store.AutomationQuarantineSourceFilter{
+			Kind:       automationSessionSourceKind,
+			ActiveOnly: true,
+		},
+	)
+	closeErr := authority.Close()
+	if sourceErr != nil || closeErr != nil || len(sources) != 1 ||
+		sources[0].DiagnosticCode != automationShutdownDiagnostic {
+		close(plannerReleased)
+		t.Fatalf(
+			"uncertain planner source=%+v listErr=%v closeErr=%v",
+			sources,
+			sourceErr,
+			closeErr,
+		)
 	}
 	close(plannerReleased)
 	select {

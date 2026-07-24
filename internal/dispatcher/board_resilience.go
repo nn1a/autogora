@@ -224,6 +224,7 @@ func resilientAllBoardWatch(options Options) bool {
 type dispatcherTestHooks struct {
 	readMetadata     func(*boards.Manager, string) (boards.Metadata, error)
 	openStore        func(context.Context, *boards.Manager, string) (*store.Store, error)
+	maintainGlobal   func(context.Context, *boards.Manager, Options) error
 	maintainBoard    func(context.Context, *boards.Manager, string, Options) error
 	claimProfile     func(context.Context, *boards.Manager, *store.Store, string, Options) ([]string, map[string]int, error)
 	claimTask        func(context.Context, *store.Store, store.ClaimOptions) (*model.ClaimedTask, error)
@@ -231,6 +232,8 @@ type dispatcherTestHooks struct {
 	discoveredBoards func(context.Context, string) ([]string, error)
 	managedRunPhase  func(context.Context, string) error
 	recoveryObserved func(context.Context, store.ActiveRun) error
+	notifications    func(context.Context, *boards.Manager, []string, Options)
+	queueEnqueued    func(string, []string)
 }
 
 func (o Options) readBoardMetadata(manager *boards.Manager, board string) (boards.Metadata, error) {
@@ -254,6 +257,16 @@ func (o Options) maintainOneBoard(ctx context.Context, manager *boards.Manager, 
 	return maintainBoard(ctx, manager, board, o)
 }
 
+func (o Options) maintainGlobalCoordination(
+	ctx context.Context,
+	manager *boards.Manager,
+) error {
+	if o.testHooks != nil && o.testHooks.maintainGlobal != nil {
+		return o.testHooks.maintainGlobal(ctx, manager, o)
+	}
+	return maintainGlobalCoordination(ctx, manager, o)
+}
+
 func (o Options) boardClaimProfilePolicy(
 	ctx context.Context,
 	manager *boards.Manager,
@@ -269,12 +282,19 @@ func (o Options) boardClaimProfilePolicy(
 func (o Options) claimBoardTask(
 	ctx context.Context,
 	opened *store.Store,
+	permit *store.AutomationPermit,
 	input store.ClaimOptions,
 ) (*model.ClaimedTask, error) {
 	if o.testHooks != nil && o.testHooks.claimTask != nil {
-		return o.testHooks.claimTask(ctx, opened, input)
+		var claim *model.ClaimedTask
+		err := opened.WithAutomationPermit(ctx, permit, func() error {
+			var claimErr error
+			claim, claimErr = o.testHooks.claimTask(ctx, opened, input)
+			return claimErr
+		})
+		return claim, err
 	}
-	return opened.ClaimTask(ctx, input)
+	return opened.ClaimTaskAutomated(ctx, permit, input)
 }
 
 func (o Options) executeClaim(
@@ -320,4 +340,25 @@ func (o Options) discoverBoards(ctx context.Context) ([]string, error) {
 	}
 	sort.Strings(result[1:])
 	return result, nil
+}
+
+func (o Options) deliverNotifications(
+	ctx context.Context,
+	manager *boards.Manager,
+	boards []string,
+) {
+	if o.testHooks != nil && o.testHooks.notifications != nil {
+		o.testHooks.notifications(ctx, manager, boards, o)
+		return
+	}
+	deliverBoardNotifications(ctx, manager, boards, o)
+}
+
+func (o Options) recordQueueEnqueue(kind string, boards []string) {
+	if o.testHooks != nil && o.testHooks.queueEnqueued != nil {
+		o.testHooks.queueEnqueued(
+			kind,
+			append([]string(nil), boards...),
+		)
+	}
 }

@@ -76,6 +76,12 @@ func TestManagerInjectsOneAutomationAuthorityAndLockIntoEveryBoardStore(t *testi
 	if err := permit.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if released, err := coordination.ReleaseAutomationDispatcherSession(
+		ctx,
+		lease,
+	); err != nil || !released {
+		t.Fatalf("release global session released=%v, err=%v", released, err)
+	}
 	scopedLease, acquired, err := coordination.RegisterAutomationDispatcherSession(
 		ctx,
 		"alpha",
@@ -119,7 +125,10 @@ func TestManagerInjectsOneAutomationAuthorityAndLockIntoEveryBoardStore(t *testi
 		observed.Generation != activated.Generation {
 		t.Fatalf("board authority view = %+v, err=%v", observed, err)
 	}
-	if _, err := alpha.AcquireAutomationPermitForSession(ctx, lease); !errors.Is(err, store.ErrAutomationQuarantined) {
+	if _, err := alpha.AcquireAutomationPermitForSession(
+		ctx,
+		scopedLease,
+	); !errors.Is(err, store.ErrAutomationQuarantined) {
 		t.Fatalf("board permit behind global quarantine error = %v", err)
 	}
 }
