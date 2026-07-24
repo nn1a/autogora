@@ -209,6 +209,140 @@ func TestAutomationQuarantineSerializesPermitAndRotatesOnlyForNewSource(t *testi
 	}
 }
 
+func TestEnsureAutomationQuarantineSourceDistinguishesResolvedSource(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	opened := openAutomationTestStore(t)
+	input := AutomationQuarantineSourceInput{
+		Board:              "default",
+		Kind:               automationTestSourceKind,
+		SourceID:           "publication-lifecycle",
+		ObservedUpdatedAt:  "epoch-one",
+		ObservedClaimEpoch: "1",
+		DiagnosticCode:     "process_teardown_unconfirmed",
+	}
+
+	first, outcome, err := opened.EnsureAutomationQuarantineSource(ctx, input)
+	if err != nil ||
+		outcome != AutomationQuarantineSourceCreated ||
+		!first.Active ||
+		first.Generation != 1 ||
+		first.ActiveSourceCount != 1 {
+		t.Fatalf("created source: gate=%+v outcome=%q err=%v", first, outcome, err)
+	}
+
+	validatorCalls := 0
+	duplicate := input
+	duplicate.ValidateCurrent = func(
+		context.Context,
+		AutomationQuarantineSourceInput,
+	) (bool, error) {
+		validatorCalls++
+		return false, nil
+	}
+	existing, outcome, err := opened.EnsureAutomationQuarantineSource(
+		ctx,
+		duplicate,
+	)
+	if err != nil ||
+		outcome != AutomationQuarantineSourceExistingActive ||
+		existing.Generation != first.Generation ||
+		existing.ActiveSourceCount != 1 ||
+		validatorCalls != 0 {
+		t.Fatalf(
+			"existing active source: gate=%+v outcome=%q calls=%d err=%v",
+			existing,
+			outcome,
+			validatorCalls,
+			err,
+		)
+	}
+
+	sources, err := opened.ListAutomationQuarantineSources(
+		ctx,
+		AutomationQuarantineSourceFilter{
+			Board:    input.Board,
+			Kind:     input.Kind,
+			SourceID: input.SourceID,
+		},
+	)
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("list active source=%+v err=%v", sources, err)
+	}
+	cleared, changed, err := opened.ConfirmAutomationQuarantine(
+		ctx,
+		automationConfirmation(first, sources),
+	)
+	if err != nil || !changed || cleared.Active {
+		t.Fatalf("resolve source: gate=%+v changed=%v err=%v", cleared, changed, err)
+	}
+
+	otherInput := input
+	otherInput.SourceID = "other-publication"
+	otherInput.ObservedUpdatedAt = "epoch-two"
+	otherInput.ObservedClaimEpoch = "2"
+	other, outcome, err := opened.EnsureAutomationQuarantineSource(
+		ctx,
+		otherInput,
+	)
+	if err != nil ||
+		outcome != AutomationQuarantineSourceCreated ||
+		!other.Active ||
+		other.Generation != 2 ||
+		other.ActiveSourceCount != 1 {
+		t.Fatalf("other source: gate=%+v outcome=%q err=%v", other, outcome, err)
+	}
+
+	validatorCalls = 0
+	resolved, outcome, err := opened.EnsureAutomationQuarantineSource(
+		ctx,
+		duplicate,
+	)
+	if err != nil ||
+		outcome != AutomationQuarantineSourceExistingResolved ||
+		!resolved.Active ||
+		resolved.Generation != other.Generation ||
+		resolved.ActiveSourceCount != 1 ||
+		validatorCalls != 0 {
+		t.Fatalf(
+			"existing resolved source: gate=%+v outcome=%q calls=%d err=%v",
+			resolved,
+			outcome,
+			validatorCalls,
+			err,
+		)
+	}
+
+	legacy, activated, err := opened.ActivateAutomationQuarantine(ctx, duplicate)
+	if err != nil ||
+		activated ||
+		legacy.Generation != other.Generation ||
+		legacy.ActiveSourceCount != 1 ||
+		validatorCalls != 0 {
+		t.Fatalf(
+			"legacy resolved activation: gate=%+v activated=%v calls=%d err=%v",
+			legacy,
+			activated,
+			validatorCalls,
+			err,
+		)
+	}
+	resolvedSources, err := opened.ListAutomationQuarantineSources(
+		ctx,
+		AutomationQuarantineSourceFilter{
+			Board:    input.Board,
+			Kind:     input.Kind,
+			SourceID: input.SourceID,
+		},
+	)
+	if err != nil ||
+		len(resolvedSources) != 1 ||
+		resolvedSources[0].Disposition != string(AutomationSourceAbandoned) {
+		t.Fatalf("resolved source changed=%+v err=%v", resolvedSources, err)
+	}
+}
+
 func TestAutomationQuarantineRecoverySnapshotUsesExactPhaseOneSourceSet(t *testing.T) {
 	ctx := context.Background()
 	opened := openAutomationTestStore(t)

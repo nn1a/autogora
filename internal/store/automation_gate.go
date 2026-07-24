@@ -740,6 +740,17 @@ type AutomationQuarantineSourceInput struct {
 	ValidateCurrent    AutomationQuarantineSourceValidator `json:"-"`
 }
 
+// AutomationQuarantineSourceEnsureOutcome distinguishes a newly persisted
+// source from an existing source without inferring its state from the shared
+// gate. A resolved source is immutable and is never reactivated.
+type AutomationQuarantineSourceEnsureOutcome string
+
+const (
+	AutomationQuarantineSourceCreated          AutomationQuarantineSourceEnsureOutcome = "created"
+	AutomationQuarantineSourceExistingActive   AutomationQuarantineSourceEnsureOutcome = "existing_active"
+	AutomationQuarantineSourceExistingResolved AutomationQuarantineSourceEnsureOutcome = "existing_resolved"
+)
+
 // AutomationQuarantineSourceValidator runs while the authority's exclusive
 // operating-system lock prevents automatic mutations. It must return true only
 // while the normalized source still describes the exact current side effect.
@@ -1079,46 +1090,61 @@ func automationQuarantineSourceExists(
 	return exists, err
 }
 
-func activateAutomationQuarantineTx(
+func ensureAutomationQuarantineSourceTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	input AutomationQuarantineSourceInput,
 	sourceKey string,
 	timestamp string,
-) (AutomationQuarantine, bool, error) {
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM automation_quarantine_sources WHERE source_key = ?
-	)`, sourceKey).Scan(&exists); err != nil {
-		return AutomationQuarantine{}, false, err
+) (AutomationQuarantine, AutomationQuarantineSourceEnsureOutcome, error) {
+	var disposition string
+	sourceErr := tx.QueryRowContext(ctx, `SELECT disposition
+		FROM automation_quarantine_sources WHERE source_key = ?`,
+		sourceKey,
+	).Scan(&disposition)
+	if sourceErr != nil && !errors.Is(sourceErr, sql.ErrNoRows) {
+		return AutomationQuarantine{}, "", sourceErr
 	}
 	record, err := readAutomationGate(ctx, tx)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
-	if exists {
+	if sourceErr == nil {
+		var outcome AutomationQuarantineSourceEnsureOutcome
+		switch disposition {
+		case "active":
+			outcome = AutomationQuarantineSourceExistingActive
+		case string(AutomationSourceSuperseded),
+			string(AutomationSourceAbandoned):
+			outcome = AutomationQuarantineSourceExistingResolved
+		default:
+			return AutomationQuarantine{}, "", fmt.Errorf(
+				"automation quarantine source has invalid disposition %q",
+				disposition,
+			)
+		}
 		value, err := publicAutomationGate(ctx, tx, record)
-		return value, false, err
+		return value, outcome, err
 	}
 	var activeSourceCount int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM automation_quarantine_sources WHERE disposition = 'active'`,
 	).Scan(&activeSourceCount); err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	if activeSourceCount >= 1000 {
-		return AutomationQuarantine{}, false, errors.New(
+		return AutomationQuarantine{}, "", errors.New(
 			"automation quarantine has too many active sources",
 		)
 	}
 	if record.Generation == math.MaxInt64 {
-		return AutomationQuarantine{}, false, errors.New(
+		return AutomationQuarantine{}, "", errors.New(
 			"automation quarantine generation is exhausted",
 		)
 	}
 	token, err := randomAutomationToken()
 	if err != nil {
-		return AutomationQuarantine{}, false, fmt.Errorf(
+		return AutomationQuarantine{}, "", fmt.Errorf(
 			"generate automation generation token: %w",
 			err,
 		)
@@ -1132,7 +1158,7 @@ func activateAutomationQuarantineTx(
 		input.ObservedUpdatedAt, input.ObservedClaimEpoch, input.DiagnosticCode,
 		timestamp,
 	); err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE automation_quarantine_gate
 		SET active = 1, generation = ?, permit_token = ?, activated_at = ?,
@@ -1143,41 +1169,63 @@ func activateAutomationQuarantineTx(
 		WHERE singleton = 1`,
 		generation, token, timestamp,
 	); err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	record, err = readAutomationGate(ctx, tx)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	value, err := publicAutomationGate(ctx, tx, record)
-	return value, true, err
+	return value, AutomationQuarantineSourceCreated, err
 }
 
-// ActivateAutomationQuarantine serializes source observation and gate rotation
-// with an exclusive operating-system lock.
-func (s *Store) ActivateAutomationQuarantine(
+func activateAutomationQuarantineTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	input AutomationQuarantineSourceInput,
+	sourceKey string,
+	timestamp string,
+) (AutomationQuarantine, bool, error) {
+	value, outcome, err := ensureAutomationQuarantineSourceTx(
+		ctx,
+		tx,
+		input,
+		sourceKey,
+		timestamp,
+	)
+	return value, outcome == AutomationQuarantineSourceCreated, err
+}
+
+// EnsureAutomationQuarantineSource serializes source observation and gate
+// rotation with an exclusive operating-system lock. It returns the exact
+// lifecycle outcome read or written in the authority transaction.
+func (s *Store) EnsureAutomationQuarantineSource(
 	ctx context.Context,
 	input AutomationQuarantineSourceInput,
-) (value AutomationQuarantine, activated bool, resultErr error) {
+) (
+	value AutomationQuarantine,
+	outcome AutomationQuarantineSourceEnsureOutcome,
+	resultErr error,
+) {
 	if err := s.requireCoordinationStore(); err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	runtime, err := s.automationRuntime()
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	if runtime.authorityDB != s.db {
-		return AutomationQuarantine{}, false, errors.New(
+		return AutomationQuarantine{}, "", errors.New(
 			"automation quarantine activation requires the authority Store",
 		)
 	}
 	input, sourceKey, err := normalizeAutomationSource(input)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	lock, err := acquireAutomationFileLock(ctx, runtime.lockPath, true)
 	if err != nil {
-		return AutomationQuarantine{}, false, fmt.Errorf("lock automation quarantine: %w", err)
+		return AutomationQuarantine{}, "", fmt.Errorf("lock automation quarantine: %w", err)
 	}
 	defer func() {
 		resultErr = errors.Join(resultErr, lock.Close())
@@ -1185,26 +1233,18 @@ func (s *Store) ActivateAutomationQuarantine(
 
 	exists, err := automationQuarantineSourceExists(ctx, s.db, sourceKey)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
-	if exists {
-		record, err := readAutomationGate(ctx, s.db)
-		if err != nil {
-			return AutomationQuarantine{}, false, err
-		}
-		value, err := publicAutomationGate(ctx, s.db, record)
-		return value, false, err
-	}
-	if input.ValidateCurrent != nil {
+	if !exists && input.ValidateCurrent != nil {
 		current, err := input.ValidateCurrent(ctx, input)
 		if err != nil {
-			return AutomationQuarantine{}, false, fmt.Errorf(
+			return AutomationQuarantine{}, "", fmt.Errorf(
 				"validate automation quarantine source: %w",
 				err,
 			)
 		}
 		if !current {
-			return AutomationQuarantine{}, false,
+			return AutomationQuarantine{}, "",
 				&AutomationSourceStaleError{
 					Board:    input.Board,
 					Kind:     input.Kind,
@@ -1215,7 +1255,7 @@ func (s *Store) ActivateAutomationQuarantine(
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	committed := false
 	defer func() {
@@ -1224,7 +1264,7 @@ func (s *Store) ActivateAutomationQuarantine(
 		}
 	}()
 	timestamp := time.Now().UTC().Format(automationTimestampLayout)
-	value, activated, err = activateAutomationQuarantineTx(
+	value, outcome, err = ensureAutomationQuarantineSourceTx(
 		ctx,
 		tx,
 		input,
@@ -1232,13 +1272,23 @@ func (s *Store) ActivateAutomationQuarantine(
 		timestamp,
 	)
 	if err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	if err := tx.Commit(); err != nil {
-		return AutomationQuarantine{}, false, err
+		return AutomationQuarantine{}, "", err
 	}
 	committed = true
-	return value, activated, nil
+	return value, outcome, nil
+}
+
+// ActivateAutomationQuarantine preserves the original activation contract:
+// activated is true only when this call creates a new active source.
+func (s *Store) ActivateAutomationQuarantine(
+	ctx context.Context,
+	input AutomationQuarantineSourceInput,
+) (AutomationQuarantine, bool, error) {
+	value, outcome, err := s.EnsureAutomationQuarantineSource(ctx, input)
+	return value, outcome == AutomationQuarantineSourceCreated, err
 }
 
 type AutomationSourceDisposition string
