@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 var objectIDPattern = regexp.MustCompile(`\A[0-9a-fA-F]+\z`)
@@ -18,6 +19,7 @@ type validatedPublication struct {
 	publication        model.Publication
 	repository         string
 	worktree           string
+	gitCommonDir       string
 	head               string
 	base               string
 	target             string
@@ -76,7 +78,8 @@ func (e *Engine) validate(
 	if err != nil {
 		return validatedPublication{}, err
 	}
-	if err := e.validateRepositoryPair(ctx, repository, worktree); err != nil {
+	gitCommonDir, err := e.validateRepositoryPair(ctx, repository, worktree)
+	if err != nil {
 		return validatedPublication{}, err
 	}
 
@@ -103,7 +106,7 @@ func (e *Engine) validate(
 			"durable ref must be an unmodified refs/autogora/runs ref",
 		)
 	}
-	if _, err := e.command(ctx, repository, "validate durable ref",
+	if _, err := e.readCommand(ctx, repository, "validate durable ref",
 		"git", "check-ref-format", durableRef); err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
 			return validatedPublication{}, controlErr
@@ -194,7 +197,8 @@ func (e *Engine) validate(
 	}
 	return validatedPublication{
 		publication: publication, repository: repository, worktree: worktree,
-		head: head, base: base, target: target, targetRef: targetRef,
+		gitCommonDir: gitCommonDir,
+		head:         head, base: base, target: target, targetRef: targetRef,
 		targetHead: strings.ToLower(targetHead), targetContainsHead: targetContainsHead,
 	}, nil
 }
@@ -248,7 +252,7 @@ func sameObjectID(left, right string) bool {
 	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
 }
 
-func (e *Engine) command(
+func (e *Engine) readCommand(
 	ctx context.Context,
 	directory string,
 	operation string,
@@ -269,13 +273,39 @@ func (e *Engine) command(
 	return result, &Error{Kind: ErrorCommandFailed, Operation: operation, Err: err}
 }
 
+func (e *Engine) effectCommand(
+	ctx context.Context,
+	descriptor publicationeffect.Descriptor,
+	directory string,
+	operation string,
+	file string,
+	args ...string,
+) (commandResult, error) {
+	result, err := e.runEffect(ctx, descriptor, EffectCommand{
+		Directory: directory,
+		File:      file,
+		Args:      append([]string(nil), args...),
+	})
+	if err == nil {
+		return result, nil
+	}
+	var execution *Error
+	if errors.As(err, &execution) {
+		return result, &Error{
+			Kind: execution.Kind, Operation: operation, Err: execution.Err,
+			exitCode: execution.exitCode, hasExitCode: execution.hasExitCode,
+		}
+	}
+	return result, &Error{Kind: ErrorCommandFailed, Operation: operation, Err: err}
+}
+
 func (e *Engine) gitText(
 	ctx context.Context,
 	directory string,
 	operation string,
 	args ...string,
 ) (string, error) {
-	output, err := e.command(ctx, directory, operation, "git", args...)
+	output, err := e.readCommand(ctx, directory, operation, "git", args...)
 	if err != nil {
 		return "", err
 	}
@@ -286,14 +316,14 @@ func (e *Engine) validateRepositoryPair(
 	ctx context.Context,
 	repository string,
 	worktree string,
-) error {
+) (string, error) {
 	repositoryRoot, err := e.gitText(ctx, repository, "resolve repository root",
 		"rev-parse", "--path-format=absolute", "--show-toplevel")
 	if err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
-			return controlErr
+			return "", controlErr
 		}
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve repository root", ErrRepository,
 			"repository is not a Git worktree",
 		)
@@ -302,23 +332,23 @@ func (e *Engine) validateRepositoryPair(
 		"rev-parse", "--path-format=absolute", "--show-toplevel")
 	if err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
-			return controlErr
+			return "", controlErr
 		}
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve source worktree root", ErrRepository,
 			"source worktree is not a Git worktree",
 		)
 	}
 	repositoryRoot, err = canonicalGitPath(repository, repositoryRoot)
 	if err != nil || repositoryRoot != repository {
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "validate repository root", ErrRepository,
 			"repository path is not the Git worktree root",
 		)
 	}
 	worktreeRoot, err = canonicalGitPath(worktree, worktreeRoot)
 	if err != nil || worktreeRoot != worktree {
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "validate source worktree root", ErrRepository,
 			"source worktree path is not the Git worktree root",
 		)
@@ -327,9 +357,9 @@ func (e *Engine) validateRepositoryPair(
 		"rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
-			return controlErr
+			return "", controlErr
 		}
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve repository common directory", ErrRepository, err.Error(),
 		)
 	}
@@ -337,31 +367,31 @@ func (e *Engine) validateRepositoryPair(
 		"rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
-			return controlErr
+			return "", controlErr
 		}
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve source common directory", ErrRepository, err.Error(),
 		)
 	}
 	repositoryCommon, err = canonicalGitPath(repository, repositoryCommon)
 	if err != nil {
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve repository common directory", ErrRepository, err.Error(),
 		)
 	}
 	worktreeCommon, err = canonicalGitPath(worktree, worktreeCommon)
 	if err != nil {
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "resolve source common directory", ErrRepository, err.Error(),
 		)
 	}
 	if repositoryCommon != worktreeCommon {
-		return semanticError(
+		return "", semanticError(
 			ErrorRepository, "validate source repository", ErrRepository,
 			"source worktree belongs to a different Git common repository",
 		)
 	}
-	return nil
+	return repositoryCommon, nil
 }
 
 func canonicalGitPath(base, raw string) (string, error) {
@@ -481,7 +511,7 @@ func (e *Engine) isAncestor(
 	if sameObjectID(ancestor, descendant) {
 		return true, nil
 	}
-	_, err := e.command(ctx, repository, "inspect commit ancestry", "git",
+	_, err := e.readCommand(ctx, repository, "inspect commit ancestry", "git",
 		"merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
@@ -554,7 +584,7 @@ func (e *Engine) checkedOutTarget(
 	ctx context.Context,
 	publication validatedPublication,
 ) (string, error) {
-	output, err := e.command(ctx, publication.repository, "list Git worktrees",
+	output, err := e.readCommand(ctx, publication.repository, "list Git worktrees",
 		"git", "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return "", err
@@ -600,7 +630,21 @@ func (e *Engine) publishLocalFF(
 		return result, err
 	}
 	if targetWorktree == "" {
-		if _, err := e.command(ctx, publication.repository,
+		descriptor, describeErr := publicationeffect.NewLocalRefCAS(
+			publicationeffect.LocalRefCASInput{
+				GitCommonDirPath: publication.gitCommonDir,
+				TargetRef:        publication.targetRef,
+				BeforeOID:        publication.targetHead,
+				AfterOID:         publication.head,
+			},
+		)
+		if describeErr != nil {
+			return result, effectDescriptorError(
+				"describe target branch fast-forward",
+				describeErr,
+			)
+		}
+		if _, err := e.effectCommand(ctx, descriptor, publication.repository,
 			"fast-forward target branch", "git", "update-ref",
 			publication.targetRef, publication.head, publication.targetHead); err != nil {
 			if controlErr := commandControlError(err); controlErr != nil {
@@ -612,7 +656,7 @@ func (e *Engine) publishLocalFF(
 			)
 		}
 	} else {
-		status, err := e.command(ctx, targetWorktree, "inspect target worktree",
+		status, err := e.readCommand(ctx, targetWorktree, "inspect target worktree",
 			"git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 		if err != nil {
 			return result, err
@@ -634,7 +678,44 @@ func (e *Engine) publishLocalFF(
 				"checked-out target branch changed before fast-forward",
 			)
 		}
-		if _, err := e.command(ctx, targetWorktree, "fast-forward checked-out target",
+		gitDir, err := e.gitText(
+			ctx,
+			targetWorktree,
+			"resolve target worktree Git directory",
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-dir",
+		)
+		if err != nil {
+			return result, err
+		}
+		gitDir, err = canonicalGitPath(targetWorktree, gitDir)
+		if err != nil {
+			return result, semanticError(
+				ErrorRepository,
+				"resolve target worktree Git directory",
+				ErrRepository,
+				err.Error(),
+			)
+		}
+		descriptor, describeErr := publicationeffect.NewLocalWorktreeFF(
+			publicationeffect.LocalWorktreeFFInput{
+				GitCommonDirPath: publication.gitCommonDir,
+				GitDirPath:       gitDir,
+				WorktreePath:     targetWorktree,
+				TargetRef:        publication.targetRef,
+				BeforeOID:        publication.targetHead,
+				AfterOID:         publication.head,
+			},
+		)
+		if describeErr != nil {
+			return result, effectDescriptorError(
+				"describe checked-out target fast-forward",
+				describeErr,
+			)
+		}
+		if _, err := e.effectCommand(ctx, descriptor, targetWorktree,
+			"fast-forward checked-out target",
 			"git", "merge", "--ff-only", "--no-edit", publication.head); err != nil {
 			if controlErr := commandControlError(err); controlErr != nil {
 				return result, controlErr
@@ -658,4 +739,13 @@ func (e *Engine) publishLocalFF(
 	result.Status = ResultPublished
 	result.Message = "target branch fast-forwarded to the captured head commit"
 	return result, nil
+}
+
+func effectDescriptorError(operation string, err error) error {
+	return semanticError(
+		ErrorInvalidInput,
+		operation,
+		ErrInvalidInput,
+		"cannot construct publication effect descriptor: "+err.Error(),
+	)
 }

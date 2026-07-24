@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 type gitFixture struct {
@@ -30,6 +31,37 @@ type recordedCommand struct {
 
 type recordingExecRunner struct {
 	commands []recordedCommand
+}
+
+type recordedEffect struct {
+	descriptor publicationeffect.Descriptor
+	command    EffectCommand
+}
+
+type recordingEffectExecutor struct {
+	runner  CommandRunner
+	effects []recordedEffect
+}
+
+func (e *recordingEffectExecutor) ExecuteEffect(
+	ctx context.Context,
+	descriptor publicationeffect.Descriptor,
+	command EffectCommand,
+) (CommandOutput, error) {
+	e.effects = append(e.effects, recordedEffect{
+		descriptor: descriptor,
+		command: EffectCommand{
+			Directory: command.Directory,
+			File:      command.File,
+			Args:      append([]string(nil), command.Args...),
+		},
+	})
+	return e.runner.Run(
+		ctx,
+		command.Directory,
+		command.File,
+		command.Args...,
+	)
 }
 
 func (r *recordingExecRunner) Run(
@@ -125,7 +157,12 @@ func newGitFixture(t *testing.T) gitFixture {
 
 func TestLocalFFCheckedOutTargetAndIdempotency(t *testing.T) {
 	fixture := newGitFixture(t)
-	result, err := Execute(context.Background(), fixture.publication, Options{})
+	runner := &recordingExecRunner{}
+	effects := &recordingEffectExecutor{runner: runner}
+	result, err := Execute(context.Background(), fixture.publication, Options{
+		Runner:         runner,
+		EffectExecutor: effects,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +175,47 @@ func TestLocalFFCheckedOutTargetAndIdempotency(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(fixture.repository, "result.txt"))
 	if err != nil || string(content) != "captured\n" {
 		t.Fatalf("checked-out files were not updated: %q, %v", content, err)
+	}
+	if len(effects.effects) != 1 {
+		t.Fatalf("checked-out publication effects = %+v", effects.effects)
+	}
+	gitCommonDir := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	)
+	gitDir := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-dir",
+	)
+	expected, err := publicationeffect.NewLocalWorktreeFF(
+		publicationeffect.LocalWorktreeFFInput{
+			GitCommonDirPath: gitCommonDir,
+			GitDirPath:       gitDir,
+			WorktreePath:     fixture.repository,
+			TargetRef:        "refs/heads/main",
+			BeforeOID:        fixture.base,
+			AfterOID:         fixture.head,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effects.effects[0].descriptor; got.Kind() !=
+		publicationeffect.KindLocalWorktreeFF ||
+		got.Fingerprint() != expected.Fingerprint() {
+		t.Fatalf(
+			"checked-out effect kind=%s fingerprint=%s, want %s %s",
+			got.Kind(),
+			got.Fingerprint(),
+			expected.Kind(),
+			expected.Fingerprint(),
+		)
 	}
 	second, err := Execute(context.Background(), fixture.publication, Options{})
 	if err != nil {
@@ -153,8 +231,9 @@ func TestLocalFFUncheckedTargetUsesCompareAndSwap(t *testing.T) {
 	runGit(t, fixture.repository, "branch", "release", fixture.base)
 	fixture.publication.TargetBranch = "release"
 	runner := &recordingExecRunner{}
+	effects := &recordingEffectExecutor{runner: runner}
 	result, err := Execute(context.Background(), fixture.publication, Options{
-		Runner: runner,
+		Runner: runner, EffectExecutor: effects,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +267,38 @@ func TestLocalFFUncheckedTargetUsesCompareAndSwap(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("compare-and-swap update-ref was not used: %+v", runner.commands)
+	}
+	if len(effects.effects) != 1 {
+		t.Fatalf("unchecked publication effects = %+v", effects.effects)
+	}
+	gitCommonDir := runGit(
+		t,
+		fixture.repository,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	)
+	expected, err := publicationeffect.NewLocalRefCAS(
+		publicationeffect.LocalRefCASInput{
+			GitCommonDirPath: gitCommonDir,
+			TargetRef:        "refs/heads/release",
+			BeforeOID:        fixture.base,
+			AfterOID:         fixture.head,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effects.effects[0].descriptor; got.Kind() !=
+		publicationeffect.KindLocalRefCAS ||
+		got.Fingerprint() != expected.Fingerprint() {
+		t.Fatalf(
+			"unchecked effect kind=%s fingerprint=%s, want %s %s",
+			got.Kind(),
+			got.Fingerprint(),
+			expected.Kind(),
+			expected.Fingerprint(),
+		)
 	}
 }
 

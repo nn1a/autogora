@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 var safeRemotePattern = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
@@ -23,6 +25,7 @@ type publicationRemote struct {
 	name               string
 	repositorySelector string
 	repositoryIdentity string
+	pushURL            string
 }
 
 type remoteRepositoryIdentity struct {
@@ -237,7 +240,7 @@ func (e *Engine) pullRequestBranch(
 		return "", err
 	}
 	branch := fmt.Sprintf("autogora/%s-%s", taskID, publication.head[:8])
-	if _, err := e.command(ctx, publication.repository, "validate pull-request branch",
+	if _, err := e.readCommand(ctx, publication.repository, "validate pull-request branch",
 		"git", "check-ref-format", "--branch", branch); err != nil {
 		if controlErr := commandControlError(err); controlErr != nil {
 			return "", controlErr
@@ -317,6 +320,7 @@ func (e *Engine) configuredRemote(
 		name:               remote,
 		repositorySelector: fetchIdentity.selector,
 		repositoryIdentity: fetchIdentity.identity,
+		pushURL:            pushURLs[0],
 	}, nil
 }
 
@@ -383,7 +387,26 @@ func (e *Engine) ensurePullRequestBranch(
 		return true, nil
 	}
 	refspec := publication.head + ":" + ref
-	if _, err := e.command(ctx, publication.repository, "push pull-request branch",
+	descriptor, describeErr := publicationeffect.NewPRBranchPush(
+		publicationeffect.PRBranchPushInput{
+			RepositoryIdentity: remote.repositoryIdentity,
+			RemoteURL:          remote.pushURL,
+			SourceOID:          publication.head,
+			TargetRef:          ref,
+			ExpectedAbsent:     true,
+		},
+	)
+	if describeErr != nil {
+		return false, effectDescriptorError(
+			"describe pull-request branch push",
+			describeErr,
+		)
+	}
+	if _, err := e.effectCommand(
+		ctx,
+		descriptor,
+		publication.repository,
+		"push pull-request branch",
 		"git", "push", "--porcelain",
 		"--force-with-lease="+ref+":",
 		remote.name,
@@ -433,7 +456,7 @@ func (e *Engine) listPullRequests(
 	remote publicationRemote,
 	branch string,
 ) ([]pullRequestRecord, error) {
-	output, err := e.command(ctx, publication.repository, "list pull requests", "gh",
+	output, err := e.readCommand(ctx, publication.repository, "list pull requests", "gh",
 		"pr", "list",
 		"--repo", remote.repositorySelector,
 		"--head", branch,
@@ -574,13 +597,43 @@ func (e *Engine) createPullRequest(
 	remote publicationRemote,
 	branch string,
 ) (string, error) {
-	output, err := e.command(ctx, publication.repository, "create pull request", "gh",
+	title := pullRequestTitle(publication)
+	body := pullRequestBody(publication)
+	bodyDigest, describeErr := publicationeffect.DigestPRBody([]byte(body))
+	if describeErr != nil {
+		return "", effectDescriptorError(
+			"describe pull request creation",
+			describeErr,
+		)
+	}
+	descriptor, describeErr := publicationeffect.NewPRCreate(
+		publicationeffect.PRCreateInput{
+			RepositoryIdentity: remote.repositoryIdentity,
+			BaseRef:            "refs/heads/" + publication.target,
+			HeadRef:            "refs/heads/" + branch,
+			Title:              title,
+			BodyDigest:         bodyDigest,
+			ExpectedHeadOID:    publication.head,
+		},
+	)
+	if describeErr != nil {
+		return "", effectDescriptorError(
+			"describe pull request creation",
+			describeErr,
+		)
+	}
+	output, err := e.effectCommand(
+		ctx,
+		descriptor,
+		publication.repository,
+		"create pull request",
+		"gh",
 		"pr", "create",
 		"--repo", remote.repositorySelector,
 		"--base", publication.target,
 		"--head", branch,
-		"--title", pullRequestTitle(publication),
-		"--body", pullRequestBody(publication),
+		"--title", title,
+		"--body", body,
 	)
 	if err == nil {
 		return createdPullRequestURL(output.stdout, remote)

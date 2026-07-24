@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 type expectedCommand struct {
@@ -400,6 +401,7 @@ func TestPullRequestPushCASRaceReusesMatchingRemoteBranch(t *testing.T) {
 		name:               "origin",
 		repositorySelector: "example.test/owner/repo",
 		repositoryIdentity: "example.test/owner/repo",
+		pushURL:            "git@example.test:owner/repo.git",
 	}
 	runner := &scriptedRunner{
 		t: t,
@@ -501,8 +503,9 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 		},
 	)
 	runner := &scriptedRunner{t: t, steps: steps}
+	effects := &recordingEffectExecutor{runner: runner}
 	result, err := Execute(context.Background(), fixture.publication, Options{
-		Runner: runner,
+		Runner: runner, EffectExecutor: effects,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -511,6 +514,59 @@ func TestPullRequestAllowsDivergedTargetAndCreatesPR(t *testing.T) {
 	if result.Status != ResultPublished || result.Branch != fixture.branch ||
 		result.URL == nil || *result.URL != "https://example.test/owner/repo/pull/42" {
 		t.Fatalf("pull-request result = %+v", result)
+	}
+	if len(effects.effects) != 2 {
+		t.Fatalf("pull-request effects = %+v", effects.effects)
+	}
+	expectedPush, err := publicationeffect.NewPRBranchPush(
+		publicationeffect.PRBranchPushInput{
+			RepositoryIdentity: "example.test/owner/repo",
+			RemoteURL:          "git@example.test:owner/repo.git",
+			SourceOID:          fixture.head,
+			TargetRef:          ref,
+			ExpectedAbsent:     true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pullRequestBody(validatedPublication{
+		publication: fixture.publication,
+		head:        fixture.head,
+	})
+	bodyDigest, err := publicationeffect.DigestPRBody([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedCreate, err := publicationeffect.NewPRCreate(
+		publicationeffect.PRCreateInput{
+			RepositoryIdentity: "example.test/owner/repo",
+			BaseRef:            "refs/heads/main",
+			HeadRef:            ref,
+			Title:              "Autogora: publish Task / Unsafe Name",
+			BodyDigest:         bodyDigest,
+			ExpectedHeadOID:    fixture.head,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, expected := range []publicationeffect.Descriptor{
+		expectedPush,
+		expectedCreate,
+	} {
+		got := effects.effects[index].descriptor
+		if got.Kind() != expected.Kind() ||
+			got.Fingerprint() != expected.Fingerprint() {
+			t.Fatalf(
+				"effect %d kind=%s fingerprint=%s, want %s %s",
+				index,
+				got.Kind(),
+				got.Fingerprint(),
+				expected.Kind(),
+				expected.Fingerprint(),
+			)
+		}
 	}
 	foundAbsentRefLease := false
 	for _, step := range steps {
@@ -662,7 +718,7 @@ func TestPullRequestRefusesRemoteBranchCollision(t *testing.T) {
 	runner.assertDone()
 }
 
-func TestPullRequestReleaseGateRunsForEveryCommand(t *testing.T) {
+func TestPullRequestReadOnlyReuseBypassesEffectExecutor(t *testing.T) {
 	fixture := newFakePullRequestFixture(t)
 	steps := fakePullRequestPreflight(fixture)
 	ref := "refs/heads/" + fixture.branch
@@ -694,19 +750,19 @@ func TestPullRequestReleaseGateRunsForEveryCommand(t *testing.T) {
 		},
 	)
 	runner := &scriptedRunner{t: t, steps: steps}
-	gateCalls := 0
 	result, err := Execute(
 		context.Background(),
 		fixture.publication,
 		Options{
 			Runner: runner,
-			ReleaseGate: func(
-				_ context.Context,
-				release CommandRelease,
-			) (bool, error) {
-				gateCalls++
-				return release()
-			},
+			EffectExecutor: EffectExecutorFunc(func(
+				context.Context,
+				publicationeffect.Descriptor,
+				EffectCommand,
+			) (CommandOutput, error) {
+				t.Fatal("read-only publication called the effect executor")
+				return CommandOutput{}, nil
+			}),
 		},
 	)
 	if err != nil {
@@ -714,62 +770,12 @@ func TestPullRequestReleaseGateRunsForEveryCommand(t *testing.T) {
 	}
 	runner.assertDone()
 	if result.Status != ResultAlreadyPublished ||
-		gateCalls != len(steps) || runner.gatedCalls != len(steps) {
+		runner.gatedCalls != 0 {
 		t.Fatalf(
-			"gated result=%+v gateCalls=%d runnerCalls=%d commands=%d",
+			"read-only result=%+v gatedCalls=%d commands=%d",
 			result,
-			gateCalls,
 			runner.gatedCalls,
 			len(steps),
-		)
-	}
-}
-
-func TestNthCommandGateDenialPreservesControlError(t *testing.T) {
-	fixture := newFakePullRequestFixture(t)
-	steps := fakeValidationSteps(fixture)
-	const denyAt = 7
-	runner := &scriptedRunner{t: t, steps: steps}
-	gateCause := errors.New("publication permit was revoked")
-	gateCalls := 0
-	_, err := Execute(
-		context.Background(),
-		fixture.publication,
-		Options{
-			Runner: runner,
-			ReleaseGate: func(
-				_ context.Context,
-				release CommandRelease,
-			) (bool, error) {
-				gateCalls++
-				if gateCalls == denyAt {
-					return false, gateCause
-				}
-				return release()
-			},
-		},
-	)
-	var startErr *CommandStartError
-	var execution *Error
-	if !errors.As(err, &startErr) || startErr.Released ||
-		!errors.As(err, &execution) ||
-		execution.Kind != ErrorCommandStartBlocked ||
-		!errors.Is(err, gateCause) ||
-		errors.Is(err, ErrInvalidInput) {
-		t.Fatalf(
-			"denied command error=%v start=%#v execution=%#v",
-			err,
-			startErr,
-			execution,
-		)
-	}
-	if gateCalls != denyAt || runner.gatedCalls != denyAt ||
-		runner.index != denyAt-1 {
-		t.Fatalf(
-			"denial boundary gates=%d runnerGates=%d commands=%d",
-			gateCalls,
-			runner.gatedCalls,
-			runner.index,
 		)
 	}
 }
@@ -816,7 +822,6 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 			args:      createArgs,
 		},
 	)
-	denyAt := len(steps)
 	runner := &scriptedRunner{t: t, steps: steps}
 	gateCause := errors.New("create authorization was revoked")
 	gateCalls := 0
@@ -830,10 +835,7 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 				release CommandRelease,
 			) (bool, error) {
 				gateCalls++
-				if gateCalls == denyAt {
-					return false, gateCause
-				}
-				return release()
+				return false, gateCause
 			},
 		},
 	)
@@ -843,8 +845,8 @@ func TestPullRequestCreateStartDenialDoesNotReconcile(t *testing.T) {
 		errors.Is(err, ErrCommandFailed) {
 		t.Fatalf("create start error=%v detail=%#v", err, startErr)
 	}
-	if gateCalls != denyAt || runner.gatedCalls != denyAt ||
-		runner.index != denyAt-1 {
+	if gateCalls != 1 || runner.gatedCalls != 1 ||
+		runner.index != len(steps)-1 {
 		t.Fatalf(
 			"create denial reconciled: gates=%d runnerGates=%d commands=%d",
 			gateCalls,

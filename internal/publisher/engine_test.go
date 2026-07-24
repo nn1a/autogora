@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nn1a/autogora/internal/model"
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 type panicRunner struct{}
@@ -128,6 +129,22 @@ type gatedOutputRunner struct {
 	err        error
 }
 
+func testEffectDescriptor(t *testing.T) publicationeffect.Descriptor {
+	t.Helper()
+	descriptor, err := publicationeffect.NewLocalRefCAS(
+		publicationeffect.LocalRefCASInput{
+			GitCommonDirPath: "/test/repository/.git",
+			TargetRef:        "refs/heads/main",
+			BeforeOID:        strings.Repeat("a", 40),
+			AfterOID:         strings.Repeat("b", 40),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return descriptor
+}
+
 func (r *gatedOutputRunner) Run(
 	context.Context,
 	string,
@@ -162,7 +179,11 @@ func TestConfiguredReleaseGateRejectsNonGatedRunner(t *testing.T) {
 			return true, nil
 		},
 	})
-	_, err := engine.run(context.Background(), ".", "ignored")
+	_, err := engine.runEffect(
+		context.Background(),
+		testEffectDescriptor(t),
+		EffectCommand{Directory: ".", File: "ignored"},
+	)
 	if !errors.Is(err, ErrCommandStartBlocked) {
 		t.Fatalf("unsupported gated runner error = %v", err)
 	}
@@ -178,7 +199,7 @@ func TestConfiguredReleaseGateRejectsNonGatedRunner(t *testing.T) {
 	}
 }
 
-func TestUngatedEngineKeepsUsingCommandRunner(t *testing.T) {
+func TestReadOnlyCommandAlwaysUsesCommandRunner(t *testing.T) {
 	runner := &gatedOutputRunner{
 		output: CommandOutput{Stdout: "ungated"},
 	}
@@ -222,7 +243,11 @@ func TestEnginePrioritizesTeardownWhilePreservingCommandStartError(
 			return false, errors.New("unused fake gate")
 		},
 	})
-	_, err := engine.run(context.Background(), ".", "ignored")
+	_, err := engine.runEffect(
+		context.Background(),
+		testEffectDescriptor(t),
+		EffectCommand{Directory: ".", File: "ignored"},
+	)
 	var startErr *CommandStartError
 	var execution *Error
 	if !errors.As(err, &startErr) || !startErr.Released ||

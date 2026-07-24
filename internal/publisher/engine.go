@@ -16,6 +16,7 @@ import (
 
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/processguard"
+	"github.com/nn1a/autogora/internal/publicationeffect"
 )
 
 const (
@@ -129,6 +130,43 @@ type CommandOutput struct {
 // involved.
 type CommandRunner interface {
 	Run(ctx context.Context, directory, file string, args ...string) (CommandOutput, error)
+}
+
+// EffectCommand is the executable form of one publication mutation. Its
+// Descriptor is supplied separately so durable executors can authorize and
+// recover the semantic effect without persisting argv.
+type EffectCommand struct {
+	Directory string
+	File      string
+	Args      []string
+}
+
+// EffectExecutor is the only Publisher extension point allowed to execute a
+// mutating command. Read-only probes always use CommandRunner directly.
+//
+// Implementations must execute command at most once. The Publisher invokes
+// ExecuteEffect exactly once for each attempted semantic mutation.
+type EffectExecutor interface {
+	ExecuteEffect(
+		ctx context.Context,
+		descriptor publicationeffect.Descriptor,
+		command EffectCommand,
+	) (CommandOutput, error)
+}
+
+// EffectExecutorFunc adapts a function to EffectExecutor.
+type EffectExecutorFunc func(
+	context.Context,
+	publicationeffect.Descriptor,
+	EffectCommand,
+) (CommandOutput, error)
+
+func (f EffectExecutorFunc) ExecuteEffect(
+	ctx context.Context,
+	descriptor publicationeffect.Descriptor,
+	command EffectCommand,
+) (CommandOutput, error) {
+	return f(ctx, descriptor, command)
 }
 
 // CommandRelease opens the one-shot fence in front of an already-started
@@ -401,13 +439,18 @@ func commandEnvironment() []string {
 type Options struct {
 	Runner         CommandRunner
 	CommandTimeout time.Duration
-	ReleaseGate    CommandReleaseGate
+	EffectExecutor EffectExecutor
+
+	// ReleaseGate is retained as a transition adapter for callers that have
+	// not yet adopted EffectExecutor. It fences mutation commands only;
+	// read-only commands never cross this gate.
+	ReleaseGate CommandReleaseGate
 }
 
 type Engine struct {
 	runner         CommandRunner
 	commandTimeout time.Duration
-	releaseGate    CommandReleaseGate
+	effectExecutor EffectExecutor
 }
 
 func New(options Options) *Engine {
@@ -422,10 +465,54 @@ func New(options Options) *Engine {
 	if timeout > MaxCommandTimeout {
 		timeout = MaxCommandTimeout
 	}
+	effectExecutor := options.EffectExecutor
+	if effectExecutor == nil {
+		effectExecutor = runnerEffectExecutor{
+			runner:      runner,
+			releaseGate: options.ReleaseGate,
+		}
+	}
 	return &Engine{
 		runner: runner, commandTimeout: timeout,
-		releaseGate: options.ReleaseGate,
+		effectExecutor: effectExecutor,
 	}
+}
+
+type runnerEffectExecutor struct {
+	runner      CommandRunner
+	releaseGate CommandReleaseGate
+}
+
+func (e runnerEffectExecutor) ExecuteEffect(
+	ctx context.Context,
+	_ publicationeffect.Descriptor,
+	command EffectCommand,
+) (CommandOutput, error) {
+	args := append([]string(nil), command.Args...)
+	if e.releaseGate == nil {
+		return e.runner.Run(
+			ctx,
+			command.Directory,
+			command.File,
+			args...,
+		)
+	}
+	runner, ok := e.runner.(GatedCommandRunner)
+	if !ok {
+		return CommandOutput{}, newCommandStartError(
+			false,
+			errors.New(
+				"configured command release gate requires a gated command runner",
+			),
+		)
+	}
+	return runner.RunGated(
+		ctx,
+		command.Directory,
+		command.File,
+		e.releaseGate,
+		args...,
+	)
 }
 
 func Execute(
@@ -447,26 +534,39 @@ func (e *Engine) run(
 	file string,
 	args ...string,
 ) (commandResult, error) {
+	return e.runCommand(
+		ctx,
+		func(runCtx context.Context) (CommandOutput, error) {
+			return e.runner.Run(runCtx, directory, file, args...)
+		},
+	)
+}
+
+func (e *Engine) runEffect(
+	ctx context.Context,
+	descriptor publicationeffect.Descriptor,
+	command EffectCommand,
+) (commandResult, error) {
+	command.Args = append([]string(nil), command.Args...)
+	return e.runCommand(
+		ctx,
+		func(runCtx context.Context) (CommandOutput, error) {
+			return e.effectExecutor.ExecuteEffect(
+				runCtx,
+				descriptor,
+				command,
+			)
+		},
+	)
+}
+
+func (e *Engine) runCommand(
+	ctx context.Context,
+	run func(context.Context) (CommandOutput, error),
+) (commandResult, error) {
 	runCtx, cancel := context.WithTimeout(ctx, e.commandTimeout)
 	defer cancel()
-	var output CommandOutput
-	var err error
-	if e.releaseGate == nil {
-		output, err = e.runner.Run(runCtx, directory, file, args...)
-	} else if runner, ok := e.runner.(GatedCommandRunner); ok {
-		output, err = runner.RunGated(
-			runCtx,
-			directory,
-			file,
-			e.releaseGate,
-			args...,
-		)
-	} else {
-		err = newCommandStartError(
-			false,
-			errors.New("configured command release gate requires a gated command runner"),
-		)
-	}
+	output, err := run(runCtx)
 	output = normalizeOutput(output)
 	result := commandResult{stdout: output.Stdout, stderr: output.Stderr}
 	if err != nil {
