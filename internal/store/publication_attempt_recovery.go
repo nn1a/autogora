@@ -538,8 +538,12 @@ func canonicalPublicationAttemptRecoveryTimestamp(
 	if err != nil {
 		return "", fmt.Errorf("%s must be RFC3339", field)
 	}
-	if parsed.Location() != time.UTC ||
-		parsed.UTC().Format(time.RFC3339Nano) != value {
+	if parsed.Location() != time.UTC {
+		return "", fmt.Errorf("%s is not stored canonically", field)
+	}
+	shortest := parsed.UTC().Format(time.RFC3339Nano)
+	fixedNanoseconds := parsed.UTC().Format(publicationTimestampLayout)
+	if value != shortest && value != fixedNanoseconds {
 		return "", fmt.Errorf("%s is not stored canonically", field)
 	}
 	return value, nil

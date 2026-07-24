@@ -46,6 +46,55 @@ func mutatePublicationAttemptRecoveryDatabase(
 	}
 }
 
+func TestCanonicalPublicationAttemptRecoveryTimestampAcceptsDurableFormats(
+	t *testing.T,
+) {
+	t.Parallel()
+	for _, value := range []string{
+		"2026-07-24T01:02:03Z",
+		"2026-07-24T01:02:03.8488666Z",
+		"2026-07-24T01:02:03.848866600Z",
+		"2026-07-24T01:02:03.000000000Z",
+	} {
+		value := value
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			got, err := canonicalPublicationAttemptRecoveryTimestamp(
+				value,
+				"timestamp",
+				true,
+			)
+			if err != nil || got != value {
+				t.Fatalf("timestamp=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestCanonicalPublicationAttemptRecoveryTimestampRejectsAlternateForms(
+	t *testing.T,
+) {
+	t.Parallel()
+	for _, value := range []string{
+		" 2026-07-24T01:02:03Z",
+		"2026-07-24T01:02:03+00:00",
+		"2026-07-24T01:02:03.0Z",
+		"2026-07-24T01:02:03.84886660Z",
+	} {
+		value := value
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			if _, err := canonicalPublicationAttemptRecoveryTimestamp(
+				value,
+				"timestamp",
+				true,
+			); err == nil {
+				t.Fatalf("timestamp %q unexpectedly accepted", value)
+			}
+		})
+	}
+}
+
 func TestPublicationAttemptRecoveryReaderReportsPreV28Unsupported(
 	t *testing.T,
 ) {
