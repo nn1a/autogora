@@ -831,7 +831,7 @@ func TestDispatcherStartupAttemptProvenanceDivergenceFailsClosed(
 		{
 			name:   "task id",
 			column: "task_id",
-			value:  "task_startup_provenance_tampered",
+			value:  "replaced-with-valid-task-id",
 		},
 		{
 			name:   "repository path",
@@ -859,6 +859,30 @@ func TestDispatcherStartupAttemptProvenanceDivergenceFailsClosed(
 			)
 			if fixture.Intent.ExecutionProvenanceFingerprint == "" {
 				t.Fatal("startup attempt lacks execution provenance")
+			}
+			if test.column == "task_id" {
+				opened, err := manager.OpenStore(
+					context.Background(),
+					fixture.Intent.Board,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				detail, createErr := opened.CreateTask(
+					context.Background(),
+					store.CreateTaskInput{
+						Title: "alternate valid publication owner",
+					},
+				)
+				closeErr := opened.Close()
+				if createErr != nil || closeErr != nil {
+					t.Fatalf(
+						"create alternate provenance task: create=%v close=%v",
+						createErr,
+						closeErr,
+					)
+				}
+				test.value = detail.Task.ID
 			}
 			raw, err := sql.Open("sqlite", dbPath)
 			if err != nil {
