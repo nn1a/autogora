@@ -565,7 +565,7 @@ func TestActiveAutomationQuarantinePreventsEveryDispatcherEntryPath(
 				context.Background(),
 				store.AutomationQuarantineSourceInput{
 					Board:              "default",
-					Kind:               "publication",
+					Kind:               "dispatcher_test",
 					SourceID:           "startup-gate",
 					ObservedUpdatedAt:  "2026-07-24T00:00:00.000Z",
 					ObservedClaimEpoch: "1",
@@ -757,7 +757,7 @@ func TestAutomationWorkerReleaseGateSerializesQuarantineActivation(
 		blockedContext,
 		store.AutomationQuarantineSourceInput{
 			Board:             "default",
-			Kind:              "publication",
+			Kind:              "dispatcher_test",
 			SourceID:          "release-gate-publication",
 			ObservedUpdatedAt: "epoch-one",
 			DiagnosticCode:    "process_teardown_unconfirmed",
@@ -781,7 +781,7 @@ func TestAutomationWorkerReleaseGateSerializesQuarantineActivation(
 		ctx,
 		store.AutomationQuarantineSourceInput{
 			Board:             "default",
-			Kind:              "publication",
+			Kind:              "dispatcher_test",
 			SourceID:          "release-gate-publication",
 			ObservedUpdatedAt: "epoch-one",
 			DiagnosticCode:    "process_teardown_unconfirmed",

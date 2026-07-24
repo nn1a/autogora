@@ -113,14 +113,16 @@ type Metadata struct {
 }
 
 type listedBoardIdentity struct {
-	slug          string
-	archived      bool
-	dbPath        string
-	dbInfo        os.FileInfo
-	directoryPath string
-	directoryInfo os.FileInfo
-	createdAt     string
-	hasCreatedAt  bool
+	slug            string
+	archived        bool
+	dbPath          string
+	dbInfo          os.FileInfo
+	archiveRootPath string
+	archiveRootInfo os.FileInfo
+	directoryPath   string
+	directoryInfo   os.FileInfo
+	createdAt       string
+	hasCreatedAt    bool
 }
 
 type Update struct {
@@ -246,6 +248,18 @@ func (m *Manager) boardMetadataLockPath(slug string) string {
 
 func (m *Manager) boardLifecycleLockPath(slug string) string {
 	return filepath.Join(m.home, ".locks", "boards", slug+".lifecycle.lock")
+}
+
+// archivedRecoveryLockPath coordinates every manager-owned archive mutation
+// with exact archived readers/writers. Future archive GC/import operations
+// must take this lock exclusively before changing the archive root.
+func (m *Manager) archivedRecoveryLockPath() string {
+	return filepath.Join(
+		m.home,
+		".locks",
+		"boards",
+		"_archived.recovery.lock",
+	)
 }
 
 func (m *Manager) currentLockPath() string {
@@ -846,17 +860,12 @@ func attachListedBoardIdentity(
 	if err != nil || strings.TrimSpace(metadata.DBPath) == "" {
 		return errors.New("listed board database path is required")
 	}
-	var dbInfo os.FileInfo
-	if metadata.Archived {
-		dbInfo, err = os.Lstat(dbPath)
-	} else {
-		dbInfo, err = os.Stat(dbPath)
-	}
+	dbInfo, err := os.Lstat(dbPath)
 	if err != nil {
 		return fmt.Errorf("inspect listed board %s database: %w", slug, err)
 	}
 	if !dbInfo.Mode().IsRegular() ||
-		(metadata.Archived && dbInfo.Mode()&os.ModeSymlink != 0) {
+		dbInfo.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf(
 			"listed board %s database must be a regular file",
 			slug,
@@ -875,6 +884,22 @@ func attachListedBoardIdentity(
 		if err != nil || strings.TrimSpace(archivedDirectory) == "" {
 			return errors.New("listed archived board directory is required")
 		}
+		archiveRootPath := filepath.Dir(directoryPath)
+		archiveRootInfo, err := os.Lstat(archiveRootPath)
+		if err != nil {
+			return fmt.Errorf(
+				"inspect listed archived board root for %s: %w",
+				slug,
+				err,
+			)
+		}
+		if !archiveRootInfo.IsDir() ||
+			archiveRootInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"listed archived board root for %s must be a real directory",
+				slug,
+			)
+		}
 		directoryInfo, err := os.Lstat(directoryPath)
 		if err != nil {
 			return fmt.Errorf(
@@ -890,6 +915,8 @@ func attachListedBoardIdentity(
 				slug,
 			)
 		}
+		identity.archiveRootPath = archiveRootPath
+		identity.archiveRootInfo = archiveRootInfo
 		identity.directoryPath = directoryPath
 		identity.directoryInfo = directoryInfo
 	}
@@ -1413,13 +1440,27 @@ func (m *Manager) Remove(board string, hardDelete bool) (RemoveResult, error) {
 	if slug == "default" {
 		return RemoveResult{}, errors.New("the default board cannot be removed")
 	}
+	ctx := context.Background()
+	// Acquire the global automation lock before any board metadata or lifecycle
+	// lock. Recovery confirmation takes the same locks in that order, so
+	// reversing them here could deadlock while the board is being removed.
+	authority, err := m.openStoreUnlocked(ctx, "default")
+	if err != nil {
+		return RemoveResult{}, fmt.Errorf(
+			"open automation authority before removing board %s: %w",
+			slug,
+			err,
+		)
+	}
 	var result RemoveResult
-	err = m.withBoardMutation(context.Background(), slug, true, func(coordination *store.Store) error {
-		var removeErr error
-		result, removeErr = m.remove(context.Background(), slug, hardDelete, coordination)
-		return removeErr
+	err = authority.RunWithAutomationGateOpen(ctx, func() error {
+		return m.withBoardMutation(ctx, slug, true, func(coordination *store.Store) error {
+			var removeErr error
+			result, removeErr = m.remove(ctx, slug, hardDelete, coordination)
+			return removeErr
+		})
 	})
-	return result, err
+	return result, errors.Join(err, authority.Close())
 }
 
 func (m *Manager) cleanupTerminalGlobalLeases(
@@ -1566,22 +1607,46 @@ func (m *Manager) remove(
 	if _, err := m.write(slug, Update{}, &archived); err != nil {
 		return rollback(err)
 	}
+	archiveLock, acquired, archiveLockErr := acquireBoardMutationLock(
+		m.archivedRecoveryLockPath(),
+		true,
+	)
+	if archiveLockErr != nil || !acquired {
+		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
+		if archiveLockErr == nil {
+			archiveLockErr = ErrBoardMutationInProgress
+		}
+		return rollback(errors.Join(archiveLockErr, restoreErr))
+	}
 	archivedRoot := filepath.Join(m.boardsRoot, "_archived")
 	if err := os.MkdirAll(archivedRoot, 0o755); err != nil {
 		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
-		return rollback(errors.Join(err, restoreErr))
+		return rollback(errors.Join(
+			err,
+			restoreErr,
+			archiveLock.Close(),
+		))
 	}
 	if err := m.validateRemovalGuards(ctx, slug, coordinationStore, localGuard, coordinationGuard); err != nil {
 		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
-		return rollback(errors.Join(err, restoreErr))
+		return rollback(errors.Join(
+			err,
+			restoreErr,
+			archiveLock.Close(),
+		))
 	}
 	target := filepath.Join(archivedRoot, fmt.Sprintf("%s-%d", slug, time.Now().UnixMilli()))
 	if err := os.Rename(source, target); err != nil {
 		_, restoreErr := m.write(slug, Update{}, &previous.Archived)
-		return rollback(errors.Join(err, restoreErr))
+		return rollback(errors.Join(
+			err,
+			restoreErr,
+			archiveLock.Close(),
+		))
 	}
 	_ = m.resetCurrentAfterRemoval(slug)
-	return RemoveResult{Slug: slug, Archived: true, Path: target}, nil
+	return RemoveResult{Slug: slug, Archived: true, Path: target},
+		archiveLock.Close()
 }
 
 func (m *Manager) OpenStore(ctx context.Context, board string) (*store.Store, error) {
@@ -1768,7 +1833,7 @@ func (m *Manager) openActiveListedPublicationRecoveryReader(
 			slug,
 		))
 	}
-	dbInfo, err := os.Stat(identity.dbPath)
+	dbInfo, err := os.Lstat(identity.dbPath)
 	if err != nil {
 		return nil, closeLocks(fmt.Errorf(
 			"inspect active board %s database: %w",
@@ -1777,6 +1842,7 @@ func (m *Manager) openActiveListedPublicationRecoveryReader(
 		))
 	}
 	if !dbInfo.Mode().IsRegular() ||
+		dbInfo.Mode()&os.ModeSymlink != 0 ||
 		!os.SameFile(identity.dbInfo, dbInfo) {
 		return nil, closeLocks(fmt.Errorf(
 			"active board %s database changed since recovery inventory",
@@ -1792,9 +1858,10 @@ func (m *Manager) openActiveListedPublicationRecoveryReader(
 		return nil, closeLocks(err)
 	}
 	opened.SetCloseHook(lifecycleLock.Close)
-	dbInfoAfterOpen, statErr := os.Stat(identity.dbPath)
+	dbInfoAfterOpen, statErr := os.Lstat(identity.dbPath)
 	if statErr != nil ||
 		!dbInfoAfterOpen.Mode().IsRegular() ||
+		dbInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
 		!os.SameFile(identity.dbInfo, dbInfoAfterOpen) {
 		if statErr == nil {
 			statErr = fmt.Errorf(
@@ -1850,72 +1917,115 @@ func (m *Manager) OpenListedPublicationRecoveryReader(
 			slug,
 		)
 	}
+	archiveLock, acquired, lockErr := acquireBoardMutationLock(
+		m.archivedRecoveryLockPath(),
+		false,
+	)
+	if lockErr != nil {
+		return nil, fmt.Errorf(
+			"lock archived publication recovery inventory: %w",
+			lockErr,
+		)
+	}
+	if !acquired {
+		return nil, ErrBoardMutationInProgress
+	}
+	closeArchiveLock := func(cause error) error {
+		return errors.Join(cause, archiveLock.Close())
+	}
 	archiveRoot, err := filepath.Abs(filepath.Join(m.boardsRoot, "_archived"))
 	if err != nil {
-		return nil, fmt.Errorf("resolve archived board root: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"resolve archived board root: %w",
+			err,
+		))
 	}
 	dbPath, err := filepath.Abs(strings.TrimSpace(metadata.DBPath))
 	if err != nil || strings.TrimSpace(metadata.DBPath) == "" {
-		return nil, errors.New("archived board database path is required")
+		return nil, closeArchiveLock(errors.New(
+			"archived board database path is required",
+		))
 	}
 	relative, err := filepath.Rel(archiveRoot, dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve archived board database: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"resolve archived board database: %w",
+			err,
+		))
 	}
 	parts := strings.Split(relative, string(filepath.Separator))
 	if len(parts) != 2 || parts[0] == "" || parts[0] == "." ||
 		parts[0] == ".." || parts[1] != "autogora.db" {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board database is outside its manager-owned location",
-		)
+		))
 	}
 	directory := filepath.Join(archiveRoot, parts[0])
 	identity, err := validateListedBoardIdentity(metadata, slug, true)
 	if err != nil {
-		return nil, err
+		return nil, closeArchiveLock(err)
 	}
 	if identity.directoryInfo == nil ||
 		identity.directoryPath != directory {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board directory does not match its listed recovery identity",
-		)
+		))
 	}
 	directoryInfo, err := os.Lstat(directory)
 	if err != nil {
-		return nil, fmt.Errorf("inspect archived board directory: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"inspect archived board directory: %w",
+			err,
+		))
 	}
 	if !directoryInfo.IsDir() ||
 		directoryInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("archived board directory must be a real directory")
+		return nil, closeArchiveLock(errors.New(
+			"archived board directory must be a real directory",
+		))
 	}
 	if !os.SameFile(identity.directoryInfo, directoryInfo) {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board directory changed since recovery inventory",
-		)
+		))
 	}
 	dbInfo, err := os.Lstat(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("inspect archived board database: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"inspect archived board database: %w",
+			err,
+		))
 	}
 	if !dbInfo.Mode().IsRegular() || dbInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("archived board database must be a regular file")
+		return nil, closeArchiveLock(errors.New(
+			"archived board database must be a regular file",
+		))
 	}
 	if !os.SameFile(identity.dbInfo, dbInfo) {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board database changed since recovery inventory",
-		)
+		))
 	}
 	canonicalRoot, err := filepath.EvalSymlinks(archiveRoot)
 	if err != nil {
-		return nil, fmt.Errorf("resolve archived board root links: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"resolve archived board root links: %w",
+			err,
+		))
 	}
 	canonicalDB, err := filepath.EvalSymlinks(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve archived board database links: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"resolve archived board database links: %w",
+			err,
+		))
 	}
 	canonicalRelative, err := filepath.Rel(canonicalRoot, canonicalDB)
 	if err != nil {
-		return nil, fmt.Errorf("validate archived board database links: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"validate archived board database links: %w",
+			err,
+		))
 	}
 	canonicalParts := strings.Split(
 		canonicalRelative,
@@ -1924,31 +2034,38 @@ func (m *Manager) OpenListedPublicationRecoveryReader(
 	if len(canonicalParts) != 2 ||
 		canonicalParts[0] != parts[0] ||
 		canonicalParts[1] != "autogora.db" {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board database resolves outside its manager-owned location",
-		)
+		))
 	}
 	contents, err := os.ReadFile(filepath.Join(directory, "board.json"))
 	if err != nil {
-		return nil, fmt.Errorf("read archived board metadata: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"read archived board metadata: %w",
+			err,
+		))
 	}
 	var raw persistedMetadata
 	if err := json.Unmarshal(contents, &raw); err != nil {
-		return nil, fmt.Errorf("decode archived board metadata: %w", err)
+		return nil, closeArchiveLock(fmt.Errorf(
+			"decode archived board metadata: %w",
+			err,
+		))
 	}
 	persistedSlug, err := NormalizeSlug(raw.Slug)
 	if err != nil ||
 		persistedSlug != slug ||
 		!raw.Archived ||
 		!listedCreatedAtMatches(identity, raw.CreatedAt) {
-		return nil, errors.New(
+		return nil, closeArchiveLock(errors.New(
 			"archived board metadata does not match its listed identity",
-		)
+		))
 	}
 	opened, err := store.OpenPublicationRecoveryReader(ctx, dbPath, slug)
 	if err != nil {
-		return nil, err
+		return nil, closeArchiveLock(err)
 	}
+	opened.SetCloseHook(archiveLock.Close)
 	directoryInfoAfterOpen, directoryStatErr := os.Lstat(directory)
 	dbInfoAfterOpen, dbStatErr := os.Lstat(dbPath)
 	if directoryStatErr != nil ||
@@ -1972,6 +2089,523 @@ func (m *Manager) OpenListedPublicationRecoveryReader(
 		return nil, errors.Join(err, opened.Close())
 	}
 	return opened, nil
+}
+
+// ApplyListedPublicationRecovery is the only board-manager path that opens an
+// archived database for an operator write. It accepts only the opaque listed
+// identity returned by ListMetadata, revalidates that identity before and
+// after opening the database, applies one exact publication recovery, and
+// closes the Store without exposing it to callers.
+func (m *Manager) ApplyListedPublicationRecovery(
+	ctx context.Context,
+	metadata Metadata,
+	permit *store.AutomationRecoveryPermit,
+	input store.PublicationRecoveryInput,
+) (store.PublicationRecoveryResult, error) {
+	results, err := m.ApplyListedPublicationRecoveries(
+		ctx,
+		metadata,
+		permit,
+		[]store.PublicationRecoveryInput{input},
+	)
+	if err != nil {
+		return store.PublicationRecoveryResult{}, err
+	}
+	if len(results) != 1 {
+		return store.PublicationRecoveryResult{}, errors.New(
+			"operator publication recovery returned an invalid result count",
+		)
+	}
+	return results[0], nil
+}
+
+// ApplyListedPublicationRecoveries amortizes identity verification and Store
+// opening for a board while keeping each recovery in its own Store
+// transaction. A later source failure therefore remains safely resumable from
+// the immutable receipts committed for earlier sources.
+func (m *Manager) ApplyListedPublicationRecoveries(
+	ctx context.Context,
+	metadata Metadata,
+	permit *store.AutomationRecoveryPermit,
+	inputs []store.PublicationRecoveryInput,
+) ([]store.PublicationRecoveryResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(inputs) == 0 {
+		return nil, errors.New(
+			"operator publication recovery requires at least one source",
+		)
+	}
+	if len(inputs) > 1000 {
+		return nil, errors.New(
+			"operator publication recovery cannot exceed 1000 sources",
+		)
+	}
+	slug, err := NormalizeSlug(metadata.Slug)
+	if err != nil {
+		return nil, err
+	}
+	if metadata.Archived {
+		return m.applyArchivedListedPublicationRecoveries(
+			ctx,
+			metadata,
+			slug,
+			permit,
+			inputs,
+		)
+	}
+	return m.applyActiveListedPublicationRecoveries(
+		ctx,
+		metadata,
+		slug,
+		permit,
+		inputs,
+	)
+}
+
+func (m *Manager) applyActiveListedPublicationRecoveries(
+	ctx context.Context,
+	metadata Metadata,
+	slug string,
+	permit *store.AutomationRecoveryPermit,
+	inputs []store.PublicationRecoveryInput,
+) (results []store.PublicationRecoveryResult, resultErr error) {
+	identity, err := validateListedBoardIdentity(metadata, slug, false)
+	if err != nil {
+		return nil, err
+	}
+	expectedDBPath, err := m.DBPath(slug)
+	if err != nil {
+		return nil, err
+	}
+	expectedDBPath, err = filepath.Abs(expectedDBPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"resolve active board %s recovery database: %w",
+			slug,
+			err,
+		)
+	}
+	if expectedDBPath != identity.dbPath {
+		return nil, errors.New(
+			"active board recovery database is outside its manager-owned location",
+		)
+	}
+
+	metadataLock, acquired, lockErr := acquireBoardMutationLock(
+		m.boardMetadataLockPath(slug),
+		false,
+	)
+	if lockErr != nil {
+		return nil, fmt.Errorf(
+			"lock board %s metadata for operator recovery: %w",
+			slug,
+			lockErr,
+		)
+	}
+	if !acquired {
+		return nil, fmt.Errorf(
+			"%w: %s",
+			ErrBoardMutationInProgress,
+			slug,
+		)
+	}
+	lifecycleLock, acquired, lifecycleErr := acquireBoardMutationLock(
+		m.boardLifecycleLockPath(slug),
+		false,
+	)
+	if lifecycleErr != nil || !acquired {
+		closeErr := metadataLock.Close()
+		if lifecycleErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf(
+					"lock board %s lifecycle for operator recovery: %w",
+					slug,
+					lifecycleErr,
+				),
+				closeErr,
+			)
+		}
+		return nil, errors.Join(
+			fmt.Errorf("%w: %s", ErrBoardMutationInProgress, slug),
+			closeErr,
+		)
+	}
+	closeLocks := func(cause error) error {
+		return errors.Join(
+			cause,
+			lifecycleLock.Close(),
+			metadataLock.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, closeLocks(err)
+	}
+	current, err := m.Read(slug)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	currentDBPath, err := filepath.Abs(current.DBPath)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	if current.Slug != slug ||
+		current.Archived ||
+		currentDBPath != identity.dbPath ||
+		!listedCreatedAtMatches(identity, current.CreatedAt) {
+		return nil, closeLocks(fmt.Errorf(
+			"active board %s changed since operator recovery inventory",
+			slug,
+		))
+	}
+	dbInfo, err := os.Lstat(identity.dbPath)
+	if err != nil {
+		return nil, closeLocks(fmt.Errorf(
+			"inspect active board %s operator recovery database: %w",
+			slug,
+			err,
+		))
+	}
+	if !dbInfo.Mode().IsRegular() ||
+		dbInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.dbInfo, dbInfo) {
+		return nil, closeLocks(fmt.Errorf(
+			"active board %s database changed since operator recovery inventory",
+			slug,
+		))
+	}
+	attachmentsRoot, err := m.AttachmentsRoot(slug)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	opened, err := store.Open(identity.dbPath, slug, attachmentsRoot)
+	if err != nil {
+		return nil, closeLocks(err)
+	}
+	opened.SetCloseHook(lifecycleLock.Close)
+	dbInfoAfterOpen, statErr := os.Lstat(identity.dbPath)
+	if statErr != nil ||
+		!dbInfoAfterOpen.Mode().IsRegular() ||
+		dbInfoAfterOpen.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.dbInfo, dbInfoAfterOpen) {
+		if statErr == nil {
+			statErr = fmt.Errorf(
+				"active board %s database changed while opening operator recovery writer",
+				slug,
+			)
+		} else {
+			statErr = fmt.Errorf(
+				"reinspect active board %s operator recovery database: %w",
+				slug,
+				statErr,
+			)
+		}
+		return nil, errors.Join(
+			statErr,
+			opened.Close(),
+			metadataLock.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(
+			err,
+			opened.Close(),
+			metadataLock.Close(),
+		)
+	}
+	results = make([]store.PublicationRecoveryResult, 0, len(inputs))
+	for _, input := range inputs {
+		result, err := opened.ApplyPublicationRecovery(ctx, permit, input)
+		if err != nil {
+			resultErr = fmt.Errorf(
+				"apply publication recovery %s on board %s: %w",
+				input.SourceKey,
+				slug,
+				err,
+			)
+			break
+		}
+		results = append(results, result)
+	}
+	dbInfoAfterApply, identityErr := os.Lstat(identity.dbPath)
+	if identityErr == nil &&
+		(!dbInfoAfterApply.Mode().IsRegular() ||
+			dbInfoAfterApply.Mode()&os.ModeSymlink != 0 ||
+			!os.SameFile(identity.dbInfo, dbInfoAfterApply)) {
+		identityErr = errors.New(
+			"active board database changed during operator recovery",
+		)
+	}
+	if identityErr != nil {
+		resultErr = errors.Join(
+			resultErr,
+			fmt.Errorf(
+				"revalidate active board %s after operator recovery: %w",
+				slug,
+				identityErr,
+			),
+		)
+	}
+	resultErr = errors.Join(
+		resultErr,
+		opened.Close(),
+		metadataLock.Close(),
+	)
+	return results, resultErr
+}
+
+func (m *Manager) validateArchivedListedRecoveryLocation(
+	metadata Metadata,
+	slug string,
+) (*listedBoardIdentity, string, string, error) {
+	identity, err := validateListedBoardIdentity(metadata, slug, true)
+	if err != nil {
+		return nil, "", "", err
+	}
+	archiveRoot, err := filepath.Abs(filepath.Join(m.boardsRoot, "_archived"))
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"resolve archived operator recovery root: %w",
+			err,
+		)
+	}
+	if identity.archiveRootInfo == nil ||
+		identity.archiveRootPath != archiveRoot {
+		return nil, "", "", errors.New(
+			"archived board root does not match its listed recovery identity",
+		)
+	}
+	rootInfo, err := os.Lstat(archiveRoot)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"inspect archived operator recovery root: %w",
+			err,
+		)
+	}
+	if !rootInfo.IsDir() ||
+		rootInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.archiveRootInfo, rootInfo) {
+		return nil, "", "", errors.New(
+			"archived board root changed since recovery inventory",
+		)
+	}
+	relative, err := filepath.Rel(archiveRoot, identity.dbPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"resolve archived operator recovery database: %w",
+			err,
+		)
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] == "" || parts[0] == "." ||
+		parts[0] == ".." || parts[1] != "autogora.db" {
+		return nil, "", "", errors.New(
+			"archived operator recovery database is outside its manager-owned location",
+		)
+	}
+	directory := filepath.Join(archiveRoot, parts[0])
+	if identity.directoryInfo == nil ||
+		identity.directoryPath != directory {
+		return nil, "", "", errors.New(
+			"archived board directory does not match its listed recovery identity",
+		)
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"inspect archived operator recovery directory: %w",
+			err,
+		)
+	}
+	if !directoryInfo.IsDir() ||
+		directoryInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.directoryInfo, directoryInfo) {
+		return nil, "", "", errors.New(
+			"archived board directory changed since recovery inventory",
+		)
+	}
+	dbInfo, err := os.Lstat(identity.dbPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"inspect archived operator recovery database: %w",
+			err,
+		)
+	}
+	if !dbInfo.Mode().IsRegular() ||
+		dbInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity.dbInfo, dbInfo) {
+		return nil, "", "", errors.New(
+			"archived board database changed since recovery inventory",
+		)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(archiveRoot)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"resolve archived operator recovery root links: %w",
+			err,
+		)
+	}
+	canonicalDB, err := filepath.EvalSymlinks(identity.dbPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"resolve archived operator recovery database links: %w",
+			err,
+		)
+	}
+	canonicalRelative, err := filepath.Rel(canonicalRoot, canonicalDB)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"validate archived operator recovery database links: %w",
+			err,
+		)
+	}
+	canonicalParts := strings.Split(
+		canonicalRelative,
+		string(filepath.Separator),
+	)
+	if len(canonicalParts) != 2 ||
+		canonicalParts[0] != parts[0] ||
+		canonicalParts[1] != "autogora.db" {
+		return nil, "", "", errors.New(
+			"archived operator recovery database resolves outside its manager-owned location",
+		)
+	}
+	boardMetadataPath := filepath.Join(directory, "board.json")
+	boardMetadataInfo, err := os.Lstat(boardMetadataPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"inspect archived operator recovery metadata: %w",
+			err,
+		)
+	}
+	if !boardMetadataInfo.Mode().IsRegular() ||
+		boardMetadataInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, "", "", errors.New(
+			"archived operator recovery metadata must be a regular file",
+		)
+	}
+	contents, err := os.ReadFile(boardMetadataPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf(
+			"read archived operator recovery metadata: %w",
+			err,
+		)
+	}
+	var raw persistedMetadata
+	if err := json.Unmarshal(contents, &raw); err != nil {
+		return nil, "", "", fmt.Errorf(
+			"decode archived operator recovery metadata: %w",
+			err,
+		)
+	}
+	persistedSlug, err := NormalizeSlug(raw.Slug)
+	if err != nil ||
+		persistedSlug != slug ||
+		!raw.Archived ||
+		!listedCreatedAtMatches(identity, raw.CreatedAt) {
+		return nil, "", "", errors.New(
+			"archived board metadata does not match its listed recovery identity",
+		)
+	}
+	return identity, directory, boardMetadataPath, nil
+}
+
+func (m *Manager) applyArchivedListedPublicationRecoveries(
+	ctx context.Context,
+	metadata Metadata,
+	slug string,
+	permit *store.AutomationRecoveryPermit,
+	inputs []store.PublicationRecoveryInput,
+) (results []store.PublicationRecoveryResult, resultErr error) {
+	archiveLock, acquired, lockErr := acquireBoardMutationLock(
+		m.archivedRecoveryLockPath(),
+		false,
+	)
+	if lockErr != nil {
+		return nil, fmt.Errorf(
+			"lock archived operator recovery writer: %w",
+			lockErr,
+		)
+	}
+	if !acquired {
+		return nil, ErrBoardMutationInProgress
+	}
+	closeArchiveLock := func(cause error) error {
+		return errors.Join(cause, archiveLock.Close())
+	}
+	identity, directory, _, err := m.validateArchivedListedRecoveryLocation(
+		metadata,
+		slug,
+	)
+	if err != nil {
+		return nil, closeArchiveLock(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, closeArchiveLock(err)
+	}
+	opened, err := store.Open(
+		identity.dbPath,
+		slug,
+		filepath.Join(directory, "attachments"),
+	)
+	if err != nil {
+		return nil, closeArchiveLock(err)
+	}
+	currentIdentity, currentDirectory, _, validationErr :=
+		m.validateArchivedListedRecoveryLocation(metadata, slug)
+	if validationErr != nil ||
+		currentIdentity.dbPath != identity.dbPath ||
+		currentDirectory != directory {
+		if validationErr == nil {
+			validationErr = errors.New(
+				"archived board changed while opening operator recovery writer",
+			)
+		}
+		return nil, errors.Join(
+			validationErr,
+			opened.Close(),
+			archiveLock.Close(),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(
+			err,
+			opened.Close(),
+			archiveLock.Close(),
+		)
+	}
+	results = make([]store.PublicationRecoveryResult, 0, len(inputs))
+	for _, input := range inputs {
+		result, err := opened.ApplyPublicationRecovery(ctx, permit, input)
+		if err != nil {
+			resultErr = fmt.Errorf(
+				"apply publication recovery %s on archived board %s: %w",
+				input.SourceKey,
+				slug,
+				err,
+			)
+			break
+		}
+		results = append(results, result)
+	}
+	if _, _, _, identityErr :=
+		m.validateArchivedListedRecoveryLocation(metadata, slug); identityErr != nil {
+		resultErr = errors.Join(
+			resultErr,
+			fmt.Errorf(
+				"revalidate archived board %s after operator recovery: %w",
+				slug,
+				identityErr,
+			),
+		)
+	}
+	resultErr = errors.Join(
+		resultErr,
+		opened.Close(),
+		archiveLock.Close(),
+	)
+	return results, resultErr
 }
 
 func (m *Manager) openStoreUnlocked(ctx context.Context, board string) (*store.Store, error) {

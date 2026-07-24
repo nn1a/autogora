@@ -252,6 +252,7 @@ func executePublicationWithCapability(
 	cancel()
 	if errors.Is(executionErr, processguard.ErrTeardownUnconfirmed) {
 		quarantineErr := options.automationSession.quarantinePublicationTeardown(
+			opened,
 			claimed,
 		)
 		return true, errors.Join(

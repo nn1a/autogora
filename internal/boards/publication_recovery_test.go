@@ -304,3 +304,143 @@ func TestOpenListedPublicationRecoveryReaderDoesNotChangeArchiveDatabase(
 		)
 	}
 }
+
+func publicationRecoveryWriterInput() store.PublicationRecoveryInput {
+	return store.PublicationRecoveryInput{
+		SourceKey:          strings.Repeat("a", 64),
+		FirstGeneration:    1,
+		PublicationID:      "pub_writer_identity",
+		ObservedUpdatedAt:  "2026-07-24T01:02:03.000000000Z",
+		ObservedClaimEpoch: 1,
+		Outcome:            store.PublicationRecoveryFailed,
+		Disposition:        store.AutomationSourceAbandoned,
+		Actor:              "operator",
+		Reason:             "verified writer identity test",
+	}
+}
+
+func TestApplyListedPublicationRecoveryRejectsChangedBoardIdentity(
+	t *testing.T,
+) {
+	t.Run("active archived after inventory", func(t *testing.T) {
+		manager, metadata := activePublicationRecoveryFixture(t)
+		if _, err := manager.Remove("active", false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.ApplyListedPublicationRecovery(
+			context.Background(),
+			metadata,
+			nil,
+			publicationRecoveryWriterInput(),
+		); err == nil || !strings.Contains(
+			err.Error(),
+			"changed since operator recovery inventory",
+		) {
+			t.Fatalf("stale active writer identity error = %v", err)
+		}
+	})
+
+	t.Run("archived database replaced after inventory", func(t *testing.T) {
+		manager, metadata := archivedPublicationRecoveryFixture(t)
+		original := metadata.DBPath + ".original"
+		if err := os.Rename(metadata.DBPath, original); err != nil {
+			t.Fatal(err)
+		}
+		contents, err := os.ReadFile(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(metadata.DBPath, contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.ApplyListedPublicationRecovery(
+			context.Background(),
+			metadata,
+			nil,
+			publicationRecoveryWriterInput(),
+		); err == nil || !strings.Contains(
+			err.Error(),
+			"database changed since recovery inventory",
+		) {
+			t.Fatalf("replaced archived writer identity error = %v", err)
+		}
+	})
+
+	t.Run("archived root replaced after inventory", func(t *testing.T) {
+		manager, metadata := archivedPublicationRecoveryFixture(t)
+		archiveRoot := filepath.Dir(filepath.Dir(metadata.DBPath))
+		originalRoot := archiveRoot + ".original"
+		if err := os.Rename(archiveRoot, originalRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(archiveRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.ApplyListedPublicationRecovery(
+			context.Background(),
+			metadata,
+			nil,
+			publicationRecoveryWriterInput(),
+		); err == nil || !strings.Contains(
+			err.Error(),
+			"root changed since recovery inventory",
+		) {
+			t.Fatalf("replaced archived root identity error = %v", err)
+		}
+	})
+}
+
+func TestPublicationRecoveryRejectsActiveDatabaseSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic link creation requires platform privileges")
+	}
+	manager, metadata := activePublicationRecoveryFixture(t)
+	realDatabase := metadata.DBPath + ".real"
+	if err := os.Rename(metadata.DBPath, realDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDatabase, metadata.DBPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ListMetadata(
+		context.Background(),
+		false,
+	); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("active database symlink inventory error = %v", err)
+	}
+}
+
+func TestArchivedRecoveryReaderBlocksManagerArchiveMutation(t *testing.T) {
+	manager, metadata := archivedPublicationRecoveryFixture(t)
+	if _, err := manager.Create(
+		context.Background(),
+		"next",
+		Update{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := manager.OpenListedPublicationRecoveryReader(
+		context.Background(),
+		metadata,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Remove("next", false); !errors.Is(
+		err,
+		ErrBoardMutationInProgress,
+	) {
+		reader.Close()
+		t.Fatalf("archive during archived recovery read error = %v", err)
+	}
+	if !manager.Exists("next") {
+		reader.Close()
+		t.Fatal("blocked archive removed the active board")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Remove("next", false); err != nil {
+		t.Fatalf("archive after recovery reader close: %v", err)
+	}
+}

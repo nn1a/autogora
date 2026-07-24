@@ -2,6 +2,7 @@ package boards
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,107 @@ import (
 	"github.com/nn1a/autogora/internal/model"
 	"github.com/nn1a/autogora/internal/store"
 )
+
+func seedPublishingPublication(
+	t *testing.T,
+	manager *Manager,
+	board string,
+) model.Publication {
+	t.Helper()
+	ctx := context.Background()
+	opened, err := manager.OpenStore(ctx, board)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := opened.Close(); err != nil {
+			t.Errorf("close publishing publication fixture: %v", err)
+		}
+	}()
+	assignee := "finalizer"
+	task, err := opened.CreateTask(ctx, store.CreateTaskInput{
+		Title:        "publish before board removal",
+		Assignee:     &assignee,
+		Runtime:      model.RuntimeCodex,
+		WorkflowRole: model.WorkflowRoleFinalizer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := opened.ClaimTask(
+		ctx,
+		store.ClaimOptions{TaskID: task.Task.ID},
+	)
+	if err != nil || claim == nil {
+		t.Fatalf("claim publication source = %+v, err=%v", claim, err)
+	}
+	scope := store.RunScope{
+		RunID:      claim.Run.ID,
+		ClaimToken: claim.ClaimToken,
+	}
+	if _, err := opened.RequestRunCompletion(
+		ctx,
+		scope,
+		store.CompletionInput{Summary: "ready to publish"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	changeSet, err := opened.RecordRunChangeSet(
+		ctx,
+		scope,
+		store.RecordChangeSetInput{
+			RunID:          claim.Run.ID,
+			RepositoryPath: filepath.Join(t.TempDir(), "repository"),
+			WorktreePath:   filepath.Join(t.TempDir(), "worktree"),
+			BaseCommit:     strings.Repeat("a", 40),
+			HeadCommit:     strings.Repeat("b", 40),
+			DurableRef:     "refs/autogora/results/" + claim.Run.ID,
+			State:          "ready",
+			ChangedFiles:   []string{"main.go"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.FinalizeRunTerminal(ctx, scope, 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, created, err := opened.EnsurePublication(
+		ctx,
+		store.EnsurePublicationInput{
+			ChangeSetID:    changeSet.ID,
+			Mode:           model.PublicationModePullRequest,
+			TargetBranch:   "main",
+			Remote:         "origin",
+			PolicySnapshot: json.RawMessage(`{"revision":"board-removal-test"}`),
+		},
+	)
+	if err != nil || !created {
+		t.Fatalf(
+			"ensure publication = %+v, created=%v, err=%v",
+			pending,
+			created,
+			err,
+		)
+	}
+	claimed, acquired, err := opened.ClaimPublication(
+		ctx,
+		pending.ID,
+		store.ClaimPublicationInput{
+			ExpectedUpdatedAt: pending.UpdatedAt,
+			TTL:               time.Minute,
+		},
+	)
+	if err != nil || !acquired {
+		t.Fatalf(
+			"claim publication = %+v, acquired=%v, err=%v",
+			claimed,
+			acquired,
+			err,
+		)
+	}
+	return claimed
+}
 
 func TestBoardsIsolateStorageAndArchiveRecoverably(t *testing.T) {
 	ctx := context.Background()
@@ -222,6 +324,98 @@ func TestBoardRemovalRejectsActiveRunsForArchiveAndHardDelete(t *testing.T) {
 			}
 			if _, err := manager.Remove("active", hardDelete); err != nil {
 				t.Fatalf("remove idle board after rejected attempt: %v", err)
+			}
+		})
+	}
+}
+
+func TestBoardRemovalRejectsPublishingPublicationForArchiveAndHardDelete(
+	t *testing.T,
+) {
+	for _, hardDelete := range []bool{false, true} {
+		t.Run(map[bool]string{
+			false: "archive",
+			true:  "hard-delete",
+		}[hardDelete], func(t *testing.T) {
+			ctx := context.Background()
+			manager, err := NewManager(
+				filepath.Join(t.TempDir(), "autogora.db"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Create(
+				ctx,
+				"publishing",
+				Update{},
+			); err != nil {
+				t.Fatal(err)
+			}
+			claimed := seedPublishingPublication(
+				t,
+				manager,
+				"publishing",
+			)
+
+			_, err = manager.Remove("publishing", hardDelete)
+			var busy *store.BoardBusyError
+			if !errors.As(err, &busy) ||
+				busy.PublishingPublications != 1 {
+				t.Fatalf(
+					"remove publishing board error = %#v",
+					err,
+				)
+			}
+			if !manager.Exists("publishing") {
+				t.Fatal("publishing board was removed")
+			}
+			metadata, err := manager.Read("publishing")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if metadata.Archived {
+				t.Fatal("rejected removal marked publishing board archived")
+			}
+			opened, err := manager.OpenStore(ctx, "publishing")
+			if err != nil {
+				t.Fatal(err)
+			}
+			preserved, readErr := opened.GetPublication(
+				ctx,
+				claimed.ID,
+			)
+			if readErr != nil ||
+				preserved.Status != model.PublicationPublishing ||
+				preserved.ClaimEpoch != claimed.ClaimEpoch {
+				opened.Close()
+				t.Fatalf(
+					"publishing evidence = %+v, err=%v",
+					preserved,
+					readErr,
+				)
+			}
+			_, terminalErr := opened.FailPublication(
+				ctx,
+				claimed.ID,
+				store.FailPublicationInput{
+					ExpectedUpdatedAt: claimed.UpdatedAt,
+					ClaimToken:        claimed.ClaimToken,
+					ClaimEpoch:        claimed.ClaimEpoch,
+					Error:             "terminal before board removal",
+				},
+			)
+			closeErr := opened.Close()
+			if terminalErr != nil || closeErr != nil {
+				t.Fatal(errors.Join(terminalErr, closeErr))
+			}
+			if _, err := manager.Remove(
+				"publishing",
+				hardDelete,
+			); err != nil {
+				t.Fatalf(
+					"remove board after publication terminal: %v",
+					err,
+				)
 			}
 		})
 	}

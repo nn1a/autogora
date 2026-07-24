@@ -24,22 +24,32 @@ const (
 // BoardBusyError reports every resource that must be released before a board
 // can be archived or deleted.
 type BoardBusyError struct {
-	Board                 string
-	ActiveRuns            int
-	RunningTasks          int
-	LocalWorkspaceLeases  int
-	GlobalAgentSlots      int
-	GlobalWorkspaceLeases int
-	LiveTerminalProcesses int
+	Board                  string
+	ActiveRuns             int
+	RunningTasks           int
+	PublishingPublications int
+	LocalWorkspaceLeases   int
+	GlobalAgentSlots       int
+	GlobalWorkspaceLeases  int
+	LiveTerminalProcesses  int
 }
 
 func (e *BoardBusyError) Error() string {
-	reasons := make([]string, 0, 5)
+	reasons := make([]string, 0, 6)
 	if e.ActiveRuns > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d active run(s)", e.ActiveRuns))
 	}
 	if e.RunningTasks > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d running task(s)", e.RunningTasks))
+	}
+	if e.PublishingPublications > 0 {
+		reasons = append(
+			reasons,
+			fmt.Sprintf(
+				"%d publishing publication(s)",
+				e.PublishingPublications,
+			),
+		)
 	}
 	if e.LocalWorkspaceLeases > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d local workspace lease(s)", e.LocalWorkspaceLeases))
@@ -133,7 +143,7 @@ func (s *Store) AcquireBoardRemovalGuard(ctx context.Context, rawBoard string) (
 	}
 
 	guard = BoardRemovalGuard{Board: board, Token: newID("br"), Scope: scope}
-	err = s.withWriteUnchecked(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		var existing string
 		existingErr := tx.QueryRowContext(ctx,
 			"SELECT token FROM board_removal_guards WHERE board = ? AND scope = ?", board, scope).Scan(&existing)
@@ -169,12 +179,24 @@ func (s *Store) AcquireBoardRemovalGuard(ctx context.Context, rawBoard string) (
 				"SELECT COUNT(*) FROM tasks WHERE status = 'running'").Scan(&busy.RunningTasks); err != nil {
 				return fmt.Errorf("count running tasks for board %s: %w", board, err)
 			}
+			if err := tx.QueryRowContext(
+				ctx,
+				"SELECT COUNT(*) FROM publications WHERE status = 'publishing'",
+			).Scan(&busy.PublishingPublications); err != nil {
+				return fmt.Errorf(
+					"count publishing publications for board %s: %w",
+					board,
+					err,
+				)
+			}
 			if err := tx.QueryRowContext(ctx,
 				"SELECT COUNT(*) FROM resource_leases").Scan(&busy.LocalWorkspaceLeases); err != nil {
 				return fmt.Errorf("count local workspace leases for board %s: %w", board, err)
 			}
 		}
-		if busy.ActiveRuns > 0 || busy.RunningTasks > 0 || busy.LocalWorkspaceLeases > 0 ||
+		if busy.ActiveRuns > 0 || busy.RunningTasks > 0 ||
+			busy.PublishingPublications > 0 ||
+			busy.LocalWorkspaceLeases > 0 ||
 			busy.GlobalAgentSlots > 0 || busy.GlobalWorkspaceLeases > 0 {
 			return busy
 		}

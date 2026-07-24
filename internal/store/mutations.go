@@ -411,7 +411,7 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 // DeleteTaskWithVersion applies optimistic concurrency when expectedUpdatedAt
 // is set. Non-interactive callers can continue to use DeleteTask.
 func (s *Store) DeleteTaskWithVersion(ctx context.Context, taskID string, expectedUpdatedAt *string) error {
-	err := s.withWrite(ctx, func(tx *sql.Tx) error {
+	err := s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		task, err := requireTask(ctx, tx, taskID)
 		if err != nil {
 			return err
@@ -421,6 +421,27 @@ func (s *Store) DeleteTaskWithVersion(ctx context.Context, taskID string, expect
 		}
 		if task.CurrentRunID != nil {
 			return errors.New("cannot delete a running task; terminate the active run first")
+		}
+		var publishingPublications int
+		if err := tx.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM publications
+				WHERE task_id = ? AND status = 'publishing'`,
+			taskID,
+		).Scan(&publishingPublications); err != nil {
+			return fmt.Errorf(
+				"count publishing publications for task %s: %w",
+				taskID,
+				err,
+			)
+		}
+		if publishingPublications > 0 {
+			return fmt.Errorf(
+				"%w: cannot delete task %s with %d publishing publication(s)",
+				ErrPublicationStateConflict,
+				taskID,
+				publishingPublications,
+			)
 		}
 		var topologyEdges int
 		if err := tx.QueryRowContext(ctx, `

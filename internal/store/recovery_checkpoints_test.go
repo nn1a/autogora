@@ -1882,7 +1882,7 @@ func TestSchema24UpgradesVersion22WithRecoveryCheckpoints(t *testing.T) {
 		WHERE type = 'trigger' AND name LIKE 'recovery_checkpoint_%'`).Scan(&triggerCount); err != nil {
 		t.Fatal(err)
 	}
-	if version != 26 || schemaVersion != 26 || tableCount != 1 || triggerCount != 12 {
+	if version != 27 || schemaVersion != 27 || tableCount != 1 || triggerCount != 12 {
 		t.Fatalf(
 			"v22 migration version=%d constant=%d tables=%d triggers=%d",
 			version,

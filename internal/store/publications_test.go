@@ -563,6 +563,90 @@ func TestPublicationClaimEpochCompleteFailAndNoExpiredTakeover(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskRejectsPublishingPublicationAndPreservesEvidence(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	opened, err := Open(":memory:", "default", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	task, changeSet := createPublicationSource(
+		t,
+		opened,
+		"delete_guard",
+		model.WorkflowRoleFinalizer,
+		model.TaskStatusDone,
+		model.RunStatusCompleted,
+		"ready",
+	)
+	pending, _, err := opened.EnsurePublication(
+		ctx,
+		publicationPolicyInput(changeSet.ID, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, acquired, err := opened.ClaimPublication(
+		ctx,
+		pending.ID,
+		ClaimPublicationInput{
+			ExpectedUpdatedAt: pending.UpdatedAt,
+			TTL:               time.Minute,
+		},
+	)
+	if err != nil || !acquired {
+		t.Fatalf(
+			"claim publication = %+v, acquired=%v, err=%v",
+			claimed,
+			acquired,
+			err,
+		)
+	}
+
+	if err := opened.DeleteTask(
+		ctx,
+		task.ID,
+	); !errors.Is(err, ErrPublicationStateConflict) {
+		t.Fatalf("delete task with publishing publication error = %v", err)
+	}
+	if _, err := opened.GetTask(ctx, task.ID); err != nil {
+		t.Fatalf("publishing task was not preserved: %v", err)
+	}
+	preserved, err := opened.GetPublication(ctx, claimed.ID)
+	if err != nil || preserved.Status != model.PublicationPublishing ||
+		preserved.ClaimEpoch != claimed.ClaimEpoch {
+		t.Fatalf(
+			"publishing evidence = %+v, err=%v",
+			preserved,
+			err,
+		)
+	}
+
+	published, err := opened.CompletePublication(
+		ctx,
+		claimed.ID,
+		CompletePublicationInput{
+			ExpectedUpdatedAt: claimed.UpdatedAt,
+			ClaimToken:        claimed.ClaimToken,
+			ClaimEpoch:        claimed.ClaimEpoch,
+		},
+	)
+	if err != nil || published.Status != model.PublicationPublished {
+		t.Fatalf("complete publication = %+v, err=%v", published, err)
+	}
+	if err := opened.DeleteTask(ctx, task.ID); err != nil {
+		t.Fatalf("delete task with terminal publication: %v", err)
+	}
+	if _, err := opened.GetPublication(
+		ctx,
+		claimed.ID,
+	); !errors.Is(err, ErrPublicationNotFound) {
+		t.Fatalf("terminal publication after task deletion error = %v", err)
+	}
+}
+
 func TestPublicationClaimRejectsExhaustedEpoch(t *testing.T) {
 	ctx := context.Background()
 	opened, err := Open(":memory:", "default", "")
@@ -856,7 +940,7 @@ func TestExistingPublicationSchemaAddsClaimEpoch(t *testing.T) {
 	).Scan(&version); versionErr != nil {
 		t.Fatal(versionErr)
 	}
-	if version != schemaVersion || schemaVersion != 26 ||
+	if version != schemaVersion || schemaVersion != 27 ||
 		columnType != "INTEGER" || notNull != 1 || defaultValue != "0" {
 		t.Fatalf(
 			"claim epoch migration: version=%d constant=%d type=%q notNull=%d default=%q",

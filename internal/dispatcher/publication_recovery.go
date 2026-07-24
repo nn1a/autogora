@@ -21,6 +21,7 @@ const (
 
 func publicationQuarantineSource(
 	value model.Publication,
+	validate store.AutomationQuarantineSourceValidator,
 ) store.AutomationQuarantineSourceInput {
 	claimEpoch := ""
 	if value.ClaimEpoch > 0 {
@@ -33,12 +34,14 @@ func publicationQuarantineSource(
 		ObservedUpdatedAt:  value.UpdatedAt,
 		ObservedClaimEpoch: claimEpoch,
 		DiagnosticCode:     publicationOwnershipUnconfirmedDiagnostic,
+		ValidateCurrent:    validate,
 	}
 }
 
 func (s *automationDispatcherSession) persistPublicationQuarantine(
 	ctx context.Context,
 	value model.Publication,
+	validate store.AutomationQuarantineSourceValidator,
 ) (store.AutomationQuarantine, error) {
 	if s == nil {
 		return store.AutomationQuarantine{}, errors.New(
@@ -54,7 +57,7 @@ func (s *automationDispatcherSession) persistPublicationQuarantine(
 	}
 	gate, _, err := s.authority.ActivateAutomationQuarantine(
 		ctx,
-		publicationQuarantineSource(value),
+		publicationQuarantineSource(value, validate),
 	)
 	if err != nil {
 		return store.AutomationQuarantine{}, fmt.Errorf(
@@ -76,6 +79,7 @@ func (s *automationDispatcherSession) persistPublicationQuarantine(
 // the caller can transition it to Failed. The session latch withholds its ACK,
 // and observeGate cancels every remaining dispatcher queue.
 func (s *automationDispatcherSession) quarantinePublicationTeardown(
+	opened *store.Store,
 	value model.Publication,
 ) error {
 	if s == nil {
@@ -83,13 +87,28 @@ func (s *automationDispatcherSession) quarantinePublicationTeardown(
 			"automation dispatcher session is required after unconfirmed publication teardown",
 		)
 	}
+	if opened == nil {
+		return errors.New(
+			"publication Store is required after unconfirmed publication teardown",
+		)
+	}
 	s.unconfirmed.Store(true)
 	operationContext, cancel := context.WithTimeout(
 		context.Background(),
 		automationSessionOperationLimit,
 	)
-	gate, err := s.persistPublicationQuarantine(operationContext, value)
+	gate, err := s.persistPublicationQuarantine(
+		operationContext,
+		value,
+		opened.ValidatePublishingAutomationSource,
+	)
 	cancel()
+	if errors.Is(err, store.ErrAutomationSourceStale) {
+		return errors.Join(
+			err,
+			s.activateUnconfirmedQuarantine(automationTeardownDiagnostic),
+		)
+	}
 	if err != nil {
 		s.recordFailure(err)
 		return err
@@ -125,6 +144,55 @@ func failPublishingOwnershipScan(
 		observeErr = session.observeGate(gate)
 	}
 	return errors.Join(scanErr, activationErr, inspectErr, observeErr)
+}
+
+func persistCurrentPublishingQuarantine(
+	ctx context.Context,
+	session *automationDispatcherSession,
+	reader *store.PublicationRecoveryReader,
+	value model.Publication,
+) (store.AutomationQuarantine, bool, error) {
+	const maxTupleAttempts = 3
+	for attempt := 0; attempt < maxTupleAttempts; attempt++ {
+		gate, err := session.persistPublicationQuarantine(
+			ctx,
+			value,
+			reader.ValidatePublishingAutomationSource,
+		)
+		if err == nil {
+			return gate, true, nil
+		}
+		if !errors.Is(err, store.ErrAutomationSourceStale) {
+			return store.AutomationQuarantine{}, false, err
+		}
+		current, found, refreshErr := reader.GetPublicationForRecovery(
+			ctx,
+			value.ID,
+		)
+		if refreshErr != nil {
+			return store.AutomationQuarantine{}, false, fmt.Errorf(
+				"refresh stale publication %s: %w",
+				value.ID,
+				refreshErr,
+			)
+		}
+		if !found || current.Status != model.PublicationPublishing {
+			return store.AutomationQuarantine{}, false, nil
+		}
+		if current.Board != value.Board {
+			return store.AutomationQuarantine{}, false, fmt.Errorf(
+				"publication %s changed board from %s to %s",
+				value.ID,
+				value.Board,
+				current.Board,
+			)
+		}
+		value = current
+	}
+	return store.AutomationQuarantine{}, false, fmt.Errorf(
+		"publication %s ownership tuple did not stabilize",
+		value.ID,
+	)
 }
 
 // quarantineUnconfirmedPublishingOwnership scans every active and archived
@@ -204,15 +272,18 @@ func quarantineUnconfirmedPublishingOwnership(
 				// conservatively collapse to the same source key. Recovery must
 				// scan every active and archived database and reject the source
 				// unless this tuple has exactly one storage match.
-				latestGate, err = session.persistPublicationQuarantine(
+				var quarantined bool
+				latestGate, quarantined, err = persistCurrentPublishingQuarantine(
 					scanContext,
+					session,
+					opened,
 					publication,
 				)
 				if err != nil {
 					_ = opened.Close()
 					return failPublishingOwnershipScan(session, err)
 				}
-				found = true
+				found = found || quarantined
 			}
 			if next == "" {
 				break

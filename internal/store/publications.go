@@ -649,7 +649,7 @@ func (s *Store) RetryPublication(
 		return model.Publication{}, err
 	}
 	var value model.Publication
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		current, err := publicationForBoard(ctx, tx, id, board)
 		if err != nil {
 			return err
@@ -780,7 +780,7 @@ func (s *Store) SupersedePublication(
 		return model.Publication{}, err
 	}
 	var value model.Publication
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		current, err := publicationForBoard(ctx, tx, id, board)
 		if err != nil {
 			return err
@@ -848,7 +848,7 @@ func (s *Store) ClaimPublication(
 	}
 	var value model.Publication
 	claimed := false
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		current, err := publicationForBoard(ctx, tx, id, board)
 		if err != nil {
 			return err
@@ -980,7 +980,7 @@ func (s *Store) CompletePublication(
 		return model.Publication{}, err
 	}
 	var value model.Publication
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		current, err := publicationForBoard(ctx, tx, id, board)
 		if err != nil {
 			return err
@@ -1059,7 +1059,7 @@ func (s *Store) FailPublication(
 		return model.Publication{}, err
 	}
 	var value model.Publication
-	err = s.withWrite(ctx, func(tx *sql.Tx) error {
+	err = s.withAutomationGateOpenWrite(ctx, func(tx *sql.Tx) error {
 		current, err := publicationForBoard(ctx, tx, id, board)
 		if err != nil {
 			return err

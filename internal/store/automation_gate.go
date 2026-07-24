@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -32,6 +33,9 @@ var (
 	ErrAutomationSourceConflict  = errors.New("automation quarantine source changed")
 	ErrAutomationLockUnavailable = errors.New("automation coordination lock is unavailable")
 	ErrAutomationPermitScope     = errors.New("automation permit does not cover this board")
+	ErrAutomationRecoveryPermit  = errors.New("automation recovery permit is invalid")
+	ErrAutomationRecoveryScope   = errors.New("automation recovery permit does not cover this source")
+	ErrAutomationSourceStale     = errors.New("automation quarantine source is stale")
 )
 
 func secretSafeAutomationLockError(err error) error {
@@ -325,6 +329,79 @@ func (s *Store) GetAutomationQuarantine(ctx context.Context) (AutomationQuaranti
 	return publicAutomationGate(ctx, runtime.authorityDB, record)
 }
 
+// withAutomationGateOpenWrite protects a cooperative board mutation that
+// could invalidate operator recovery evidence or cross an automatic execution
+// boundary. Unconfigured isolated Stores retain their local behavior;
+// manager-owned Stores hold the shared authority lock through the complete
+// board transaction.
+func (s *Store) withAutomationGateOpenWrite(
+	ctx context.Context,
+	mutate func(*sql.Tx) error,
+) (resultErr error) {
+	if s.automation == nil {
+		return s.withWrite(ctx, mutate)
+	}
+	runtime, err := s.automationRuntime()
+	if err != nil {
+		return err
+	}
+	lock, err := acquireAutomationFileLock(ctx, runtime.lockPath, false)
+	if err != nil {
+		return fmt.Errorf("lock automation-aware mutation: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Close())
+	}()
+	record, err := readAutomationGate(ctx, runtime.authorityDB)
+	if err != nil {
+		return err
+	}
+	if record.Active {
+		return &AutomationQuarantinedError{Generation: record.Generation}
+	}
+	return s.withWrite(ctx, mutate)
+}
+
+// RunWithAutomationGateOpen holds the authority's shared operating-system lock
+// for a complete cross-store mutation such as board removal. The callback does
+// not run once quarantine is active, and quarantine activation cannot begin
+// until a running callback returns.
+func (s *Store) RunWithAutomationGateOpen(
+	ctx context.Context,
+	run func() error,
+) (resultErr error) {
+	if run == nil {
+		return errors.New("automation-aware operation callback is required")
+	}
+	if err := s.requireCoordinationStore(); err != nil {
+		return err
+	}
+	runtime, err := s.automationRuntime()
+	if err != nil {
+		return err
+	}
+	if runtime.authorityDB != s.db {
+		return errors.New(
+			"automation-aware operation requires the authority Store",
+		)
+	}
+	lock, err := acquireAutomationFileLock(ctx, runtime.lockPath, false)
+	if err != nil {
+		return fmt.Errorf("lock automation-aware operation: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Close())
+	}()
+	record, err := readAutomationGate(ctx, runtime.authorityDB)
+	if err != nil {
+		return err
+	}
+	if record.Active {
+		return &AutomationQuarantinedError{Generation: record.Generation}
+	}
+	return run()
+}
+
 // AutomationPermit holds a shared operating-system lock only for a short
 // automatic mutation or process-start boundary. It must not be retained for a
 // worker's lifetime.
@@ -605,8 +682,42 @@ type AutomationQuarantineSourceInput struct {
 	ObservedUpdatedAt string `json:"observedUpdatedAt,omitempty"`
 	// ObservedClaimEpoch is a decimal, monotonically increasing attempt epoch.
 	// It must never contain a publication claim token.
-	ObservedClaimEpoch string `json:"observedClaimEpoch,omitempty"`
-	DiagnosticCode     string `json:"diagnosticCode"`
+	ObservedClaimEpoch string                              `json:"observedClaimEpoch,omitempty"`
+	DiagnosticCode     string                              `json:"diagnosticCode"`
+	ValidateCurrent    AutomationQuarantineSourceValidator `json:"-"`
+}
+
+// AutomationQuarantineSourceValidator runs while the authority's exclusive
+// operating-system lock prevents automatic mutations. It must return true only
+// while the normalized source still describes the exact current side effect.
+type AutomationQuarantineSourceValidator func(
+	context.Context,
+	AutomationQuarantineSourceInput,
+) (bool, error)
+
+// AutomationSourceStaleError reports an observation that stopped matching
+// before the authority could durably quarantine it.
+type AutomationSourceStaleError struct {
+	Board    string
+	Kind     string
+	SourceID string
+}
+
+func (e *AutomationSourceStaleError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s: board %s %s %s",
+		ErrAutomationSourceStale,
+		e.Board,
+		e.Kind,
+		e.SourceID,
+	)
+}
+
+func (e *AutomationSourceStaleError) Unwrap() error {
+	return ErrAutomationSourceStale
 }
 
 type AutomationQuarantineSource struct {
@@ -670,6 +781,28 @@ func normalizeAutomationSource(
 	)
 	if err != nil {
 		return AutomationQuarantineSourceInput{}, "", err
+	}
+	if input.Kind == "publication" {
+		if input.ValidateCurrent == nil {
+			return AutomationQuarantineSourceInput{}, "", errors.New(
+				"publication source requires an exact current-state validator",
+			)
+		}
+		if input.ObservedUpdatedAt == "" ||
+			input.ObservedClaimEpoch == "" {
+			return AutomationQuarantineSourceInput{}, "", errors.New(
+				"publication source requires updatedAt and claim epoch",
+			)
+		}
+		if _, err := strconv.ParseInt(
+			input.ObservedClaimEpoch,
+			10,
+			64,
+		); err != nil {
+			return AutomationQuarantineSourceInput{}, "", errors.New(
+				"publication source claim epoch exceeds the supported range",
+			)
+		}
 	}
 	canonical := strings.Join([]string{
 		input.Board,
@@ -826,6 +959,73 @@ func randomAutomationToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+func exactPublishingAutomationSource(
+	ctx context.Context,
+	q querier,
+	board string,
+	input AutomationQuarantineSourceInput,
+) (bool, error) {
+	if input.Kind != "publication" || input.Board != board ||
+		input.ObservedUpdatedAt == "" ||
+		input.ObservedClaimEpoch == "" {
+		return false, nil
+	}
+	claimEpoch, err := strconv.ParseInt(input.ObservedClaimEpoch, 10, 64)
+	if err != nil || claimEpoch < 1 {
+		return false, nil
+	}
+	var exact bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM publications
+		WHERE id = ? AND board = ? AND status = 'publishing'
+			AND updated_at = ? AND claim_epoch = ?
+	)`,
+		input.SourceID,
+		input.Board,
+		input.ObservedUpdatedAt,
+		claimEpoch,
+	).Scan(&exact); err != nil {
+		return false, err
+	}
+	return exact, nil
+}
+
+// ValidatePublishingAutomationSource checks the exact current Publishing
+// tuple in an active board Store. Pass this method as ValidateCurrent.
+func (s *Store) ValidatePublishingAutomationSource(
+	ctx context.Context,
+	input AutomationQuarantineSourceInput,
+) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("publication Store is closed")
+	}
+	return exactPublishingAutomationSource(ctx, s.db, s.board, input)
+}
+
+// ValidatePublishingAutomationSource checks the exact current Publishing
+// tuple through an active or archived query-only recovery reader.
+func (r *PublicationRecoveryReader) ValidatePublishingAutomationSource(
+	ctx context.Context,
+	input AutomationQuarantineSourceInput,
+) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("publication recovery reader is closed")
+	}
+	return exactPublishingAutomationSource(ctx, r.db, r.board, input)
+}
+
+func automationQuarantineSourceExists(
+	ctx context.Context,
+	q querier,
+	sourceKey string,
+) (bool, error) {
+	var exists bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM automation_quarantine_sources WHERE source_key = ?
+	)`, sourceKey).Scan(&exists)
+	return exists, err
+}
+
 func activateAutomationQuarantineTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -930,6 +1130,36 @@ func (s *Store) ActivateAutomationQuarantine(
 		resultErr = errors.Join(resultErr, lock.Close())
 	}()
 
+	exists, err := automationQuarantineSourceExists(ctx, s.db, sourceKey)
+	if err != nil {
+		return AutomationQuarantine{}, false, err
+	}
+	if exists {
+		record, err := readAutomationGate(ctx, s.db)
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		value, err := publicAutomationGate(ctx, s.db, record)
+		return value, false, err
+	}
+	if input.ValidateCurrent != nil {
+		current, err := input.ValidateCurrent(ctx, input)
+		if err != nil {
+			return AutomationQuarantine{}, false, fmt.Errorf(
+				"validate automation quarantine source: %w",
+				err,
+			)
+		}
+		if !current {
+			return AutomationQuarantine{}, false,
+				&AutomationSourceStaleError{
+					Board:    input.Board,
+					Kind:     input.Kind,
+					SourceID: input.SourceID,
+				}
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AutomationQuarantine{}, false, err
@@ -970,11 +1200,267 @@ type AutomationQuarantineSourceResolution struct {
 	ObservedUpdatedAt  string                      `json:"observedUpdatedAt,omitempty"`
 	ObservedClaimEpoch string                      `json:"observedClaimEpoch,omitempty"`
 	Disposition        AutomationSourceDisposition `json:"disposition"`
+	Outcome            PublicationRecoveryOutcome  `json:"outcome,omitempty"`
+	ResultURL          *string                     `json:"resultUrl,omitempty"`
 }
 
 type AutomationQuarantineSnapshot struct {
-	Gate    AutomationQuarantine         `json:"gate"`
-	Sources []AutomationQuarantineSource `json:"sources"`
+	Gate           AutomationQuarantine         `json:"gate"`
+	Sources        []AutomationQuarantineSource `json:"sources"`
+	RecoveryPermit *AutomationRecoveryPermit    `json:"-"`
+}
+
+type automationRecoveryScope struct {
+	SourceKey          string
+	FirstGeneration    int64
+	Board              string
+	Kind               string
+	SourceID           string
+	ObservedUpdatedAt  string
+	ObservedClaimEpoch string
+	Disposition        AutomationSourceDisposition
+	Outcome            PublicationRecoveryOutcome
+	ResultURL          *string
+	Actor              string
+	Reason             string
+}
+
+type automationRecoveryPermitState struct {
+	mu         sync.RWMutex
+	valid      bool
+	generation int64
+	scopes     map[string]automationRecoveryScope
+}
+
+// AutomationRecoveryPermit is a callback-scoped capability created only while
+// ConfirmAutomationQuarantine holds the authority's exclusive lock. Its fields
+// are deliberately private, copied values share one revocation state, and a
+// zero value is never valid.
+type AutomationRecoveryPermit struct {
+	state *automationRecoveryPermitState
+}
+
+func (p *AutomationRecoveryPermit) String() string {
+	return "automation recovery permit"
+}
+
+func (p *AutomationRecoveryPermit) GoString() string {
+	return p.String()
+}
+
+func newAutomationRecoveryPermit(
+	input AutomationQuarantineConfirmation,
+	sources []AutomationQuarantineSource,
+) (*AutomationRecoveryPermit, error) {
+	resolutions := make(
+		map[string]AutomationQuarantineSourceResolution,
+		len(input.Sources),
+	)
+	for _, resolution := range input.Sources {
+		resolutions[resolution.SourceKey] = resolution
+	}
+	scopes := make(map[string]automationRecoveryScope, len(sources))
+	for _, source := range sources {
+		resolution, ok := resolutions[source.SourceKey]
+		if !ok {
+			return nil, fmt.Errorf(
+				"%w: exact source resolution is missing",
+				ErrAutomationRecoveryScope,
+			)
+		}
+		if err := validateAutomationRecoveryResolution(
+			source,
+			resolution,
+			input,
+		); err != nil {
+			return nil, err
+		}
+		scopes[source.SourceKey] = automationRecoveryScope{
+			SourceKey:          source.SourceKey,
+			FirstGeneration:    source.Generation,
+			Board:              source.Board,
+			Kind:               source.Kind,
+			SourceID:           source.SourceID,
+			ObservedUpdatedAt:  source.ObservedUpdatedAt,
+			ObservedClaimEpoch: source.ObservedClaimEpoch,
+			Disposition:        resolution.Disposition,
+			Outcome:            resolution.Outcome,
+			ResultURL:          clonePublicationRecoveryString(resolution.ResultURL),
+			Actor:              input.Actor,
+			Reason:             input.Reason,
+		}
+	}
+	if len(scopes) != len(input.Sources) {
+		return nil, fmt.Errorf(
+			"%w: exact source set is required",
+			ErrAutomationRecoveryScope,
+		)
+	}
+	return &AutomationRecoveryPermit{
+		state: &automationRecoveryPermitState{
+			valid:      true,
+			generation: input.Generation,
+			scopes:     scopes,
+		},
+	}, nil
+}
+
+func validateAutomationRecoveryResolution(
+	source AutomationQuarantineSource,
+	resolution AutomationQuarantineSourceResolution,
+	confirmation AutomationQuarantineConfirmation,
+) error {
+	if source.Kind != "publication" {
+		if resolution.Outcome != "" || resolution.ResultURL != nil {
+			return fmt.Errorf(
+				"%w: non-publication source has a publication result",
+				ErrAutomationRecoveryScope,
+			)
+		}
+		return nil
+	}
+	claimEpoch, err := strconv.ParseInt(source.ObservedClaimEpoch, 10, 64)
+	if err != nil || claimEpoch < 1 {
+		return fmt.Errorf(
+			"%w: publication source claim epoch is invalid",
+			ErrAutomationRecoveryScope,
+		)
+	}
+	normalized, err := normalizePublicationRecoveryInput(
+		PublicationRecoveryInput{
+			SourceKey:          source.SourceKey,
+			FirstGeneration:    source.Generation,
+			PublicationID:      source.SourceID,
+			ObservedUpdatedAt:  source.ObservedUpdatedAt,
+			ObservedClaimEpoch: claimEpoch,
+			Outcome:            resolution.Outcome,
+			Disposition:        resolution.Disposition,
+			ResultURL:          resolution.ResultURL,
+			Actor:              confirmation.Actor,
+			Reason:             confirmation.Reason,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAutomationRecoveryScope, err)
+	}
+	if normalized.SourceKey != source.SourceKey ||
+		normalized.FirstGeneration != source.Generation ||
+		normalized.PublicationID != source.SourceID ||
+		normalized.ObservedUpdatedAt != source.ObservedUpdatedAt ||
+		normalized.ObservedClaimEpoch != claimEpoch ||
+		normalized.Outcome != resolution.Outcome ||
+		normalized.Disposition != resolution.Disposition ||
+		!sameOptionalString(normalized.ResultURL, resolution.ResultURL) ||
+		normalized.Actor != confirmation.Actor ||
+		normalized.Reason != confirmation.Reason {
+		return fmt.Errorf(
+			"%w: publication resolution is not canonical",
+			ErrAutomationRecoveryScope,
+		)
+	}
+	return nil
+}
+
+func (p *AutomationRecoveryPermit) invalidate() {
+	if p == nil || p.state == nil {
+		return
+	}
+	p.state.mu.Lock()
+	p.state.valid = false
+	p.state.scopes = nil
+	p.state.mu.Unlock()
+}
+
+// acquirePublicationRecovery keeps the permit's read lock until the returned
+// release function runs. Revocation at Guard return therefore waits for every
+// synchronous recovery transaction and prevents a captured permit from
+// authorizing work after the callback boundary.
+func (p *AutomationRecoveryPermit) acquirePublicationRecovery(
+	board string,
+	input PublicationRecoveryInput,
+) (func(), error) {
+	if p == nil || p.state == nil {
+		return nil, ErrAutomationRecoveryPermit
+	}
+	p.state.mu.RLock()
+	release := p.state.mu.RUnlock
+	if !p.state.valid {
+		release()
+		return nil, ErrAutomationRecoveryPermit
+	}
+	scope, ok := p.state.scopes[input.SourceKey]
+	if !ok ||
+		scope.FirstGeneration != input.FirstGeneration ||
+		scope.Board != board ||
+		scope.Kind != "publication" ||
+		scope.SourceID != input.PublicationID ||
+		scope.ObservedUpdatedAt != input.ObservedUpdatedAt ||
+		scope.ObservedClaimEpoch != strconv.FormatInt(
+			input.ObservedClaimEpoch,
+			10,
+		) ||
+		scope.Disposition != input.Disposition ||
+		scope.Outcome != input.Outcome ||
+		!sameOptionalString(scope.ResultURL, input.ResultURL) ||
+		scope.Actor != input.Actor ||
+		scope.Reason != input.Reason {
+		release()
+		return nil, ErrAutomationRecoveryScope
+	}
+	return release, nil
+}
+
+func runAutomationConfirmationGuard(
+	ctx context.Context,
+	input AutomationQuarantineConfirmation,
+	gate AutomationQuarantine,
+	sources []AutomationQuarantineSource,
+) error {
+	permit, err := newAutomationRecoveryPermit(input, sources)
+	if err != nil {
+		return err
+	}
+	defer permit.invalidate()
+	if input.Guard == nil {
+		for _, source := range sources {
+			if source.Kind == "publication" {
+				return errors.New(
+					"publication quarantine confirmation requires a recovery guard",
+				)
+			}
+		}
+		return nil
+	}
+	if err := input.Guard(ctx, AutomationQuarantineSnapshot{
+		Gate:           gate,
+		Sources:        append([]AutomationQuarantineSource(nil), sources...),
+		RecoveryPermit: permit,
+	}); err != nil {
+		return fmt.Errorf("automation confirmation guard: %w", err)
+	}
+	return nil
+}
+
+// AutomationQuarantineRecoveryConfirmationState is a secret-safe view of an
+// operator confirmation. It intentionally excludes gate, permit, session, and
+// filesystem lock credentials.
+type AutomationQuarantineRecoveryConfirmationState struct {
+	Pending               bool    `json:"pending"`
+	StartedAt             *string `json:"startedAt,omitempty"`
+	Actor                 *string `json:"actor,omitempty"`
+	Reason                *string `json:"reason,omitempty"`
+	HelpersStopped        bool    `json:"helpersStopped"`
+	ExternalWritesStopped bool    `json:"externalWritesStopped"`
+}
+
+// AutomationQuarantineRecoverySnapshot binds one gate generation to its exact
+// active source set, or to the exact resolved set while phase-one confirmation
+// is pending.
+type AutomationQuarantineRecoverySnapshot struct {
+	Gate                       AutomationQuarantine                          `json:"gate"`
+	Sources                    []AutomationQuarantineSource                  `json:"sources"`
+	Confirmation               AutomationQuarantineRecoveryConfirmationState `json:"confirmation"`
+	UnacknowledgedSessionCount int                                           `json:"unacknowledgedSessionCount"`
 }
 
 type AutomationQuarantineConfirmation struct {
@@ -985,6 +1471,177 @@ type AutomationQuarantineConfirmation struct {
 	ExternalWritesStopped bool                                                      `json:"externalWritesStopped"`
 	Sources               []AutomationQuarantineSourceResolution                    `json:"sources"`
 	Guard                 func(context.Context, AutomationQuarantineSnapshot) error `json:"-"`
+}
+
+func listAutomationRecoverySnapshotSources(
+	ctx context.Context,
+	q querier,
+	where string,
+	args ...any,
+) ([]AutomationQuarantineSource, error) {
+	query := "SELECT " + automationSourceColumns +
+		" FROM automation_quarantine_sources WHERE " + where +
+		" ORDER BY generation DESC, observed_at DESC, source_key LIMIT 1001"
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]AutomationQuarantineSource, 0)
+	for rows.Next() {
+		value, err := scanAutomationSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(result) > 1000 {
+		return nil, errors.New(
+			"automation recovery snapshot has more than 1000 current sources",
+		)
+	}
+	return result, nil
+}
+
+// GetAutomationQuarantineRecoverySnapshot reads the gate and its current
+// source set from one SQLite snapshot while holding the authority's shared
+// operating-system lock. Historical sources are never loaded.
+func (s *Store) GetAutomationQuarantineRecoverySnapshot(
+	ctx context.Context,
+) (
+	value AutomationQuarantineRecoverySnapshot,
+	resultErr error,
+) {
+	if err := s.requireCoordinationStore(); err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	runtime, err := s.automationRuntime()
+	if err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	if runtime.authorityDB != s.db {
+		return AutomationQuarantineRecoverySnapshot{}, errors.New(
+			"automation recovery snapshot requires the authority Store",
+		)
+	}
+	lock, err := acquireAutomationFileLock(ctx, runtime.lockPath, false)
+	if err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, fmt.Errorf(
+			"lock automation recovery snapshot: %w",
+			err,
+		)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Close())
+	}()
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	record, err := readAutomationGate(ctx, conn)
+	if err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	activeSources, err := listAutomationRecoverySnapshotSources(
+		ctx,
+		conn,
+		"disposition = 'active'",
+	)
+	if err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	confirmationPending := record.Active &&
+		record.ConfirmationStartedAt != nil
+	sources := activeSources
+	if confirmationPending {
+		if len(activeSources) != 0 {
+			return AutomationQuarantineRecoverySnapshot{}, errors.New(
+				"automation confirmation has both active and resolved sources",
+			)
+		}
+		sources, err = listAutomationRecoverySnapshotSources(
+			ctx,
+			conn,
+			"resolved_generation = ?",
+			record.Generation,
+		)
+		if err != nil {
+			return AutomationQuarantineRecoverySnapshot{}, err
+		}
+		if len(sources) == 0 {
+			return AutomationQuarantineRecoverySnapshot{}, errors.New(
+				"automation confirmation has no resolved sources",
+			)
+		}
+	}
+	if !record.Active && len(activeSources) != 0 {
+		return AutomationQuarantineRecoverySnapshot{}, errors.New(
+			"inactive automation gate has active sources",
+		)
+	}
+	if record.Active && !confirmationPending && len(activeSources) == 0 {
+		return AutomationQuarantineRecoverySnapshot{}, errors.New(
+			"active automation gate has no active sources",
+		)
+	}
+	unacknowledgedSessionCount := 0
+	if record.Active {
+		unacknowledged, err := liveSessionsWithoutAck(
+			ctx,
+			conn,
+			record.Generation,
+			time.Now().UTC().Format(automationTimestampLayout),
+		)
+		if err != nil {
+			return AutomationQuarantineRecoverySnapshot{}, err
+		}
+		unacknowledgedSessionCount = len(unacknowledged)
+	}
+
+	value = AutomationQuarantineRecoverySnapshot{
+		Gate: AutomationQuarantine{
+			Active:                record.Active,
+			Generation:            record.Generation,
+			ActivatedAt:           record.ActivatedAt,
+			ClearedAt:             record.ClearedAt,
+			ActiveSourceCount:     len(activeSources),
+			ConfirmationPending:   confirmationPending,
+			ConfirmationStartedAt: record.ConfirmationStartedAt,
+			ConfirmationActor:     record.ConfirmationActor,
+		},
+		Sources: append([]AutomationQuarantineSource(nil), sources...),
+		Confirmation: AutomationQuarantineRecoveryConfirmationState{
+			Pending:               confirmationPending,
+			StartedAt:             record.ConfirmationStartedAt,
+			Actor:                 record.ConfirmationActor,
+			Reason:                record.ConfirmationReason,
+			HelpersStopped:        record.ConfirmationHelpersStopped,
+			ExternalWritesStopped: record.ConfirmationExternalWritesOff,
+		},
+		UnacknowledgedSessionCount: unacknowledgedSessionCount,
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return AutomationQuarantineRecoverySnapshot{}, err
+	}
+	committed = true
+	return value, nil
 }
 
 type AutomationGateConflictError struct {
@@ -1077,6 +1734,22 @@ func normalizeAutomationConfirmation(
 				resolution.Disposition,
 			)
 		}
+		rawOutcome, err := boundedAutomationText(
+			string(resolution.Outcome),
+			"source recovery outcome",
+			32,
+			false,
+		)
+		if err != nil {
+			return AutomationQuarantineConfirmation{}, err
+		}
+		resolution.Outcome = PublicationRecoveryOutcome(rawOutcome)
+		resolution.ResultURL, err = normalizePublicationURL(
+			resolution.ResultURL,
+		)
+		if err != nil {
+			return AutomationQuarantineConfirmation{}, err
+		}
 		if seen[resolution.SourceKey] {
 			return AutomationQuarantineConfirmation{}, errors.New(
 				"duplicate source resolution",
@@ -1099,6 +1772,72 @@ func confirmationMatches(
 		record.ConfirmationReason != nil && *record.ConfirmationReason == input.Reason &&
 		record.ConfirmationHelpersStopped == input.HelpersStopped &&
 		record.ConfirmationExternalWritesOff == input.ExternalWritesStopped
+}
+
+type automationConfirmationEvidence struct {
+	Version               int                                    `json:"version"`
+	Generation            int64                                  `json:"generation"`
+	Actor                 string                                 `json:"actor"`
+	Reason                string                                 `json:"reason"`
+	HelpersStopped        bool                                   `json:"helpersStopped"`
+	ExternalWritesStopped bool                                   `json:"externalWritesStopped"`
+	Sources               []AutomationQuarantineSourceResolution `json:"sources"`
+}
+
+func automationConfirmationDigest(
+	input AutomationQuarantineConfirmation,
+) (string, error) {
+	encoded, err := json.Marshal(automationConfirmationEvidence{
+		Version:               1,
+		Generation:            input.Generation,
+		Actor:                 input.Actor,
+		Reason:                input.Reason,
+		HelpersStopped:        input.HelpersStopped,
+		ExternalWritesStopped: input.ExternalWritesStopped,
+		Sources: append(
+			[]AutomationQuarantineSourceResolution(nil),
+			input.Sources...,
+		),
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode automation confirmation evidence: %w", err)
+	}
+	digestInput := append(
+		[]byte("autogora/automation-confirmation/v1\x00"),
+		encoded...,
+	)
+	sum := sha256.Sum256(digestInput)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func requireAutomationConfirmationEvidence(
+	ctx context.Context,
+	q querier,
+	generation int64,
+	expectedDigest string,
+) error {
+	var actualDigest string
+	err := q.QueryRowContext(ctx, `
+		SELECT confirmation_digest
+		FROM automation_quarantine_confirmation_evidence
+		WHERE generation = ?
+	`, generation).Scan(&actualDigest)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf(
+			"%w: confirmation evidence is missing",
+			ErrAutomationGateConflict,
+		)
+	case err != nil:
+		return err
+	case actualDigest != expectedDigest:
+		return fmt.Errorf(
+			"%w: confirmation evidence differs",
+			ErrAutomationGateConflict,
+		)
+	default:
+		return nil
+	}
 }
 
 func exactResolutionSet(
@@ -1198,6 +1937,10 @@ func (s *Store) ConfirmAutomationQuarantine(
 	if err != nil {
 		return AutomationQuarantine{}, false, err
 	}
+	confirmationDigest, err := automationConfirmationDigest(input)
+	if err != nil {
+		return AutomationQuarantine{}, false, err
+	}
 	lock, err := acquireAutomationFileLock(ctx, runtime.lockPath, true)
 	if err != nil {
 		return AutomationQuarantine{}, false, fmt.Errorf(
@@ -1247,8 +1990,27 @@ func (s *Store) ConfirmAutomationQuarantine(
 		if err := exactResolutionSet(resolved, input.Sources, true, input); err != nil {
 			return AutomationQuarantine{}, false, err
 		}
+		if err := requireAutomationConfirmationEvidence(
+			ctx,
+			s.db,
+			input.Generation,
+			confirmationDigest,
+		); err != nil {
+			return AutomationQuarantine{}, false, err
+		}
 		value, err := publicAutomationGate(ctx, s.db, record)
-		return value, false, err
+		if err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		if err := runAutomationConfirmationGuard(
+			ctx,
+			input,
+			value,
+			resolved,
+		); err != nil {
+			return AutomationQuarantine{}, false, err
+		}
+		return value, false, nil
 	}
 
 	activeSources, err := listAutomationSources(ctx, s.db, AutomationQuarantineSourceFilter{
@@ -1287,6 +2049,14 @@ func (s *Store) ConfirmAutomationQuarantine(
 		); err != nil {
 			return AutomationQuarantine{}, false, err
 		}
+		if err := requireAutomationConfirmationEvidence(
+			ctx,
+			s.db,
+			input.Generation,
+			confirmationDigest,
+		); err != nil {
+			return AutomationQuarantine{}, false, err
+		}
 	} else {
 		if err := exactResolutionSet(activeSources, input.Sources, false, input); err != nil {
 			return AutomationQuarantine{}, false, err
@@ -1316,16 +2086,13 @@ func (s *Store) ConfirmAutomationQuarantine(
 	if err != nil {
 		return AutomationQuarantine{}, false, err
 	}
-	if input.Guard != nil {
-		if err := input.Guard(ctx, AutomationQuarantineSnapshot{
-			Gate:    publicGate,
-			Sources: append([]AutomationQuarantineSource(nil), confirmationSources...),
-		}); err != nil {
-			return AutomationQuarantine{}, false, fmt.Errorf(
-				"automation confirmation guard: %w",
-				err,
-			)
-		}
+	if err := runAutomationConfirmationGuard(
+		ctx,
+		input,
+		publicGate,
+		confirmationSources,
+	); err != nil {
+		return AutomationQuarantine{}, false, err
 	}
 
 	if !phaseOneComplete {
@@ -1375,6 +2142,20 @@ func (s *Store) ConfirmAutomationQuarantine(
 				return AutomationQuarantine{}, false, ErrAutomationSourceConflict
 			}
 		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO automation_quarantine_confirmation_evidence(
+				generation, confirmation_digest, recorded_at
+			) VALUES (?, ?, ?)
+		`,
+			input.Generation,
+			confirmationDigest,
+			current,
+		); err != nil {
+			return AutomationQuarantine{}, false, fmt.Errorf(
+				"record automation confirmation evidence: %w",
+				err,
+			)
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE automation_quarantine_gate
 			SET confirmation_started_at = ?, confirmation_actor = ?,
 				confirmation_reason = ?, confirmation_helpers_stopped = 1,
@@ -1422,6 +2203,14 @@ func (s *Store) ConfirmAutomationQuarantine(
 	if !currentRecord.Active || currentRecord.Generation != input.Generation ||
 		!confirmationMatches(currentRecord, input) {
 		return AutomationQuarantine{}, false, ErrAutomationGateConflict
+	}
+	if err := requireAutomationConfirmationEvidence(
+		ctx,
+		tx,
+		input.Generation,
+		confirmationDigest,
+	); err != nil {
+		return AutomationQuarantine{}, false, err
 	}
 	var activeCount int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)

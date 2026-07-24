@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,5 +203,89 @@ func TestLocalRemovalGuardCountsWholeDatabase(t *testing.T) {
 	}
 	if _, err := opened.AcquireBoardRemovalGuard(ctx, "alpha"); !errors.Is(err, ErrBoardBusy) {
 		t.Fatalf("guard ignored active run with mismatched board value: %v", err)
+	}
+}
+
+func TestLocalRemovalGuardRejectsPublishingPublication(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(filepath.Join(t.TempDir(), "alpha.db"), "alpha", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	_, changeSet := createPublicationSource(
+		t,
+		opened,
+		"board_removal",
+		model.WorkflowRoleFinalizer,
+		model.TaskStatusDone,
+		model.RunStatusCompleted,
+		"ready",
+	)
+	pending, _, err := opened.EnsurePublication(
+		ctx,
+		publicationPolicyInput(changeSet.ID, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, acquired, err := opened.ClaimPublication(
+		ctx,
+		pending.ID,
+		ClaimPublicationInput{
+			ExpectedUpdatedAt: pending.UpdatedAt,
+			TTL:               time.Minute,
+		},
+	)
+	if err != nil || !acquired {
+		t.Fatalf(
+			"claim publication = %+v, acquired=%v, err=%v",
+			claimed,
+			acquired,
+			err,
+		)
+	}
+
+	_, err = opened.AcquireBoardRemovalGuard(ctx, "alpha")
+	var busy *BoardBusyError
+	if !errors.As(err, &busy) ||
+		busy.PublishingPublications != 1 ||
+		!strings.Contains(err.Error(), "1 publishing publication(s)") {
+		t.Fatalf("publishing board removal error = %#v", err)
+	}
+	preserved, err := opened.GetPublication(ctx, claimed.ID)
+	if err != nil || preserved.Status != model.PublicationPublishing {
+		t.Fatalf(
+			"publishing evidence = %+v, err=%v",
+			preserved,
+			err,
+		)
+	}
+
+	if _, err := opened.FailPublication(
+		ctx,
+		claimed.ID,
+		FailPublicationInput{
+			ExpectedUpdatedAt: claimed.UpdatedAt,
+			ClaimToken:        claimed.ClaimToken,
+			ClaimEpoch:        claimed.ClaimEpoch,
+			Error:             "terminal for removal",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := opened.AcquireBoardRemovalGuard(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("guard after terminal publication: %v", err)
+	}
+	if released, err := opened.ReleaseBoardRemovalGuard(
+		ctx,
+		guard,
+	); err != nil || !released {
+		t.Fatalf(
+			"release guard after terminal publication = %v, %v",
+			released,
+			err,
+		)
 	}
 }

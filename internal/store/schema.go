@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 26
+const schemaVersion = 27
 
 type Store struct {
 	db               *sql.DB
@@ -1721,6 +1721,38 @@ INSERT OR IGNORE INTO automation_quarantine_gate(
   singleton, active, generation, permit_token
 ) VALUES (1, 0, 0, lower(hex(randomblob(32))));
 
+-- Phase-one confirmation records the complete normalized operator decision.
+-- One immutable digest per generation prevents a pending or inactive replay
+-- from changing a publication outcome that shares the same disposition.
+CREATE TABLE IF NOT EXISTS automation_quarantine_confirmation_evidence (
+  generation INTEGER PRIMARY KEY
+    CHECK (typeof(generation) = 'integer' AND generation >= 1),
+  confirmation_digest TEXT NOT NULL
+    CHECK (
+      typeof(confirmation_digest) = 'text'
+      AND length(CAST(confirmation_digest AS BLOB)) = 64
+      AND confirmation_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+  recorded_at TEXT NOT NULL
+    CHECK (
+      typeof(recorded_at) = 'text'
+      AND length(CAST(recorded_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(recorded_at, char(0)) = 0
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS automation_confirmation_evidence_prevent_update
+BEFORE UPDATE ON automation_quarantine_confirmation_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'automation confirmation evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS automation_confirmation_evidence_prevent_delete
+BEFORE DELETE ON automation_quarantine_confirmation_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'automation confirmation evidence is immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS automation_quarantine_sources (
   source_key TEXT PRIMARY KEY CHECK (length(source_key) = 64),
   generation INTEGER NOT NULL CHECK (generation >= 1),
@@ -1953,6 +1985,89 @@ CREATE TABLE IF NOT EXISTS publications (
   CHECK (status <> 'published' OR published_at IS NOT NULL),
   CHECK (status <> 'no_change' OR published_at IS NOT NULL)
 );
+
+-- Publication recovery receipts are immutable, board-local proof that an
+-- operator resolved one quarantined external side effect. They intentionally
+-- contain no claim credential and have no foreign key: the audit evidence must
+-- remain durable even if its task hierarchy is later removed.
+CREATE TABLE IF NOT EXISTS publication_recovery_receipts (
+  source_key TEXT PRIMARY KEY
+    CHECK (
+      typeof(source_key) = 'text'
+      AND length(CAST(source_key AS BLOB)) = 64
+      AND source_key NOT GLOB '*[^0-9a-f]*'
+    ),
+  first_generation INTEGER NOT NULL
+    CHECK (typeof(first_generation) = 'integer' AND first_generation >= 1),
+  publication_id TEXT NOT NULL
+    CHECK (
+      typeof(publication_id) = 'text'
+      AND length(CAST(publication_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(publication_id, char(0)) = 0
+    ),
+  observed_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(observed_updated_at) = 'text'
+      AND length(CAST(observed_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(observed_updated_at, char(0)) = 0
+    ),
+  observed_claim_epoch INTEGER NOT NULL
+    CHECK (typeof(observed_claim_epoch) = 'integer' AND observed_claim_epoch >= 1),
+  outcome TEXT NOT NULL
+    CHECK (outcome IN ('published', 'failed', 'superseded')),
+  disposition TEXT NOT NULL
+    CHECK (disposition IN ('superseded', 'abandoned')),
+  result_url TEXT
+    CHECK (
+      result_url IS NULL
+      OR (
+        typeof(result_url) = 'text'
+        AND length(CAST(result_url AS BLOB)) BETWEEN 1 AND 8192
+        AND instr(result_url, char(0)) = 0
+      )
+    ),
+  actor TEXT NOT NULL
+    CHECK (
+      typeof(actor) = 'text'
+      AND length(CAST(actor AS BLOB)) BETWEEN 1 AND 128
+      AND instr(actor, char(0)) = 0
+    ),
+  reason TEXT NOT NULL
+    CHECK (
+      typeof(reason) = 'text'
+      AND length(CAST(reason AS BLOB)) BETWEEN 1 AND 2048
+      AND instr(reason, char(0)) = 0
+    ),
+  recovered_at TEXT NOT NULL
+    CHECK (
+      typeof(recovered_at) = 'text'
+      AND length(CAST(recovered_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(recovered_at, char(0)) = 0
+    ),
+  result_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(result_updated_at) = 'text'
+      AND length(CAST(result_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(result_updated_at, char(0)) = 0
+    ),
+  CHECK (
+    (outcome = 'published' AND disposition = 'superseded')
+    OR (outcome = 'failed' AND disposition = 'abandoned' AND result_url IS NULL)
+    OR (outcome = 'superseded' AND disposition = 'superseded' AND result_url IS NULL)
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS publication_recovery_receipts_prevent_update
+BEFORE UPDATE ON publication_recovery_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'publication recovery receipts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS publication_recovery_receipts_prevent_delete
+BEFORE DELETE ON publication_recovery_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'publication recovery receipts are immutable');
+END;
 
 CREATE TRIGGER IF NOT EXISTS release_terminal_run_resources
 AFTER UPDATE OF status ON task_runs

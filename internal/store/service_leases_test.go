@@ -235,8 +235,8 @@ func TestSchema14ReopenAddsServiceLeases(t *testing.T) {
 	if err := reopened.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 26 {
-		t.Fatalf("test requires schema version 26, got %d", schemaVersion)
+	if schemaVersion != 27 {
+		t.Fatalf("test requires schema version 27, got %d", schemaVersion)
 	}
 	if version != schemaVersion {
 		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
