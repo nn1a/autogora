@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 28
+const schemaVersion = 29
 
 type Store struct {
 	db               *sql.DB
@@ -1986,6 +1986,266 @@ CREATE TABLE IF NOT EXISTS publications (
   CHECK (status <> 'no_change' OR published_at IS NOT NULL)
 );
 
+-- Planner attempt intents are durable evidence that an exact task and graph
+-- snapshot was committed before an external Planner call. They intentionally
+-- have no task foreign key: deleting or archiving a task must not erase an
+-- unresolved call boundary or its eventual replay evidence.
+CREATE TABLE IF NOT EXISTS planner_attempt_intents (
+  id TEXT PRIMARY KEY
+    CHECK (
+      typeof(id) = 'text'
+      AND length(CAST(id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(id, char(0)) = 0
+    ),
+  board TEXT NOT NULL
+    CHECK (
+      typeof(board) = 'text'
+      AND length(CAST(board AS BLOB)) BETWEEN 1 AND 128
+      AND instr(board, char(0)) = 0
+    ),
+  task_id TEXT NOT NULL
+    CHECK (
+      typeof(task_id) = 'text'
+      AND length(CAST(task_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(task_id, char(0)) = 0
+    ),
+  task_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(task_updated_at) = 'text'
+      AND length(CAST(task_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(task_updated_at, char(0)) = 0
+    ),
+  graph_revision INTEGER NOT NULL
+    CHECK (typeof(graph_revision) = 'integer' AND graph_revision >= 0),
+  kind TEXT NOT NULL CHECK (kind IN ('specify', 'decompose')),
+  schema_version INTEGER NOT NULL
+    CHECK (
+      typeof(schema_version) = 'integer'
+      AND schema_version BETWEEN 1 AND 2147483647
+    ),
+  snapshot_hash TEXT NOT NULL
+    CHECK (
+      typeof(snapshot_hash) = 'text'
+      AND length(CAST(snapshot_hash AS BLOB)) = 64
+      AND snapshot_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+  config_hash TEXT NOT NULL
+    CHECK (
+      typeof(config_hash) = 'text'
+      AND length(CAST(config_hash AS BLOB)) = 64
+      AND config_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+  idempotency_key TEXT NOT NULL
+    CHECK (
+      typeof(idempotency_key) = 'text'
+      AND length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 256
+      AND instr(idempotency_key, char(0)) = 0
+    ),
+  attempt INTEGER NOT NULL
+    CHECK (
+      typeof(attempt) = 'integer'
+      AND attempt BETWEEN 1 AND 2147483647
+    ),
+  started_at TEXT NOT NULL
+    CHECK (
+      typeof(started_at) = 'text'
+      AND length(CAST(started_at AS BLOB)) = 30
+      AND instr(started_at, char(0)) = 0
+      AND started_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
+    ),
+  UNIQUE(board, idempotency_key)
+);
+
+CREATE TRIGGER IF NOT EXISTS planner_attempt_intents_prevent_update
+BEFORE UPDATE ON planner_attempt_intents
+BEGIN
+  SELECT RAISE(ABORT, 'planner attempt intents are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS planner_attempt_intents_prevent_delete
+BEFORE DELETE ON planner_attempt_intents
+BEGIN
+  SELECT RAISE(ABORT, 'planner attempt intents are immutable');
+END;
+
+-- A proposal repeats the complete intent identity instead of relying on a
+-- cascading foreign key. The insert guard proves the proposal belongs to the
+-- exact pre-call snapshot, while immutable rows make process-crash replays
+-- distinguishable from a second Planner call.
+CREATE TABLE IF NOT EXISTS planner_attempt_proposals (
+  attempt_id TEXT PRIMARY KEY
+    CHECK (
+      typeof(attempt_id) = 'text'
+      AND length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(attempt_id, char(0)) = 0
+    ),
+  board TEXT NOT NULL
+    CHECK (
+      typeof(board) = 'text'
+      AND length(CAST(board AS BLOB)) BETWEEN 1 AND 128
+      AND instr(board, char(0)) = 0
+    ),
+  task_id TEXT NOT NULL
+    CHECK (
+      typeof(task_id) = 'text'
+      AND length(CAST(task_id AS BLOB)) BETWEEN 1 AND 128
+      AND instr(task_id, char(0)) = 0
+    ),
+  task_updated_at TEXT NOT NULL
+    CHECK (
+      typeof(task_updated_at) = 'text'
+      AND length(CAST(task_updated_at AS BLOB)) BETWEEN 1 AND 128
+      AND instr(task_updated_at, char(0)) = 0
+    ),
+  graph_revision INTEGER NOT NULL
+    CHECK (typeof(graph_revision) = 'integer' AND graph_revision >= 0),
+  kind TEXT NOT NULL CHECK (kind IN ('specify', 'decompose')),
+  schema_version INTEGER NOT NULL
+    CHECK (
+      typeof(schema_version) = 'integer'
+      AND schema_version BETWEEN 1 AND 2147483647
+    ),
+  snapshot_hash TEXT NOT NULL
+    CHECK (
+      typeof(snapshot_hash) = 'text'
+      AND length(CAST(snapshot_hash AS BLOB)) = 64
+      AND snapshot_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+  config_hash TEXT NOT NULL
+    CHECK (
+      typeof(config_hash) = 'text'
+      AND length(CAST(config_hash AS BLOB)) = 64
+      AND config_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+  idempotency_key TEXT NOT NULL
+    CHECK (
+      typeof(idempotency_key) = 'text'
+      AND length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 256
+      AND instr(idempotency_key, char(0)) = 0
+    ),
+  attempt INTEGER NOT NULL
+    CHECK (
+      typeof(attempt) = 'integer'
+      AND attempt BETWEEN 1 AND 2147483647
+    ),
+  started_at TEXT NOT NULL
+    CHECK (
+      typeof(started_at) = 'text'
+      AND length(CAST(started_at AS BLOB)) = 30
+      AND instr(started_at, char(0)) = 0
+      AND started_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
+    ),
+  response_hash TEXT NOT NULL
+    CHECK (
+      typeof(response_hash) = 'text'
+      AND length(CAST(response_hash AS BLOB)) = 64
+      AND response_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+  payload_json TEXT
+    CHECK (
+      payload_json IS NULL
+      OR (
+        typeof(payload_json) = 'text'
+        AND length(CAST(payload_json AS BLOB)) BETWEEN 1 AND 262144
+        AND json_valid(payload_json)
+        AND CASE
+          WHEN json_valid(payload_json) THEN json(payload_json) = payload_json
+          ELSE 0
+        END
+      )
+    ),
+  payload_hash TEXT
+    CHECK (
+      payload_hash IS NULL
+      OR (
+        typeof(payload_hash) = 'text'
+        AND length(CAST(payload_hash AS BLOB)) = 64
+        AND payload_hash NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+  validation_status TEXT NOT NULL
+    CHECK (validation_status IN ('valid', 'invalid')),
+  validation_error TEXT
+    CHECK (
+      validation_error IS NULL
+      OR (
+        typeof(validation_error) = 'text'
+        AND length(CAST(validation_error AS BLOB)) BETWEEN 1 AND 4096
+        AND instr(validation_error, char(0)) = 0
+      )
+    ),
+  validation_error_hash TEXT
+    CHECK (
+      validation_error_hash IS NULL
+      OR (
+        typeof(validation_error_hash) = 'text'
+        AND length(CAST(validation_error_hash AS BLOB)) = 64
+        AND validation_error_hash NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+  recorded_at TEXT NOT NULL
+    CHECK (
+      typeof(recorded_at) = 'text'
+      AND length(CAST(recorded_at AS BLOB)) = 30
+      AND instr(recorded_at, char(0)) = 0
+      AND recorded_at GLOB
+        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z'
+    ),
+  CHECK (
+    (validation_status = 'valid'
+      AND validation_error IS NULL
+      AND validation_error_hash IS NULL)
+    OR
+    (validation_status = 'invalid'
+      AND validation_error IS NOT NULL
+      AND validation_error_hash IS NOT NULL)
+  ),
+  CHECK (
+    (payload_json IS NULL AND payload_hash IS NULL)
+    OR
+    (payload_json IS NOT NULL AND payload_hash IS NOT NULL)
+  ),
+  CHECK (
+    validation_status <> 'valid'
+    OR (payload_json IS NOT NULL AND payload_hash IS NOT NULL)
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS planner_attempt_proposals_identity_guard
+BEFORE INSERT ON planner_attempt_proposals
+WHEN NOT EXISTS (
+  SELECT 1 FROM planner_attempt_intents i
+  WHERE i.id = NEW.attempt_id
+    AND i.board = NEW.board
+    AND i.task_id = NEW.task_id
+    AND i.task_updated_at = NEW.task_updated_at
+    AND i.graph_revision = NEW.graph_revision
+    AND i.kind = NEW.kind
+    AND i.schema_version = NEW.schema_version
+    AND i.snapshot_hash = NEW.snapshot_hash
+    AND i.config_hash = NEW.config_hash
+    AND i.idempotency_key = NEW.idempotency_key
+    AND i.attempt = NEW.attempt
+    AND i.started_at = NEW.started_at
+)
+BEGIN
+  SELECT RAISE(ABORT, 'planner proposal does not match its attempt intent');
+END;
+
+CREATE TRIGGER IF NOT EXISTS planner_attempt_proposals_prevent_update
+BEFORE UPDATE ON planner_attempt_proposals
+BEGIN
+  SELECT RAISE(ABORT, 'planner attempt proposals are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS planner_attempt_proposals_prevent_delete
+BEFORE DELETE ON planner_attempt_proposals
+BEGIN
+  SELECT RAISE(ABORT, 'planner attempt proposals are immutable');
+END;
+
 -- Publication attempt intents are immutable evidence that an exact automatic
 -- publication claim crossed the durable execution boundary. They deliberately
 -- have no task, run, change-set, or publication foreign key so task cleanup
@@ -2396,6 +2656,10 @@ CREATE INDEX IF NOT EXISTS idx_publications_board_status ON publications(board, 
 CREATE INDEX IF NOT EXISTS idx_publications_task ON publications(board, task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_publications_run ON publications(board, run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_publications_claim_due ON publications(board, status, claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_planner_attempt_intents_board_started
+  ON planner_attempt_intents(board, started_at, id);
+CREATE INDEX IF NOT EXISTS idx_planner_attempt_intents_task
+  ON planner_attempt_intents(board, task_id, attempt);
 CREATE INDEX IF NOT EXISTS idx_publication_attempt_intents_board_started
   ON publication_attempt_intents(board, started_at, id);
 CREATE INDEX IF NOT EXISTS idx_publication_attempt_intents_publication

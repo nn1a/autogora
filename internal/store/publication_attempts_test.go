@@ -1016,7 +1016,7 @@ func TestSchema28AddsImmutablePublicationAttemptLedger(t *testing.T) {
 	`).Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || schemaVersion != 28 ||
+	if version != schemaVersion || schemaVersion != 29 ||
 		tables != 2 || triggers != 5 || foreignKeys != 0 {
 		t.Fatalf(
 			"publication attempt migration version=%d constant=%d tables=%d triggers=%d foreignKeys=%d",

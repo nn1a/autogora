@@ -940,7 +940,7 @@ func TestExistingPublicationSchemaAddsClaimEpoch(t *testing.T) {
 	).Scan(&version); versionErr != nil {
 		t.Fatal(versionErr)
 	}
-	if version != schemaVersion || schemaVersion != 28 ||
+	if version != schemaVersion || schemaVersion != 29 ||
 		columnType != "INTEGER" || notNull != 1 || defaultValue != "0" {
 		t.Fatalf(
 			"claim epoch migration: version=%d constant=%d type=%q notNull=%d default=%q",
